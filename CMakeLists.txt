@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.8.12)
+cmake_minimum_required(VERSION 3.5)
 project(FokkerPlanckSolver CXX)
 
 # 为兼容 GCC 4.8.5 使用 C++11
@@ -24,6 +24,7 @@ set(SOURCES
     src/maxwell.cpp
     src/collision.cpp
     src/diagnostics.cpp
+    src/beam_pic.cpp
 )
 
 add_executable(fp_solver ${SOURCES})
