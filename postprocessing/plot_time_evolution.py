@@ -18,6 +18,7 @@ from postprocess_common import (
     read_table,
     save_figure,
     snapshot_time_fs,
+    validate_selected_data,
     y_axis_label,
 )
 
@@ -26,9 +27,10 @@ def main() -> None:
     files = files_for_prefix(config.DATA_DIR, config.TIME_PREFIX)
     labels = read_header(files[0])
     column_indices = normalize_columns(labels, config.TIME_COLUMNS)
-    labels, _ = normalize_plot_columns(
+    labels, first_data = normalize_plot_columns(
         *read_table(files[0]), column_indices, config.PARAMETERS_FILE
     )
+    validate_selected_data(files[0], labels, first_data, column_indices)
     dt_snapshot_fs, t_end_fs = infer_time_settings(config.PARAMETERS_FILE)
 
     times = np.array([snapshot_time_fs(path, dt_snapshot_fs, t_end_fs) for path in files])

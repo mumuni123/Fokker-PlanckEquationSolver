@@ -22,7 +22,7 @@ public:
     void inject(const SpatialGrid& sg, double dt, double time, int mpi_rank);
     void push(const SpatialGrid& sg, const EMFields& fields, double dt,
               int mpi_rank, int mpi_size);
-    void deposit_density(const SpatialGrid& sg);
+    void deposit_density(const SpatialGrid& sg, int mpi_rank, int mpi_size);
 
     double total_particle_number(const SpatialGrid& sg) const;
     double total_kinetic_energy() const;

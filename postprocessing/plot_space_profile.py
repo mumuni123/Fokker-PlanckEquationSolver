@@ -12,6 +12,7 @@ from postprocess_common import (
     normalize_columns,
     read_table,
     save_figure,
+    validate_selected_data,
     y_axis_label,
 )
 
@@ -22,6 +23,7 @@ def main() -> None:
     labels, data = normalize_plot_columns(
         labels, data, column_indices, config.PARAMETERS_FILE
     )
+    validate_selected_data(config.SPACE_FILE, labels, data, column_indices)
 
     fig, ax = plt.subplots(figsize=config.FIGSIZE)
     for col in column_indices:

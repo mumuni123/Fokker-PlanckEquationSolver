@@ -9,16 +9,24 @@ struct EMFields;
 
 class VlasovSolver {
 public:
+    VlasovSolver();
+
     void advect(Species& sp, const SpatialGrid& sg, const EMFields& fields,
                 double dt, int mpi_rank, int mpi_size);
 
-private:
     void advect_x(Species& sp, const SpatialGrid& sg, double dt,
                   int mpi_rank, int mpi_size);
     void advect_v(Species& sp, const SpatialGrid& sg, const EMFields& fields,
                   double dt);
     void advect_mu(Species& sp, const SpatialGrid& sg, const EMFields& fields,
                    double dt);
+
+    double last_cfl_v() const { return last_cfl_v_; }
+    double last_cfl_mu() const { return last_cfl_mu_; }
+    int last_nsub_v() const { return last_nsub_v_; }
+    int last_nsub_mu() const { return last_nsub_mu_; }
+
+private:
     void exchange_ghosts_x(Species& sp, const SpatialGrid& sg,
                            int mpi_rank, int mpi_size);
 
@@ -26,6 +34,11 @@ private:
     std::vector<double> send_right_;
     std::vector<double> recv_left_;
     std::vector<double> recv_right_;
+
+    double last_cfl_v_;
+    double last_cfl_mu_;
+    int last_nsub_v_;
+    int last_nsub_mu_;
 };
 
 #endif

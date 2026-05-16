@@ -37,10 +37,12 @@ namespace Param {
     const double Lx    = 8.0   * Const::micro;
     const int    nx    = static_cast<int>(Lx / dx);
 
-    const double t_end         = 120.0 * Const::femto;
+    const double t_end         = 6.0 * Const::femto;
     const double t_inject_end  = 25.0  * Const::femto;
     const double dt_multiplier = 0.5;
     const double dt_snapshot   = 0.6 * Const::femto;
+    const bool   enable_debug_diagnostics = false;
+    const double velocity_space_cfl = 0.45;
     const int    beam_macro_particles_per_cell = 1000;
     const double beam_macro_weight = densb * dx / beam_macro_particles_per_cell;
 

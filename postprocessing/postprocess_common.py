@@ -119,6 +119,18 @@ def y_axis_label(labels: list[str], column_indices: list[int]) -> str:
     return ", ".join(selected)
 
 
+def validate_selected_data(path: Path, labels: list[str], data: np.ndarray, column_indices: list[int]) -> None:
+    for col in column_indices:
+        values = data[:, col]
+        finite = np.isfinite(values)
+        if not finite.all():
+            bad_count = int((~finite).sum())
+            raise ValueError(
+                f"{path} column {labels[col]!r} contains {bad_count} non-finite values "
+                f"(NaN or inf). Regenerate the simulation output before plotting."
+            )
+
+
 def files_for_prefix(output_dir: Path, prefix: str) -> list[Path]:
     files = sorted(output_dir.glob(f"{prefix}_*.dat"))
     if not files:
@@ -177,6 +189,7 @@ def interpolate_at_x(
 ) -> list[float]:
     labels, data = read_table(path)
     _, data = normalize_plot_columns(labels, data, column_indices, parameters_file)
+    validate_selected_data(path, labels, data, column_indices)
     x = data[:, 0]
     xmin = float(np.min(x))
     xmax = float(np.max(x))

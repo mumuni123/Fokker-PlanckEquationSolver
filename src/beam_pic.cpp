@@ -7,6 +7,36 @@ BeamPIC::BeamPIC()
     : injection_remainder_(0.0)
 {}
 
+namespace {
+double cic_weight_to_cell(double x, int ig, double dx)
+{
+    double x_cell = (ig + 0.5) * dx;
+    double r = std::fabs(x - x_cell) / dx;
+    return (r < 1.0) ? (1.0 - r) : 0.0;
+}
+
+double gather_cic_ex(double x, const SpatialGrid& sg, const EMFields& fields)
+{
+    double s = x / sg.dx - 0.5;
+    int i0 = static_cast<int>(std::floor(s));
+    int i1 = i0 + 1;
+    double ex = 0.0;
+
+    for (int n = 0; n < 2; ++n) {
+        int ig = (n == 0) ? i0 : i1;
+        int target_ig = std::max(0, std::min(ig, sg.nx_global - 1));
+        double w = cic_weight_to_cell(x, ig, sg.dx);
+        int il = target_ig - sg.ix_start;
+        int ix = il + sg.nghost;
+        if (ix >= 0 && ix < sg.nx_total) {
+            ex += w * fields.Ex[ix];
+        }
+    }
+
+    return ex;
+}
+}
+
 void BeamPIC::init(const SpatialGrid& sg)
 {
     particles.clear();
@@ -23,10 +53,10 @@ void BeamPIC::inject(const SpatialGrid& sg, double dt, double time, int mpi_rank
     int n_new = static_cast<int>(physical_per_area / Param::beam_macro_weight);
     injection_remainder_ = physical_per_area - n_new * Param::beam_macro_weight;
 
-    double x0 = 0.5 * sg.dx;
+    double injection_length = std::min(Param::beam_v0 * dt, sg.dx);
     for (int i = 0; i < n_new; ++i) {
         BeamParticle p;
-        p.x = x0;
+        p.x = (i + 0.5) * injection_length / std::max(n_new, 1);
         p.px = Param::beam_p0;
         p.weight = Param::beam_macro_weight;
         particles.push_back(p);
@@ -36,14 +66,9 @@ void BeamPIC::inject(const SpatialGrid& sg, double dt, double time, int mpi_rank
 void BeamPIC::push(const SpatialGrid& sg, const EMFields& fields, double dt,
                    int mpi_rank, int mpi_size)
 {
-    int ng = sg.nghost;
     for (size_t i = 0; i < particles.size(); ++i) {
         BeamParticle& p = particles[i];
-        int ig = static_cast<int>(p.x / sg.dx);
-        int il = ig - sg.ix_start;
-        if (il < 0) il = 0;
-        if (il >= sg.nx_local) il = sg.nx_local - 1;
-        double ex = fields.Ex[ng + il];
+        double ex = gather_cic_ex(p.x, sg, fields);
 
         p.px += (-Const::qe) * ex * dt;
         double gamma = std::sqrt(1.0 + (p.px / (Const::me * Const::c)) *
@@ -148,16 +173,53 @@ void BeamPIC::exchange_particles(const SpatialGrid& sg, int mpi_rank, int mpi_si
     }
 }
 
-void BeamPIC::deposit_density(const SpatialGrid& sg)
+void BeamPIC::deposit_density(const SpatialGrid& sg, int mpi_rank, int mpi_size)
 {
     std::fill(density.begin(), density.end(), 0.0);
+    double send_left = 0.0;
+    double send_right = 0.0;
+
     for (size_t i = 0; i < particles.size(); ++i) {
-        int ig = static_cast<int>(particles[i].x / sg.dx);
-        int il = ig - sg.ix_start;
-        if (il >= 0 && il < sg.nx_local) {
-            density[il] += particles[i].weight / sg.dx;
+        const BeamParticle& p = particles[i];
+        double s = p.x / sg.dx - 0.5;
+        int i0 = static_cast<int>(std::floor(s));
+
+        for (int n = 0; n < 2; ++n) {
+            int ig = i0 + n;
+            int target_ig = std::max(0, std::min(ig, sg.nx_global - 1));
+            double contribution = p.weight * cic_weight_to_cell(p.x, ig, sg.dx) / sg.dx;
+            if (contribution == 0.0) continue;
+
+            int il = target_ig - sg.ix_start;
+            if (il >= 0 && il < sg.nx_local) {
+                density[il] += contribution;
+            } else if (target_ig < sg.ix_start) {
+                send_left += contribution;
+            } else {
+                send_right += contribution;
+            }
         }
     }
+
+    double recv_left = 0.0;
+    double recv_right = 0.0;
+    int left = mpi_rank - 1;
+    int right = mpi_rank + 1;
+
+    MPI_Request reqs[4];
+    int nreq = 0;
+    if (left >= 0) {
+        MPI_Isend(&send_left, 1, MPI_DOUBLE, left, 401, MPI_COMM_WORLD, &reqs[nreq++]);
+        MPI_Irecv(&recv_left, 1, MPI_DOUBLE, left, 402, MPI_COMM_WORLD, &reqs[nreq++]);
+    }
+    if (right < mpi_size) {
+        MPI_Isend(&send_right, 1, MPI_DOUBLE, right, 402, MPI_COMM_WORLD, &reqs[nreq++]);
+        MPI_Irecv(&recv_right, 1, MPI_DOUBLE, right, 401, MPI_COMM_WORLD, &reqs[nreq++]);
+    }
+    if (nreq > 0) MPI_Waitall(nreq, reqs, MPI_STATUSES_IGNORE);
+
+    if (left >= 0 && sg.nx_local > 0) density[0] += recv_left;
+    if (right < mpi_size && sg.nx_local > 0) density[sg.nx_local - 1] += recv_right;
 }
 
 double BeamPIC::total_particle_number(const SpatialGrid& sg) const
