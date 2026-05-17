@@ -29,6 +29,17 @@ public:
 
 private:
     double injection_remainder_;
+    std::vector<BeamParticle> send_left_;
+    std::vector<BeamParticle> send_right_;
+    std::vector<BeamParticle> keep_;
+    std::vector<BeamParticle> recv_left_;
+    std::vector<BeamParticle> recv_right_;
+    std::vector<std::vector<BeamParticle> > thread_keep_;
+    std::vector<std::vector<BeamParticle> > thread_send_left_;
+    std::vector<std::vector<BeamParticle> > thread_send_right_;
+    std::vector<std::vector<double> > thread_density_;
+    std::vector<double> thread_send_left_density_;
+    std::vector<double> thread_send_right_density_;
 
     void exchange_particles(const SpatialGrid& sg, int mpi_rank, int mpi_size);
 };

@@ -30,6 +30,7 @@ double compute_dt(const Species& electron, const SpatialGrid& sg)
 
 bool parse_debug_diagnostics_flag(int argc, char** argv)
 {
+#if FP_ENABLE_DEBUG_DIAGNOSTICS
     bool enabled = Param::enable_debug_diagnostics;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--debug-diagnostics") == 0 ||
@@ -41,6 +42,39 @@ bool parse_debug_diagnostics_flag(int argc, char** argv)
         }
     }
     return enabled;
+#else
+    (void)argc;
+    (void)argv;
+    return false;
+#endif
+}
+
+bool parse_full_fe_output_flag(int argc, char** argv)
+{
+    bool enabled = Param::enable_full_fe_output;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--full-fe-output") == 0 ||
+            std::strcmp(argv[i], "--write-fe") == 0) {
+            enabled = true;
+        } else if (std::strcmp(argv[i], "--no-full-fe-output") == 0 ||
+                   std::strcmp(argv[i], "--no-write-fe") == 0) {
+            enabled = false;
+        }
+    }
+    return enabled;
+}
+
+const char* poisson_solver_name()
+{
+    switch (Param::poisson_solver) {
+    case Param::POISSON_PARALLEL_CYCLIC_REDUCTION:
+        return "parallel cyclic reduction";
+    case Param::POISSON_MULTIGRID:
+        return "multigrid";
+    case Param::POISSON_DISTRIBUTED_TRIDIAGONAL:
+    default:
+        return "distributed tridiagonal";
+    }
 }
 
 void write_snapshot(Diagnostics& diag,
@@ -50,12 +84,15 @@ void write_snapshot(Diagnostics& diag,
                     const EMFields& fields,
                     const SpatialGrid& sgrid,
                     int mpi_rank,
-                    int mpi_size)
+                    int mpi_size,
+                    bool write_full_fe)
 {
     diag.write_fields(time, fields, sgrid, mpi_rank, mpi_size);
     diag.write_density_profile(time, bkg_e, beam.density, sgrid, mpi_rank, mpi_size);
     diag.write_px_distribution(time, bkg_e, mpi_rank, mpi_size);
-    diag.write_electron_distribution(time, bkg_e, sgrid, mpi_rank);
+    if (write_full_fe) {
+        diag.write_electron_distribution(time, bkg_e, sgrid, mpi_rank);
+    }
 
     if (mpi_rank == 0) {
         printf("  >> Snapshot %d written at t = %.4f fs\n",
@@ -73,6 +110,7 @@ int main(int argc, char** argv)
     MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
 
     bool enable_debug_diagnostics = parse_debug_diagnostics_flag(argc, argv);
+    bool enable_full_fe_output = parse_full_fe_output_flag(argc, argv);
 
     if (mpi_rank == 0) {
         printf("============================================================\n");
@@ -87,13 +125,22 @@ int main(int argc, char** argv)
         }
         printf("Spatial grid: nx = %d, dx = %.3e m\n", Param::nx, Param::dx);
         printf("Electron velocity grid: Nv x Nmu = %d x %d\n", Param::Nv, Param::Nmu);
+        printf("Electron velocity domain: 0 <= v <= %.1f v_th (cap 0.98 c)\n",
+               Param::Nsigma);
+        printf("Electrostatic boundary: phi(0) = phi(L) = 0\n");
+        printf("Poisson solver: %s\n", poisson_solver_name());
         printf("Fixed ions: Z*n_i = %.3e /m^3\n", Param::dens);
         printf("Background electrons: n_e0 = %.3e /m^3, T_e = %.1f eV\n",
                Param::dens, Param::temperature_e / Const::eV);
         printf("PIC beam: gamma*beta = %.2f, beta = %.4f, n_b = %.3e /m^3\n",
                Param::gambetab, Param::betab, Param::densb);
         printf("Beam macro weight: %.6e particles/m^2\n", Param::beam_macro_weight);
+#if FP_ENABLE_DEBUG_DIAGNOSTICS
         printf("Debug diagnostics: %s\n", enable_debug_diagnostics ? "ON" : "OFF");
+#else
+        printf("Debug diagnostics: compile-time disabled\n");
+#endif
+        printf("Full fe distribution output: %s\n", enable_full_fe_output ? "ON" : "OFF");
         printf("------------------------------------------------------------\n");
     }
 
@@ -132,90 +179,186 @@ int main(int argc, char** argv)
     }
 
     bkg_e.compute_moments();
+    bool moments_current = true;
     fields.set_charge_density(bkg_e, beam.density);
     fields.solve_poisson(mpi_rank, mpi_size);
-    diag.write_debug_state(0, 0.0, "initial", bkg_e, beam, fields,
-                           sgrid, mpi_rank, mpi_size);
+#if FP_ENABLE_DEBUG_DIAGNOSTICS
+    if (enable_debug_diagnostics) {
+        diag.write_debug_state(0, 0.0, "initial", bkg_e, beam, fields,
+                               sgrid, mpi_rank, mpi_size);
+    }
+#endif
     diag.write_scalars(0.0, 0, electron_species, fields, mpi_rank, mpi_size);
-    write_snapshot(diag, 0.0, bkg_e, beam, fields, sgrid, mpi_rank, mpi_size);
+    write_snapshot(diag, 0.0, bkg_e, beam, fields, sgrid, mpi_rank, mpi_size,
+                   enable_full_fe_output);
 
     double next_snapshot = Param::dt_snapshot;
-    int stdout_freq = 200;
+    int stdout_freq = 1000;
     int last_snapshot_step = 0;
 
-    for (int step = 1; step <= nsteps; ++step) {
-        double time = step * dt;
+#if FP_ENABLE_DEBUG_DIAGNOSTICS
+    if (enable_debug_diagnostics) {
+        for (int step = 1; step <= nsteps; ++step) {
+            double time = step * dt;
 
-        vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size);
-        diag.write_debug_state(step, time, "x1", bkg_e, beam, fields,
-                               sgrid, mpi_rank, mpi_size);
-        vlasov.advect_v(bkg_e, sgrid, fields, 0.5 * dt);
-        diag.write_debug_state(step, time, "v1", bkg_e, beam, fields,
-                               sgrid, mpi_rank, mpi_size,
-                               vlasov.last_cfl_v(), 0.0,
-                               vlasov.last_nsub_v(), 0);
-        vlasov.advect_mu(bkg_e, sgrid, fields, 0.5 * dt);
-        diag.write_debug_state(step, time, "mu1", bkg_e, beam, fields,
-                               sgrid, mpi_rank, mpi_size,
-                               vlasov.last_cfl_v(), vlasov.last_cfl_mu(),
-                               vlasov.last_nsub_v(), vlasov.last_nsub_mu());
+            vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size);
+            moments_current = false;
+            diag.write_debug_state(step, time, "x1", bkg_e, beam, fields,
+                                   sgrid, mpi_rank, mpi_size);
+            vlasov.advect_v(bkg_e, sgrid, fields, 0.5 * dt);
+            moments_current = false;
+            diag.write_debug_state(step, time, "v1", bkg_e, beam, fields,
+                                   sgrid, mpi_rank, mpi_size,
+                                   vlasov.last_cfl_v(), 0.0,
+                                   vlasov.last_nsub_v(), 0);
+            vlasov.advect_mu(bkg_e, sgrid, fields, 0.5 * dt);
+            moments_current = false;
+            diag.write_debug_state(step, time, "mu1", bkg_e, beam, fields,
+                                   sgrid, mpi_rank, mpi_size,
+                                   vlasov.last_cfl_v(), vlasov.last_cfl_mu(),
+                                   vlasov.last_nsub_v(), vlasov.last_nsub_mu());
 
-        beam.push(sgrid, fields, dt, mpi_rank, mpi_size);
-        beam.inject(sgrid, dt, time, mpi_rank);
-        beam.deposit_density(sgrid, mpi_rank, mpi_size);
+            beam.push(sgrid, fields, dt, mpi_rank, mpi_size);
+            beam.inject(sgrid, dt, time, mpi_rank);
+            beam.deposit_density(sgrid, mpi_rank, mpi_size);
 
-        bkg_e.compute_moments();
-        fields.set_charge_density(bkg_e, beam.density);
-        fields.solve_poisson(mpi_rank, mpi_size);
-        diag.write_debug_state(step, time, "solve_poisson", bkg_e, beam, fields,
-                               sgrid, mpi_rank, mpi_size);
+            if (!moments_current) {
+                bkg_e.compute_moments();
+                moments_current = true;
+            }
+            fields.set_charge_density(bkg_e, beam.density);
+            fields.solve_poisson(mpi_rank, mpi_size);
+            diag.write_debug_state(step, time, "solve_poisson", bkg_e, beam, fields,
+                                   sgrid, mpi_rank, mpi_size);
 
-        if (bkg_e.collisions_enabled) {
-            collision.apply(bkg_e, dt, Param::dens, Param::temperature_e,
-                            Const::me, 1.0, 1.0);
-            collision.apply(bkg_e, dt, Param::dens / Param::Z_ion,
-                            Param::temperature_i, Param::mass_ion,
-                            (double)Param::Z_ion, 1.0);
-        }
+            if (bkg_e.collisions_enabled) {
+                collision.apply(bkg_e, dt, Param::dens, Param::temperature_e,
+                                Const::me, 1.0, 1.0);
+                collision.apply(bkg_e, dt, Param::dens / Param::Z_ion,
+                                Param::temperature_i, Param::mass_ion,
+                                (double)Param::Z_ion, 1.0);
+                moments_current = false;
+            }
 
-        vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size);
-        diag.write_debug_state(step, time, "x2", bkg_e, beam, fields,
-                               sgrid, mpi_rank, mpi_size);
-        vlasov.advect_v(bkg_e, sgrid, fields, 0.5 * dt);
-        diag.write_debug_state(step, time, "v2", bkg_e, beam, fields,
-                               sgrid, mpi_rank, mpi_size,
-                               vlasov.last_cfl_v(), 0.0,
-                               vlasov.last_nsub_v(), 0);
-        vlasov.advect_mu(bkg_e, sgrid, fields, 0.5 * dt);
-        diag.write_debug_state(step, time, "mu2", bkg_e, beam, fields,
-                               sgrid, mpi_rank, mpi_size,
-                               vlasov.last_cfl_v(), vlasov.last_cfl_mu(),
-                               vlasov.last_nsub_v(), vlasov.last_nsub_mu());
+            vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size);
+            moments_current = false;
+            diag.write_debug_state(step, time, "x2", bkg_e, beam, fields,
+                                   sgrid, mpi_rank, mpi_size);
+            vlasov.advect_v(bkg_e, sgrid, fields, 0.5 * dt);
+            moments_current = false;
+            diag.write_debug_state(step, time, "v2", bkg_e, beam, fields,
+                                   sgrid, mpi_rank, mpi_size,
+                                   vlasov.last_cfl_v(), 0.0,
+                                   vlasov.last_nsub_v(), 0);
+            vlasov.advect_mu(bkg_e, sgrid, fields, 0.5 * dt);
+            moments_current = false;
+            diag.write_debug_state(step, time, "mu2", bkg_e, beam, fields,
+                                   sgrid, mpi_rank, mpi_size,
+                                   vlasov.last_cfl_v(), vlasov.last_cfl_mu(),
+                                   vlasov.last_nsub_v(), vlasov.last_nsub_mu());
 
-        if (step % stdout_freq == 0) {
-            bkg_e.compute_moments();
-            diag.write_scalars(time, step, electron_species, fields, mpi_rank, mpi_size);
-            if (mpi_rank == 0) {
-                printf("Step %d / %d, t = %.4f fs\n", step, nsteps, time / Const::femto);
+            if (step % stdout_freq == 0) {
+                if (!moments_current) {
+                    bkg_e.compute_moments();
+                    moments_current = true;
+                }
+                diag.write_scalars(time, step, electron_species, fields, mpi_rank, mpi_size);
+                if (mpi_rank == 0) {
+                    printf("Step %d / %d, t = %.4f fs\n", step, nsteps, time / Const::femto);
+                }
+            }
+
+            if (time >= next_snapshot) {
+                if (!moments_current) {
+                    bkg_e.compute_moments();
+                    moments_current = true;
+                }
+                write_snapshot(diag, time, bkg_e, beam, fields, sgrid, mpi_rank, mpi_size,
+                               enable_full_fe_output);
+                last_snapshot_step = step;
+                next_snapshot += Param::dt_snapshot;
             }
         }
+    } else
+#endif
+    {
+        for (int step = 1; step <= nsteps; ++step) {
+            double time = step * dt;
 
-        if (time >= next_snapshot) {
-            bkg_e.compute_moments();
-            write_snapshot(diag, time, bkg_e, beam, fields, sgrid, mpi_rank, mpi_size);
-            last_snapshot_step = step;
-            next_snapshot += Param::dt_snapshot;
+            vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size);
+            moments_current = false;
+            vlasov.advect_v(bkg_e, sgrid, fields, 0.5 * dt);
+            moments_current = false;
+            vlasov.advect_mu(bkg_e, sgrid, fields, 0.5 * dt);
+            moments_current = false;
+
+            beam.push(sgrid, fields, dt, mpi_rank, mpi_size);
+            beam.inject(sgrid, dt, time, mpi_rank);
+            beam.deposit_density(sgrid, mpi_rank, mpi_size);
+
+            if (!moments_current) {
+                bkg_e.compute_moments();
+                moments_current = true;
+            }
+            fields.set_charge_density(bkg_e, beam.density);
+            fields.solve_poisson(mpi_rank, mpi_size);
+
+            if (bkg_e.collisions_enabled) {
+                collision.apply(bkg_e, dt, Param::dens, Param::temperature_e,
+                                Const::me, 1.0, 1.0);
+                collision.apply(bkg_e, dt, Param::dens / Param::Z_ion,
+                                Param::temperature_i, Param::mass_ion,
+                                (double)Param::Z_ion, 1.0);
+                moments_current = false;
+            }
+
+            vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size);
+            moments_current = false;
+            vlasov.advect_v(bkg_e, sgrid, fields, 0.5 * dt);
+            moments_current = false;
+            vlasov.advect_mu(bkg_e, sgrid, fields, 0.5 * dt);
+            moments_current = false;
+
+            if (step % stdout_freq == 0) {
+                if (!moments_current) {
+                    bkg_e.compute_moments();
+                    moments_current = true;
+                }
+                diag.write_scalars(time, step, electron_species, fields, mpi_rank, mpi_size);
+                if (mpi_rank == 0) {
+                    printf("Step %d / %d, t = %.4f fs\n", step, nsteps, time / Const::femto);
+                }
+            }
+
+            if (time >= next_snapshot) {
+                if (!moments_current) {
+                    bkg_e.compute_moments();
+                    moments_current = true;
+                }
+                write_snapshot(diag, time, bkg_e, beam, fields, sgrid, mpi_rank, mpi_size,
+                               enable_full_fe_output);
+                last_snapshot_step = step;
+                next_snapshot += Param::dt_snapshot;
+            }
         }
     }
 
-    bkg_e.compute_moments();
+    if (!moments_current) {
+        bkg_e.compute_moments();
+        moments_current = true;
+    }
     fields.set_charge_density(bkg_e, beam.density);
     fields.solve_poisson(mpi_rank, mpi_size);
-    diag.write_debug_state(nsteps, Param::t_end, "final", bkg_e, beam, fields,
-                           sgrid, mpi_rank, mpi_size);
+#if FP_ENABLE_DEBUG_DIAGNOSTICS
+    if (enable_debug_diagnostics) {
+        diag.write_debug_state(nsteps, Param::t_end, "final", bkg_e, beam, fields,
+                               sgrid, mpi_rank, mpi_size);
+    }
+#endif
     diag.write_scalars(Param::t_end, nsteps, electron_species, fields, mpi_rank, mpi_size);
     if (last_snapshot_step != nsteps) {
-        write_snapshot(diag, Param::t_end, bkg_e, beam, fields, sgrid, mpi_rank, mpi_size);
+        write_snapshot(diag, Param::t_end, bkg_e, beam, fields, sgrid, mpi_rank, mpi_size,
+                       enable_full_fe_output);
     }
 
     if (mpi_rank == 0) {

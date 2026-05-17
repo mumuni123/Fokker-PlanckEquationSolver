@@ -7,13 +7,6 @@
 #include <omp.h>
 
 namespace {
-double maxwellian_value(const Species& sp, double v)
-{
-    double norm = sp.density0 * std::pow(2.0 * Const::pi * sp.temperature / sp.mass, -1.5);
-    double inv2vth2 = sp.mass / (2.0 * sp.temperature);
-    return norm * std::exp(-v * v * inv2vth2);
-}
-
 void fill_background_left_boundary(Species& sp, const SpatialGrid& sg)
 {
     // Open perturbations: outgoing vx < 0 uses zero-gradient extrapolation,
@@ -22,13 +15,18 @@ void fill_background_left_boundary(Species& sp, const SpatialGrid& sg)
     for (int g = 0; g < ng; ++g) {
         int ix_dst = ng - 1 - g;
         int ix_src = ng;
+        const size_t dst_base = static_cast<size_t>(ix_dst) * Param::Nvmu;
+        const size_t src_base = static_cast<size_t>(ix_src) * Param::Nvmu;
         for (int iv = 0; iv < Param::Nv; ++iv) {
-            double v = sp.vgrid.v(iv);
+            const size_t row = static_cast<size_t>(iv) * Param::Nmu;
+            const size_t dst_row = dst_base + row;
+            const size_t src_row = src_base + row;
+            const double f_reservoir = sp.maxwellian_boundary[iv];
             for (int imu = 0; imu < Param::Nmu; ++imu) {
-                double mu = sp.vgrid.mu(imu);
-                sp.f[idx3(ix_dst, iv, imu)] = (v * mu > 0.0)
-                    ? maxwellian_value(sp, v)
-                    : sp.f[idx3(ix_src, iv, imu)];
+                const size_t k = row + imu;
+                sp.f[dst_row + imu] = (sp.vgrid.vx_cells[k] > 0.0)
+                    ? f_reservoir
+                    : sp.f[src_row + imu];
             }
         }
     }
@@ -43,13 +41,18 @@ void fill_background_right_boundary(Species& sp, const SpatialGrid& sg)
     for (int g = 0; g < ng; ++g) {
         int ix_dst = ng + nxl + g;
         int ix_src = ng + nxl - 1;
+        const size_t dst_base = static_cast<size_t>(ix_dst) * Param::Nvmu;
+        const size_t src_base = static_cast<size_t>(ix_src) * Param::Nvmu;
         for (int iv = 0; iv < Param::Nv; ++iv) {
-            double v = sp.vgrid.v(iv);
+            const size_t row = static_cast<size_t>(iv) * Param::Nmu;
+            const size_t dst_row = dst_base + row;
+            const size_t src_row = src_base + row;
+            const double f_reservoir = sp.maxwellian_boundary[iv];
             for (int imu = 0; imu < Param::Nmu; ++imu) {
-                double mu = sp.vgrid.mu(imu);
-                sp.f[idx3(ix_dst, iv, imu)] = (v * mu < 0.0)
-                    ? maxwellian_value(sp, v)
-                    : sp.f[idx3(ix_src, iv, imu)];
+                const size_t k = row + imu;
+                sp.f[dst_row + imu] = (sp.vgrid.vx_cells[k] < 0.0)
+                    ? f_reservoir
+                    : sp.f[src_row + imu];
             }
         }
     }
@@ -87,10 +90,63 @@ void fill_global_right_boundary(Species& sp, const SpatialGrid& sg)
     }
 }
 
-int substeps_from_cfl(double cfl)
+int substeps_from_cfl(double cfl, double cfl_limit)
 {
-    if (cfl <= Param::velocity_space_cfl) return 1;
-    return static_cast<int>(std::ceil(cfl / Param::velocity_space_cfl));
+    if (cfl <= cfl_limit) return 1;
+    return static_cast<int>(std::ceil(cfl / cfl_limit));
+}
+
+RemapStencil build_translation_stencil(double shift_over_dx)
+{
+    RemapStencil s;
+    s.first = 0;
+    s.count = 0;
+    for (int i = 0; i < 6; ++i) s.weight[i] = 0.0;
+
+    const double left = -shift_over_dx;
+    const int first = static_cast<int>(std::floor(left));
+    const double frac = left - first;
+    const double eps = 1.0e-14;
+
+    if (frac < eps) {
+        s.first = first;
+        s.count = 1;
+        s.weight[0] = 1.0;
+    } else if (1.0 - frac < eps) {
+        s.first = first + 1;
+        s.count = 1;
+        s.weight[0] = 1.0;
+    } else {
+        s.first = first;
+        s.count = 2;
+        s.weight[0] = 1.0 - frac;
+        s.weight[1] = frac;
+    }
+    return s;
+}
+
+RemapStencil build_interval_stencil(double left, double right,
+                                    double x_min, double inv_dx)
+{
+    RemapStencil s;
+    s.first = 0;
+    s.count = 0;
+    for (int i = 0; i < 6; ++i) s.weight[i] = 0.0;
+
+    double a = (left - x_min) * inv_dx;
+    double b = (right - x_min) * inv_dx;
+    if (a > b) std::swap(a, b);
+    const int first = static_cast<int>(std::floor(a));
+    const int last = static_cast<int>(std::floor(b - 1.0e-14));
+    s.first = first;
+
+    for (int donor = first; donor <= last && s.count < 6; ++donor) {
+        const double overlap = std::min(b, donor + 1.0) - std::max(a, (double)donor);
+        if (overlap > 0.0) {
+            s.weight[s.count++] = overlap;
+        }
+    }
+    return s;
 }
 }
 
@@ -113,97 +169,107 @@ void VlasovSolver::advect(Species& sp, const SpatialGrid& sg,
 void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
                             int mpi_rank, int mpi_size)
 {
-    exchange_ghosts_x(sp, sg, mpi_rank, mpi_size);
+    const int ng = sg.nghost;
+    const int nxl = sg.nx_local;
+    const double max_cfl = sp.vgrid.v_max * sp.vgrid.max_abs_mu * dt / sg.dx;
+    const double cfl_limit = std::min(Param::semi_lagrangian_cfl,
+                                      std::max(1.0, (double)sg.nghost - 0.5));
+    const int nsub_x = substeps_from_cfl(max_cfl, cfl_limit);
+    const double dt_sub = dt / nsub_x;
 
-    int ng = sg.nghost;
-    int nxl = sg.nx_local;
-    double dxi = 1.0 / sg.dx;
-
+    x_stencil_.resize(Param::Nvmu);
     #pragma omp parallel for schedule(static)
-    for (int ix = ng; ix < ng + nxl; ++ix) {
-        for (int iv = 0; iv < Param::Nv; ++iv) {
-            double v = sp.vgrid.v(iv);
-            for (int imu = 0; imu < Param::Nmu; ++imu) {
-                // The Vlasov equation keeps vx explicitly; in spherical variables
-                // vx = |v| cos(theta) = v * mu.
-                double vel = v * sp.vgrid.mu(imu);
-                double f0 = sp.f[idx3(ix, iv, imu)];
-                double up = (vel >= 0.0)
-                          ? sp.f[idx3(ix - 1, iv, imu)]
-                          : sp.f[idx3(ix + 1, iv, imu)];
-                double fval = f0 - dt * vel * dxi * (f0 - up);
-                sp.f_tmp[idx3(ix, iv, imu)] = std::max(0.0, fval);
-            }
-        }
+    for (int k = 0; k < static_cast<int>(Param::Nvmu); ++k) {
+        x_stencil_[k] = build_translation_stencil(sp.vgrid.vx_cells[k] * dt_sub / sg.dx);
     }
 
-    sp.f.swap(sp.f_tmp);
+    for (int isub = 0; isub < nsub_x; ++isub) {
+        exchange_ghosts_x(sp, sg, mpi_rank, mpi_size);
+
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int ix = ng; ix < ng + nxl; ++ix) {
+            for (int iv = 0; iv < Param::Nv; ++iv) {
+                const size_t xbase = static_cast<size_t>(ix) * Param::Nvmu;
+                const size_t row = static_cast<size_t>(iv) * Param::Nmu;
+                for (int imu = 0; imu < Param::Nmu; ++imu) {
+                    // The Vlasov equation keeps vx explicitly; in spherical variables
+                    // vx = |v| cos(theta) = v * mu.
+                    const size_t k = row + imu;
+                    const size_t offset = xbase + k;
+                    const RemapStencil& st = x_stencil_[k];
+                    double fval = 0.0;
+                    for (int m = 0; m < st.count; ++m) {
+                        const int donor_ix = ix + st.first + m;
+                        if (donor_ix >= 0 && donor_ix < sg.nx_total) {
+                            fval += st.weight[m] *
+                                    sp.f[static_cast<size_t>(donor_ix) * Param::Nvmu + k];
+                        }
+                    }
+                    sp.f_tmp[offset] = std::max(0.0, fval);
+                }
+            }
+        }
+
+        sp.f.swap(sp.f_tmp);
+    }
 }
 
 void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
                             const EMFields& fields, double dt)
 {
-    int ng = sg.nghost;
-    int nxl = sg.nx_local;
+    const int ng = sg.nghost;
+    const int nxl = sg.nx_local;
     double max_cfl = 0.0;
-    double max_abs_mu = 0.0;
-    for (int imu = 0; imu < Param::Nmu; ++imu) {
-        max_abs_mu = std::max(max_abs_mu, std::fabs(sp.vgrid.mu(imu)));
-    }
+    const double cfl_scale = sp.vgrid.max_abs_mu * dt * sp.vgrid.inv_dv;
 
     #pragma omp parallel for schedule(static) reduction(max:max_cfl)
     for (int ix = 0; ix < nxl; ++ix) {
-        int ix_g = ix + ng;
-        double a_abs = std::fabs(sp.charge * fields.Ex[ix_g] / sp.mass);
-        max_cfl = std::max(max_cfl, a_abs * max_abs_mu * dt / sp.vgrid.dv);
+        const int ix_g = ix + ng;
+        const double a_abs = std::fabs(sp.charge * fields.Ex[ix_g] / sp.mass);
+        max_cfl = std::max(max_cfl, a_abs * cfl_scale);
     }
 
-    last_nsub_v_ = substeps_from_cfl(max_cfl);
+    last_nsub_v_ = substeps_from_cfl(max_cfl, Param::semi_lagrangian_cfl);
     last_cfl_v_ = max_cfl / last_nsub_v_;
-    double dt_sub = dt / last_nsub_v_;
+    const double dt_sub = dt / last_nsub_v_;
+    v_stencil_.resize(static_cast<size_t>(nxl) * Param::Nmu);
 
     for (int isub = 0; isub < last_nsub_v_; ++isub) {
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for collapse(2) schedule(static)
         for (int ix = 0; ix < nxl; ++ix) {
-            int ix_g = ix + ng;
-            double a = sp.charge * fields.Ex[ix_g] / sp.mass;
+            for (int imu = 0; imu < Param::Nmu; ++imu) {
+                const int ix_g = ix + ng;
+                const double a = sp.charge * fields.Ex[ix_g] / sp.mass;
+                const double shift = a * sp.vgrid.mu_cells[imu] * dt_sub;
+                v_stencil_[static_cast<size_t>(ix) * Param::Nmu + imu] =
+                    build_translation_stencil(shift * sp.vgrid.inv_dv);
+            }
+        }
 
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int ix = 0; ix < nxl; ++ix) {
             for (int iv = 0; iv < Param::Nv; ++iv) {
-                double v_center = std::max(sp.vgrid.v(iv), Param::v_floor);
-                double jac = v_center * v_center;
+                const int ix_g = ix + ng;
+                const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
+                const double inv_jac = sp.vgrid.inv_v2_cells[iv];
+                const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
 
                 for (int imu = 0; imu < Param::Nmu; ++imu) {
-                    double mu = sp.vgrid.mu(imu);
-                    double flux_left = 0.0;
-                    double flux_right = 0.0;
-
-                    for (int side = 0; side < 2; ++side) {
-                        int iface = iv + side;
-                        double v_face = sp.vgrid.v_face(iface);
-                        double av = a * mu;
-                        double f_up = 0.0;
-
-                        if (av >= 0.0) {
-                            if (iface > 0) {
-                                f_up = sp.f[idx3(ix_g, iface - 1, imu)];
-                            }
-                        } else {
-                            if (iface < Param::Nv) {
-                                f_up = sp.f[idx3(ix_g, iface, imu)];
-                            }
-                        }
-
-                        double flux = v_face * v_face * av * f_up;
-                        if (side == 0) {
-                            flux_left = flux;
-                        } else {
-                            flux_right = flux;
+                    const size_t offset = row + imu;
+                    const RemapStencil& st =
+                        v_stencil_[static_cast<size_t>(ix) * Param::Nmu + imu];
+                    double gval = 0.0;
+                    for (int m = 0; m < st.count; ++m) {
+                        const int donor_iv = iv + st.first + m;
+                        if (donor_iv >= 0 && donor_iv < Param::Nv) {
+                            const size_t donor = xbase
+                                               + static_cast<size_t>(donor_iv) * Param::Nmu
+                                               + imu;
+                            gval += st.weight[m] * sp.vgrid.v2_cells[donor_iv]
+                                  * sp.f[donor];
                         }
                     }
-
-                    double g0 = jac * sp.f[idx3(ix_g, iv, imu)];
-                    double gval = g0 - dt_sub / sp.vgrid.dv * (flux_right - flux_left);
-                    sp.f_tmp[idx3(ix_g, iv, imu)] = std::max(0.0, gval / jac);
+                    sp.f_tmp[offset] = std::max(0.0, gval * inv_jac);
                 }
             }
         }
@@ -215,73 +281,73 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
 void VlasovSolver::advect_mu(Species& sp, const SpatialGrid& sg,
                              const EMFields& fields, double dt)
 {
-    int ng = sg.nghost;
-    int nxl = sg.nx_local;
+    const int ng = sg.nghost;
+    const int nxl = sg.nx_local;
     double max_cfl = 0.0;
-    double max_mu_face_factor = 0.0;
-    for (int imu = 0; imu <= Param::Nmu; ++imu) {
-        double mu_face = sp.vgrid.mu_face(imu);
-        max_mu_face_factor = std::max(max_mu_face_factor,
-                                      1.0 - mu_face * mu_face);
-    }
+    const double cfl_scale = sp.vgrid.max_mu_face_factor * dt
+                           * sp.vgrid.inv_dmu * sp.vgrid.max_inv_v;
 
     #pragma omp parallel for schedule(static) reduction(max:max_cfl)
     for (int ix = 0; ix < nxl; ++ix) {
-        int ix_g = ix + ng;
-        double a_abs = std::fabs(sp.charge * fields.Ex[ix_g] / sp.mass);
-        for (int iv = 0; iv < Param::Nv; ++iv) {
-            double vv = std::max(sp.vgrid.v(iv), Param::v_floor);
-            max_cfl = std::max(max_cfl,
-                               a_abs * max_mu_face_factor * dt
-                             / (vv * sp.vgrid.dmu));
-        }
+        const int ix_g = ix + ng;
+        const double a_abs = std::fabs(sp.charge * fields.Ex[ix_g] / sp.mass);
+        max_cfl = std::max(max_cfl, a_abs * cfl_scale);
     }
 
-    last_nsub_mu_ = substeps_from_cfl(max_cfl);
+    last_nsub_mu_ = substeps_from_cfl(max_cfl, std::min(Param::semi_lagrangian_cfl, 0.9));
     last_cfl_mu_ = max_cfl / last_nsub_mu_;
-    double dt_sub = dt / last_nsub_mu_;
+    const double dt_sub = dt / last_nsub_mu_;
+    mu_stencil_.resize(static_cast<size_t>(nxl) * Param::Nvmu);
 
     for (int isub = 0; isub < last_nsub_mu_; ++isub) {
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for collapse(2) schedule(static)
         for (int ix = 0; ix < nxl; ++ix) {
-            int ix_g = ix + ng;
-            double a = sp.charge * fields.Ex[ix_g] / sp.mass;
-
             for (int iv = 0; iv < Param::Nv; ++iv) {
-                double vv = std::max(sp.vgrid.v(iv), Param::v_floor);
-                double jac = vv * vv;
+                const int ix_g = ix + ng;
+                const double a = sp.charge * fields.Ex[ix_g] / sp.mass;
+                const double inv_v = sp.vgrid.inv_v_cells[iv];
 
                 for (int imu = 0; imu < Param::Nmu; ++imu) {
-                    double flux_left = 0.0;
-                    double flux_right = 0.0;
+                    const double amu_left = a * sp.vgrid.mu_face_factor[imu] * inv_v;
+                    const double amu_right = a * sp.vgrid.mu_face_factor[imu + 1] * inv_v;
+                    double left = sp.vgrid.mu_faces[imu] - amu_left * dt_sub;
+                    double right = sp.vgrid.mu_faces[imu + 1] - amu_right * dt_sub;
+                    if (left > right) {
+                        std::swap(left, right);
+                    }
+                    const size_t stencil_idx = static_cast<size_t>(ix) * Param::Nvmu
+                                             + static_cast<size_t>(iv) * Param::Nmu
+                                             + imu;
+                    mu_stencil_[stencil_idx] =
+                        build_interval_stencil(left, right, sp.vgrid.mu_min,
+                                               sp.vgrid.inv_dmu);
+                }
+            }
+        }
 
-                    for (int side = 0; side < 2; ++side) {
-                        int iface = imu + side;
-                        double mu_face = sp.vgrid.mu_face(iface);
-                        double amu = a * (1.0 - mu_face * mu_face) / vv;
-                        double f_up = 0.0;
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int ix = 0; ix < nxl; ++ix) {
+            for (int iv = 0; iv < Param::Nv; ++iv) {
+                const int ix_g = ix + ng;
+                const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
+                const double inv_jac = sp.vgrid.inv_v2_cells[iv];
+                const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
 
-                        if (amu >= 0.0) {
-                            if (iface > 0) {
-                                f_up = sp.f[idx3(ix_g, iv, iface - 1)];
-                            }
-                        } else {
-                            if (iface < Param::Nmu) {
-                                f_up = sp.f[idx3(ix_g, iv, iface)];
-                            }
-                        }
-
-                        double flux = jac * amu * f_up;
-                        if (side == 0) {
-                            flux_left = flux;
-                        } else {
-                            flux_right = flux;
+                for (int imu = 0; imu < Param::Nmu; ++imu) {
+                    const size_t stencil_idx = static_cast<size_t>(ix) * Param::Nvmu
+                                             + static_cast<size_t>(iv) * Param::Nmu
+                                             + imu;
+                    const RemapStencil& st = mu_stencil_[stencil_idx];
+                    double gval = 0.0;
+                    for (int m = 0; m < st.count; ++m) {
+                        const int donor_imu = st.first + m;
+                        if (donor_imu >= 0 && donor_imu < Param::Nmu) {
+                            gval += st.weight[m] * sp.vgrid.v2_cells[iv]
+                                  * sp.f[row + donor_imu];
                         }
                     }
-
-                    double g0 = jac * sp.f[idx3(ix_g, iv, imu)];
-                    double gval = g0 - dt_sub / sp.vgrid.dmu * (flux_right - flux_left);
-                    sp.f_tmp[idx3(ix_g, iv, imu)] = std::max(0.0, gval / jac);
+                    const size_t offset = row + imu;
+                    sp.f_tmp[offset] = std::max(0.0, gval * inv_jac);
                 }
             }
         }

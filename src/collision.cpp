@@ -71,24 +71,24 @@ void CollisionOperator::apply(Species& sp, double dt,
                               double Z_field, double Z_test)
 {
     double lnL = coulomb_log(n_field, T_field);
-    int ng = sp.sgrid->nghost;
-    int nxl = sp.sgrid->nx_local;
+    const int ng = sp.sgrid->nghost;
+    const int nxl = sp.sgrid->nx_local;
+    const double inv_dv = sp.vgrid.inv_dv;
+    const double inv_dmu = sp.vgrid.inv_dmu;
 
     std::vector<double> nu_perp(Param::Nv, 0.0);
-    std::vector<double> v2_center(Param::Nv, 0.0);
     std::vector<double> flux_A_face(Param::Nv + 1, 0.0);
     std::vector<double> flux_D_face(Param::Nv + 1, 0.0);
 
     for (int iv = 0; iv < Param::Nv; ++iv) {
-        double v = std::max(sp.vgrid.v(iv), Param::v_floor);
+        double v = std::max(sp.vgrid.v_cells[iv], Param::v_floor);
         CollisionRates rates = compute_rates(v, sp.mass, n_field, T_field,
                                              m_field, lnL, Z_test, Z_field);
         nu_perp[iv] = rates.nu_perp;
-        v2_center[iv] = v * v;
     }
 
     for (int ivf = 1; ivf < Param::Nv; ++ivf) {
-        double vf = std::max(sp.vgrid.v_face(ivf), Param::v_floor);
+        double vf = std::max(sp.vgrid.v_faces[ivf], Param::v_floor);
         CollisionRates rates = compute_rates(vf, sp.mass, n_field, T_field,
                                              m_field, lnL, Z_test, Z_field);
         double A = -rates.nu_s * vf;
@@ -108,56 +108,57 @@ void CollisionOperator::apply(Species& sp, double dt,
     // D_perp = <Delta v_perp^2>/dt = nu_perp v^2.
     #pragma omp parallel for
     for (int ix = 0; ix < nxl; ++ix) {
-        int ix_g = ix + ng;
+        const int ix_g = ix + ng;
+        const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
 
         for (int iv = 0; iv < Param::Nv; ++iv) {
-            double v2 = v2_center[iv];
+            const double v2 = sp.vgrid.v2_cells[iv];
+            const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
+            const bool has_left_v = (iv > 0);
+            const bool has_right_v = (iv + 1 < Param::Nv);
+            const size_t row_left = has_left_v ? row - Param::Nmu : row;
+            const size_t row_right = has_right_v ? row + Param::Nmu : row;
 
             for (int imu = 0; imu < Param::Nmu; ++imu) {
-                double f0 = sp.f[idx3(ix_g, iv, imu)];
+                const size_t offset = row + imu;
+                double f0 = sp.f[offset];
 
                 double flux_v_l = 0.0;
                 double flux_v_r = 0.0;
 
-                if (iv > 0) {
-                    double fL = sp.f[idx3(ix_g, iv - 1, imu)];
-                    double fR = f0;
-                    double f_up = (flux_A_face[iv] >= 0.0) ? fL : fR;
+                if (has_left_v) {
+                    double fL = sp.f[row_left + imu];
+                    double f_up = (flux_A_face[iv] >= 0.0) ? fL : f0;
                     flux_v_l = flux_A_face[iv] * f_up
-                             - 0.5 * flux_D_face[iv] * (fR - fL) / sp.vgrid.dv;
+                             - 0.5 * flux_D_face[iv] * (f0 - fL) * inv_dv;
                 }
 
-                if (iv + 1 < Param::Nv) {
-                    double fL = f0;
-                    double fR = sp.f[idx3(ix_g, iv + 1, imu)];
-                    double f_up = (flux_A_face[iv + 1] >= 0.0) ? fL : fR;
+                if (has_right_v) {
+                    double fR = sp.f[row_right + imu];
+                    double f_up = (flux_A_face[iv + 1] >= 0.0) ? f0 : fR;
                     flux_v_r = flux_A_face[iv + 1] * f_up
-                             - 0.5 * flux_D_face[iv + 1] * (fR - fL) / sp.vgrid.dv;
+                             - 0.5 * flux_D_face[iv + 1] * (fR - f0) * inv_dv;
                 }
 
-                double radial = -(flux_v_r - flux_v_l) / (v2 * sp.vgrid.dv);
+                double radial = -(flux_v_r - flux_v_l) / v2 * inv_dv;
 
                 double flux_mu_l = 0.0;
                 double flux_mu_r = 0.0;
 
                 if (imu > 0) {
-                    double muf = sp.vgrid.mu_face(imu);
-                    double fL = sp.f[idx3(ix_g, iv, imu - 1)];
-                    double fR = f0;
-                    flux_mu_l = (1.0 - muf * muf) * (fR - fL) / sp.vgrid.dmu;
+                    double fL = sp.f[offset - 1];
+                    flux_mu_l = sp.vgrid.mu_face_factor[imu] * (f0 - fL) * inv_dmu;
                 }
                 if (imu + 1 < Param::Nmu) {
-                    double muf = sp.vgrid.mu_face(imu + 1);
-                    double fL = f0;
-                    double fR = sp.f[idx3(ix_g, iv, imu + 1)];
-                    flux_mu_r = (1.0 - muf * muf) * (fR - fL) / sp.vgrid.dmu;
+                    double fR = sp.f[offset + 1];
+                    flux_mu_r = sp.vgrid.mu_face_factor[imu + 1] * (fR - f0) * inv_dmu;
                 }
 
                 double pitch = 0.5 * nu_perp[iv]
-                             * (flux_mu_r - flux_mu_l) / sp.vgrid.dmu;
+                             * (flux_mu_r - flux_mu_l) * inv_dmu;
 
                 double val = f0 + dt * (radial + pitch);
-                sp.f_tmp[idx3(ix_g, iv, imu)] = std::max(0.0, val);
+                sp.f_tmp[offset] = std::max(0.0, val);
             }
         }
     }

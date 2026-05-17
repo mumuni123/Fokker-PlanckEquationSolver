@@ -27,7 +27,12 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
 {
     output_dir = dir;
     snapshot_count = 0;
+#if FP_ENABLE_DEBUG_DIAGNOSTICS
     debug_enabled = enable_debug_diagnostics;
+#else
+    (void)enable_debug_diagnostics;
+    debug_enabled = false;
+#endif
 
     if (mpi_rank == 0) {
         make_output_dir(output_dir);
@@ -35,6 +40,7 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
         scalar_file << "# step  time[fs]  N_bkg_e  KE_bkg_e  E_energy  Total_energy\n";
         scalar_file << std::scientific << std::setprecision(8);
 
+#if FP_ENABLE_DEBUG_DIAGNOSTICS
         if (debug_enabled) {
             debug_file.open((output_dir + "/debug_diagnostics.dat").c_str());
             debug_file << "# step  time[fs]  stage  max_abs_Ex[V/m]  N_bkg_e  "
@@ -42,6 +48,7 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                        << "nsub_v  nsub_mu\n";
             debug_file << std::scientific << std::setprecision(8);
         }
+#endif
     }
     MPI_Barrier(MPI_COMM_WORLD);
 }
@@ -54,8 +61,7 @@ void Diagnostics::write_scalars(double time, int step,
     std::vector<double> local_N(species.size());
     std::vector<double> local_KE(species.size());
     for (size_t s = 0; s < species.size(); ++s) {
-        local_N[s] = species[s]->total_particle_number();
-        local_KE[s] = species[s]->total_kinetic_energy();
+        species[s]->total_particle_number_and_energy(local_N[s], local_KE[s]);
     }
     double local_E = fields.total_energy();
 
@@ -93,6 +99,7 @@ void Diagnostics::write_debug_state(int step, double time,
                                     int nsub_v,
                                     int nsub_mu)
 {
+#if FP_ENABLE_DEBUG_DIAGNOSTICS
     if (!debug_enabled) return;
 
     double local_max_abs_Ex = 0.0;
@@ -145,6 +152,21 @@ void Diagnostics::write_debug_state(int step, double time,
                    << global_nsub_mu << "\n";
         debug_file.flush();
     }
+#else
+    (void)step;
+    (void)time;
+    (void)stage;
+    (void)electrons;
+    (void)beam;
+    (void)fields;
+    (void)sg;
+    (void)mpi_rank;
+    (void)mpi_size;
+    (void)cfl_v;
+    (void)cfl_mu;
+    (void)nsub_v;
+    (void)nsub_mu;
+#endif
 }
 
 void Diagnostics::write_fields(double time,
@@ -156,7 +178,9 @@ void Diagnostics::write_fields(double time,
     int nxl = sg.nx_local;
 
     std::vector<double> local_Ex(nxl);
+    std::vector<double> local_phi(nxl);
     for (int i = 0; i < nxl; ++i) local_Ex[i] = fields.Ex[i + ng];
+    for (int i = 0; i < nxl; ++i) local_phi[i] = fields.phi[i + ng];
 
     std::vector<int> counts(mpi_size);
     std::vector<int> displs(mpi_size);
@@ -167,8 +191,12 @@ void Diagnostics::write_fields(double time,
     }
 
     std::vector<double> global_Ex(sg.nx_global);
+    std::vector<double> global_phi(sg.nx_global);
     MPI_Gatherv(local_Ex.data(), nxl, MPI_DOUBLE,
                 global_Ex.data(), counts.data(), displs.data(), MPI_DOUBLE,
+                0, MPI_COMM_WORLD);
+    MPI_Gatherv(local_phi.data(), nxl, MPI_DOUBLE,
+                global_phi.data(), counts.data(), displs.data(), MPI_DOUBLE,
                 0, MPI_COMM_WORLD);
 
     if (mpi_rank == 0) {
@@ -176,10 +204,12 @@ void Diagnostics::write_fields(double time,
         fname << output_dir << "/fields_" << std::setw(5) << std::setfill('0')
               << snapshot_count << ".dat";
         std::ofstream out(fname.str().c_str());
-        out << "# x[um]  Ex[V/m]\n";
+        out << "# x[um]  Ex[V/m]  phi[V]\n";
         out << std::scientific << std::setprecision(8);
         for (int i = 0; i < sg.nx_global; ++i) {
-            out << (i + 0.5) * sg.dx / Const::micro << "  " << global_Ex[i] << "\n";
+            out << (i + 0.5) * sg.dx / Const::micro << "  "
+                << global_Ex[i] << "  "
+                << global_phi[i] << "\n";
         }
     }
 }
@@ -194,11 +224,13 @@ void Diagnostics::write_px_distribution(double time,
     std::vector<double> local_Fv(Param::Nv, 0.0);
     for (int ix = 0; ix < nxl; ++ix) {
         int ix_g = ix + ng;
+        size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
         for (int iv = 0; iv < Param::Nv; ++iv) {
             double v = sp.vgrid.v(iv);
             double sum = 0.0;
+            size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
             for (int imu = 0; imu < Param::Nmu; ++imu) {
-                sum += sp.f[idx3(ix_g, iv, imu)];
+                sum += sp.f[row + imu];
             }
             local_Fv[iv] += sum * 2.0 * Const::pi * v * v
                           * sp.vgrid.dmu * sp.sgrid->dx;
@@ -284,13 +316,15 @@ void Diagnostics::write_electron_distribution(double time,
     for (int ix = 0; ix < sg.nx_local; ++ix) {
         const int ix_g = ix + ng;
         const double x_um = sg.x(ix_g) / Const::micro;
+        const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
         for (int iv = 0; iv < Param::Nv; ++iv) {
             const double v = electrons.vgrid.v(iv);
+            const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
             for (int imu = 0; imu < Param::Nmu; ++imu) {
                 out << x_um << "  "
                     << v << "  "
                     << electrons.vgrid.mu(imu) << "  "
-                    << electrons.f[idx3(ix_g, iv, imu)] << "\n";
+                    << electrons.f[row + imu] << "\n";
             }
         }
     }

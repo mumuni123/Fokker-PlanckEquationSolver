@@ -29,9 +29,10 @@ void Species::init(const std::string& n, SpeciesType t,
         vmax = 0.999999 * Const::c;
     } else {
         double vth = std::sqrt(temperature / mass);
-        vmax = std::min(Param::Nsigma * vth, 0.95 * Const::c);
+        vmax = std::min(Param::Nsigma * vth, 0.98 * Const::c);
     }
     vgrid.init(vmax);
+    precompute_maxwellian_boundary();
 
     f.assign(local_size(), 0.0);
     f_tmp.assign(local_size(), 0.0);
@@ -40,24 +41,47 @@ void Species::init(const std::string& n, SpeciesType t,
     current_x.assign(sgrid->nx_local, 0.0);
 }
 
+void Species::precompute_maxwellian_boundary()
+{
+    maxwellian_boundary.assign(Param::Nv, 0.0);
+    if (type == SpeciesType::BEAM) return;
+
+    const double norm = density0 * std::pow(2.0 * Const::pi * temperature / mass, -1.5);
+    const double inv2vth2 = mass / (2.0 * temperature);
+    for (int iv = 0; iv < Param::Nv; ++iv) {
+        const double vv = vgrid.v_cells[iv];
+        maxwellian_boundary[iv] = norm * std::exp(-vv * vv * inv2vth2);
+    }
+}
+
 void Species::initialize_maxwellian(double drift_vx)
 {
     if (type == SpeciesType::BEAM) return;
 
-    double norm = density0 * std::pow(2.0 * Const::pi * temperature / mass, -1.5);
-    double inv2vth2 = mass / (2.0 * temperature);
-    int nxt = sgrid->nx_total;
+    const double norm = density0 * std::pow(2.0 * Const::pi * temperature / mass, -1.5);
+    const double inv2vth2 = mass / (2.0 * temperature);
+    const int nxt = sgrid->nx_total;
+    const bool zero_drift = std::fabs(drift_vx) == 0.0;
 
     #pragma omp parallel for collapse(2)
     for (int ix = 0; ix < nxt; ++ix) {
         for (int iv = 0; iv < Param::Nv; ++iv) {
-            double vv = vgrid.v(iv);
+            const double vv = vgrid.v_cells[iv];
+            const size_t row = static_cast<size_t>(ix) * Param::Nvmu
+                             + static_cast<size_t>(iv) * Param::Nmu;
+            if (zero_drift) {
+                const double f0 = maxwellian_boundary[iv];
+                for (int imu = 0; imu < Param::Nmu; ++imu) {
+                    f[row + imu] = f0;
+                }
+                continue;
+            }
             for (int imu = 0; imu < Param::Nmu; ++imu) {
-                double mu = vgrid.mu(imu);
-                double vx = vv * mu - drift_vx;
-                double vperp2 = vv * vv * (1.0 - mu * mu);
-                double v2 = vx * vx + vperp2;
-                f[idx3(ix, iv, imu)] = norm * std::exp(-v2 * inv2vth2);
+                const double mu = vgrid.mu_cells[imu];
+                const double vx = vv * mu - drift_vx;
+                const double vperp2 = vv * vv * (1.0 - mu * mu);
+                const double v2 = vx * vx + vperp2;
+                f[row + imu] = norm * std::exp(-v2 * inv2vth2);
             }
         }
     }
@@ -65,9 +89,8 @@ void Species::initialize_maxwellian(double drift_vx)
 
 void Species::compute_moments()
 {
-    int ng = sgrid->nghost;
-    int nxl = sgrid->nx_local;
-    double weight0 = 2.0 * Const::pi * vgrid.dv * vgrid.dmu;
+    const int ng = sgrid->nghost;
+    const int nxl = sgrid->nx_local;
 
     std::fill(number_density.begin(), number_density.end(), 0.0);
     std::fill(charge_density.begin(), charge_density.end(), 0.0);
@@ -75,19 +98,19 @@ void Species::compute_moments()
 
     #pragma omp parallel for
     for (int ix = 0; ix < nxl; ++ix) {
-        int ix_g = ix + ng;
+        const int ix_g = ix + ng;
+        const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
         double n = 0.0;
         double jx_over_q = 0.0;
 
         for (int iv = 0; iv < Param::Nv; ++iv) {
-            double vv = vgrid.v(iv);
-            double shell = weight0 * vv * vv;
+            const double w = vgrid.moment_weight[iv];
+            const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
+            const size_t vrow = static_cast<size_t>(iv) * Param::Nmu;
             for (int imu = 0; imu < Param::Nmu; ++imu) {
-                double mu = vgrid.mu(imu);
-                double fval = f[idx3(ix_g, iv, imu)];
-                double w = shell;
+                const double fval = f[row + imu];
                 n += fval * w;
-                jx_over_q += fval * (vv * mu) * w;
+                jx_over_q += fval * vgrid.current_weight[vrow + imu];
             }
         }
         number_density[ix] = n;
@@ -98,20 +121,20 @@ void Species::compute_moments()
 
 double Species::total_particle_number() const
 {
-    int ng = sgrid->nghost;
-    int nxl = sgrid->nx_local;
-    double weight0 = 2.0 * Const::pi * vgrid.dv * vgrid.dmu;
+    const int ng = sgrid->nghost;
+    const int nxl = sgrid->nx_local;
     double total = 0.0;
 
     #pragma omp parallel for reduction(+:total)
     for (int ix = 0; ix < nxl; ++ix) {
-        int ix_g = ix + ng;
+        const int ix_g = ix + ng;
+        const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
         double n = 0.0;
         for (int iv = 0; iv < Param::Nv; ++iv) {
-            double vv = vgrid.v(iv);
-            double shell = weight0 * vv * vv;
+            const double shell = vgrid.moment_weight[iv];
+            const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
             for (int imu = 0; imu < Param::Nmu; ++imu) {
-                n += f[idx3(ix_g, iv, imu)] * shell;
+                n += f[row + imu] * shell;
             }
         }
         total += n * sgrid->dx;
@@ -121,26 +144,62 @@ double Species::total_particle_number() const
 
 double Species::total_kinetic_energy() const
 {
-    int ng = sgrid->nghost;
-    int nxl = sgrid->nx_local;
-    double weight0 = 2.0 * Const::pi * vgrid.dv * vgrid.dmu;
+    const int ng = sgrid->nghost;
+    const int nxl = sgrid->nx_local;
     double total = 0.0;
 
     #pragma omp parallel for reduction(+:total)
     for (int ix = 0; ix < nxl; ++ix) {
-        int ix_g = ix + ng;
+        const int ix_g = ix + ng;
+        const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
         double e = 0.0;
         for (int iv = 0; iv < Param::Nv; ++iv) {
-            double vv = vgrid.v(iv);
-            double shell = weight0 * vv * vv;
-            double ke = relativistic_push
+            const double vv = vgrid.v_cells[iv];
+            const double shell = vgrid.moment_weight[iv];
+            const double ke = relativistic_push
                       ? (gamma_from_v(vv) - 1.0) * mass * Const::c * Const::c
                       : 0.5 * mass * vv * vv;
+            const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
             for (int imu = 0; imu < Param::Nmu; ++imu) {
-                e += f[idx3(ix_g, iv, imu)] * ke * shell;
+                e += f[row + imu] * ke * shell;
             }
         }
         total += e * sgrid->dx;
     }
     return total;
+}
+
+void Species::total_particle_number_and_energy(double& number,
+                                               double& kinetic_energy) const
+{
+    const int ng = sgrid->nghost;
+    const int nxl = sgrid->nx_local;
+    double total_n = 0.0;
+    double total_e = 0.0;
+
+    #pragma omp parallel for reduction(+:total_n,total_e)
+    for (int ix = 0; ix < nxl; ++ix) {
+        const int ix_g = ix + ng;
+        const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
+        double n = 0.0;
+        double e = 0.0;
+        for (int iv = 0; iv < Param::Nv; ++iv) {
+            const double vv = vgrid.v_cells[iv];
+            const double shell = vgrid.moment_weight[iv];
+            const double ke = relativistic_push
+                      ? (gamma_from_v(vv) - 1.0) * mass * Const::c * Const::c
+                      : 0.5 * mass * vv * vv;
+            const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
+            for (int imu = 0; imu < Param::Nmu; ++imu) {
+                const double weighted_f = f[row + imu] * shell;
+                n += weighted_f;
+                e += weighted_f * ke;
+            }
+        }
+        total_n += n * sgrid->dx;
+        total_e += e * sgrid->dx;
+    }
+
+    number = total_n;
+    kinetic_energy = total_e;
 }

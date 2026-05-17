@@ -61,7 +61,9 @@ public:
 
 private:
     std::ofstream scalar_file;
+#if FP_ENABLE_DEBUG_DIAGNOSTICS
     std::ofstream debug_file;
+#endif
     bool debug_enabled;
 };
 

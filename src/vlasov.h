@@ -7,6 +7,12 @@
 
 struct EMFields;
 
+struct RemapStencil {
+    int first;
+    int count;
+    double weight[6];
+};
+
 class VlasovSolver {
 public:
     VlasovSolver();
@@ -34,6 +40,9 @@ private:
     std::vector<double> send_right_;
     std::vector<double> recv_left_;
     std::vector<double> recv_right_;
+    std::vector<RemapStencil> x_stencil_;
+    std::vector<RemapStencil> v_stencil_;
+    std::vector<RemapStencil> mu_stencil_;
 
     double last_cfl_v_;
     double last_cfl_mu_;

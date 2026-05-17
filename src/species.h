@@ -33,6 +33,7 @@ public:
     std::vector<double> number_density;
     std::vector<double> charge_density;
     std::vector<double> current_x;
+    std::vector<double> maxwellian_boundary;
 
     Species();
 
@@ -43,9 +44,12 @@ public:
               const SpatialGrid& sg);
 
     void initialize_maxwellian(double drift_vx = 0.0);
+    void precompute_maxwellian_boundary();
     void compute_moments();
     double total_particle_number() const;
     double total_kinetic_energy() const;
+    void total_particle_number_and_energy(double& number,
+                                          double& kinetic_energy) const;
 
     size_t local_size() const {
         return static_cast<size_t>(sgrid->nx_total) * Param::Nvmu;

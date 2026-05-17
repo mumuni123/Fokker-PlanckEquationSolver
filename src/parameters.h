@@ -4,6 +4,10 @@
 #include <cmath>
 #include <cstddef>
 
+#ifndef FP_ENABLE_DEBUG_DIAGNOSTICS
+#define FP_ENABLE_DEBUG_DIAGNOSTICS 1
+#endif
+
 namespace Const {
     const double me   = 9.10938e-31;
     const double qe   = 1.60218e-19;
@@ -18,6 +22,12 @@ namespace Const {
 }
 
 namespace Param {
+    enum PoissonSolverKind {
+        POISSON_DISTRIBUTED_TRIDIAGONAL = 0,
+        POISSON_PARALLEL_CYCLIC_REDUCTION = 1,
+        POISSON_MULTIGRID = 2
+    };
+
     const double temperature_e = 100.0 * Const::eV;
     const double temperature_i = 10.0  * Const::eV;
     const double dens          = 1.2e29;
@@ -42,7 +52,13 @@ namespace Param {
     const double dt_multiplier = 0.5;
     const double dt_snapshot   = 0.6 * Const::femto;
     const bool   enable_debug_diagnostics = false;
+    const bool   enable_full_fe_output = false;
     const double velocity_space_cfl = 0.45;
+    const double semi_lagrangian_cfl = 2.5;
+    const PoissonSolverKind poisson_solver = POISSON_DISTRIBUTED_TRIDIAGONAL;
+    const int    poisson_multigrid_vcycles = 10;
+    const int    poisson_multigrid_pre_smooth = 3;
+    const int    poisson_multigrid_post_smooth = 3;
     const int    beam_macro_particles_per_cell = 1000;
     const double beam_macro_weight = densb * dx / beam_macro_particles_per_cell;
 
@@ -52,7 +68,7 @@ namespace Param {
     const int Nmu = 64;
     const size_t Nvmu = static_cast<size_t>(Nv) * Nmu;
 
-    const double Nsigma = 8.0;
+    const double Nsigma = 12.0;
     const int Nghost = 3;
 
     const double v_floor = 1.0e-12 * Const::c;
