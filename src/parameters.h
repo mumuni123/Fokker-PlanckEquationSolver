@@ -59,13 +59,13 @@ namespace Param {
     const int    poisson_multigrid_vcycles = 10;
     const int    poisson_multigrid_pre_smooth = 3;
     const int    poisson_multigrid_post_smooth = 3;
-    const int    beam_macro_particles_per_cell = 1000;
+    const int    beam_macro_particles_per_cell = 100; // 1000
     const double beam_macro_weight = densb * dx / beam_macro_particles_per_cell;
 
     // Axisymmetric spherical velocity grid: (v, mu), mu = cos(theta) = vx / |v|.
     // This is still a 3D velocity-space model after integrating over the azimuth.
-    const int Nv  = 96;
-    const int Nmu = 64;
+    const int Nv  = 40; //96
+    const int Nmu = 32; //64
     const size_t Nvmu = static_cast<size_t>(Nv) * Nmu;
 
     const double Nsigma = 12.0;

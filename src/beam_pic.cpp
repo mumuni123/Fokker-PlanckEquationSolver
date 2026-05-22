@@ -213,12 +213,24 @@ void BeamPIC::exchange_particles(const SpatialGrid& sg, int mpi_rank, int mpi_si
     MPI_Request data_reqs[4];
     nreq = 0;
     if (left >= 0) {
-        MPI_Isend(send_left_.data(), particle_byte_count(send_left_count), MPI_BYTE, left, 303, MPI_COMM_WORLD, &data_reqs[nreq++]);
-        MPI_Irecv(recv_left_.data(), particle_byte_count(recv_left_count), MPI_BYTE, left, 304, MPI_COMM_WORLD, &data_reqs[nreq++]);
+        if (send_left_count > 0) {
+            MPI_Isend(send_left_.data(), particle_byte_count(send_left_count), MPI_BYTE,
+                      left, 303, MPI_COMM_WORLD, &data_reqs[nreq++]);
+        }
+        if (recv_left_count > 0) {
+            MPI_Irecv(recv_left_.data(), particle_byte_count(recv_left_count), MPI_BYTE,
+                      left, 304, MPI_COMM_WORLD, &data_reqs[nreq++]);
+        }
     }
     if (right < mpi_size) {
-        MPI_Isend(send_right_.data(), particle_byte_count(send_right_count), MPI_BYTE, right, 304, MPI_COMM_WORLD, &data_reqs[nreq++]);
-        MPI_Irecv(recv_right_.data(), particle_byte_count(recv_right_count), MPI_BYTE, right, 303, MPI_COMM_WORLD, &data_reqs[nreq++]);
+        if (send_right_count > 0) {
+            MPI_Isend(send_right_.data(), particle_byte_count(send_right_count), MPI_BYTE,
+                      right, 304, MPI_COMM_WORLD, &data_reqs[nreq++]);
+        }
+        if (recv_right_count > 0) {
+            MPI_Irecv(recv_right_.data(), particle_byte_count(recv_right_count), MPI_BYTE,
+                      right, 303, MPI_COMM_WORLD, &data_reqs[nreq++]);
+        }
     }
     if (nreq > 0) MPI_Waitall(nreq, data_reqs, MPI_STATUSES_IGNORE);
 
