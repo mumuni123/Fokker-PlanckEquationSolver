@@ -19,14 +19,17 @@ static void make_output_dir(const std::string& dir)
 
 Diagnostics::Diagnostics()
     : snapshot_count(0),
-      debug_enabled(false)
+      debug_enabled(false),
+      step_enabled(false)
 {}
 
 void Diagnostics::init(const std::string& dir, int mpi_rank,
-                       bool enable_debug_diagnostics)
+                       bool enable_debug_diagnostics,
+                       bool enable_step_diagnostics)
 {
     output_dir = dir;
     snapshot_count = 0;
+    step_enabled = enable_step_diagnostics;
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
     debug_enabled = enable_debug_diagnostics;
 #else
@@ -49,6 +52,16 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
             debug_file << std::scientific << std::setprecision(8);
         }
 #endif
+        if (step_enabled) {
+            step_file.open((output_dir + "/step_diagnostics.dat").c_str());
+            step_file << "# step  time[fs]  max_abs_Ex[V/m]  N_bkg_e  "
+                      << "N_beam_macro  N_beam_weighted  "
+                      << "nsub_v1  nsub_mu1  nsub_v2  nsub_mu2  "
+                      << "loss_v1  loss_mu1  loss_v2  loss_mu2  "
+                      << "loss_v1_low  loss_v1_high  "
+                      << "loss_v2_low  loss_v2_high\n";
+            step_file << std::scientific << std::setprecision(8);
+        }
     }
     MPI_Barrier(MPI_COMM_WORLD);
 }
@@ -167,6 +180,84 @@ void Diagnostics::write_debug_state(int step, double time,
     (void)nsub_v;
     (void)nsub_mu;
 #endif
+}
+
+void Diagnostics::write_step_diagnostics(int step, double time,
+                                         const Species& electrons,
+                                         const BeamPIC& beam,
+                                         const EMFields& fields,
+                                         const SpatialGrid& sg,
+                                         int mpi_rank, int mpi_size,
+                                         int nsub_v1,
+                                         int nsub_mu1,
+                                         int nsub_v2,
+                                         int nsub_mu2,
+                                         double loss_v1,
+                                         double loss_mu1,
+                                         double loss_v2,
+                                         double loss_mu2,
+                                         double loss_v1_low,
+                                         double loss_v1_high,
+                                         double loss_v2_low,
+                                         double loss_v2_high)
+{
+    if (!step_enabled) return;
+
+    double local_max_abs_Ex = 0.0;
+    for (int ix = 0; ix < sg.nx_local; ++ix) {
+        local_max_abs_Ex = std::max(local_max_abs_Ex,
+                                    std::fabs(fields.Ex[ix + sg.nghost]));
+    }
+
+    const double local_N_bkg_e = electrons.total_particle_number();
+    const double local_N_beam_macro = static_cast<double>(beam.particles.size());
+    const double local_N_beam_weighted = beam.total_particle_number(sg);
+
+    double local_losses[8] = {
+        loss_v1, loss_mu1, loss_v2, loss_mu2,
+        loss_v1_low, loss_v1_high, loss_v2_low, loss_v2_high
+    };
+    double global_losses[8] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+
+    double global_max_abs_Ex = 0.0;
+    double global_N_bkg_e = 0.0;
+    double global_N_beam_macro = 0.0;
+    double global_N_beam_weighted = 0.0;
+    int local_nsub[4] = { nsub_v1, nsub_mu1, nsub_v2, nsub_mu2 };
+    int global_nsub[4] = { 0, 0, 0, 0 };
+
+    MPI_Reduce(&local_max_abs_Ex, &global_max_abs_Ex, 1,
+               MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_N_bkg_e, &global_N_bkg_e, 1,
+               MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_N_beam_macro, &global_N_beam_macro, 1,
+               MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_N_beam_weighted, &global_N_beam_weighted, 1,
+               MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local_nsub, global_nsub, 4, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local_losses, global_losses, 8, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    if (mpi_rank == 0) {
+        step_file << step << "  "
+                  << time / Const::femto << "  "
+                  << global_max_abs_Ex << "  "
+                  << global_N_bkg_e << "  "
+                  << global_N_beam_macro << "  "
+                  << global_N_beam_weighted << "  "
+                  << global_nsub[0] << "  "
+                  << global_nsub[1] << "  "
+                  << global_nsub[2] << "  "
+                  << global_nsub[3] << "  "
+                  << global_losses[0] << "  "
+                  << global_losses[1] << "  "
+                  << global_losses[2] << "  "
+                  << global_losses[3] << "  "
+                  << global_losses[4] << "  "
+                  << global_losses[5] << "  "
+                  << global_losses[6] << "  "
+                  << global_losses[7] << "\n";
+        step_file.flush();
+    }
 }
 
 void Diagnostics::write_fields(double time,

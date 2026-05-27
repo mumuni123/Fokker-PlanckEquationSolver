@@ -42,12 +42,14 @@ namespace Param {
     const double densb     = jb / (Const::qe * betab * Const::c);
     const double beam_v0   = betab * Const::c;
     const double beam_p0   = gambetab * Const::me * Const::c;
+    const double return_current_drift_vx = -(densb / dens) * beam_v0;
 
     const double dx    = 0.002 * Const::micro;
     const double Lx    = 8.0   * Const::micro;
-    const int    nx    = static_cast<int>(Lx / dx);
+    const int    nx    = static_cast<int>(std::lround(Lx / dx));
 
-    const double t_end         = 6.0 * Const::femto;
+    const double t_end         = 120.0 * Const::femto;
+    const double t_inject_start = 0.0   * Const::femto;
     const double t_inject_end  = 25.0  * Const::femto;
     const double dt_multiplier = 0.5;
     const double dt_snapshot   = 0.6 * Const::femto;
@@ -55,6 +57,8 @@ namespace Param {
     const bool   enable_full_fe_output = false;
     const double velocity_space_cfl = 0.45;
     const double semi_lagrangian_cfl = 2.5;
+    const bool   abort_on_vmax_loss = true;
+    const double vmax_loss_abort_fraction = 1.0e-12;
     const PoissonSolverKind poisson_solver = POISSON_DISTRIBUTED_TRIDIAGONAL;
     const int    poisson_multigrid_vcycles = 10;
     const int    poisson_multigrid_pre_smooth = 3;
@@ -64,11 +68,12 @@ namespace Param {
 
     // Axisymmetric spherical velocity grid: (v, mu), mu = cos(theta) = vx / |v|.
     // This is still a 3D velocity-space model after integrating over the azimuth.
-    const int Nv  = 40; //96
-    const int Nmu = 32; //64
+    const int Nv  = 96;
+    const int Nmu = 64;
     const size_t Nvmu = static_cast<size_t>(Nv) * Nmu;
 
-    const double Nsigma = 12.0;
+    const double Nsigma = 80.0;
+    const double vmax_fraction_c = 0.995;
     const int Nghost = 3;
 
     const double v_floor = 1.0e-12 * Const::c;

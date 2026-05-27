@@ -39,30 +39,32 @@ def evaluate_cpp_double_constants(parameters_file: Path) -> dict[str, float]:
         "pi": np.pi,
     }
 
-    namespace_pattern = re.compile(r"namespace\s+(Const|Param)\s*\{(?P<body>.*?)\}", re.S)
-    assignment_pattern = re.compile(r"const\s+double\s+(\w+)\s*=\s*(.*?);", re.S)
-
-    for namespace_match in namespace_pattern.finditer(text):
-        namespace = namespace_match.group(1)
-        body = namespace_match.group("body")
-        for name, expression in assignment_pattern.findall(body):
-            py_expression = expression
-            py_expression = py_expression.replace("std::sqrt", "sqrt")
-            py_expression = py_expression.replace("std::pow", "pow")
-            py_expression = re.sub(r"Const::(\w+)", r"\1", py_expression)
-            py_expression = re.sub(r"Param::(\w+)", r"\1", py_expression)
-            try:
-                value = float(eval(py_expression, {"__builtins__": {}}, constants))
-            except Exception:
-                continue
-            constants[name] = value
-            constants[f"{namespace}::{name}"] = value
+    assignment_pattern = re.compile(r"const\s+(?:double|int)\s+(\w+)\s*=\s*(.*?);", re.S)
+    for name, expression in assignment_pattern.findall(text):
+        py_expression = expression
+        py_expression = py_expression.replace("std::sqrt", "sqrt")
+        py_expression = py_expression.replace("std::pow", "pow")
+        py_expression = re.sub(r"Const::(\w+)", r"\1", py_expression)
+        py_expression = re.sub(r"Param::(\w+)", r"\1", py_expression)
+        try:
+            value = float(eval(py_expression, {"__builtins__": {}}, constants))
+        except Exception:
+            continue
+        constants[name] = value
 
     return constants
 
 
 def electric_field_scale(parameters_file: Path) -> float:
     constants = evaluate_cpp_double_constants(parameters_file)
+    required = ("qe", "densb", "c", "eps0", "dens", "me")
+    missing = [name for name in required if name not in constants]
+    if missing:
+        raise ValueError(
+            f"Cannot compute E0 because {parameters_file} is missing parsable constants: "
+            f"{', '.join(missing)}"
+        )
+
     qe = constants["qe"]
     nb = constants["densb"]
     c = constants["c"]

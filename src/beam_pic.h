@@ -15,6 +15,7 @@ class BeamPIC {
 public:
     std::vector<BeamParticle> particles;
     std::vector<double> density;
+    std::vector<double> current_x;
 
     BeamPIC();
 
@@ -38,8 +39,11 @@ private:
     std::vector<std::vector<BeamParticle> > thread_send_left_;
     std::vector<std::vector<BeamParticle> > thread_send_right_;
     std::vector<std::vector<double> > thread_density_;
+    std::vector<std::vector<double> > thread_current_;
     std::vector<double> thread_send_left_density_;
     std::vector<double> thread_send_right_density_;
+    std::vector<double> thread_send_left_current_;
+    std::vector<double> thread_send_right_current_;
 
     void exchange_particles(const SpatialGrid& sg, int mpi_rank, int mpi_size);
 };

@@ -11,6 +11,7 @@ RuntimeConfig load_runtime_config()
 #else
     config.enable_debug_diagnostics = false;
 #endif
+    config.enable_step_diagnostics = Config::enable_step_diagnostics;
     config.enable_full_fe_output = Config::enable_full_fe_output;
     config.enable_progress_trace = Config::enable_progress_trace;
     return config;

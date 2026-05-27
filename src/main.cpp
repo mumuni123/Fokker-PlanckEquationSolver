@@ -22,7 +22,6 @@ double compute_dt(const Species& electron, const SpatialGrid& sg)
     double a_est = std::abs(electron.charge) * e_est / electron.mass;
     if (a_est > 1.0e-30) {
         dt_min = std::min(dt_min, 0.25 * electron.vgrid.dv / a_est);
-        dt_min = std::min(dt_min, 0.25 * electron.vgrid.dmu * electron.vgrid.dv / a_est);
     }
     dt_min *= Param::dt_multiplier;
     return std::min(dt_min, 0.01 * Const::femto);
@@ -38,6 +37,71 @@ const char* poisson_solver_name()
     case Param::POISSON_DISTRIBUTED_TRIDIAGONAL:
     default:
         return "distributed tridiagonal";
+    }
+}
+
+void update_dynamic_return_current(Species& electrons,
+                                   const BeamPIC& beam,
+                                   const SpatialGrid& sg,
+                                   std::vector<double>& previous_drift)
+{
+    if (previous_drift.size() != static_cast<size_t>(sg.nx_local)) {
+        previous_drift.assign(sg.nx_local, 0.0);
+    }
+    if (beam.current_x.size() < static_cast<size_t>(sg.nx_local)) return;
+
+    std::vector<double> target_drift(sg.nx_local, 0.0);
+    std::vector<double> delta_drift(sg.nx_local, 0.0);
+    const double denom = Const::qe * std::max(Param::dens, 1.0e-300);
+    const double drift_limit = 0.5 * electrons.vgrid.v_max;
+    bool has_delta = false;
+
+    for (int ix = 0; ix < sg.nx_local; ++ix) {
+        double drift = beam.current_x[ix] / denom;
+        drift = std::max(-drift_limit, std::min(drift_limit, drift));
+        target_drift[ix] = drift;
+        delta_drift[ix] = drift - previous_drift[ix];
+        has_delta = has_delta || (std::fabs(delta_drift[ix]) > 1.0e-12);
+    }
+
+    if (has_delta) {
+        electrons.apply_vx_shift_profile(delta_drift);
+    }
+    previous_drift.swap(target_drift);
+
+    const double left_drift =
+        (sg.ix_start == 0 && sg.nx_local > 0) ? previous_drift.front() : 0.0;
+    const double right_drift =
+        (sg.ix_start + sg.nx_local == sg.nx_global && sg.nx_local > 0)
+        ? previous_drift.back() : 0.0;
+    electrons.set_maxwellian_boundary_drifts(left_drift, right_drift);
+}
+
+void abort_if_vmax_loss(const VlasovSolver& vlasov,
+                        int step,
+                        double time,
+                        const char* stage,
+                        int mpi_rank)
+{
+    if (!Param::abort_on_vmax_loss) return;
+
+    const double local_loss = vlasov.last_loss_v_high();
+    double global_loss = 0.0;
+    MPI_Allreduce(&local_loss, &global_loss, 1, MPI_DOUBLE,
+                  MPI_SUM, MPI_COMM_WORLD);
+
+    const double threshold =
+        Param::vmax_loss_abort_fraction * Param::dens * Param::Lx;
+    if (!(global_loss <= threshold)) {
+        if (mpi_rank == 0) {
+            std::fprintf(stderr,
+                         "ERROR: background electron distribution reached vmax "
+                         "during %s at step %d, t = %.6e s. "
+                         "loss_v_high = %.8e, threshold = %.8e. "
+                         "Stopping to avoid amplifying nonphysical results.\n",
+                         stage, step, time, global_loss, threshold);
+        }
+        MPI_Abort(MPI_COMM_WORLD, 2);
     }
 }
 
@@ -88,8 +152,8 @@ int main(int argc, char** argv)
         }
         printf("Spatial grid: nx = %d, dx = %.3e m\n", Param::nx, Param::dx);
         printf("Electron velocity grid: Nv x Nmu = %d x %d\n", Param::Nv, Param::Nmu);
-        printf("Electron velocity domain: 0 <= v <= %.1f v_th (cap 0.98 c)\n",
-               Param::Nsigma);
+        printf("Electron velocity domain: 0 <= v <= %.1f v_th (cap %.3f c)\n",
+               Param::Nsigma, Param::vmax_fraction_c);
         printf("Electrostatic boundary: phi(0) = phi(L) = 0\n");
         printf("Poisson solver: %s\n", poisson_solver_name());
         printf("Fixed ions: Z*n_i = %.3e /m^3\n", Param::dens);
@@ -97,6 +161,8 @@ int main(int argc, char** argv)
                Param::dens, Param::temperature_e / Const::eV);
         printf("PIC beam: gamma*beta = %.2f, beta = %.4f, n_b = %.3e /m^3\n",
                Param::gambetab, Param::betab, Param::densb);
+        printf("Full-density return-current drift scale: u_ret = %.3e m/s\n",
+               Param::return_current_drift_vx);
         printf("Beam macro weight: %.6e particles/m^2\n", Param::beam_macro_weight);
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
         printf("Debug diagnostics: %s\n",
@@ -106,6 +172,8 @@ int main(int argc, char** argv)
 #endif
         printf("Full fe distribution output: %s\n",
                config.enable_full_fe_output ? "ON" : "OFF");
+        printf("Step diagnostics: %s\n",
+               config.enable_step_diagnostics ? "ON" : "OFF");
         printf("Progress trace: %s\n",
                config.enable_progress_trace ? "ON" : "OFF");
         printf("------------------------------------------------------------\n");
@@ -123,6 +191,8 @@ int main(int argc, char** argv)
     BeamPIC beam;
     beam.init(sgrid);
     beam.deposit_density(sgrid, mpi_rank, mpi_size);
+    std::vector<double> return_current_drift(sgrid.nx_local, 0.0);
+    update_dynamic_return_current(bkg_e, beam, sgrid, return_current_drift);
 
     std::vector<Species*> electron_species;
     electron_species.push_back(&bkg_e);
@@ -131,9 +201,11 @@ int main(int argc, char** argv)
     fields.init(sgrid);
 
     VlasovSolver vlasov;
+    vlasov.set_step_diagnostics_enabled(config.enable_step_diagnostics);
     CollisionOperator collision;
     Diagnostics diag;
-    diag.init("output", mpi_rank, config.enable_debug_diagnostics);
+    diag.init("output", mpi_rank, config.enable_debug_diagnostics,
+              config.enable_step_diagnostics);
 
     double dt = compute_dt(bkg_e, sgrid);
     MPI_Allreduce(MPI_IN_PLACE, &dt, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
@@ -167,6 +239,18 @@ int main(int argc, char** argv)
     if (config.enable_debug_diagnostics) {
         for (int step = 1; step <= nsteps; ++step) {
             double time = step * dt;
+            int nsub_v1 = 0;
+            int nsub_mu1 = 0;
+            int nsub_v2 = 0;
+            int nsub_mu2 = 0;
+            double loss_v1 = 0.0;
+            double loss_v1_low = 0.0;
+            double loss_v1_high = 0.0;
+            double loss_mu1 = 0.0;
+            double loss_v2 = 0.0;
+            double loss_v2_low = 0.0;
+            double loss_v2_high = 0.0;
+            double loss_mu2 = 0.0;
 
             trace_progress(config, mpi_rank, step, "before x1");
             vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size);
@@ -177,6 +261,11 @@ int main(int argc, char** argv)
             trace_progress(config, mpi_rank, step, "before v1");
             vlasov.advect_v(bkg_e, sgrid, fields, 0.5 * dt);
             trace_progress(config, mpi_rank, step, "after v1");
+            nsub_v1 = vlasov.last_nsub_v();
+            loss_v1 = vlasov.last_loss_v();
+            loss_v1_low = vlasov.last_loss_v_low();
+            loss_v1_high = vlasov.last_loss_v_high();
+            abort_if_vmax_loss(vlasov, step, time, "v1", mpi_rank);
             moments_current = false;
             diag.write_debug_state(step, time, "v1", bkg_e, beam, fields,
                                    sgrid, mpi_rank, mpi_size,
@@ -185,21 +274,25 @@ int main(int argc, char** argv)
             trace_progress(config, mpi_rank, step, "before mu1");
             vlasov.advect_mu(bkg_e, sgrid, fields, 0.5 * dt);
             trace_progress(config, mpi_rank, step, "after mu1");
+            nsub_mu1 = vlasov.last_nsub_mu();
+            loss_mu1 = vlasov.last_loss_mu();
             moments_current = false;
             diag.write_debug_state(step, time, "mu1", bkg_e, beam, fields,
                                    sgrid, mpi_rank, mpi_size,
                                    vlasov.last_cfl_v(), vlasov.last_cfl_mu(),
                                    vlasov.last_nsub_v(), vlasov.last_nsub_mu());
 
-            trace_progress(config, mpi_rank, step, "before beam push");
-            beam.push(sgrid, fields, dt, mpi_rank, mpi_size);
-            trace_progress(config, mpi_rank, step, "after beam push");
             trace_progress(config, mpi_rank, step, "before beam inject");
             beam.inject(sgrid, dt, time, mpi_rank);
             trace_progress(config, mpi_rank, step, "after beam inject");
+            trace_progress(config, mpi_rank, step, "before beam push");
+            beam.push(sgrid, fields, dt, mpi_rank, mpi_size);
+            trace_progress(config, mpi_rank, step, "after beam push");
             trace_progress(config, mpi_rank, step, "before beam deposit");
             beam.deposit_density(sgrid, mpi_rank, mpi_size);
             trace_progress(config, mpi_rank, step, "after beam deposit");
+            update_dynamic_return_current(bkg_e, beam, sgrid, return_current_drift);
+            moments_current = false;
 
             if (!moments_current) {
                 trace_progress(config, mpi_rank, step, "before moments");
@@ -234,6 +327,11 @@ int main(int argc, char** argv)
             trace_progress(config, mpi_rank, step, "before v2");
             vlasov.advect_v(bkg_e, sgrid, fields, 0.5 * dt);
             trace_progress(config, mpi_rank, step, "after v2");
+            nsub_v2 = vlasov.last_nsub_v();
+            loss_v2 = vlasov.last_loss_v();
+            loss_v2_low = vlasov.last_loss_v_low();
+            loss_v2_high = vlasov.last_loss_v_high();
+            abort_if_vmax_loss(vlasov, step, time, "v2", mpi_rank);
             moments_current = false;
             diag.write_debug_state(step, time, "v2", bkg_e, beam, fields,
                                    sgrid, mpi_rank, mpi_size,
@@ -242,11 +340,24 @@ int main(int argc, char** argv)
             trace_progress(config, mpi_rank, step, "before mu2");
             vlasov.advect_mu(bkg_e, sgrid, fields, 0.5 * dt);
             trace_progress(config, mpi_rank, step, "after mu2");
+            nsub_mu2 = vlasov.last_nsub_mu();
+            loss_mu2 = vlasov.last_loss_mu();
             moments_current = false;
             diag.write_debug_state(step, time, "mu2", bkg_e, beam, fields,
                                    sgrid, mpi_rank, mpi_size,
                                    vlasov.last_cfl_v(), vlasov.last_cfl_mu(),
                                    vlasov.last_nsub_v(), vlasov.last_nsub_mu());
+
+            if (config.enable_step_diagnostics) {
+                diag.write_step_diagnostics(step, time, bkg_e, beam, fields,
+                                            sgrid, mpi_rank, mpi_size,
+                                            nsub_v1, nsub_mu1,
+                                            nsub_v2, nsub_mu2,
+                                            loss_v1, loss_mu1,
+                                            loss_v2, loss_mu2,
+                                            loss_v1_low, loss_v1_high,
+                                            loss_v2_low, loss_v2_high);
+            }
 
             if (step % stdout_freq == 0) {
                 if (!moments_current) {
@@ -275,6 +386,18 @@ int main(int argc, char** argv)
     {
         for (int step = 1; step <= nsteps; ++step) {
             double time = step * dt;
+            int nsub_v1 = 0;
+            int nsub_mu1 = 0;
+            int nsub_v2 = 0;
+            int nsub_mu2 = 0;
+            double loss_v1 = 0.0;
+            double loss_v1_low = 0.0;
+            double loss_v1_high = 0.0;
+            double loss_mu1 = 0.0;
+            double loss_v2 = 0.0;
+            double loss_v2_low = 0.0;
+            double loss_v2_high = 0.0;
+            double loss_mu2 = 0.0;
 
             trace_progress(config, mpi_rank, step, "before x1");
             vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size);
@@ -283,21 +406,30 @@ int main(int argc, char** argv)
             trace_progress(config, mpi_rank, step, "before v1");
             vlasov.advect_v(bkg_e, sgrid, fields, 0.5 * dt);
             trace_progress(config, mpi_rank, step, "after v1");
+            nsub_v1 = vlasov.last_nsub_v();
+            loss_v1 = vlasov.last_loss_v();
+            loss_v1_low = vlasov.last_loss_v_low();
+            loss_v1_high = vlasov.last_loss_v_high();
+            abort_if_vmax_loss(vlasov, step, time, "v1", mpi_rank);
             moments_current = false;
             trace_progress(config, mpi_rank, step, "before mu1");
             vlasov.advect_mu(bkg_e, sgrid, fields, 0.5 * dt);
             trace_progress(config, mpi_rank, step, "after mu1");
+            nsub_mu1 = vlasov.last_nsub_mu();
+            loss_mu1 = vlasov.last_loss_mu();
             moments_current = false;
 
-            trace_progress(config, mpi_rank, step, "before beam push");
-            beam.push(sgrid, fields, dt, mpi_rank, mpi_size);
-            trace_progress(config, mpi_rank, step, "after beam push");
             trace_progress(config, mpi_rank, step, "before beam inject");
             beam.inject(sgrid, dt, time, mpi_rank);
             trace_progress(config, mpi_rank, step, "after beam inject");
+            trace_progress(config, mpi_rank, step, "before beam push");
+            beam.push(sgrid, fields, dt, mpi_rank, mpi_size);
+            trace_progress(config, mpi_rank, step, "after beam push");
             trace_progress(config, mpi_rank, step, "before beam deposit");
             beam.deposit_density(sgrid, mpi_rank, mpi_size);
             trace_progress(config, mpi_rank, step, "after beam deposit");
+            update_dynamic_return_current(bkg_e, beam, sgrid, return_current_drift);
+            moments_current = false;
 
             if (!moments_current) {
                 trace_progress(config, mpi_rank, step, "before moments");
@@ -328,11 +460,29 @@ int main(int argc, char** argv)
             trace_progress(config, mpi_rank, step, "before v2");
             vlasov.advect_v(bkg_e, sgrid, fields, 0.5 * dt);
             trace_progress(config, mpi_rank, step, "after v2");
+            nsub_v2 = vlasov.last_nsub_v();
+            loss_v2 = vlasov.last_loss_v();
+            loss_v2_low = vlasov.last_loss_v_low();
+            loss_v2_high = vlasov.last_loss_v_high();
+            abort_if_vmax_loss(vlasov, step, time, "v2", mpi_rank);
             moments_current = false;
             trace_progress(config, mpi_rank, step, "before mu2");
             vlasov.advect_mu(bkg_e, sgrid, fields, 0.5 * dt);
             trace_progress(config, mpi_rank, step, "after mu2");
+            nsub_mu2 = vlasov.last_nsub_mu();
+            loss_mu2 = vlasov.last_loss_mu();
             moments_current = false;
+
+            if (config.enable_step_diagnostics) {
+                diag.write_step_diagnostics(step, time, bkg_e, beam, fields,
+                                            sgrid, mpi_rank, mpi_size,
+                                            nsub_v1, nsub_mu1,
+                                            nsub_v2, nsub_mu2,
+                                            loss_v1, loss_mu1,
+                                            loss_v2, loss_mu2,
+                                            loss_v1_low, loss_v1_high,
+                                            loss_v2_low, loss_v2_high);
+            }
 
             if (step % stdout_freq == 0) {
                 if (!moments_current) {

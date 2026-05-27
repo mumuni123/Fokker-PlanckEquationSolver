@@ -18,7 +18,7 @@ POSITION_UM = 2.5
 TIME_COLUMNS = ["Ex[V/m]"]
 
 # Settings for plot_space_profile.py.
-SPACE_FILE = DATA_DIR / "fields_00100.dat"
+SPACE_FILE = DATA_DIR / "fields_00010.dat"
 SPACE_COLUMNS = ["Ex[V/m]"]
 
 # Plot style and output quality.

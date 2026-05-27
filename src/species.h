@@ -33,7 +33,8 @@ public:
     std::vector<double> number_density;
     std::vector<double> charge_density;
     std::vector<double> current_x;
-    std::vector<double> maxwellian_boundary;
+    std::vector<double> maxwellian_left_boundary;
+    std::vector<double> maxwellian_right_boundary;
 
     Species();
 
@@ -44,7 +45,9 @@ public:
               const SpatialGrid& sg);
 
     void initialize_maxwellian(double drift_vx = 0.0);
-    void precompute_maxwellian_boundary();
+    void set_maxwellian_boundary_drifts(double left_drift_vx,
+                                         double right_drift_vx);
+    void apply_vx_shift_profile(const std::vector<double>& delta_vx);
     void compute_moments();
     double total_particle_number() const;
     double total_kinetic_energy() const;
