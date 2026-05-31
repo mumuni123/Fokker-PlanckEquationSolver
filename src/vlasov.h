@@ -39,6 +39,14 @@ public:
     double last_loss_v_low() const { return last_loss_v_low_; }
     double last_loss_v_high() const { return last_loss_v_high_; }
     double last_loss_mu() const { return last_loss_mu_; }
+    double last_loss_x_left() const { return last_loss_x_left_; }
+    double last_loss_x_right() const { return last_loss_x_right_; }
+    double last_mass_error_v() const { return last_mass_error_v_; }
+    double last_mass_error_mu() const { return last_mass_error_mu_; }
+    double last_momentum_delta_v() const { return last_momentum_delta_v_; }
+    double last_momentum_delta_mu() const { return last_momentum_delta_mu_; }
+    double last_energy_delta_v() const { return last_energy_delta_v_; }
+    double last_energy_delta_mu() const { return last_energy_delta_mu_; }
 
 private:
     void exchange_ghosts_x(Species& sp, const SpatialGrid& sg,
@@ -56,6 +64,14 @@ private:
     double last_loss_v_low_;
     double last_loss_v_high_;
     double last_loss_mu_;
+    double last_loss_x_left_;
+    double last_loss_x_right_;
+    double last_mass_error_v_;
+    double last_mass_error_mu_;
+    double last_momentum_delta_v_;
+    double last_momentum_delta_mu_;
+    double last_energy_delta_v_;
+    double last_energy_delta_mu_;
     int last_nsub_v_;
     int last_nsub_mu_;
     bool step_diagnostics_enabled_;

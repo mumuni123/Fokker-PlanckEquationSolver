@@ -5,9 +5,9 @@
 
 class CollisionOperator {
 public:
-    void apply(Species& sp, double dt,
-               double n_field, double T_field, double m_field,
-               double Z_field, double Z_test);
+    double apply(Species& sp, double dt,
+                 double n_field, double T_field, double m_field,
+                 double Z_field, double Z_test);
 
 private:
     struct CollisionRates {

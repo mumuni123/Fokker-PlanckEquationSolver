@@ -10,6 +10,18 @@
 
 class BeamPIC;
 
+struct LowModeFractions {
+    double rho[3];
+    double Ex[3];
+
+    LowModeFractions();
+};
+
+LowModeFractions compute_low_mode_fractions(const EMFields& fields,
+                                            const SpatialGrid& sg,
+                                            int mpi_rank,
+                                            int mpi_size);
+
 class Diagnostics {
 public:
     std::string output_dir;
@@ -22,8 +34,10 @@ public:
               bool enable_step_diagnostics);
 
     void write_scalars(double time, int step,
-                       const std::vector<Species*>& species,
+                       const Species& electrons,
+                       const BeamPIC& beam,
                        const EMFields& fields,
+                       double cumulative_collision_energy_delta,
                        int mpi_rank, int mpi_size);
 
     void write_debug_state(int step, double time,
@@ -55,7 +69,27 @@ public:
                                 double loss_v1_low,
                                 double loss_v1_high,
                                 double loss_v2_low,
-                                double loss_v2_high);
+                                double loss_v2_high,
+                                double loss_x1_left,
+                                double loss_x1_right,
+                                double loss_x2_left,
+                                double loss_x2_right,
+                                double collision_energy_step,
+                                double cumulative_collision_energy_delta,
+                                double dke_bkg_step,
+                                double dke_beam_push,
+                                double dE_field_step,
+                                double W_bkg_E,
+                                double W_beam_E,
+                                double v_mass_error_step,
+                                double mu_mass_error_step,
+                                double v_momentum_delta_step,
+                                double mu_momentum_delta_step,
+                                double v_energy_delta_step,
+                                double mu_energy_delta_step,
+                                double E_src_in_step,
+                                double E_src_out_step,
+                                double E_balance_step);
 
     void write_fields(double time,
                       const EMFields& fields,
@@ -69,6 +103,7 @@ public:
     void write_density_profile(double time,
                                const Species& electrons,
                                const std::vector<double>& beam_density,
+                               const std::vector<double>& ion_density_profile,
                                const SpatialGrid& sg,
                                int mpi_rank, int mpi_size);
 
@@ -87,6 +122,8 @@ private:
     std::ofstream step_file;
     bool debug_enabled;
     bool step_enabled;
+    bool has_energy_reference;
+    double energy_reference;
 };
 
 #endif

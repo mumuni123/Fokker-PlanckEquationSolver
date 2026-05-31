@@ -66,10 +66,11 @@ CollisionOperator::compute_rates(double v, double mass_test,
     return r;
 }
 
-void CollisionOperator::apply(Species& sp, double dt,
-                              double n_field, double T_field, double m_field,
-                              double Z_field, double Z_test)
+double CollisionOperator::apply(Species& sp, double dt,
+                                double n_field, double T_field, double m_field,
+                                double Z_field, double Z_test)
 {
+    const double energy_before = sp.total_kinetic_energy();
     double lnL = coulomb_log(n_field, T_field);
     const int ng = sp.sgrid->nghost;
     const int nxl = sp.sgrid->nx_local;
@@ -164,4 +165,5 @@ void CollisionOperator::apply(Species& sp, double dt,
     }
 
     sp.f.swap(sp.f_tmp);
+    return sp.total_kinetic_energy() - energy_before;
 }

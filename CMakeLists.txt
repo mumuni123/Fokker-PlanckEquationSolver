@@ -3,7 +3,7 @@ project(FokkerPlanckSolver CXX)
 
 # 为兼容 GCC 4.8.5 使用 C++11
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -O3 -Wall")
-option(FP_ENABLE_DEBUG_DIAGNOSTICS "Compile debug diagnostics support" ON)
+option(FP_ENABLE_DEBUG_DIAGNOSTICS "Compile debug diagnostics support" OFF)
 
 # MPI: 通过 mpicxx 封装器自动处理（在 PBS 脚本中通过
 # -DCMAKE_CXX_COMPILER=mpicxx 指定）。
@@ -20,6 +20,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 # 源文件列表
 set(SOURCES
     src/main.cpp
+    src/fft_utils.cpp
     src/config.cpp
     src/species.cpp
     src/vlasov.cpp

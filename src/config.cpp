@@ -14,7 +14,15 @@ RuntimeConfig load_runtime_config()
     config.enable_step_diagnostics = Config::enable_step_diagnostics;
     config.enable_full_fe_output = Config::enable_full_fe_output;
     config.enable_progress_trace = Config::enable_progress_trace;
+    config.step_diagnostics_interval = Config::step_diagnostics_interval;
     return config;
+}
+
+bool should_write_step_diagnostics(const RuntimeConfig& config, int step)
+{
+    if (!config.enable_step_diagnostics) return false;
+    if (config.step_diagnostics_interval <= 1) return true;
+    return step % config.step_diagnostics_interval == 0;
 }
 
 bool should_trace_progress(const RuntimeConfig& config, int step)

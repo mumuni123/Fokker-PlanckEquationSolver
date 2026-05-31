@@ -18,8 +18,16 @@ POSITION_UM = 2.5
 TIME_COLUMNS = ["Ex[V/m]"]
 
 # Settings for plot_space_profile.py.
-SPACE_FILE = DATA_DIR / "fields_00010.dat"
+SPACE_FILE = DATA_DIR / "fields_00025.dat"
 SPACE_COLUMNS = ["Ex[V/m]"]
+
+# Settings for plot_beam_density_profile.py.
+DENSITY_FILE = DATA_DIR / "density_00010.dat"
+DENSITY_COLUMNS = ["n_beam[m^-3]"]
+
+# Settings for plot_fv_profile.py.
+FV_FILE = DATA_DIR / "fv_bkg_e_00010.dat"
+FV_COLUMNS = ["F(v)"]
 
 # Plot style and output quality.
 FIGSIZE = (7.2, 4.5)

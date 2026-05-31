@@ -8,6 +8,7 @@ namespace Config {
     const bool enable_full_fe_output = false;
     const bool enable_progress_trace = false;
 
+    const int step_diagnostics_interval = 1000;
     const int progress_trace_initial_steps = 3;
     const int progress_trace_interval = 100;
 }
@@ -17,9 +18,11 @@ struct RuntimeConfig {
     bool enable_step_diagnostics;
     bool enable_full_fe_output;
     bool enable_progress_trace;
+    int step_diagnostics_interval;
 };
 
 RuntimeConfig load_runtime_config();
+bool should_write_step_diagnostics(const RuntimeConfig& config, int step);
 bool should_trace_progress(const RuntimeConfig& config, int step);
 void trace_progress(const RuntimeConfig& config, int mpi_rank, int step,
                     const char* stage);

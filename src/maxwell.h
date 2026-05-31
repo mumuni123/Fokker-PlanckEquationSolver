@@ -18,6 +18,7 @@ struct EMFields {
     std::vector<int> displs;
     std::vector<double> local_rhs;
     std::vector<double> global_rhs;
+    std::vector<double> global_ex;
     std::vector<double> global_phi;
     std::vector<double> tri_a;
     std::vector<double> tri_b;
@@ -42,11 +43,15 @@ struct EMFields {
     void zero_currents();
     void accumulate_moments(const class Species& sp);
     void set_charge_density(const class Species& electrons,
-                            const std::vector<double>& beam_density);
+                            const std::vector<double>& beam_density,
+                            const std::vector<double>& ion_density_profile);
 
-    // Electrostatic solve: phi(0) = phi(L) = 0, Ex = -dphi/dx.
+    // Main-step electrostatic solve: FFT periodic Poisson with charge zero-mode removed.
     void solve_poisson(int mpi_rank, int mpi_size);
-    void exchange_ghosts(int mpi_rank, int mpi_size);
+    // Snapshot-only potential reconstruction with mean(phi) = 0.
+    void compute_potential(int mpi_rank, int mpi_size);
+    void exchange_ex_ghosts(int mpi_rank, int mpi_size);
+    void exchange_phi_ghosts(int mpi_rank, int mpi_size);
 
     double total_energy() const;
 };

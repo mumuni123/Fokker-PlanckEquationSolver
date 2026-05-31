@@ -22,12 +22,6 @@ namespace Const {
 }
 
 namespace Param {
-    enum PoissonSolverKind {
-        POISSON_DISTRIBUTED_TRIDIAGONAL = 0,
-        POISSON_PARALLEL_CYCLIC_REDUCTION = 1,
-        POISSON_MULTIGRID = 2
-    };
-
     const double temperature_e = 100.0 * Const::eV;
     const double temperature_i = 10.0  * Const::eV;
     const double dens          = 1.2e29;
@@ -42,10 +36,10 @@ namespace Param {
     const double densb     = jb / (Const::qe * betab * Const::c);
     const double beam_v0   = betab * Const::c;
     const double beam_p0   = gambetab * Const::me * Const::c;
-    const double return_current_drift_vx = -(densb / dens) * beam_v0;
 
     const double dx    = 0.002 * Const::micro;
-    const double Lx    = 8.0   * Const::micro;
+    const double Lx    = 8.0 * Const::micro;
+    const double plasma_length = Lx;
     const int    nx    = static_cast<int>(std::lround(Lx / dx));
 
     const double t_end         = 120.0 * Const::femto;
@@ -55,16 +49,14 @@ namespace Param {
     const double dt_snapshot   = 0.6 * Const::femto;
     const bool   enable_debug_diagnostics = false;
     const bool   enable_full_fe_output = false;
-    const double velocity_space_cfl = 0.45;
+    const double velocity_space_cfl = 0.35;
     const double semi_lagrangian_cfl = 2.5;
-    const bool   abort_on_vmax_loss = true;
+    const bool   abort_on_vmax_loss = false;
     const double vmax_loss_abort_fraction = 1.0e-12;
-    const PoissonSolverKind poisson_solver = POISSON_DISTRIBUTED_TRIDIAGONAL;
-    const int    poisson_multigrid_vcycles = 10;
-    const int    poisson_multigrid_pre_smooth = 3;
-    const int    poisson_multigrid_post_smooth = 3;
-    const int    beam_macro_particles_per_cell = 100; // 1000
+    const int    beam_macro_particles_per_cell = 1000; // 1000
     const double beam_macro_weight = densb * dx / beam_macro_particles_per_cell;
+    const double beam_source_x_start = 0.5 * Const::micro;
+    const double beam_source_length  = 0.3 * Const::micro;
 
     // Axisymmetric spherical velocity grid: (v, mu), mu = cos(theta) = vx / |v|.
     // This is still a 3D velocity-space model after integrating over the azimuth.
