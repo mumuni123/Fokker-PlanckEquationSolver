@@ -46,9 +46,9 @@ struct EMFields {
                             const std::vector<double>& beam_density,
                             const std::vector<double>& ion_density_profile);
 
-    // Main-step electrostatic solve: FFT periodic Poisson with charge zero-mode removed.
+    // Main-step electrostatic solve. Default model uses grounded Dirichlet boundaries.
     void solve_poisson(int mpi_rank, int mpi_size);
-    // Snapshot-only potential reconstruction with mean(phi) = 0.
+    // Snapshot-only potential reconstruction.
     void compute_potential(int mpi_rank, int mpi_size);
     void exchange_ex_ghosts(int mpi_rank, int mpi_size);
     void exchange_phi_ghosts(int mpi_rank, int mpi_size);

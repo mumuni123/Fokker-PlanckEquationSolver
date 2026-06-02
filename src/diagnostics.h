@@ -10,18 +10,6 @@
 
 class BeamPIC;
 
-struct LowModeFractions {
-    double rho[3];
-    double Ex[3];
-
-    LowModeFractions();
-};
-
-LowModeFractions compute_low_mode_fractions(const EMFields& fields,
-                                            const SpatialGrid& sg,
-                                            int mpi_rank,
-                                            int mpi_size);
-
 class Diagnostics {
 public:
     std::string output_dir;

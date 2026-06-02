@@ -1,9 +1,7 @@
 #include "maxwell.h"
-#include "fft_utils.h"
 #include "species.h"
 #include <algorithm>
 #include <cmath>
-#include <complex>
 #include <mpi.h>
 #include <vector>
 
@@ -37,28 +35,11 @@ void prepare_mpi_layout(EMFields& fields, int mpi_size)
     fields.global_phi.assign(static_cast<size_t>(Param::nx), 0.0);
 }
 
-void enforce_discrete_neutrality(EMFields& fields)
-{
-    const int ng = Param::Nghost;
-    const int nxl = fields.nx_total - 2 * ng;
-
-    double local_sum = 0.0;
-    for (int ix = 0; ix < nxl; ++ix) local_sum += fields.rho[ng + ix];
-
-    double global_sum = 0.0;
-    MPI_Allreduce(&local_sum, &global_sum, 1, MPI_DOUBLE,
-                  MPI_SUM, MPI_COMM_WORLD);
-    const double rho_mean = global_sum / static_cast<double>(Param::nx);
-
-    for (int ix = 0; ix < nxl; ++ix) fields.rho[ng + ix] -= rho_mean;
-}
-
-void gather_neutral_rho(EMFields& fields, int mpi_size)
+void gather_rho(EMFields& fields, int mpi_size)
 {
     const int ng = Param::Nghost;
     const int nxl = fields.nx_total - 2 * ng;
     prepare_mpi_layout(fields, mpi_size);
-    enforce_discrete_neutrality(fields);
 
     for (int ix = 0; ix < nxl; ++ix) {
         fields.local_rhs[static_cast<size_t>(ix)] = fields.rho[ng + ix];
@@ -69,73 +50,63 @@ void gather_neutral_rho(EMFields& fields, int mpi_size)
                 fields.displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
 }
 
-void compute_fft_periodic_poisson(EMFields& fields,
-                                  bool compute_ex,
-                                  bool compute_phi)
+void compute_dirichlet_poisson(EMFields& fields,
+                               bool compute_ex,
+                               bool compute_phi)
 {
     const int n = Param::nx;
-    const double length = static_cast<double>(n) * fields.dx;
-    std::vector<std::complex<double> > rho_hat(static_cast<size_t>(n));
+    if (n <= 0) return;
+
+    fields.tri_work_a.assign(static_cast<size_t>(n), -1.0);
+    fields.tri_work_b.assign(static_cast<size_t>(n), 2.0);
+    fields.tri_work_c.assign(static_cast<size_t>(n), -1.0);
+    fields.tri_work_d.assign(static_cast<size_t>(n), 0.0);
+    fields.tri_work_a[0] = 0.0;
+    fields.tri_work_c[static_cast<size_t>(n - 1)] = 0.0;
+
+    const double rhs_scale = fields.dx * fields.dx / Const::eps0;
     for (int i = 0; i < n; ++i) {
-        rho_hat[static_cast<size_t>(i)] =
-            std::complex<double>(fields.global_rhs[static_cast<size_t>(i)], 0.0);
+        fields.tri_work_d[static_cast<size_t>(i)] =
+            fields.global_rhs[static_cast<size_t>(i)] * rhs_scale;
     }
 
-    fft_any(rho_hat, false);
-    rho_hat[0] = std::complex<double>(0.0, 0.0);
-
-    std::vector<std::complex<double> > ex_hat;
-    std::vector<std::complex<double> > phi_hat;
-    if (compute_ex) {
-        ex_hat.assign(static_cast<size_t>(n), std::complex<double>(0.0, 0.0));
-    }
-    if (compute_phi) {
-        phi_hat.assign(static_cast<size_t>(n), std::complex<double>(0.0, 0.0));
+    for (int i = 1; i < n; ++i) {
+        const size_t im = static_cast<size_t>(i - 1);
+        const size_t ii = static_cast<size_t>(i);
+        const double m = fields.tri_work_a[ii] / fields.tri_work_b[im];
+        fields.tri_work_b[ii] -= m * fields.tri_work_c[im];
+        fields.tri_work_d[ii] -= m * fields.tri_work_d[im];
     }
 
-    for (int k = 1; k < n; ++k) {
-        const bool nyquist = ((n % 2) == 0 && k == n / 2);
-        const int mode = (k <= n / 2) ? k : k - n;
-        const double wave_number =
-            2.0 * Const::pi * static_cast<double>(mode) / length;
-        const double theta = wave_number * fields.dx;
-        const double laplace_symbol =
-            4.0 * std::sin(0.5 * theta) * std::sin(0.5 * theta)
-            / (fields.dx * fields.dx);
-        if (!(laplace_symbol > 0.0)) continue;
-        const std::complex<double> phi_k =
-            rho_hat[static_cast<size_t>(k)] /
-            (Const::eps0 * laplace_symbol);
-        if (compute_phi) phi_hat[static_cast<size_t>(k)] = phi_k;
-        if (compute_ex && !nyquist) {
-            const double grad_symbol = std::sin(theta) / fields.dx;
-            ex_hat[static_cast<size_t>(k)] =
-                std::complex<double>(0.0, -grad_symbol) * phi_k;
-        }
+    fields.global_phi.assign(static_cast<size_t>(n), 0.0);
+    fields.global_phi[static_cast<size_t>(n - 1)] =
+        fields.tri_work_d[static_cast<size_t>(n - 1)] /
+        fields.tri_work_b[static_cast<size_t>(n - 1)];
+    for (int i = n - 2; i >= 0; --i) {
+        const size_t ii = static_cast<size_t>(i);
+        fields.global_phi[ii] =
+            (fields.tri_work_d[ii] -
+             fields.tri_work_c[ii] * fields.global_phi[ii + 1]) /
+            fields.tri_work_b[ii];
     }
 
     if (compute_ex) {
-        fft_any(ex_hat, true);
-        double mean_ex = 0.0;
-        for (int i = 0; i < n; ++i) {
-            const double value = ex_hat[static_cast<size_t>(i)].real();
-            fields.global_ex[static_cast<size_t>(i)] = value;
-            mean_ex += value;
+        fields.global_ex.assign(static_cast<size_t>(n), 0.0);
+        if (n > 1) {
+            fields.global_ex[0] = -fields.global_phi[1] / fields.dx;
+            for (int i = 1; i < n - 1; ++i) {
+                fields.global_ex[static_cast<size_t>(i)] =
+                    -(fields.global_phi[static_cast<size_t>(i + 1)] -
+                      fields.global_phi[static_cast<size_t>(i - 1)]) /
+                    (2.0 * fields.dx);
+            }
+            fields.global_ex[static_cast<size_t>(n - 1)] =
+                fields.global_phi[static_cast<size_t>(n - 2)] / fields.dx;
         }
-        mean_ex /= static_cast<double>(n);
-        for (int i = 0; i < n; ++i) fields.global_ex[static_cast<size_t>(i)] -= mean_ex;
     }
 
-    if (compute_phi) {
-        fft_any(phi_hat, true);
-        double mean_phi = 0.0;
-        for (int i = 0; i < n; ++i) {
-            const double value = phi_hat[static_cast<size_t>(i)].real();
-            fields.global_phi[static_cast<size_t>(i)] = value;
-            mean_phi += value;
-        }
-        mean_phi /= static_cast<double>(n);
-        for (int i = 0; i < n; ++i) fields.global_phi[static_cast<size_t>(i)] -= mean_phi;
+    if (!compute_phi) {
+        std::fill(fields.global_phi.begin(), fields.global_phi.end(), 0.0);
     }
 }
 
@@ -155,13 +126,13 @@ void exchange_scalar_ghosts(EMFields& fields,
         fields.recv_right.resize(ng);
     }
 
-    const int left = (mpi_rank - 1 + mpi_size) % mpi_size;
-    const int right = (mpi_rank + 1) % mpi_size;
+    const int left = mpi_rank - 1;
+    const int right = mpi_rank + 1;
 
     if (mpi_size == 1) {
         for (int g = 0; g < ng; ++g) {
-            a[g] = a[ng + nxl - ng + g];
-            a[ng + nxl + g] = a[ng + g];
+            a[g] = a[ng];
+            a[ng + nxl + g] = a[ng + nxl - 1];
         }
         return;
     }
@@ -173,19 +144,24 @@ void exchange_scalar_ghosts(EMFields& fields,
 
     MPI_Request reqs[4];
     int nreq = 0;
-    MPI_Isend(fields.send_left.data(), ng, MPI_DOUBLE, left, tag_base,
-              MPI_COMM_WORLD, &reqs[nreq++]);
-    MPI_Irecv(fields.recv_left.data(), ng, MPI_DOUBLE, left, tag_base + 1,
-              MPI_COMM_WORLD, &reqs[nreq++]);
-    MPI_Isend(fields.send_right.data(), ng, MPI_DOUBLE, right, tag_base + 1,
-              MPI_COMM_WORLD, &reqs[nreq++]);
-    MPI_Irecv(fields.recv_right.data(), ng, MPI_DOUBLE, right, tag_base,
-              MPI_COMM_WORLD, &reqs[nreq++]);
-    MPI_Waitall(nreq, reqs, MPI_STATUSES_IGNORE);
+    if (left >= 0) {
+        MPI_Isend(fields.send_left.data(), ng, MPI_DOUBLE, left, tag_base,
+                  MPI_COMM_WORLD, &reqs[nreq++]);
+        MPI_Irecv(fields.recv_left.data(), ng, MPI_DOUBLE, left, tag_base + 1,
+                  MPI_COMM_WORLD, &reqs[nreq++]);
+    }
+    if (right < mpi_size) {
+        MPI_Isend(fields.send_right.data(), ng, MPI_DOUBLE, right, tag_base + 1,
+                  MPI_COMM_WORLD, &reqs[nreq++]);
+        MPI_Irecv(fields.recv_right.data(), ng, MPI_DOUBLE, right, tag_base,
+                  MPI_COMM_WORLD, &reqs[nreq++]);
+    }
+    if (nreq > 0) MPI_Waitall(nreq, reqs, MPI_STATUSES_IGNORE);
 
     for (int g = 0; g < ng; ++g) {
-        a[g] = fields.recv_left[g];
-        a[ng + nxl + g] = fields.recv_right[g];
+        a[g] = (left >= 0) ? fields.recv_left[g] : a[ng];
+        a[ng + nxl + g] =
+            (right < mpi_size) ? fields.recv_right[g] : a[ng + nxl - 1];
     }
 }
 }
@@ -241,9 +217,11 @@ void EMFields::solve_poisson(int mpi_rank, int mpi_size)
 {
     const int ng = Param::Nghost;
     const int nxl = nx_total - 2 * ng;
-    gather_neutral_rho(*this, mpi_size);
+    gather_rho(*this, mpi_size);
 
-    if (mpi_rank == 0) compute_fft_periodic_poisson(*this, true, false);
+    if (mpi_rank == 0) {
+        compute_dirichlet_poisson(*this, true, false);
+    }
 
     MPI_Scatterv(global_ex.data(), counts.data(), displs.data(), MPI_DOUBLE,
                  local_rhs.data(), nxl, MPI_DOUBLE, 0, MPI_COMM_WORLD);
@@ -255,9 +233,11 @@ void EMFields::compute_potential(int mpi_rank, int mpi_size)
 {
     const int ng = Param::Nghost;
     const int nxl = nx_total - 2 * ng;
-    gather_neutral_rho(*this, mpi_size);
+    gather_rho(*this, mpi_size);
 
-    if (mpi_rank == 0) compute_fft_periodic_poisson(*this, false, true);
+    if (mpi_rank == 0) {
+        compute_dirichlet_poisson(*this, false, true);
+    }
 
     MPI_Scatterv(global_phi.data(), counts.data(), displs.data(), MPI_DOUBLE,
                  local_rhs.data(), nxl, MPI_DOUBLE, 0, MPI_COMM_WORLD);

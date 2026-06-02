@@ -29,7 +29,7 @@ double compute_dt(const Species& electron, const SpatialGrid& sg)
 
 const char* poisson_solver_name()
 {
-    return "FFT periodic discrete Poisson with zero-mode removal";
+    return "grounded Dirichlet tridiagonal Poisson";
 }
 
 std::vector<double> build_local_ion_density_profile(const SpatialGrid& sg)
@@ -160,18 +160,18 @@ int main(int argc, char** argv)
         printf("Electron velocity grid: Nv x Nmu = %d x %d\n", Param::Nv, Param::Nmu);
         printf("Electron velocity domain: 0 <= v <= %.1f v_th (cap %.3f c)\n",
                Param::Nsigma, Param::vmax_fraction_c);
-        printf("Electrostatic boundary: periodic discrete FFT, net charge forced to zero before each solve\n");
+        printf("Electrostatic boundary: grounded Dirichlet phi(0)=phi(L)=0\n");
         printf("Poisson solver: %s\n", poisson_solver_name());
         printf("Fixed ions: uniform Z*n_i = %.3e /m^3\n", Param::dens);
-        printf("Background electrons: full-domain Maxwellian, T_e = %.1f eV, periodic ghosts\n",
-               Param::temperature_e / Const::eV);
+        printf("Background electrons: reservoir/open ghosts, T_e = %.1f eV, u_return = %.6e m/s\n",
+               Param::temperature_e / Const::eV,
+               Param::background_reservoir_u_return);
         printf("PIC beam: gamma*beta = %.2f, beta = %.4f, n_b = %.3e /m^3\n",
                Param::gambetab, Param::betab, Param::densb);
-        printf("Beam source: quiet-start internal flux plane at x = %.3f um\n",
-               Param::beam_source_x_start / Const::micro);
+        printf("Beam source: quiet-start left boundary injection at x = 0\n");
         printf("Beam injection: charge-conserving path current, centered before Poisson\n");
         printf("Beam boundary: particles crossing the domain edge are deleted and counted in the energy ledger\n");
-        printf("Return current: self-consistent background-electron response only\n");
+        printf("Return current: boundary reservoir and Vlasov response\n");
         printf("Beam macro weight: %.6e particles/m^2\n", Param::beam_macro_weight);
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
         printf("Debug diagnostics: %s\n",
@@ -237,7 +237,8 @@ int main(int argc, char** argv)
     }
 #endif
     diag.write_scalars(0.0, 0, bkg_e, beam, fields,
-                       cumulative_collision_energy_delta, mpi_rank, mpi_size);
+                       cumulative_collision_energy_delta,
+                       mpi_rank, mpi_size);
     write_snapshot(diag, 0.0, bkg_e, beam, fields, ion_density_profile,
                    sgrid, mpi_rank, mpi_size, config.enable_full_fe_output);
 
@@ -413,7 +414,12 @@ int main(int argc, char** argv)
         beam.deposit_density(sgrid, mpi_rank, mpi_size);
         beam.finalize_charge_conserving_current(sgrid, dt,
                                                 mpi_rank, mpi_size);
+        bkg_e.compute_moments();
+        moments_current = true;
         trace_progress(config, mpi_rank, step, "after beam end deposit");
+        fields.set_charge_density(bkg_e, beam.density, ion_density_profile);
+        fields.solve_poisson(mpi_rank, mpi_size);
+        trace_progress(config, mpi_rank, step, "after beam end Ex solve");
         if (collect_step_diagnostics) {
             W_beam_E = beam.last_field_work();
         }
@@ -562,7 +568,8 @@ int main(int argc, char** argv)
     }
 #endif
     diag.write_scalars(Param::t_end, nsteps, bkg_e, beam, fields,
-                       cumulative_collision_energy_delta, mpi_rank, mpi_size);
+                       cumulative_collision_energy_delta,
+                       mpi_rank, mpi_size);
     if (last_snapshot_step != nsteps) {
         write_snapshot(diag, Param::t_end, bkg_e, beam, fields, ion_density_profile,
                        sgrid, mpi_rank, mpi_size, config.enable_full_fe_output);

@@ -129,6 +129,45 @@ void Species::initialize_maxwellian_profile(const std::vector<double>& density_p
     }
 }
 
+double Species::maxwellian_f_value(double density,
+                                   double temp,
+                                   double drift_vx,
+                                   int iv,
+                                   int imu) const
+{
+    if (type == SpeciesType::BEAM || iv < 0 || iv >= Param::Nv ||
+        imu < 0 || imu >= Param::Nmu || !(temp > 0.0)) {
+        return 0.0;
+    }
+    const double inv2vth2 = mass / (2.0 * temp);
+    const double raw_sum = discrete_maxwellian_sum(*this, drift_vx, inv2vth2);
+    if (!(raw_sum > 0.0)) return 0.0;
+    return std::max(0.0, density) *
+           maxwellian_raw_at(*this, iv, imu, drift_vx, inv2vth2) / raw_sum;
+}
+
+void Species::fill_maxwellian_velocity_slice(std::vector<double>& values,
+                                             double density,
+                                             double temp,
+                                             double drift_vx) const
+{
+    values.assign(Param::Nvmu, 0.0);
+    if (type == SpeciesType::BEAM || !(temp > 0.0)) return;
+
+    const double inv2vth2 = mass / (2.0 * temp);
+    const double raw_sum = discrete_maxwellian_sum(*this, drift_vx, inv2vth2);
+    if (!(raw_sum > 0.0)) return;
+
+    const double norm = std::max(0.0, density) / raw_sum;
+    for (int iv = 0; iv < Param::Nv; ++iv) {
+        const size_t row = static_cast<size_t>(iv) * Param::Nmu;
+        for (int imu = 0; imu < Param::Nmu; ++imu) {
+            values[row + static_cast<size_t>(imu)] =
+                norm * maxwellian_raw_at(*this, iv, imu, drift_vx, inv2vth2);
+        }
+    }
+}
+
 void Species::compute_moments()
 {
     const int ng = sgrid->nghost;

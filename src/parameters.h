@@ -49,14 +49,16 @@ namespace Param {
     const double dt_snapshot   = 0.6 * Const::femto;
     const bool   enable_debug_diagnostics = false;
     const bool   enable_full_fe_output = false;
+    const bool   enable_beam_boundary_injection = true;
     const double velocity_space_cfl = 0.35;
     const double semi_lagrangian_cfl = 2.5;
-    const bool   abort_on_vmax_loss = false;
+    const bool   abort_on_vmax_loss = true;
     const double vmax_loss_abort_fraction = 1.0e-12;
     const int    beam_macro_particles_per_cell = 1000; // 1000
     const double beam_macro_weight = densb * dx / beam_macro_particles_per_cell;
     const double beam_source_x_start = 0.5 * Const::micro;
     const double beam_source_length  = 0.3 * Const::micro;
+    const double background_reservoir_u_return = -jb / (Const::qe * dens);
 
     // Axisymmetric spherical velocity grid: (v, mu), mu = cos(theta) = vx / |v|.
     // This is still a 3D velocity-space model after integrating over the azimuth.

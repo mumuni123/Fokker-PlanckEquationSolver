@@ -20,7 +20,6 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 # 源文件列表
 set(SOURCES
     src/main.cpp
-    src/fft_utils.cpp
     src/config.cpp
     src/species.cpp
     src/vlasov.cpp

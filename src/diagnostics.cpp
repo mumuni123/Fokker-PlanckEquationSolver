@@ -1,9 +1,7 @@
 #include "diagnostics.h"
 #include "beam_pic.h"
-#include "fft_utils.h"
 #include <algorithm>
 #include <cmath>
-#include <complex>
 #include <cstdio>
 #include <iomanip>
 #include <mpi.h>
@@ -27,98 +25,84 @@ Diagnostics::Diagnostics()
       energy_reference(0.0)
 {}
 
-LowModeFractions::LowModeFractions()
-{
-    for (int i = 0; i < 3; ++i) {
-        rho[i] = 0.0;
-        Ex[i] = 0.0;
-    }
-}
-
 namespace {
-void fill_low_mode_fractions(std::vector<std::complex<double> >& spectrum,
-                             double fractions[3])
+void compute_background_boundary_fluxes(const Species& electrons,
+                                        const SpatialGrid& sg,
+                                        int mpi_rank,
+                                        int mpi_size,
+                                        double values[6])
 {
-    const int n = static_cast<int>(spectrum.size());
-    if (n <= 1) return;
-
-    fft_any(spectrum, false);
-
-    double total_power = 0.0;
-    for (int k = 1; k < n; ++k) {
-        total_power += std::norm(spectrum[static_cast<size_t>(k)]);
+    for (int i = 0; i < 6; ++i) values[i] = 0.0;
+    if (electrons.type != SpeciesType::BACKGROUND_ELECTRON ||
+        sg.nx_local <= 0) {
+        return;
     }
-    if (!(total_power > 0.0)) return;
 
-    for (int mode = 1; mode <= 3; ++mode) {
-        if (mode >= n) break;
-        double mode_power = std::norm(spectrum[static_cast<size_t>(mode)]);
-        const int mirror = n - mode;
-        if (mirror != mode && mirror > 0 && mirror < n) {
-            mode_power += std::norm(spectrum[static_cast<size_t>(mirror)]);
-        }
-        fractions[mode - 1] = mode_power / total_power;
-    }
-}
-}
-
-LowModeFractions compute_low_mode_fractions(const EMFields& fields,
-                                            const SpatialGrid& sg,
-                                            int mpi_rank,
-                                            int mpi_size)
-{
-    LowModeFractions result;
+    std::vector<double> reservoir;
+    electrons.fill_maxwellian_velocity_slice(
+        reservoir, electrons.density0, electrons.temperature,
+        Param::background_reservoir_u_return);
 
     const int ng = sg.nghost;
-    const int nxl = sg.nx_local;
-    std::vector<double> local_rho(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> local_Ex(static_cast<size_t>(nxl), 0.0);
-    for (int ix = 0; ix < nxl; ++ix) {
-        local_rho[static_cast<size_t>(ix)] = fields.rho[ix + ng];
-        local_Ex[static_cast<size_t>(ix)] = fields.Ex[ix + ng];
-    }
-
-    std::vector<int> counts(static_cast<size_t>(mpi_size), 0);
-    std::vector<int> displs(static_cast<size_t>(mpi_size), 0);
-    MPI_Gather(&nxl, 1, MPI_INT, counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
     if (mpi_rank == 0) {
-        for (int r = 1; r < mpi_size; ++r) {
-            displs[static_cast<size_t>(r)] =
-                displs[static_cast<size_t>(r - 1)] +
-                counts[static_cast<size_t>(r - 1)];
+        const size_t xbase = static_cast<size_t>(ng) * Param::Nvmu;
+        for (size_t k = 0; k < Param::Nvmu; ++k) {
+            const double vx = electrons.vgrid.vx_cells[k];
+            const int iv = static_cast<int>(k / Param::Nmu);
+            const double weight = electrons.vgrid.moment_weight[iv];
+            if (vx > 0.0) {
+                values[0] += vx * reservoir[k] * weight;
+                values[4] += electrons.charge * vx * reservoir[k] * weight;
+            } else if (vx < 0.0) {
+                values[1] += -vx * electrons.f[xbase + k] * weight;
+            }
         }
     }
 
-    std::vector<double> global_rho;
-    std::vector<double> global_Ex;
-    if (mpi_rank == 0) {
-        global_rho.assign(static_cast<size_t>(sg.nx_global), 0.0);
-        global_Ex.assign(static_cast<size_t>(sg.nx_global), 0.0);
-    }
-
-    MPI_Gatherv(local_rho.data(), nxl, MPI_DOUBLE,
-                mpi_rank == 0 ? global_rho.data() : static_cast<double*>(0),
-                counts.data(), displs.data(), MPI_DOUBLE,
-                0, MPI_COMM_WORLD);
-    MPI_Gatherv(local_Ex.data(), nxl, MPI_DOUBLE,
-                mpi_rank == 0 ? global_Ex.data() : static_cast<double*>(0),
-                counts.data(), displs.data(), MPI_DOUBLE,
-                0, MPI_COMM_WORLD);
-
-    if (mpi_rank == 0) {
-        std::vector<std::complex<double> > rho_spectrum(static_cast<size_t>(sg.nx_global));
-        std::vector<std::complex<double> > ex_spectrum(static_cast<size_t>(sg.nx_global));
-        for (int i = 0; i < sg.nx_global; ++i) {
-            rho_spectrum[static_cast<size_t>(i)] =
-                std::complex<double>(global_rho[static_cast<size_t>(i)], 0.0);
-            ex_spectrum[static_cast<size_t>(i)] =
-                std::complex<double>(global_Ex[static_cast<size_t>(i)], 0.0);
+    if (mpi_rank == mpi_size - 1) {
+        const size_t xbase =
+            static_cast<size_t>(ng + sg.nx_local - 1) * Param::Nvmu;
+        for (size_t k = 0; k < Param::Nvmu; ++k) {
+            const double vx = electrons.vgrid.vx_cells[k];
+            const int iv = static_cast<int>(k / Param::Nmu);
+            const double weight = electrons.vgrid.moment_weight[iv];
+            if (vx < 0.0) {
+                values[2] += -vx * reservoir[k] * weight;
+                values[5] += electrons.charge * vx * reservoir[k] * weight;
+            } else if (vx > 0.0) {
+                values[3] += vx * electrons.f[xbase + k] * weight;
+            }
         }
-        fill_low_mode_fractions(rho_spectrum, result.rho);
-        fill_low_mode_fractions(ex_spectrum, result.Ex);
     }
+}
 
-    return result;
+void gather_max_ex_location(double local_max_abs_Ex,
+                            double local_x_at_max_abs_Ex,
+                            int mpi_rank,
+                            int mpi_size,
+                            double& global_max_abs_Ex,
+                            double& global_x_at_max_abs_Ex)
+{
+    double local_pair[2] = { local_max_abs_Ex, local_x_at_max_abs_Ex };
+    std::vector<double> gathered;
+    if (mpi_rank == 0) gathered.assign(static_cast<size_t>(2 * mpi_size), 0.0);
+    MPI_Gather(local_pair, 2, MPI_DOUBLE,
+               mpi_rank == 0 ? gathered.data() : static_cast<double*>(0),
+               2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    if (mpi_rank == 0) {
+        global_max_abs_Ex = 0.0;
+        global_x_at_max_abs_Ex = 0.0;
+        for (int r = 0; r < mpi_size; ++r) {
+            const double value = gathered[static_cast<size_t>(2 * r)];
+            const double xpos = gathered[static_cast<size_t>(2 * r + 1)];
+            if (value > global_max_abs_Ex) {
+                global_max_abs_Ex = value;
+                global_x_at_max_abs_Ex = xpos;
+            }
+        }
+    }
+}
 }
 
 void Diagnostics::init(const std::string& dir, int mpi_rank,
@@ -142,7 +126,14 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                     << "N_beam  KE_beam[J/m2]  E_field[J/m2]  "
                     << "E_total[J/m2]  E_beam_injected_cum[J/m2]  "
                     << "E_beam_outflow_cum[J/m2]  E_collision_cum[J/m2]  "
-                    << "E_accounted[J/m2]  E_balance_error[J/m2]\n";
+                    << "E_accounted[J/m2]  E_balance_error[J/m2]  "
+                    << "Q_total[C/m2]  N_bkg_minus_n0  "
+                    << "Gamma_bkg_in_left  Gamma_bkg_out_left  "
+                    << "Gamma_bkg_in_right  Gamma_bkg_out_right  "
+                    << "J_bkg_in_left[A/m2]  J_bkg_in_right[A/m2]  "
+                    << "N_beam_in_left_step  N_beam_out_step  "
+                    << "J_beam_in_left_step  J_beam_out_step  "
+                    << "max_abs_Ex[V/m]  x_at_max_abs_Ex[m]\n";
         scalar_file << std::scientific << std::setprecision(8);
 
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
@@ -156,10 +147,9 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
 #endif
         if (step_enabled) {
             step_file.open((output_dir + "/step_diagnostics.dat").c_str());
-            step_file << "# step  time[fs]  max_abs_Ex[V/m]  N_bkg_e  "
+            step_file << "# step  time[fs]  max_abs_Ex[V/m]  x_at_max_abs_Ex[m]  N_bkg_e  "
                       << "N_beam_macro  N_beam_weighted  "
-                      << "N_beam_source_step  N_beam_absorb_step  "
-                      << "J_beam_source_int[A/m]  "
+                      << "N_beam_absorb_step  J_beam_absorb_int[A/m]  "
                       << "beam_cont_l1  beam_cont_linf  "
                       << "nsub_v1  nsub_mu1  nsub_v2  nsub_mu2  "
                       << "loss_v1  loss_mu1  loss_v2  loss_mu2  "
@@ -167,8 +157,6 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                       << "loss_v2_low  loss_v2_high  "
                       << "loss_x1_left  loss_x1_right  "
                       << "loss_x2_left  loss_x2_right  "
-                      << "rho_k1_frac  rho_k2_frac  rho_k3_frac  "
-                      << "Ex_k1_frac  Ex_k2_frac  Ex_k3_frac  "
                       << "KE_bkg_e[J/m2]  KE_beam[J/m2]  E_field[J/m2]  "
                       << "E_total[J/m2]  dKE_bkg[J/m2]  dKE_beam[J/m2]  "
                       << "dE_field[J/m2]  W_bkg_E[J/m2]  W_beam_E[J/m2]  "
@@ -196,7 +184,29 @@ void Diagnostics::write_scalars(double time, int step,
     double local_bkg_ke = 0.0;
     electrons.total_particle_number_and_energy(local_bkg_number, local_bkg_ke);
 
-    double local_values[8] = {
+    double local_q_total = 0.0;
+    double local_bkg_delta = 0.0;
+    double local_max_abs_Ex = 0.0;
+    double local_x_at_max_abs_Ex = 0.0;
+    const int ng = electrons.sgrid->nghost;
+    for (int ix = 0; ix < electrons.sgrid->nx_local; ++ix) {
+        local_q_total += fields.rho[ix + ng] * electrons.sgrid->dx;
+        local_bkg_delta +=
+            (electrons.number_density[static_cast<size_t>(ix)] - Param::dens) *
+            electrons.sgrid->dx;
+        const double abs_ex = std::fabs(fields.Ex[ix + ng]);
+        if (abs_ex > local_max_abs_Ex) {
+            local_max_abs_Ex = abs_ex;
+            local_x_at_max_abs_Ex = electrons.sgrid->x(ix + ng);
+        }
+    }
+
+    double local_boundary[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    double global_boundary[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    compute_background_boundary_fluxes(electrons, *electrons.sgrid,
+                                       mpi_rank, mpi_size, local_boundary);
+
+    double local_values[14] = {
         local_bkg_number,
         local_bkg_ke,
         beam.total_particle_number(*electrons.sgrid),
@@ -204,20 +214,36 @@ void Diagnostics::write_scalars(double time, int step,
         fields.total_energy(),
         beam.cumulative_injected_energy(),
         beam.cumulative_outflow_energy(),
-        cumulative_collision_energy_delta
+        cumulative_collision_energy_delta,
+        local_q_total,
+        local_bkg_delta,
+        beam.last_injected_number(),
+        beam.last_outflow_number(),
+        beam.last_injected_current(),
+        beam.last_outflow_current()
     };
-    double global_values[8] = {
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    double global_values[14] = {
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     };
 
-    MPI_Reduce(local_values, global_values, 8, MPI_DOUBLE, MPI_SUM,
+    MPI_Reduce(local_values, global_values, 14, MPI_DOUBLE, MPI_SUM,
                0, MPI_COMM_WORLD);
+    MPI_Reduce(local_boundary, global_boundary, 6, MPI_DOUBLE, MPI_SUM,
+               0, MPI_COMM_WORLD);
+
+    double global_max_abs_Ex = 0.0;
+    double global_x_at_max_abs_Ex = 0.0;
+    gather_max_ex_location(local_max_abs_Ex, local_x_at_max_abs_Ex,
+                           mpi_rank, mpi_size,
+                           global_max_abs_Ex, global_x_at_max_abs_Ex);
 
     if (mpi_rank == 0) {
         const double total_energy =
             global_values[1] + global_values[3] + global_values[4];
         const double accounted_energy =
-            total_energy - global_values[5] + global_values[6] - global_values[7];
+            total_energy - global_values[5] + global_values[6]
+            - global_values[7];
         if (!has_energy_reference) {
             energy_reference = accounted_energy;
             has_energy_reference = true;
@@ -236,7 +262,21 @@ void Diagnostics::write_scalars(double time, int step,
                     << global_values[6] << "  "
                     << global_values[7] << "  "
                     << accounted_energy << "  "
-                    << balance_error << "\n";
+                    << balance_error << "  "
+                    << global_values[8] << "  "
+                    << global_values[9] << "  "
+                    << global_boundary[0] << "  "
+                    << global_boundary[1] << "  "
+                    << global_boundary[2] << "  "
+                    << global_boundary[3] << "  "
+                    << global_boundary[4] << "  "
+                    << global_boundary[5] << "  "
+                    << global_values[10] << "  "
+                    << global_values[11] << "  "
+                    << global_values[12] << "  "
+                    << global_values[13] << "  "
+                    << global_max_abs_Ex << "  "
+                    << global_x_at_max_abs_Ex << "\n";
         scalar_file.flush();
     }
     (void)mpi_size;
@@ -366,24 +406,26 @@ void Diagnostics::write_step_diagnostics(int step, double time,
     if (!step_enabled) return;
 
     double local_max_abs_Ex = 0.0;
+    double local_x_at_max_abs_Ex = 0.0;
     for (int ix = 0; ix < sg.nx_local; ++ix) {
-        local_max_abs_Ex = std::max(local_max_abs_Ex,
-                                    std::fabs(fields.Ex[ix + sg.nghost]));
+        const double abs_ex = std::fabs(fields.Ex[ix + sg.nghost]);
+        if (abs_ex > local_max_abs_Ex) {
+            local_max_abs_Ex = abs_ex;
+            local_x_at_max_abs_Ex = sg.x(ix + sg.nghost);
+        }
     }
 
     const double local_N_bkg_e = electrons.total_particle_number();
     const double local_N_beam_macro = static_cast<double>(beam.particles.size());
     const double local_N_beam_weighted = beam.total_particle_number(sg);
-    double local_beam_source[3] = { 0.0, 0.0, 0.0 };
+    double local_beam_absorber[2] = { 0.0, 0.0 };
     for (int ix = 0; ix < sg.nx_local; ++ix) {
-        local_beam_source[0] +=
-            beam.source_density_delta[static_cast<size_t>(ix)] * sg.dx;
-        local_beam_source[1] +=
+        local_beam_absorber[0] +=
             beam.absorber_density_delta[static_cast<size_t>(ix)] * sg.dx;
-        local_beam_source[2] +=
-            beam.source_current_x[static_cast<size_t>(ix)] * sg.dx;
+        local_beam_absorber[1] +=
+            beam.absorber_current_x[static_cast<size_t>(ix)] * sg.dx;
     }
-    double global_beam_source[3] = { 0.0, 0.0, 0.0 };
+    double global_beam_absorber[2] = { 0.0, 0.0 };
     double local_beam_continuity[2] = {
         beam.last_continuity_l1_error(),
         beam.last_continuity_linf_error()
@@ -434,25 +476,24 @@ void Diagnostics::write_step_diagnostics(int step, double time,
         0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
         0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     };
-    const LowModeFractions low_modes =
-        compute_low_mode_fractions(fields, sg, mpi_rank, mpi_size);
-
     double global_max_abs_Ex = 0.0;
+    double global_x_at_max_abs_Ex = 0.0;
     double global_N_bkg_e = 0.0;
     double global_N_beam_macro = 0.0;
     double global_N_beam_weighted = 0.0;
     int local_nsub[4] = { nsub_v1, nsub_mu1, nsub_v2, nsub_mu2 };
     int global_nsub[4] = { 0, 0, 0, 0 };
 
-    MPI_Reduce(&local_max_abs_Ex, &global_max_abs_Ex, 1,
-               MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    gather_max_ex_location(local_max_abs_Ex, local_x_at_max_abs_Ex,
+                           mpi_rank, mpi_size,
+                           global_max_abs_Ex, global_x_at_max_abs_Ex);
     MPI_Reduce(&local_N_bkg_e, &global_N_bkg_e, 1,
                MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_N_beam_macro, &global_N_beam_macro, 1,
                MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_N_beam_weighted, &global_N_beam_weighted, 1,
                MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(local_beam_source, global_beam_source, 3,
+    MPI_Reduce(local_beam_absorber, global_beam_absorber, 2,
                MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_beam_continuity[0], &global_beam_continuity_l1,
                1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
@@ -466,12 +507,12 @@ void Diagnostics::write_step_diagnostics(int step, double time,
         step_file << step << "  "
                   << time / Const::femto << "  "
                   << global_max_abs_Ex << "  "
+                  << global_x_at_max_abs_Ex << "  "
                   << global_N_bkg_e << "  "
                   << global_N_beam_macro << "  "
                   << global_N_beam_weighted << "  "
-                  << global_beam_source[0] << "  "
-                  << global_beam_source[1] << "  "
-                  << global_beam_source[2] << "  "
+                  << global_beam_absorber[0] << "  "
+                  << global_beam_absorber[1] << "  "
                   << global_beam_continuity_l1 << "  "
                   << global_beam_continuity_linf << "  "
                   << global_nsub[0] << "  "
@@ -490,12 +531,6 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << global_losses[9] << "  "
                   << global_losses[10] << "  "
                   << global_losses[11] << "  "
-                  << low_modes.rho[0] << "  "
-                  << low_modes.rho[1] << "  "
-                  << low_modes.rho[2] << "  "
-                  << low_modes.Ex[0] << "  "
-                  << low_modes.Ex[1] << "  "
-                  << low_modes.Ex[2] << "  "
                   << global_energy[0] << "  "
                   << global_energy[1] << "  "
                   << global_energy[2] << "  "

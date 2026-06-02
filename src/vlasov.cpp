@@ -8,18 +8,41 @@
 #include <omp.h>
 
 namespace {
-void fill_periodic_local_ghosts(Species& sp, const SpatialGrid& sg)
+void fill_left_physical_ghosts(Species& sp, const SpatialGrid& sg,
+                               const std::vector<double>& reservoir)
 {
     const int ng = sg.nghost;
     const int nxl = sg.nx_local;
-    const size_t slice_size = Param::Nvmu;
+    if (nxl <= 0) return;
+    const size_t source = static_cast<size_t>(ng) * Param::Nvmu;
     for (int g = 0; g < ng; ++g) {
-        std::memcpy(&sp.f[static_cast<size_t>(g) * slice_size],
-                    &sp.f[static_cast<size_t>(ng + nxl - ng + g) * slice_size],
-                    slice_size * sizeof(double));
-        std::memcpy(&sp.f[static_cast<size_t>(ng + nxl + g) * slice_size],
-                    &sp.f[static_cast<size_t>(ng + g) * slice_size],
-                    slice_size * sizeof(double));
+        const size_t dst = static_cast<size_t>(ng - 1 - g) * Param::Nvmu;
+        for (size_t k = 0; k < Param::Nvmu; ++k) {
+            const double vx = sp.vgrid.vx_cells[k];
+            sp.f[dst + k] =
+                (sp.type == SpeciesType::BACKGROUND_ELECTRON && vx > 0.0)
+                ? reservoir[k]
+                : sp.f[source + k];
+        }
+    }
+}
+
+void fill_right_physical_ghosts(Species& sp, const SpatialGrid& sg,
+                                const std::vector<double>& reservoir)
+{
+    const int ng = sg.nghost;
+    const int nxl = sg.nx_local;
+    if (nxl <= 0) return;
+    const size_t source = static_cast<size_t>(ng + nxl - 1) * Param::Nvmu;
+    for (int g = 0; g < ng; ++g) {
+        const size_t dst = static_cast<size_t>(ng + nxl + g) * Param::Nvmu;
+        for (size_t k = 0; k < Param::Nvmu; ++k) {
+            const double vx = sp.vgrid.vx_cells[k];
+            sp.f[dst + k] =
+                (sp.type == SpeciesType::BACKGROUND_ELECTRON && vx < 0.0)
+                ? reservoir[k]
+                : sp.f[source + k];
+        }
     }
 }
 
@@ -481,14 +504,8 @@ void VlasovSolver::exchange_ghosts_x(Species& sp, const SpatialGrid& sg,
     int ng = sg.nghost;
     int nxl = sg.nx_local;
     size_t slice_size = Param::Nvmu;
-
-    if (mpi_size == 1) {
-        fill_periodic_local_ghosts(sp, sg);
-        return;
-    }
-
-    int left_rank = (mpi_rank - 1 + mpi_size) % mpi_size;
-    int right_rank = (mpi_rank + 1) % mpi_size;
+    int left_rank = mpi_rank - 1;
+    int right_rank = mpi_rank + 1;
 
     size_t buffer_size = static_cast<size_t>(ng) * slice_size;
     if (send_left_.size() != buffer_size) {
@@ -507,17 +524,37 @@ void VlasovSolver::exchange_ghosts_x(Species& sp, const SpatialGrid& sg,
 
     MPI_Request reqs[4];
     int nreq = 0;
-    MPI_Isend(send_left_.data(), (int)buffer_size, MPI_DOUBLE,
-              left_rank, 101, MPI_COMM_WORLD, &reqs[nreq++]);
-    MPI_Irecv(recv_left_.data(), (int)buffer_size, MPI_DOUBLE,
-              left_rank, 102, MPI_COMM_WORLD, &reqs[nreq++]);
-    MPI_Isend(send_right_.data(), (int)buffer_size, MPI_DOUBLE,
-              right_rank, 102, MPI_COMM_WORLD, &reqs[nreq++]);
-    MPI_Irecv(recv_right_.data(), (int)buffer_size, MPI_DOUBLE,
-              right_rank, 101, MPI_COMM_WORLD, &reqs[nreq++]);
-    MPI_Waitall(nreq, reqs, MPI_STATUSES_IGNORE);
+    if (left_rank >= 0) {
+        MPI_Isend(send_left_.data(), (int)buffer_size, MPI_DOUBLE,
+                  left_rank, 101, MPI_COMM_WORLD, &reqs[nreq++]);
+        MPI_Irecv(recv_left_.data(), (int)buffer_size, MPI_DOUBLE,
+                  left_rank, 102, MPI_COMM_WORLD, &reqs[nreq++]);
+    }
+    if (right_rank < mpi_size) {
+        MPI_Isend(send_right_.data(), (int)buffer_size, MPI_DOUBLE,
+                  right_rank, 102, MPI_COMM_WORLD, &reqs[nreq++]);
+        MPI_Irecv(recv_right_.data(), (int)buffer_size, MPI_DOUBLE,
+                  right_rank, 101, MPI_COMM_WORLD, &reqs[nreq++]);
+    }
+    if (nreq > 0) MPI_Waitall(nreq, reqs, MPI_STATUSES_IGNORE);
 
-    std::memcpy(&sp.f[0], recv_left_.data(), buffer_size * sizeof(double));
-    std::memcpy(&sp.f[static_cast<size_t>(ng + nxl) * slice_size],
-                recv_right_.data(), buffer_size * sizeof(double));
+    std::vector<double> reservoir;
+    if (sp.type == SpeciesType::BACKGROUND_ELECTRON) {
+        sp.fill_maxwellian_velocity_slice(reservoir, sp.density0,
+                                          sp.temperature,
+                                          Param::background_reservoir_u_return);
+    }
+
+    if (left_rank >= 0) {
+        std::memcpy(&sp.f[0], recv_left_.data(), buffer_size * sizeof(double));
+    } else {
+        fill_left_physical_ghosts(sp, sg, reservoir);
+    }
+
+    if (right_rank < mpi_size) {
+        std::memcpy(&sp.f[static_cast<size_t>(ng + nxl) * slice_size],
+                    recv_right_.data(), buffer_size * sizeof(double));
+    } else {
+        fill_right_physical_ghosts(sp, sg, reservoir);
+    }
 }

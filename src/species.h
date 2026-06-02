@@ -45,6 +45,15 @@ public:
     void initialize_maxwellian(double drift_vx = 0.0);
     void initialize_maxwellian_profile(const std::vector<double>& density_profile,
                                        double drift_vx = 0.0);
+    double maxwellian_f_value(double density,
+                              double temperature,
+                              double drift_vx,
+                              int iv,
+                              int imu) const;
+    void fill_maxwellian_velocity_slice(std::vector<double>& values,
+                                        double density,
+                                        double temperature,
+                                        double drift_vx) const;
     void compute_moments();
     double total_particle_number() const;
     double total_kinetic_energy() const;
