@@ -51,6 +51,29 @@ void sync_moments_and_fields(Species& electrons,
     fields.solve_poisson(mpi_rank, mpi_size);
 }
 
+void refresh_dynamic_reservoir(VlasovSolver& vlasov,
+                               Species& electrons,
+                               const BeamPIC& beam,
+                               EMFields& fields,
+                               const std::vector<double>& ion_density_profile,
+                               const SpatialGrid& sgrid,
+                               double control_dt,
+                               int mpi_rank,
+                               int mpi_size,
+                               bool& moments_current)
+{
+    if (!Param::enable_dynamic_background_reservoir) return;
+    if (!moments_current) {
+        electrons.compute_moments();
+        moments_current = true;
+    }
+    fields.set_charge_density(electrons, beam.density, ion_density_profile);
+    vlasov.update_dynamic_reservoir(electrons, sgrid, fields,
+                                    beam.last_injected_number(),
+                                    beam.last_outflow_number(),
+                                    control_dt, mpi_rank, mpi_size);
+}
+
 void abort_if_vmax_loss(const VlasovSolver& vlasov,
                         int step,
                         double time,
@@ -163,9 +186,12 @@ int main(int argc, char** argv)
         printf("Electrostatic boundary: grounded Dirichlet phi(0)=phi(L)=0\n");
         printf("Poisson solver: %s\n", poisson_solver_name());
         printf("Fixed ions: uniform Z*n_i = %.3e /m^3\n", Param::dens);
-        printf("Background electrons: reservoir/open ghosts, T_e = %.1f eV, u_return = %.6e m/s\n",
+        printf("Background electrons: dynamic boundary reservoir/open ghosts, T_e = %.1f eV, u_return = %.6e m/s\n",
                Param::temperature_e / Const::eV,
                Param::background_reservoir_u_return);
+        printf("Reservoir control: boundary outflow + beam injection + local charge residual, density clamp = [%.2f, %.2f] n0\n",
+               Param::background_reservoir_min_density_factor,
+               Param::background_reservoir_max_density_factor);
         printf("PIC beam: gamma*beta = %.2f, beta = %.4f, n_b = %.3e /m^3\n",
                Param::gambetab, Param::betab, Param::densb);
         printf("Beam source: quiet-start left boundary injection at x = 0\n");
@@ -230,6 +256,9 @@ int main(int argc, char** argv)
     bool moments_current = true;
     sync_moments_and_fields(bkg_e, beam, fields, ion_density_profile,
                             mpi_rank, mpi_size, moments_current);
+    refresh_dynamic_reservoir(vlasov, bkg_e, beam, fields,
+                              ion_density_profile, sgrid, dt,
+                              mpi_rank, mpi_size, moments_current);
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
     if (config.enable_debug_diagnostics) {
         diag.write_debug_state(0, 0.0, "initial", bkg_e, beam, fields,
@@ -303,6 +332,11 @@ int main(int argc, char** argv)
             ex_step_start = copy_local_ex(fields, sgrid);
         }
 
+        trace_progress(config, mpi_rank, step, "before reservoir update 1");
+        refresh_dynamic_reservoir(vlasov, bkg_e, beam, fields,
+                                  ion_density_profile, sgrid, dt,
+                                  mpi_rank, mpi_size, moments_current);
+        trace_progress(config, mpi_rank, step, "after reservoir update 1");
         trace_progress(config, mpi_rank, step, "before x half 1");
         vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size);
         trace_progress(config, mpi_rank, step, "after x half 1");
@@ -463,6 +497,11 @@ int main(int argc, char** argv)
         }
 #endif
 
+        trace_progress(config, mpi_rank, step, "before reservoir update 2");
+        refresh_dynamic_reservoir(vlasov, bkg_e, beam, fields,
+                                  ion_density_profile, sgrid, dt,
+                                  mpi_rank, mpi_size, moments_current);
+        trace_progress(config, mpi_rank, step, "after reservoir update 2");
         trace_progress(config, mpi_rank, step, "before x half 2");
         vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size);
         trace_progress(config, mpi_rank, step, "after x half 2");

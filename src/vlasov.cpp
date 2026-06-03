@@ -46,6 +46,42 @@ void fill_right_physical_ghosts(Species& sp, const SpatialGrid& sg,
     }
 }
 
+void local_boundary_outflow_fluxes(const Species& sp,
+                                   const SpatialGrid& sg,
+                                   int mpi_rank,
+                                   int mpi_size,
+                                   double& left_out,
+                                   double& right_out)
+{
+    left_out = 0.0;
+    right_out = 0.0;
+    if (sp.type != SpeciesType::BACKGROUND_ELECTRON || sg.nx_local <= 0) {
+        return;
+    }
+
+    const int ng = sg.nghost;
+    if (mpi_rank == 0) {
+        const size_t xbase = static_cast<size_t>(ng) * Param::Nvmu;
+        for (size_t k = 0; k < Param::Nvmu; ++k) {
+            const double vx = sp.vgrid.vx_cells[k];
+            if (vx >= 0.0) continue;
+            const int iv = static_cast<int>(k / Param::Nmu);
+            left_out += -vx * sp.f[xbase + k] * sp.vgrid.moment_weight[iv];
+        }
+    }
+
+    if (mpi_rank == mpi_size - 1) {
+        const size_t xbase =
+            static_cast<size_t>(ng + sg.nx_local - 1) * Param::Nvmu;
+        for (size_t k = 0; k < Param::Nvmu; ++k) {
+            const double vx = sp.vgrid.vx_cells[k];
+            if (vx <= 0.0) continue;
+            const int iv = static_cast<int>(k / Param::Nmu);
+            right_out += vx * sp.f[xbase + k] * sp.vgrid.moment_weight[iv];
+        }
+    }
+}
+
 int substeps_from_cfl(double cfl, double cfl_limit)
 {
     if (cfl <= cfl_limit) return 1;
@@ -123,7 +159,15 @@ inline double reconstruct_mu_face(const Species& sp, size_t row,
 }
 
 VlasovSolver::VlasovSolver()
-    : last_cfl_v_(0.0),
+    : cached_reservoir_density_left_(-1.0),
+      cached_reservoir_density_right_(-1.0),
+      cached_reservoir_drift_left_(0.0),
+      cached_reservoir_drift_right_(0.0),
+      cached_unit_flux_left_(0.0),
+      cached_unit_flux_right_(0.0),
+      cached_unit_flux_drift_left_(0.0),
+      cached_unit_flux_drift_right_(0.0),
+      last_cfl_v_(0.0),
       last_cfl_mu_(0.0),
       last_loss_v_(0.0),
       last_loss_v_low_(0.0),
@@ -139,6 +183,9 @@ VlasovSolver::VlasovSolver()
       last_energy_delta_mu_(0.0),
       last_nsub_v_(1),
       last_nsub_mu_(1),
+      reservoir_cache_valid_(false),
+      unit_flux_left_valid_(false),
+      unit_flux_right_valid_(false),
       step_diagnostics_enabled_(false)
 {}
 
@@ -151,6 +198,146 @@ void VlasovSolver::advect(Species& sp, const SpatialGrid& sg,
     advect_mu(sp, sg, fields, dt);
     advect_v(sp, sg, fields, 0.5 * dt);
     advect_x(sp, sg, 0.5 * dt, mpi_rank, mpi_size);
+}
+
+void VlasovSolver::update_reservoir_cache(const Species& sp)
+{
+    if (sp.type != SpeciesType::BACKGROUND_ELECTRON) return;
+
+    const bool needs_update =
+        !reservoir_cache_valid_ ||
+        cached_reservoir_density_left_ != sp.reservoir_density_left ||
+        cached_reservoir_density_right_ != sp.reservoir_density_right ||
+        cached_reservoir_drift_left_ != sp.reservoir_drift_left ||
+        cached_reservoir_drift_right_ != sp.reservoir_drift_right;
+    if (!needs_update) return;
+
+    sp.fill_maxwellian_velocity_slice(reservoir_left_,
+                                      sp.reservoir_density_left,
+                                      sp.temperature,
+                                      sp.reservoir_drift_left);
+    sp.fill_maxwellian_velocity_slice(reservoir_right_,
+                                      sp.reservoir_density_right,
+                                      sp.temperature,
+                                      sp.reservoir_drift_right);
+    cached_reservoir_density_left_ = sp.reservoir_density_left;
+    cached_reservoir_density_right_ = sp.reservoir_density_right;
+    cached_reservoir_drift_left_ = sp.reservoir_drift_left;
+    cached_reservoir_drift_right_ = sp.reservoir_drift_right;
+    reservoir_cache_valid_ = true;
+}
+
+double VlasovSolver::cached_incoming_flux_per_density(const Species& sp,
+                                                      bool left_boundary)
+{
+    const double drift = left_boundary
+        ? sp.reservoir_drift_left
+        : sp.reservoir_drift_right;
+    bool& valid = left_boundary ? unit_flux_left_valid_ : unit_flux_right_valid_;
+    double& cached_drift = left_boundary
+        ? cached_unit_flux_drift_left_
+        : cached_unit_flux_drift_right_;
+    double& cached_flux = left_boundary
+        ? cached_unit_flux_left_
+        : cached_unit_flux_right_;
+
+    if (valid && cached_drift == drift) return cached_flux;
+
+    sp.fill_maxwellian_velocity_slice(unit_reservoir_, 1.0,
+                                      sp.temperature, drift);
+    double flux = 0.0;
+    for (size_t k = 0; k < Param::Nvmu; ++k) {
+        const double vx = sp.vgrid.vx_cells[k];
+        const bool incoming = left_boundary ? (vx > 0.0) : (vx < 0.0);
+        if (!incoming) continue;
+        const int iv = static_cast<int>(k / Param::Nmu);
+        const double speed = left_boundary ? vx : -vx;
+        flux += speed * unit_reservoir_[k] * sp.vgrid.moment_weight[iv];
+    }
+
+    cached_drift = drift;
+    cached_flux = flux;
+    valid = true;
+    return cached_flux;
+}
+
+double VlasovSolver::bounded_density_from_flux(const Species& sp,
+                                               double target_flux,
+                                               bool left_boundary)
+{
+    const double unit_flux =
+        cached_incoming_flux_per_density(sp, left_boundary);
+    if (!(unit_flux > 0.0) || !(target_flux > 0.0)) {
+        return Param::background_reservoir_min_density_factor * sp.density0;
+    }
+
+    const double min_density =
+        Param::background_reservoir_min_density_factor * sp.density0;
+    const double max_density =
+        Param::background_reservoir_max_density_factor * sp.density0;
+    return std::max(min_density,
+                    std::min(max_density, target_flux / unit_flux));
+}
+
+void VlasovSolver::update_dynamic_reservoir(Species& sp,
+                                            const SpatialGrid& sg,
+                                            const EMFields& fields,
+                                            double beam_injected_number,
+                                            double beam_outflow_number,
+                                            double control_dt,
+                                            int mpi_rank,
+                                            int mpi_size)
+{
+    (void)beam_outflow_number;
+    if (!Param::enable_dynamic_background_reservoir ||
+        sp.type != SpeciesType::BACKGROUND_ELECTRON ||
+        sg.nx_local <= 0 || !(control_dt > 0.0)) {
+        return;
+    }
+
+    double local_left_out = 0.0;
+    double local_right_out = 0.0;
+    local_boundary_outflow_fluxes(sp, sg, mpi_rank, mpi_size,
+                                  local_left_out, local_right_out);
+
+    double local_left_charge_residual = 0.0;
+    double local_right_charge_residual = 0.0;
+    const int ng = sg.nghost;
+    if (mpi_rank == 0) {
+        local_left_charge_residual = fields.rho[ng] / Const::qe;
+    }
+    if (mpi_rank == mpi_size - 1) {
+        local_right_charge_residual =
+            fields.rho[ng + sg.nx_local - 1] / Const::qe;
+    }
+
+    double local_beam_injected = beam_injected_number;
+    double global_values[5] = { 0.0, 0.0, 0.0, 0.0, 0.0 };
+    double local_values[5] = {
+        local_left_out,
+        local_right_out,
+        local_left_charge_residual,
+        local_right_charge_residual,
+        local_beam_injected
+    };
+    MPI_Allreduce(local_values, global_values, 5, MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+
+    const double charge_scale =
+        Param::background_reservoir_charge_feedback * sg.dx / control_dt;
+    const double left_charge_flux = global_values[2] * charge_scale;
+    const double right_charge_flux = global_values[3] * charge_scale;
+    const double beam_injected_flux = std::max(0.0, global_values[4] / control_dt);
+
+    const double target_left =
+        std::max(0.0, global_values[0] + beam_injected_flux + left_charge_flux);
+    const double target_right =
+        std::max(0.0, global_values[1] + right_charge_flux);
+
+    sp.reservoir_density_left =
+        bounded_density_from_flux(sp, target_left, true);
+    sp.reservoir_density_right =
+        bounded_density_from_flux(sp, target_right, false);
 }
 
 void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
@@ -167,6 +354,12 @@ void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
 
     for (int isub = 0; isub < nsub_x; ++isub) {
         exchange_ghosts_x(sp, sg, mpi_rank, mpi_size);
+        double out_left = 0.0;
+        double out_right = 0.0;
+        local_boundary_outflow_fluxes(sp, sg, mpi_rank, mpi_size,
+                                      out_left, out_right);
+        last_loss_x_left_ += out_left * dt_sub;
+        last_loss_x_right_ += out_right * dt_sub;
 
         #pragma omp parallel for collapse(2) schedule(static)
         for (int ix = ng; ix < ng + nxl; ++ix) {
@@ -538,23 +731,20 @@ void VlasovSolver::exchange_ghosts_x(Species& sp, const SpatialGrid& sg,
     }
     if (nreq > 0) MPI_Waitall(nreq, reqs, MPI_STATUSES_IGNORE);
 
-    std::vector<double> reservoir;
     if (sp.type == SpeciesType::BACKGROUND_ELECTRON) {
-        sp.fill_maxwellian_velocity_slice(reservoir, sp.density0,
-                                          sp.temperature,
-                                          Param::background_reservoir_u_return);
+        update_reservoir_cache(sp);
     }
 
     if (left_rank >= 0) {
         std::memcpy(&sp.f[0], recv_left_.data(), buffer_size * sizeof(double));
     } else {
-        fill_left_physical_ghosts(sp, sg, reservoir);
+        fill_left_physical_ghosts(sp, sg, reservoir_left_);
     }
 
     if (right_rank < mpi_size) {
         std::memcpy(&sp.f[static_cast<size_t>(ng + nxl) * slice_size],
                     recv_right_.data(), buffer_size * sizeof(double));
     } else {
-        fill_right_physical_ghosts(sp, sg, reservoir);
+        fill_right_physical_ghosts(sp, sg, reservoir_right_);
     }
 }

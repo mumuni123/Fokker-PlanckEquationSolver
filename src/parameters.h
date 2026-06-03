@@ -59,6 +59,10 @@ namespace Param {
     const double beam_source_x_start = 0.5 * Const::micro;
     const double beam_source_length  = 0.3 * Const::micro;
     const double background_reservoir_u_return = -jb / (Const::qe * dens);
+    const bool   enable_dynamic_background_reservoir = true;
+    const double background_reservoir_charge_feedback = 1.0;
+    const double background_reservoir_min_density_factor = 0.0;
+    const double background_reservoir_max_density_factor = 8.0;
 
     // Axisymmetric spherical velocity grid: (v, mu), mu = cos(theta) = vx / |v|.
     // This is still a 3D velocity-space model after integrating over the azimuth.

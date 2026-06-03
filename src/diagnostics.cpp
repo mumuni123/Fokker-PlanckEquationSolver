@@ -38,10 +38,14 @@ void compute_background_boundary_fluxes(const Species& electrons,
         return;
     }
 
-    std::vector<double> reservoir;
+    std::vector<double> reservoir_left;
+    std::vector<double> reservoir_right;
     electrons.fill_maxwellian_velocity_slice(
-        reservoir, electrons.density0, electrons.temperature,
-        Param::background_reservoir_u_return);
+        reservoir_left, electrons.reservoir_density_left,
+        electrons.temperature, electrons.reservoir_drift_left);
+    electrons.fill_maxwellian_velocity_slice(
+        reservoir_right, electrons.reservoir_density_right,
+        electrons.temperature, electrons.reservoir_drift_right);
 
     const int ng = sg.nghost;
     if (mpi_rank == 0) {
@@ -51,8 +55,8 @@ void compute_background_boundary_fluxes(const Species& electrons,
             const int iv = static_cast<int>(k / Param::Nmu);
             const double weight = electrons.vgrid.moment_weight[iv];
             if (vx > 0.0) {
-                values[0] += vx * reservoir[k] * weight;
-                values[4] += electrons.charge * vx * reservoir[k] * weight;
+                values[0] += vx * reservoir_left[k] * weight;
+                values[4] += electrons.charge * vx * reservoir_left[k] * weight;
             } else if (vx < 0.0) {
                 values[1] += -vx * electrons.f[xbase + k] * weight;
             }
@@ -67,8 +71,8 @@ void compute_background_boundary_fluxes(const Species& electrons,
             const int iv = static_cast<int>(k / Param::Nmu);
             const double weight = electrons.vgrid.moment_weight[iv];
             if (vx < 0.0) {
-                values[2] += -vx * reservoir[k] * weight;
-                values[5] += electrons.charge * vx * reservoir[k] * weight;
+                values[2] += -vx * reservoir_right[k] * weight;
+                values[5] += electrons.charge * vx * reservoir_right[k] * weight;
             } else if (vx > 0.0) {
                 values[3] += vx * electrons.f[xbase + k] * weight;
             }
@@ -127,7 +131,8 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                     << "E_total[J/m2]  E_beam_injected_cum[J/m2]  "
                     << "E_beam_outflow_cum[J/m2]  E_collision_cum[J/m2]  "
                     << "E_accounted[J/m2]  E_balance_error[J/m2]  "
-                    << "Q_total[C/m2]  N_bkg_minus_n0  "
+                    << "Q_total[C/m2]  charge_residual_int[m^-2]  "
+                    << "charge_residual_abs_max[m^-3]  N_bkg_minus_n0  "
                     << "Gamma_bkg_in_left  Gamma_bkg_out_left  "
                     << "Gamma_bkg_in_right  Gamma_bkg_out_right  "
                     << "J_bkg_in_left[A/m2]  J_bkg_in_right[A/m2]  "
@@ -147,7 +152,9 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
 #endif
         if (step_enabled) {
             step_file.open((output_dir + "/step_diagnostics.dat").c_str());
-            step_file << "# step  time[fs]  max_abs_Ex[V/m]  x_at_max_abs_Ex[m]  N_bkg_e  "
+            step_file << "# step  time[fs]  max_abs_Ex[V/m]  x_at_max_abs_Ex[m]  "
+                      << "charge_residual_int[m^-2]  charge_residual_abs_max[m^-3]  "
+                      << "N_bkg_e  "
                       << "N_beam_macro  N_beam_weighted  "
                       << "N_beam_absorb_step  J_beam_absorb_int[A/m]  "
                       << "beam_cont_l1  beam_cont_linf  "
@@ -185,12 +192,18 @@ void Diagnostics::write_scalars(double time, int step,
     electrons.total_particle_number_and_energy(local_bkg_number, local_bkg_ke);
 
     double local_q_total = 0.0;
+    double local_charge_residual_int = 0.0;
+    double local_charge_residual_abs_max = 0.0;
     double local_bkg_delta = 0.0;
     double local_max_abs_Ex = 0.0;
     double local_x_at_max_abs_Ex = 0.0;
     const int ng = electrons.sgrid->nghost;
     for (int ix = 0; ix < electrons.sgrid->nx_local; ++ix) {
+        const double charge_residual = fields.rho[ix + ng] / Const::qe;
         local_q_total += fields.rho[ix + ng] * electrons.sgrid->dx;
+        local_charge_residual_int += charge_residual * electrons.sgrid->dx;
+        local_charge_residual_abs_max =
+            std::max(local_charge_residual_abs_max, std::fabs(charge_residual));
         local_bkg_delta +=
             (electrons.number_density[static_cast<size_t>(ix)] - Param::dens) *
             electrons.sgrid->dx;
@@ -206,7 +219,7 @@ void Diagnostics::write_scalars(double time, int step,
     compute_background_boundary_fluxes(electrons, *electrons.sgrid,
                                        mpi_rank, mpi_size, local_boundary);
 
-    double local_values[14] = {
+    double local_values[15] = {
         local_bkg_number,
         local_bkg_ke,
         beam.total_particle_number(*electrons.sgrid),
@@ -216,19 +229,24 @@ void Diagnostics::write_scalars(double time, int step,
         beam.cumulative_outflow_energy(),
         cumulative_collision_energy_delta,
         local_q_total,
+        local_charge_residual_int,
         local_bkg_delta,
         beam.last_injected_number(),
         beam.last_outflow_number(),
         beam.last_injected_current(),
         beam.last_outflow_current()
     };
-    double global_values[14] = {
+    double global_values[15] = {
         0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     };
+    double global_charge_residual_abs_max = 0.0;
 
-    MPI_Reduce(local_values, global_values, 14, MPI_DOUBLE, MPI_SUM,
+    MPI_Reduce(local_values, global_values, 15, MPI_DOUBLE, MPI_SUM,
                0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_charge_residual_abs_max,
+               &global_charge_residual_abs_max, 1,
+               MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(local_boundary, global_boundary, 6, MPI_DOUBLE, MPI_SUM,
                0, MPI_COMM_WORLD);
 
@@ -265,16 +283,18 @@ void Diagnostics::write_scalars(double time, int step,
                     << balance_error << "  "
                     << global_values[8] << "  "
                     << global_values[9] << "  "
+                    << global_charge_residual_abs_max << "  "
+                    << global_values[10] << "  "
                     << global_boundary[0] << "  "
                     << global_boundary[1] << "  "
                     << global_boundary[2] << "  "
                     << global_boundary[3] << "  "
                     << global_boundary[4] << "  "
                     << global_boundary[5] << "  "
-                    << global_values[10] << "  "
                     << global_values[11] << "  "
                     << global_values[12] << "  "
                     << global_values[13] << "  "
+                    << global_values[14] << "  "
                     << global_max_abs_Ex << "  "
                     << global_x_at_max_abs_Ex << "\n";
         scalar_file.flush();
@@ -407,11 +427,18 @@ void Diagnostics::write_step_diagnostics(int step, double time,
 
     double local_max_abs_Ex = 0.0;
     double local_x_at_max_abs_Ex = 0.0;
+    double local_charge_residual_int = 0.0;
+    double local_charge_residual_abs_max = 0.0;
     for (int ix = 0; ix < sg.nx_local; ++ix) {
-        const double abs_ex = std::fabs(fields.Ex[ix + sg.nghost]);
+        const int ix_g = ix + sg.nghost;
+        const double charge_residual = fields.rho[ix_g] / Const::qe;
+        local_charge_residual_int += charge_residual * sg.dx;
+        local_charge_residual_abs_max =
+            std::max(local_charge_residual_abs_max, std::fabs(charge_residual));
+        const double abs_ex = std::fabs(fields.Ex[ix_g]);
         if (abs_ex > local_max_abs_Ex) {
             local_max_abs_Ex = abs_ex;
-            local_x_at_max_abs_Ex = sg.x(ix + sg.nghost);
+            local_x_at_max_abs_Ex = sg.x(ix_g);
         }
     }
 
@@ -478,6 +505,8 @@ void Diagnostics::write_step_diagnostics(int step, double time,
     };
     double global_max_abs_Ex = 0.0;
     double global_x_at_max_abs_Ex = 0.0;
+    double global_charge_residual_int = 0.0;
+    double global_charge_residual_abs_max = 0.0;
     double global_N_bkg_e = 0.0;
     double global_N_beam_macro = 0.0;
     double global_N_beam_weighted = 0.0;
@@ -487,6 +516,11 @@ void Diagnostics::write_step_diagnostics(int step, double time,
     gather_max_ex_location(local_max_abs_Ex, local_x_at_max_abs_Ex,
                            mpi_rank, mpi_size,
                            global_max_abs_Ex, global_x_at_max_abs_Ex);
+    MPI_Reduce(&local_charge_residual_int, &global_charge_residual_int, 1,
+               MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_charge_residual_abs_max,
+               &global_charge_residual_abs_max, 1,
+               MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_N_bkg_e, &global_N_bkg_e, 1,
                MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_N_beam_macro, &global_N_beam_macro, 1,
@@ -508,6 +542,8 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << time / Const::femto << "  "
                   << global_max_abs_Ex << "  "
                   << global_x_at_max_abs_Ex << "  "
+                  << global_charge_residual_int << "  "
+                  << global_charge_residual_abs_max << "  "
                   << global_N_bkg_e << "  "
                   << global_N_beam_macro << "  "
                   << global_N_beam_weighted << "  "

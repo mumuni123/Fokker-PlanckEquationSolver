@@ -23,6 +23,14 @@ public:
 
     void advect(Species& sp, const SpatialGrid& sg, const EMFields& fields,
                 double dt, int mpi_rank, int mpi_size);
+    void update_dynamic_reservoir(Species& sp,
+                                  const SpatialGrid& sg,
+                                  const EMFields& fields,
+                                  double beam_injected_number,
+                                  double beam_outflow_number,
+                                  double control_dt,
+                                  int mpi_rank,
+                                  int mpi_size);
 
     void advect_x(Species& sp, const SpatialGrid& sg, double dt,
                   int mpi_rank, int mpi_size);
@@ -51,13 +59,30 @@ public:
 private:
     void exchange_ghosts_x(Species& sp, const SpatialGrid& sg,
                            int mpi_rank, int mpi_size);
+    void update_reservoir_cache(const Species& sp);
+    double cached_incoming_flux_per_density(const Species& sp,
+                                            bool left_boundary);
+    double bounded_density_from_flux(const Species& sp,
+                                     double target_flux,
+                                     bool left_boundary);
 
     std::vector<double> send_left_;
     std::vector<double> send_right_;
     std::vector<double> recv_left_;
     std::vector<double> recv_right_;
+    std::vector<double> reservoir_left_;
+    std::vector<double> reservoir_right_;
+    std::vector<double> unit_reservoir_;
     std::vector<RemapStencil> x_stencil_;
 
+    double cached_reservoir_density_left_;
+    double cached_reservoir_density_right_;
+    double cached_reservoir_drift_left_;
+    double cached_reservoir_drift_right_;
+    double cached_unit_flux_left_;
+    double cached_unit_flux_right_;
+    double cached_unit_flux_drift_left_;
+    double cached_unit_flux_drift_right_;
     double last_cfl_v_;
     double last_cfl_mu_;
     double last_loss_v_;
@@ -74,6 +99,9 @@ private:
     double last_energy_delta_mu_;
     int last_nsub_v_;
     int last_nsub_mu_;
+    bool reservoir_cache_valid_;
+    bool unit_flux_left_valid_;
+    bool unit_flux_right_valid_;
     bool step_diagnostics_enabled_;
 };
 

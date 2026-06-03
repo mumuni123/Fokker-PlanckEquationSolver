@@ -20,6 +20,10 @@ public:
     double mass;
     double density0;
     double temperature;
+    double reservoir_density_left;
+    double reservoir_density_right;
+    double reservoir_drift_left;
+    double reservoir_drift_right;
     bool collisions_enabled;
     bool relativistic_push;
 
