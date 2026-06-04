@@ -5,28 +5,29 @@
 
 namespace {
 double maxwellian_raw_at(const Species& sp, int iv, int imu,
-                         double drift_vx, double inv2vth2)
+                         double drift_vx, double inv2uth2)
 {
-    const double vv = sp.vgrid.v_cells[iv];
+    const double u = sp.vgrid.v_cells[iv];
     if (std::fabs(drift_vx) == 0.0) {
-        return std::exp(-vv * vv * inv2vth2);
+        return std::exp(-u * u * inv2uth2);
     }
 
     const double mu = sp.vgrid.mu_cells[imu];
-    const double vx = vv * mu - drift_vx;
-    const double vperp2 = vv * vv * (1.0 - mu * mu);
-    return std::exp(-(vx * vx + vperp2) * inv2vth2);
+    const double drift_u = u_from_v(drift_vx);
+    const double ux = u * mu - drift_u;
+    const double uperp2 = u * u * (1.0 - mu * mu);
+    return std::exp(-(ux * ux + uperp2) * inv2uth2);
 }
 
 double discrete_maxwellian_sum(const Species& sp,
                                double drift_vx,
-                               double inv2vth2)
+                               double inv2uth2)
 {
     double sum = 0.0;
     for (int iv = 0; iv < Param::Nv; ++iv) {
         const double shell = sp.vgrid.moment_weight[iv];
         for (int imu = 0; imu < Param::Nmu; ++imu) {
-            sum += maxwellian_raw_at(sp, iv, imu, drift_vx, inv2vth2) * shell;
+            sum += maxwellian_raw_at(sp, iv, imu, drift_vx, inv2uth2) * shell;
         }
     }
     return sum;
@@ -61,14 +62,8 @@ void Species::init(const std::string& n, SpeciesType t,
     relativistic_push = (type == SpeciesType::BEAM);
     sgrid = &sg;
 
-    double vmax = 0.0;
-    if (type == SpeciesType::BEAM) {
-        vmax = 0.999999 * Const::c;
-    } else {
-        double vth = std::sqrt(temperature / mass);
-        vmax = std::min(Param::Nsigma * vth, Param::vmax_fraction_c * Const::c);
-    }
-    vgrid.init(vmax);
+    double umax = Param::momentum_umax;
+    vgrid.init(umax);
 
     f.assign(local_size(), 0.0);
     f_tmp.assign(local_size(), 0.0);
@@ -81,8 +76,8 @@ void Species::initialize_maxwellian(double drift_vx)
 {
     if (type == SpeciesType::BEAM) return;
 
-    const double inv2vth2 = mass / (2.0 * temperature);
-    const double raw_sum = discrete_maxwellian_sum(*this, drift_vx, inv2vth2);
+    const double inv2uth2 = mass * Const::c * Const::c / (2.0 * temperature);
+    const double raw_sum = discrete_maxwellian_sum(*this, drift_vx, inv2uth2);
     const double norm = (raw_sum > 0.0) ? density0 / raw_sum : 0.0;
     const int nxt = sgrid->nx_total;
     const bool zero_drift = std::fabs(drift_vx) == 0.0;
@@ -94,8 +89,8 @@ void Species::initialize_maxwellian(double drift_vx)
                              + static_cast<size_t>(iv) * Param::Nmu;
             for (int imu = 0; imu < Param::Nmu; ++imu) {
                 const double raw = zero_drift
-                    ? maxwellian_raw_at(*this, iv, 0, 0.0, inv2vth2)
-                    : maxwellian_raw_at(*this, iv, imu, drift_vx, inv2vth2);
+                    ? maxwellian_raw_at(*this, iv, 0, 0.0, inv2uth2)
+                    : maxwellian_raw_at(*this, iv, imu, drift_vx, inv2uth2);
                 f[row + imu] = norm * raw;
             }
         }
@@ -108,8 +103,8 @@ void Species::initialize_maxwellian_profile(const std::vector<double>& density_p
     if (type == SpeciesType::BEAM) return;
 
     std::fill(f.begin(), f.end(), 0.0);
-    const double inv2vth2 = mass / (2.0 * temperature);
-    const double raw_sum = discrete_maxwellian_sum(*this, drift_vx, inv2vth2);
+    const double inv2uth2 = mass * Const::c * Const::c / (2.0 * temperature);
+    const double raw_sum = discrete_maxwellian_sum(*this, drift_vx, inv2uth2);
     if (raw_sum <= 0.0) return;
 
     const bool zero_drift = std::fabs(drift_vx) == 0.0;
@@ -127,8 +122,8 @@ void Species::initialize_maxwellian_profile(const std::vector<double>& density_p
                              + static_cast<size_t>(iv) * Param::Nmu;
             for (int imu = 0; imu < Param::Nmu; ++imu) {
                 const double raw = zero_drift
-                    ? maxwellian_raw_at(*this, iv, 0, 0.0, inv2vth2)
-                    : maxwellian_raw_at(*this, iv, imu, drift_vx, inv2vth2);
+                    ? maxwellian_raw_at(*this, iv, 0, 0.0, inv2uth2)
+                    : maxwellian_raw_at(*this, iv, imu, drift_vx, inv2uth2);
                 f[row + imu] = norm * raw;
             }
         }
@@ -145,11 +140,11 @@ double Species::maxwellian_f_value(double density,
         imu < 0 || imu >= Param::Nmu || !(temp > 0.0)) {
         return 0.0;
     }
-    const double inv2vth2 = mass / (2.0 * temp);
-    const double raw_sum = discrete_maxwellian_sum(*this, drift_vx, inv2vth2);
+    const double inv2uth2 = mass * Const::c * Const::c / (2.0 * temp);
+    const double raw_sum = discrete_maxwellian_sum(*this, drift_vx, inv2uth2);
     if (!(raw_sum > 0.0)) return 0.0;
     return std::max(0.0, density) *
-           maxwellian_raw_at(*this, iv, imu, drift_vx, inv2vth2) / raw_sum;
+           maxwellian_raw_at(*this, iv, imu, drift_vx, inv2uth2) / raw_sum;
 }
 
 void Species::fill_maxwellian_velocity_slice(std::vector<double>& values,
@@ -160,8 +155,8 @@ void Species::fill_maxwellian_velocity_slice(std::vector<double>& values,
     values.assign(Param::Nvmu, 0.0);
     if (type == SpeciesType::BEAM || !(temp > 0.0)) return;
 
-    const double inv2vth2 = mass / (2.0 * temp);
-    const double raw_sum = discrete_maxwellian_sum(*this, drift_vx, inv2vth2);
+    const double inv2uth2 = mass * Const::c * Const::c / (2.0 * temp);
+    const double raw_sum = discrete_maxwellian_sum(*this, drift_vx, inv2uth2);
     if (!(raw_sum > 0.0)) return;
 
     const double norm = std::max(0.0, density) / raw_sum;
@@ -169,7 +164,7 @@ void Species::fill_maxwellian_velocity_slice(std::vector<double>& values,
         const size_t row = static_cast<size_t>(iv) * Param::Nmu;
         for (int imu = 0; imu < Param::Nmu; ++imu) {
             values[row + static_cast<size_t>(imu)] =
-                norm * maxwellian_raw_at(*this, iv, imu, drift_vx, inv2vth2);
+                norm * maxwellian_raw_at(*this, iv, imu, drift_vx, inv2uth2);
         }
     }
 }
@@ -241,11 +236,10 @@ double Species::total_kinetic_energy() const
         const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
         double e = 0.0;
         for (int iv = 0; iv < Param::Nv; ++iv) {
-            const double vv = vgrid.v_cells[iv];
+            const double u = vgrid.v_cells[iv];
             const double shell = vgrid.moment_weight[iv];
-            const double ke = relativistic_push
-                      ? (gamma_from_v(vv) - 1.0) * mass * Const::c * Const::c
-                      : 0.5 * mass * vv * vv;
+            const double ke =
+                (gamma_from_u(u) - 1.0) * mass * Const::c * Const::c;
             const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
             for (int imu = 0; imu < Param::Nmu; ++imu) {
                 e += f[row + imu] * ke * shell;
@@ -271,11 +265,10 @@ void Species::total_particle_number_and_energy(double& number,
         double n = 0.0;
         double e = 0.0;
         for (int iv = 0; iv < Param::Nv; ++iv) {
-            const double vv = vgrid.v_cells[iv];
+            const double u = vgrid.v_cells[iv];
             const double shell = vgrid.moment_weight[iv];
-            const double ke = relativistic_push
-                      ? (gamma_from_v(vv) - 1.0) * mass * Const::c * Const::c
-                      : 0.5 * mass * vv * vv;
+            const double ke =
+                (gamma_from_u(u) - 1.0) * mass * Const::c * Const::c;
             const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
             for (int imu = 0; imu < Param::Nmu; ++imu) {
                 const double weighted_f = f[row + imu] * shell;

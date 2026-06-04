@@ -19,9 +19,10 @@ double compute_dt(const Species& electron, const SpatialGrid& sg)
 {
     double dt_min = 0.4 * sg.dx / Const::c;
     double e_est = Param::densb * Const::qe * sg.dx / Const::eps0;
-    double a_est = std::abs(electron.charge) * e_est / electron.mass;
-    if (a_est > 1.0e-30) {
-        dt_min = std::min(dt_min, 0.25 * electron.vgrid.dv / a_est);
+    double udot_est = std::abs(electron.charge) * e_est /
+                    (electron.mass * Const::c);
+    if (udot_est > 1.0e-30) {
+        dt_min = std::min(dt_min, 0.25 * electron.vgrid.dv / udot_est);
     }
     dt_min *= Param::dt_multiplier;
     return std::min(dt_min, 0.01 * Const::femto);
@@ -88,13 +89,13 @@ void abort_if_vmax_loss(const VlasovSolver& vlasov,
                   MPI_SUM, MPI_COMM_WORLD);
 
     const double threshold =
-        Param::vmax_loss_abort_fraction * Param::dens * Param::plasma_length;
+        Param::umax_loss_abort_fraction * Param::dens * Param::plasma_length;
     if (!(global_loss <= threshold)) {
         if (mpi_rank == 0) {
             std::fprintf(stderr,
-                         "ERROR: background electron distribution reached vmax "
+                         "ERROR: background electron distribution reached umax "
                          "during %s at step %d, t = %.6e s. "
-                         "loss_v_high = %.8e, threshold = %.8e. "
+                         "loss_u_high = %.8e, threshold = %.8e. "
                          "Stopping to avoid amplifying nonphysical results.\n",
                          stage, step, time, global_loss, threshold);
         }
@@ -168,7 +169,7 @@ int main(int argc, char** argv)
     if (mpi_rank == 0) {
         printf("============================================================\n");
         printf("  Background-electron VFP + fixed ions + PIC beam solver\n");
-        printf("  Spherical electron velocity grid: (v, mu), mu = vx / |v|\n");
+        printf("  Spherical electron momentum grid: (u, mu), u = p / (m c)\n");
         printf("============================================================\n");
         printf("MPI ranks: %d\n", mpi_size);
         #pragma omp parallel
@@ -180,9 +181,9 @@ int main(int argc, char** argv)
                Param::nx, Param::dx, Param::Lx);
         printf("Density profile: uniform plasma over full domain, n0 = %.3e /m^3\n",
                Param::dens);
-        printf("Electron velocity grid: Nv x Nmu = %d x %d\n", Param::Nv, Param::Nmu);
-        printf("Electron velocity domain: 0 <= v <= %.1f v_th (cap %.3f c)\n",
-               Param::Nsigma, Param::vmax_fraction_c);
+        printf("Electron momentum grid: Nu x Nmu = %d x %d\n", Param::Nv, Param::Nmu);
+        printf("Electron momentum domain: 0 <= u <= %.3f, vx = c u mu / sqrt(1+u^2)\n",
+               Param::momentum_umax);
         printf("Electrostatic boundary: grounded Dirichlet phi(0)=phi(L)=0\n");
         printf("Poisson solver: %s\n", poisson_solver_name());
         printf("Fixed ions: uniform Z*n_i = %.3e /m^3\n", Param::dens);

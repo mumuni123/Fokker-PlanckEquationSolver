@@ -30,7 +30,7 @@ public:
     VelocityGrid vgrid;
     const SpatialGrid* sgrid;
 
-    // Axisymmetric distribution f(x, v, mu), with d3v = 2*pi*v^2 dv dmu.
+    // Axisymmetric distribution f(x, u, mu), with d3u = 2*pi*u^2 du dmu.
     std::vector<double> f;
     std::vector<double> f_tmp;
 

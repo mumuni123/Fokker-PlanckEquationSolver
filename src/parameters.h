@@ -53,7 +53,8 @@ namespace Param {
     const double velocity_space_cfl = 0.35;
     const double semi_lagrangian_cfl = 2.5;
     const bool   abort_on_vmax_loss = true;
-    const double vmax_loss_abort_fraction = 1.0e-12;
+    const double umax_loss_abort_fraction = 1.0e-12;
+    const double vmax_loss_abort_fraction = umax_loss_abort_fraction;
     const int    beam_macro_particles_per_cell = 1000; // 1000
     const double beam_macro_weight = densb * dx / beam_macro_particles_per_cell;
     const double beam_source_x_start = 0.5 * Const::micro;
@@ -64,17 +65,19 @@ namespace Param {
     const double background_reservoir_min_density_factor = 0.0;
     const double background_reservoir_max_density_factor = 8.0;
 
-    // Axisymmetric spherical velocity grid: (v, mu), mu = cos(theta) = vx / |v|.
-    // This is still a 3D velocity-space model after integrating over the azimuth.
+    // Axisymmetric spherical momentum grid: (u, mu), u = p / (m c).
+    // The distribution is normalized with d3u = 2*pi*u^2 du dmu.
     const int Nv  = 96;
     const int Nmu = 64;
     const size_t Nvmu = static_cast<size_t>(Nv) * Nmu;
 
     const double Nsigma = 80.0;
+    const double momentum_umax = 10.0;
     const double vmax_fraction_c = 0.995;
     const int Nghost = 3;
 
     const double v_floor = 1.0e-12 * Const::c;
+    const double u_floor = 1.0e-12;
 }
 
 #endif

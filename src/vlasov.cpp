@@ -345,7 +345,7 @@ void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
 {
     const int ng = sg.nghost;
     const int nxl = sg.nx_local;
-    const double max_cfl = sp.vgrid.v_max * sp.vgrid.max_abs_mu * dt / sg.dx;
+    const double max_cfl = sp.vgrid.max_speed * sp.vgrid.max_abs_mu * dt / sg.dx;
     const double cfl_limit = std::min(0.85, Param::semi_lagrangian_cfl);
     const int nsub_x = substeps_from_cfl(max_cfl, cfl_limit);
     const double dt_sub = dt / nsub_x;
@@ -410,8 +410,9 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
     #pragma omp parallel for schedule(static) reduction(max:max_cfl)
     for (int ix = 0; ix < nxl; ++ix) {
         const int ix_g = ix + ng;
-        const double a_abs = std::fabs(sp.charge * fields.Ex[ix_g] / sp.mass);
-        max_cfl = std::max(max_cfl, a_abs * cfl_scale);
+        const double udot_abs =
+            std::fabs(sp.charge * fields.Ex[ix_g] / (sp.mass * Const::c));
+        max_cfl = std::max(max_cfl, udot_abs * cfl_scale);
     }
 
     last_nsub_v_ = substeps_from_cfl(max_cfl, Param::velocity_space_cfl);
@@ -436,8 +437,9 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
             for (int imu = 0; imu < Param::Nmu; ++imu) {
                 const int ix_g = ix + ng;
                 const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
-                const double accel = sp.charge * fields.Ex[ix_g] / sp.mass;
-                const double vdot = accel * sp.vgrid.mu_cells[imu];
+                const double accel_u =
+                    sp.charge * fields.Ex[ix_g] / (sp.mass * Const::c);
+                const double vdot = accel_u * sp.vgrid.mu_cells[imu];
                 std::array<double, Param::Nv> mass;
                 std::array<double, Param::Nv> new_mass;
                 std::array<double, Param::Nv + 1> flux;
@@ -456,13 +458,14 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
                     mass[static_cast<size_t>(iv)] = cell_mass;
                     new_mass[static_cast<size_t>(iv)] = cell_mass;
                     if (track_step_diagnostics) {
-                        const double vv = sp.vgrid.v_cells[iv];
-                        const double vx = vv * sp.vgrid.mu_cells[imu];
-                        const double ke = sp.relativistic_push
-                            ? (gamma_from_v(vv) - 1.0) * sp.mass * Const::c * Const::c
-                            : 0.5 * sp.mass * vv * vv;
+                        const double u = sp.vgrid.v_cells[iv];
+                        const double px = sp.mass * Const::c
+                                        * u * sp.vgrid.mu_cells[imu];
+                        const double ke =
+                            (gamma_from_u(u) - 1.0) * sp.mass
+                            * Const::c * Const::c;
                         n_before_sub += cell_mass * sg.dx;
-                        px_before_sub += cell_mass * sp.mass * vx * sg.dx;
+                        px_before_sub += cell_mass * px * sg.dx;
                         ke_before_sub += cell_mass * ke * sg.dx;
                     }
                 }
@@ -527,13 +530,14 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
                         (new_mass[static_cast<size_t>(iv)] > 0.0)
                         ? new_mass[static_cast<size_t>(iv)] : 0.0;
                     if (track_step_diagnostics) {
-                        const double vv = sp.vgrid.v_cells[iv];
-                        const double vx = vv * sp.vgrid.mu_cells[imu];
-                        const double ke = sp.relativistic_push
-                            ? (gamma_from_v(vv) - 1.0) * sp.mass * Const::c * Const::c
-                            : 0.5 * sp.mass * vv * vv;
+                        const double u = sp.vgrid.v_cells[iv];
+                        const double px = sp.mass * Const::c
+                                        * u * sp.vgrid.mu_cells[imu];
+                        const double ke =
+                            (gamma_from_u(u) - 1.0) * sp.mass
+                            * Const::c * Const::c;
                         n_after_sub += cell_mass * sg.dx;
-                        px_after_sub += cell_mass * sp.mass * vx * sg.dx;
+                        px_after_sub += cell_mass * px * sg.dx;
                         ke_after_sub += cell_mass * ke * sg.dx;
                     }
                     sp.f_tmp[offset] = cell_mass / sp.vgrid.moment_weight[iv];
@@ -576,8 +580,9 @@ void VlasovSolver::advect_mu(Species& sp, const SpatialGrid& sg,
     #pragma omp parallel for schedule(static) reduction(max:max_cfl)
     for (int ix = 0; ix < nxl; ++ix) {
         const int ix_g = ix + ng;
-        const double a_abs = std::fabs(sp.charge * fields.Ex[ix_g] / sp.mass);
-        max_cfl = std::max(max_cfl, a_abs * cfl_scale);
+        const double udot_abs =
+            std::fabs(sp.charge * fields.Ex[ix_g] / (sp.mass * Const::c));
+        max_cfl = std::max(max_cfl, udot_abs * cfl_scale);
     }
 
     last_nsub_mu_ = substeps_from_cfl(max_cfl, Param::velocity_space_cfl);
@@ -601,10 +606,11 @@ void VlasovSolver::advect_mu(Species& sp, const SpatialGrid& sg,
                 const int ix_g = ix + ng;
                 const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
                 const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
-                const double accel = sp.charge * fields.Ex[ix_g] / sp.mass;
-                const double v = sp.vgrid.v_cells[iv];
-                const double v_eff = std::max(v, Param::v_floor);
-                const double mu_flux_scale = face_weight_base * v * v;
+                const double accel_u =
+                    sp.charge * fields.Ex[ix_g] / (sp.mass * Const::c);
+                const double u = sp.vgrid.v_cells[iv];
+                const double u_eff = std::max(u, Param::u_floor);
+                const double mu_flux_scale = face_weight_base * u * u;
                 std::array<double, Param::Nmu> mass;
                 std::array<double, Param::Nmu> new_mass;
                 std::array<double, Param::Nmu + 1> flux;
@@ -615,9 +621,8 @@ void VlasovSolver::advect_mu(Species& sp, const SpatialGrid& sg,
                 scale.fill(1.0);
                 double ke = 0.0;
                 if (track_step_diagnostics) {
-                    ke = sp.relativistic_push
-                        ? (gamma_from_v(v) - 1.0) * sp.mass * Const::c * Const::c
-                        : 0.5 * sp.mass * v * v;
+                    ke = (gamma_from_u(u) - 1.0) * sp.mass
+                       * Const::c * Const::c;
                 }
 
                 for (int imu = 0; imu < Param::Nmu; ++imu) {
@@ -629,14 +634,15 @@ void VlasovSolver::advect_mu(Species& sp, const SpatialGrid& sg,
                     if (track_step_diagnostics) {
                         n_before_sub += cell_mass * sg.dx;
                         px_before_sub +=
-                            cell_mass * sp.mass * v * sp.vgrid.mu_cells[imu] * sg.dx;
+                            cell_mass * sp.mass * Const::c * u
+                            * sp.vgrid.mu_cells[imu] * sg.dx;
                         ke_before_sub += cell_mass * ke * sg.dx;
                     }
                 }
 
                 for (int face = 1; face < Param::Nmu; ++face) {
                     const double mudot =
-                        accel * sp.vgrid.mu_face_factor[face] / v_eff;
+                        accel_u * sp.vgrid.mu_face_factor[face] / u_eff;
                     const double f_face =
                         reconstruct_mu_face(sp, row, face, mudot);
                     flux[static_cast<size_t>(face)] =
@@ -673,7 +679,8 @@ void VlasovSolver::advect_mu(Species& sp, const SpatialGrid& sg,
                     if (track_step_diagnostics) {
                         n_after_sub += cell_mass * sg.dx;
                         px_after_sub +=
-                            cell_mass * sp.mass * v * sp.vgrid.mu_cells[imu] * sg.dx;
+                            cell_mass * sp.mass * Const::c * u
+                            * sp.vgrid.mu_cells[imu] * sg.dx;
                         ke_after_sub += cell_mass * ke * sg.dx;
                     }
                     sp.f_tmp[offset] = cell_mass * inv_shell;

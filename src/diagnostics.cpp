@@ -145,8 +145,8 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
         if (debug_enabled) {
             debug_file.open((output_dir + "/debug_diagnostics.dat").c_str());
             debug_file << "# step  time[fs]  stage  max_abs_Ex[V/m]  N_bkg_e  "
-                       << "N_beam_macro  N_beam_weighted  CFL_v  CFL_mu  "
-                       << "nsub_v  nsub_mu\n";
+                       << "N_beam_macro  N_beam_weighted  CFL_u  CFL_mu  "
+                       << "nsub_u  nsub_mu\n";
             debug_file << std::scientific << std::setprecision(8);
         }
 #endif
@@ -158,18 +158,18 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                       << "N_beam_macro  N_beam_weighted  "
                       << "N_beam_absorb_step  J_beam_absorb_int[A/m]  "
                       << "beam_cont_l1  beam_cont_linf  "
-                      << "nsub_v1  nsub_mu1  nsub_v2  nsub_mu2  "
-                      << "loss_v1  loss_mu1  loss_v2  loss_mu2  "
-                      << "loss_v1_low  loss_v1_high  "
-                      << "loss_v2_low  loss_v2_high  "
+                      << "nsub_u1  nsub_mu1  nsub_u2  nsub_mu2  "
+                      << "loss_u1  loss_mu1  loss_u2  loss_mu2  "
+                      << "loss_u1_low  loss_u1_high  "
+                      << "loss_u2_low  loss_u2_high  "
                       << "loss_x1_left  loss_x1_right  "
                       << "loss_x2_left  loss_x2_right  "
                       << "KE_bkg_e[J/m2]  KE_beam[J/m2]  E_field[J/m2]  "
                       << "E_total[J/m2]  dKE_bkg[J/m2]  dKE_beam[J/m2]  "
                       << "dE_field[J/m2]  W_bkg_E[J/m2]  W_beam_E[J/m2]  "
-                      << "v_mass_error  mu_mass_error  "
-                      << "v_px_delta[kg/m/s/m2]  mu_px_delta[kg/m/s/m2]  "
-                      << "v_energy_delta[J/m2]  mu_energy_delta[J/m2]  "
+                      << "u_mass_error  mu_mass_error  "
+                      << "u_px_delta[kg/m/s/m2]  mu_px_delta[kg/m/s/m2]  "
+                      << "u_energy_delta[J/m2]  mu_energy_delta[J/m2]  "
                       << "E_src_in[J/m2]  E_src_out[J/m2]  "
                       << "E_collision_step[J/m2]  E_balance_step[J/m2]  "
                       << "E_beam_injected_cum[J/m2]  "
@@ -645,24 +645,24 @@ void Diagnostics::write_px_distribution(double time,
     int ng = sp.sgrid->nghost;
     int nxl = sp.sgrid->nx_local;
 
-    std::vector<double> local_Fv(Param::Nv, 0.0);
+    std::vector<double> local_Fu(Param::Nv, 0.0);
     for (int ix = 0; ix < nxl; ++ix) {
         int ix_g = ix + ng;
         size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
         for (int iv = 0; iv < Param::Nv; ++iv) {
-            double v = sp.vgrid.v(iv);
+            double u = sp.vgrid.v(iv);
             double sum = 0.0;
             size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
             for (int imu = 0; imu < Param::Nmu; ++imu) {
                 sum += sp.f[row + imu];
             }
-            local_Fv[iv] += sum * 2.0 * Const::pi * v * v
+            local_Fu[iv] += sum * 2.0 * Const::pi * u * u
                           * sp.vgrid.dmu * sp.sgrid->dx;
         }
     }
 
-    std::vector<double> global_Fv(Param::Nv, 0.0);
-    MPI_Reduce(local_Fv.data(), global_Fv.data(), Param::Nv,
+    std::vector<double> global_Fu(Param::Nv, 0.0);
+    MPI_Reduce(local_Fu.data(), global_Fu.data(), Param::Nv,
                MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
     if (mpi_rank == 0) {
@@ -670,10 +670,10 @@ void Diagnostics::write_px_distribution(double time,
         fname << output_dir << "/fv_" << sp.name << "_"
               << std::setw(5) << std::setfill('0') << snapshot_count << ".dat";
         std::ofstream out(fname.str().c_str());
-        out << "# v[m/s]  F(v)\n";
+        out << "# u[p/(m c)]  F(u)\n";
         out << std::scientific << std::setprecision(8);
         for (int iv = 0; iv < Param::Nv; ++iv) {
-            out << sp.vgrid.v(iv) << "  " << global_Fv[iv] << "\n";
+            out << sp.vgrid.v(iv) << "  " << global_Fu[iv] << "\n";
         }
     }
 }
@@ -737,7 +737,7 @@ void Diagnostics::write_electron_distribution(double time,
 
     std::ofstream out(fname.str().c_str());
     out << "# time[fs] = " << time / Const::femto << "\n";
-    out << "# x[um]  v[m/s]  mu  f_e[s^3/m^6]\n";
+    out << "# x[um]  u[p/(m c)]  mu  f_e[u^-3 m^-3]\n";
     out << std::scientific << std::setprecision(8);
 
     const int ng = sg.nghost;
@@ -746,11 +746,11 @@ void Diagnostics::write_electron_distribution(double time,
         const double x_um = sg.x(ix_g) / Const::micro;
         const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
         for (int iv = 0; iv < Param::Nv; ++iv) {
-            const double v = electrons.vgrid.v(iv);
+            const double u = electrons.vgrid.v(iv);
             const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
             for (int imu = 0; imu < Param::Nmu; ++imu) {
                 out << x_um << "  "
-                    << v << "  "
+                    << u << "  "
                     << electrons.vgrid.mu(imu) << "  "
                     << electrons.f[row + imu] << "\n";
             }
