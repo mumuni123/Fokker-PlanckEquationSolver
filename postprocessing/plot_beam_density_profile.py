@@ -10,10 +10,13 @@ from matplotlib import pyplot as plt
 
 import config
 from postprocess_common import (
+    apply_x_axis_range,
     filename_token,
     normalize_columns,
+    parse_header_labels,
     save_figure,
     validate_selected_data,
+    x_range_mask,
     y_axis_label,
 )
 
@@ -27,25 +30,36 @@ def read_density_file(path: str):
     match = re.search(r"time\[fs\]\s*=\s*([0-9.+\-eE]+)", time_line)
     time_fs = float(match.group(1)) if match else 0.0
 
-    labels = header_line.lstrip("#").split()
+    labels = parse_header_labels(header_line)
     data = np.loadtxt(path, comments="#")
     if data.ndim == 1:
         data = data.reshape(1, -1)
+    if data.shape[1] != len(labels):
+        raise ValueError(
+            f"{path} has {data.shape[1]} data columns, but header has {len(labels)} labels"
+        )
     return time_fs, labels, data
 
 
 def main() -> None:
     time_fs, labels, data = read_density_file(str(config.DENSITY_FILE))
     column_indices = normalize_columns(labels, config.DENSITY_COLUMNS)
-    validate_selected_data(config.DENSITY_FILE, labels, data, column_indices)
+    mask, x_limits = x_range_mask(
+        data[:, 0],
+        config.DENSITY_X_AXIS_RANGE,
+        "DENSITY_X_AXIS_RANGE",
+    )
+    plot_data = data[mask]
+    validate_selected_data(config.DENSITY_FILE, labels, plot_data, column_indices)
 
     fig, ax = plt.subplots(figsize=config.FIGSIZE)
     for col in column_indices:
-        ax.plot(data[:, 0], data[:, col], linewidth=1.8, label=labels[col])
+        ax.plot(plot_data[:, 0], plot_data[:, col], linewidth=1.8, label=labels[col])
 
     ax.set_xlabel(labels[0])
     ax.set_ylabel(y_axis_label(labels, column_indices))
     ax.set_title(f"Beam density profile at t = {time_fs:.2f} fs")
+    apply_x_axis_range(ax, x_limits)
     ax.grid(True, alpha=0.3)
     if len(column_indices) > 1:
         ax.legend()

@@ -10,12 +10,17 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+def parse_header_labels(header_line: str) -> list[str]:
+    labels = re.split(r"\s{2,}", header_line.lstrip("#").strip())
+    return labels if len(labels) > 1 else labels[0].split()
+
+
 def read_header(path: Path) -> list[str]:
     with path.open("r", encoding="utf-8") as handle:
         first = handle.readline().strip()
     if not first.startswith("#"):
         raise ValueError(f"{path} does not start with a header line")
-    return first.lstrip("#").split()
+    return parse_header_labels(first)
 
 
 def read_table(path: Path) -> tuple[list[str], np.ndarray]:
@@ -131,6 +136,93 @@ def validate_selected_data(path: Path, labels: list[str], data: np.ndarray, colu
                 f"{path} column {labels[col]!r} contains {bad_count} non-finite values "
                 f"(NaN or inf). Regenerate the simulation output before plotting."
             )
+
+
+def normalize_x_axis_range(
+    range_config: object,
+    config_name: str = "X_AXIS_RANGE",
+) -> tuple[float | None, float | None] | None:
+    if range_config is None:
+        return None
+
+    if not isinstance(range_config, (tuple, list)) or len(range_config) != 2:
+        raise ValueError(f"{config_name} must be None or a two-item (min, max) range")
+
+    left, right = range_config
+    left_value = None if left is None else float(left)
+    right_value = None if right is None else float(right)
+
+    if left_value is None and right_value is None:
+        return None
+    if (
+        left_value is not None
+        and right_value is not None
+        and left_value >= right_value
+    ):
+        raise ValueError(f"{config_name} lower bound must be smaller than upper bound")
+
+    return left_value, right_value
+
+
+def x_range_mask(
+    x_values: np.ndarray,
+    range_config: object,
+    config_name: str = "X_AXIS_RANGE",
+) -> tuple[np.ndarray, tuple[float, float] | None]:
+    x = np.asarray(x_values)
+    finite = np.isfinite(x)
+    if not finite.all():
+        bad_count = int((~finite).sum())
+        raise ValueError(f"x axis contains {bad_count} non-finite values")
+
+    normalized = normalize_x_axis_range(range_config, config_name)
+    if normalized is None:
+        return np.ones(x.shape, dtype=bool), None
+
+    left, right = normalized
+    mask = np.ones(x.shape, dtype=bool)
+    if left is not None:
+        mask &= x >= left
+    if right is not None:
+        mask &= x <= right
+
+    if not mask.any():
+        data_min = float(np.min(x))
+        data_max = float(np.max(x))
+        requested_left = data_min if left is None else left
+        requested_right = data_max if right is None else right
+        raise ValueError(
+            f"{config_name} range [{requested_left:g}, {requested_right:g}] "
+            f"does not overlap data range [{data_min:g}, {data_max:g}]"
+        )
+
+    selected_x = x[mask]
+    x_limits = (
+        float(np.min(selected_x)) if left is None else left,
+        float(np.max(selected_x)) if right is None else right,
+    )
+    return mask, x_limits
+
+
+def apply_x_axis_range(
+    ax: plt.Axes,
+    x_limits: tuple[float, float] | None,
+) -> None:
+    if x_limits is not None:
+        ax.set_xlim(left=x_limits[0], right=x_limits[1])
+
+
+def figure_output_path(
+    results_dir: Path,
+    files: list[Path],
+    plot_name: str,
+    columns_name: str,
+) -> Path:
+    if len(files) == 1:
+        file_token = files[0].stem
+    else:
+        file_token = f"{files[0].stem}_to_{files[-1].stem}"
+    return results_dir / f"{file_token}_{plot_name}_{columns_name}.png"
 
 
 def files_for_prefix(output_dir: Path, prefix: str) -> list[Path]:

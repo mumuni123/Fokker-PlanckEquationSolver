@@ -8,6 +8,7 @@ from matplotlib import pyplot as plt
 
 import config
 from postprocess_common import (
+    apply_x_axis_range,
     filename_token,
     files_for_prefix,
     infer_time_settings,
@@ -19,6 +20,7 @@ from postprocess_common import (
     save_figure,
     snapshot_time_fs,
     validate_selected_data,
+    x_range_mask,
     y_axis_label,
 )
 
@@ -40,14 +42,30 @@ def main() -> None:
             for path in files
         ]
     )
+    mask, x_limits = x_range_mask(
+        times,
+        config.TIME_X_AXIS_RANGE,
+        "TIME_X_AXIS_RANGE",
+    )
+    plot_times = times[mask]
+    plot_values = values[mask]
+    validation_data = np.column_stack((plot_times, plot_values))
+    validation_labels = ["time[fs]", *[labels[col] for col in column_indices]]
+    validate_selected_data(
+        files[0],
+        validation_labels,
+        validation_data,
+        list(range(1, validation_data.shape[1])),
+    )
 
     fig, ax = plt.subplots(figsize=config.FIGSIZE)
     for series_id, col in enumerate(column_indices):
-        ax.plot(times, values[:, series_id], linewidth=1.8, label=labels[col])
+        ax.plot(plot_times, plot_values[:, series_id], linewidth=1.8, label=labels[col])
 
     ax.set_xlabel("time [fs]")
     ax.set_ylabel(y_axis_label(labels, column_indices))
     ax.set_title(f"{config.TIME_PREFIX} time evolution at x = {config.POSITION_UM:g} um")
+    apply_x_axis_range(ax, x_limits)
     ax.grid(True, alpha=0.3)
     if len(column_indices) > 1:
         ax.legend()

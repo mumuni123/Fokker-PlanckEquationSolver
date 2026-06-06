@@ -7,12 +7,14 @@ from matplotlib import pyplot as plt
 
 import config
 from postprocess_common import (
+    apply_x_axis_range,
     filename_token,
     normalize_plot_columns,
     normalize_columns,
     read_table,
     save_figure,
     validate_selected_data,
+    x_range_mask,
     y_axis_label,
 )
 
@@ -23,15 +25,22 @@ def main() -> None:
     labels, data = normalize_plot_columns(
         labels, data, column_indices, config.PARAMETERS_FILE
     )
-    validate_selected_data(config.SPACE_FILE, labels, data, column_indices)
+    mask, x_limits = x_range_mask(
+        data[:, 0],
+        config.SPACE_X_AXIS_RANGE,
+        "SPACE_X_AXIS_RANGE",
+    )
+    plot_data = data[mask]
+    validate_selected_data(config.SPACE_FILE, labels, plot_data, column_indices)
 
     fig, ax = plt.subplots(figsize=config.FIGSIZE)
     for col in column_indices:
-        ax.plot(data[:, 0], data[:, col], linewidth=1.8, label=labels[col])
+        ax.plot(plot_data[:, 0], plot_data[:, col], linewidth=1.8, label=labels[col])
 
     ax.set_xlabel(labels[0])
     ax.set_ylabel(y_axis_label(labels, column_indices))
     ax.set_title(f"Spatial profile: {config.SPACE_FILE.name}")
+    apply_x_axis_range(ax, x_limits)
     ax.grid(True, alpha=0.3)
     if len(column_indices) > 1:
         ax.legend()
