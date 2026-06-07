@@ -77,7 +77,11 @@ public:
                                 double mu_energy_delta_step,
                                 double E_src_in_step,
                                 double E_src_out_step,
-                                double E_balance_step);
+                                double E_balance_step,
+                                double local_max_loss_u_high,
+                                double local_x_at_max_loss_u_high,
+                                double local_f_u_max_x,
+                                double local_integral_f_u_gt_8_x);
 
     void write_fields(double time,
                       const EMFields& fields,
@@ -112,6 +116,7 @@ private:
     bool step_enabled;
     bool has_energy_reference;
     double energy_reference;
+    double initial_ke_per_particle_eV;
 };
 
 #endif

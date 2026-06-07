@@ -18,6 +18,9 @@ struct VelocityGrid {
 
     std::vector<double> v_cells;
     std::vector<double> v_faces;
+    std::vector<double> v_widths;
+    std::vector<double> inv_v_widths;
+    std::vector<double> inv_v_center_dist;
     std::vector<double> mu_cells;
     std::vector<double> mu_faces;
     std::vector<double> v2_cells;
@@ -29,6 +32,8 @@ struct VelocityGrid {
     std::vector<double> speed_cells;
     std::vector<double> mu_face_factor;
     std::vector<double> moment_weight;
+    std::vector<double> mu_flux_scale;
+    std::vector<double> mu_cfl_factor;
     std::vector<double> vx_cells;
     std::vector<double> current_weight;
 
@@ -45,6 +50,9 @@ struct VelocityGrid {
 
         v_cells.resize(Param::Nv);
         v_faces.resize(Param::Nv + 1);
+        v_widths.resize(Param::Nv);
+        inv_v_widths.resize(Param::Nv);
+        inv_v_center_dist.resize(Param::Nv + 1);
         mu_cells.resize(Param::Nmu);
         mu_faces.resize(Param::Nmu + 1);
         v2_cells.resize(Param::Nv);
@@ -56,6 +64,8 @@ struct VelocityGrid {
         speed_cells.resize(Param::Nv);
         mu_face_factor.resize(Param::Nmu + 1);
         moment_weight.resize(Param::Nv);
+        mu_flux_scale.resize(Param::Nv);
+        mu_cfl_factor.resize(Param::Nv);
         vx_cells.resize(Param::Nvmu);
         current_weight.resize(Param::Nvmu);
 
@@ -64,27 +74,58 @@ struct VelocityGrid {
         max_inv_v = 0.0;
         max_speed = 0.0;
 
-        const double weight0 = 2.0 * Const::pi * dv * dmu;
+        const double refined_u =
+            std::min(Param::momentum_refined_u, v_max);
+        const int refined_cells =
+            std::max(1, std::min(Param::momentum_refined_cells, Param::Nv - 1));
+        for (int iv = 0; iv <= Param::Nv; ++iv) {
+            if (iv <= refined_cells) {
+                v_faces[iv] =
+                    refined_u * static_cast<double>(iv) / refined_cells;
+            } else {
+                const int coarse_cells = Param::Nv - refined_cells;
+                const int coarse_iv = iv - refined_cells;
+                v_faces[iv] =
+                    refined_u + (v_max - refined_u)
+                              * static_cast<double>(coarse_iv) / coarse_cells;
+            }
+        }
+        v_faces[0] = v_min;
+        v_faces[Param::Nv] = v_max;
+
         for (int iv = 0; iv < Param::Nv; ++iv) {
-            const double u = v_min + (iv + 0.5) * dv;
+            const double u_left = v_faces[iv];
+            const double u_right = v_faces[iv + 1];
+            const double width = u_right - u_left;
+            const double u = 0.5 * (u_left + u_right);
             const double u_eff = std::max(u, Param::u_floor);
             const double gamma = std::sqrt(1.0 + u * u);
             const double beta = u / gamma;
             v_cells[iv] = u;
+            v_widths[iv] = width;
+            inv_v_widths[iv] = 1.0 / width;
             v2_cells[iv] = u_eff * u_eff;
             inv_v_cells[iv] = 1.0 / u_eff;
             inv_v2_cells[iv] = 1.0 / (u_eff * u_eff);
             gamma_cells[iv] = gamma;
             beta_cells[iv] = beta;
             speed_cells[iv] = Const::c * beta;
-            moment_weight[iv] = weight0 * u * u;
+            moment_weight[iv] =
+                2.0 * Const::pi * dmu
+                * (u_right * u_right * u_right
+                   - u_left * u_left * u_left) / 3.0;
+            mu_flux_scale[iv] = moment_weight[iv] * inv_dmu;
             max_inv_v = std::max(max_inv_v, inv_v_cells[iv]);
             max_speed = std::max(max_speed, speed_cells[iv]);
         }
+        inv_v_center_dist[0] = inv_v_widths[0];
+        inv_v_center_dist[Param::Nv] = inv_v_widths[Param::Nv - 1];
+        for (int iv = 1; iv < Param::Nv; ++iv) {
+            inv_v_center_dist[iv] =
+                1.0 / (v_cells[iv] - v_cells[iv - 1]);
+        }
         for (int iv = 0; iv <= Param::Nv; ++iv) {
-            const double uf = v_min + iv * dv;
-            v_faces[iv] = uf;
-            v2_faces[iv] = uf * uf;
+            v2_faces[iv] = v_faces[iv] * v_faces[iv];
         }
         for (int imu = 0; imu < Param::Nmu; ++imu) {
             const double mu = mu_min + (imu + 0.5) * dmu;
@@ -96,6 +137,10 @@ struct VelocityGrid {
             mu_faces[imu] = muf;
             mu_face_factor[imu] = 1.0 - muf * muf;
             max_mu_face_factor = std::max(max_mu_face_factor, mu_face_factor[imu]);
+        }
+        for (int iv = 0; iv < Param::Nv; ++iv) {
+            mu_cfl_factor[iv] =
+                max_mu_face_factor * inv_v_cells[iv] * inv_dmu;
         }
         for (int iv = 0; iv < Param::Nv; ++iv) {
             for (int imu = 0; imu < Param::Nmu; ++imu) {

@@ -59,9 +59,15 @@ namespace Param {
     const double beam_macro_weight = densb * dx / beam_macro_particles_per_cell;
     const double beam_source_x_start = 0.5 * Const::micro;
     const double beam_source_length  = 0.3 * Const::micro;
+    const double beam_charge_compensation_alpha = 0.9;
+    const double background_reservoir_drift_speed = jb / (Const::qe * dens);
     const double background_reservoir_u_return = -jb / (Const::qe * dens);
     const bool   enable_dynamic_background_reservoir = true;
     const double background_reservoir_charge_feedback = 1.0;
+    const int    background_reservoir_feedback_cells = 8;
+    const double background_reservoir_feedback_limit_fraction = 0.35;
+    const double background_reservoir_density_relaxation = 0.25;
+    const double background_reservoir_min_flux_fraction = 0.05;
     const double background_reservoir_min_density_factor = 0.0;
     const double background_reservoir_max_density_factor = 8.0;
 
@@ -73,6 +79,9 @@ namespace Param {
 
     const double Nsigma = 80.0;
     const double momentum_umax = 10.0;
+    const double momentum_refined_u = 0.2;
+    const int    momentum_refined_cells = 32;
+    const double diagnostic_tail_u_min = 8.0;
     const double vmax_fraction_c = 0.995;
     const int Nghost = 3;
 

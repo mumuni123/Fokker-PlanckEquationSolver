@@ -74,7 +74,6 @@ double CollisionOperator::apply(Species& sp, double dt,
     double lnL = coulomb_log(n_field, T_field);
     const int ng = sp.sgrid->nghost;
     const int nxl = sp.sgrid->nx_local;
-    const double inv_dv = sp.vgrid.inv_dv;
     const double inv_dmu = sp.vgrid.inv_dmu;
 
     std::vector<double> nu_perp(Param::Nv, 0.0);
@@ -131,17 +130,21 @@ double CollisionOperator::apply(Species& sp, double dt,
                     double fL = sp.f[row_left + imu];
                     double f_up = (flux_A_face[iv] >= 0.0) ? fL : f0;
                     flux_v_l = flux_A_face[iv] * f_up
-                             - 0.5 * flux_D_face[iv] * (f0 - fL) * inv_dv;
+                             - 0.5 * flux_D_face[iv] * (f0 - fL)
+                             * sp.vgrid.inv_v_center_dist[iv];
                 }
 
                 if (has_right_v) {
                     double fR = sp.f[row_right + imu];
                     double f_up = (flux_A_face[iv + 1] >= 0.0) ? f0 : fR;
                     flux_v_r = flux_A_face[iv + 1] * f_up
-                             - 0.5 * flux_D_face[iv + 1] * (fR - f0) * inv_dv;
+                             - 0.5 * flux_D_face[iv + 1] * (fR - f0)
+                             * sp.vgrid.inv_v_center_dist[iv + 1];
                 }
 
-                double radial = -(flux_v_r - flux_v_l) / v2 * inv_dv;
+                double radial =
+                    -(flux_v_r - flux_v_l) / v2
+                    * sp.vgrid.inv_v_widths[iv];
 
                 double flux_mu_l = 0.0;
                 double flux_mu_r = 0.0;

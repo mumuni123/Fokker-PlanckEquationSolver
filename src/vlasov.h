@@ -46,6 +46,18 @@ public:
     double last_loss_v() const { return last_loss_v_; }
     double last_loss_v_low() const { return last_loss_v_low_; }
     double last_loss_v_high() const { return last_loss_v_high_; }
+    double last_loss_v_high_local_max() const {
+        return last_loss_v_high_local_max_;
+    }
+    double last_x_at_max_loss_v_high() const {
+        return last_x_at_max_loss_v_high_;
+    }
+    double last_f_umax_at_max_loss_v_high() const {
+        return last_f_umax_at_max_loss_v_high_;
+    }
+    double last_integral_f_u_gt_8_at_max_loss_v_high() const {
+        return last_integral_f_u_gt_8_at_max_loss_v_high_;
+    }
     double last_loss_mu() const { return last_loss_mu_; }
     double last_loss_x_left() const { return last_loss_x_left_; }
     double last_loss_x_right() const { return last_loss_x_right_; }
@@ -88,6 +100,10 @@ private:
     double last_loss_v_;
     double last_loss_v_low_;
     double last_loss_v_high_;
+    double last_loss_v_high_local_max_;
+    double last_x_at_max_loss_v_high_;
+    double last_f_umax_at_max_loss_v_high_;
+    double last_integral_f_u_gt_8_at_max_loss_v_high_;
     double last_loss_mu_;
     double last_loss_x_left_;
     double last_loss_x_right_;

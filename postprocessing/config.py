@@ -19,11 +19,11 @@ TIME_COLUMNS = ["Ex[V/m]"]
 TIME_X_AXIS_RANGE = None
 
 # Settings for plot_space_profile.py.
-SPACE_FILE = DATA_DIR / "fields_00010.dat"
+SPACE_FILE = DATA_DIR / "fields_00005.dat"
 SPACE_COLUMNS = ["Ex[V/m]"]
 # Use None to plot the full available range, or set (min, max) to restrict it.
 # Bounds can also be None individually, e.g. (1.0, None).
-SPACE_X_AXIS_RANGE = (0.1,7.9)
+SPACE_X_AXIS_RANGE = None
 
 # Settings for plot_beam_density_profile.py.
 DENSITY_FILE = DATA_DIR / "density_00010.dat"

@@ -56,8 +56,8 @@ void Species::init(const std::string& n, SpeciesType t,
     temperature = temp;
     reservoir_density_left = dens;
     reservoir_density_right = dens;
-    reservoir_drift_left = Param::background_reservoir_u_return;
-    reservoir_drift_right = Param::background_reservoir_u_return;
+    reservoir_drift_left = Param::background_reservoir_drift_speed;
+    reservoir_drift_right = -Param::background_reservoir_drift_speed;
     collisions_enabled = coll;
     relativistic_push = (type == SpeciesType::BEAM);
     sgrid = &sg;

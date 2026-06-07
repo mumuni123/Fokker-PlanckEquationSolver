@@ -110,9 +110,21 @@ inline double f_v_line(const Species& sp, size_t xbase, int iv, int imu)
 inline double slope_v_line(const Species& sp, size_t xbase, int iv, int imu)
 {
     if (iv <= 0 || iv >= Param::Nv - 1) return 0.0;
-    return mc_limited_slope(f_v_line(sp, xbase, iv - 1, imu),
-                            f_v_line(sp, xbase, iv, imu),
-                            f_v_line(sp, xbase, iv + 1, imu));
+    const double fm = f_v_line(sp, xbase, iv - 1, imu);
+    const double f0 = f_v_line(sp, xbase, iv, imu);
+    const double fp = f_v_line(sp, xbase, iv + 1, imu);
+    const double dl =
+        (f0 - fm) * sp.vgrid.inv_v_center_dist[iv];
+    const double dr =
+        (fp - f0) * sp.vgrid.inv_v_center_dist[iv + 1];
+    if (dl * dr <= 0.0) return 0.0;
+
+    const double centered =
+        (fp - fm) / (sp.vgrid.v_cells[iv + 1] - sp.vgrid.v_cells[iv - 1]);
+    const double sign = (centered >= 0.0) ? 1.0 : -1.0;
+    return sign * std::min(std::fabs(centered),
+                           std::min(2.0 * std::fabs(dl),
+                                    2.0 * std::fabs(dr)));
 }
 
 inline double reconstruct_v_face(const Species& sp, size_t xbase,
@@ -121,12 +133,16 @@ inline double reconstruct_v_face(const Species& sp, size_t xbase,
     if (speed >= 0.0) {
         const int iv = face - 1;
         return std::max(0.0, f_v_line(sp, xbase, iv, imu)
-                             + 0.5 * slope_v_line(sp, xbase, iv, imu));
+                             + slope_v_line(sp, xbase, iv, imu)
+                             * (sp.vgrid.v_faces[face]
+                                - sp.vgrid.v_cells[iv]));
     }
 
     const int iv = face;
     return std::max(0.0, f_v_line(sp, xbase, iv, imu)
-                         - 0.5 * slope_v_line(sp, xbase, iv, imu));
+                         + slope_v_line(sp, xbase, iv, imu)
+                         * (sp.vgrid.v_faces[face]
+                            - sp.vgrid.v_cells[iv]));
 }
 
 inline double f_mu_line(const Species& sp, size_t row, int imu)
@@ -172,6 +188,10 @@ VlasovSolver::VlasovSolver()
       last_loss_v_(0.0),
       last_loss_v_low_(0.0),
       last_loss_v_high_(0.0),
+      last_loss_v_high_local_max_(0.0),
+      last_x_at_max_loss_v_high_(0.0),
+      last_f_umax_at_max_loss_v_high_(0.0),
+      last_integral_f_u_gt_8_at_max_loss_v_high_(0.0),
       last_loss_mu_(0.0),
       last_loss_x_left_(0.0),
       last_loss_x_right_(0.0),
@@ -288,6 +308,7 @@ void VlasovSolver::update_dynamic_reservoir(Species& sp,
                                             int mpi_rank,
                                             int mpi_size)
 {
+    (void)beam_injected_number;
     (void)beam_outflow_number;
     if (!Param::enable_dynamic_background_reservoir ||
         sp.type != SpeciesType::BACKGROUND_ELECTRON ||
@@ -300,44 +321,106 @@ void VlasovSolver::update_dynamic_reservoir(Species& sp,
     local_boundary_outflow_fluxes(sp, sg, mpi_rank, mpi_size,
                                   local_left_out, local_right_out);
 
-    double local_left_charge_residual = 0.0;
-    double local_right_charge_residual = 0.0;
+    double local_left_charge_residual_sum = 0.0;
+    double local_right_charge_residual_sum = 0.0;
+    double local_left_charge_residual_count = 0.0;
+    double local_right_charge_residual_count = 0.0;
     const int ng = sg.nghost;
+    const int layer_cells =
+        std::min(Param::background_reservoir_feedback_cells, sg.nx_local);
     if (mpi_rank == 0) {
-        local_left_charge_residual = fields.rho[ng] / Const::qe;
+        for (int i = 0; i < layer_cells; ++i) {
+            local_left_charge_residual_sum += fields.rho[ng + i] / Const::qe;
+            local_left_charge_residual_count += 1.0;
+        }
     }
     if (mpi_rank == mpi_size - 1) {
-        local_right_charge_residual =
-            fields.rho[ng + sg.nx_local - 1] / Const::qe;
+        for (int i = 0; i < layer_cells; ++i) {
+            local_right_charge_residual_sum +=
+                fields.rho[ng + sg.nx_local - 1 - i] / Const::qe;
+            local_right_charge_residual_count += 1.0;
+        }
     }
 
-    double local_beam_injected = beam_injected_number;
-    double global_values[5] = { 0.0, 0.0, 0.0, 0.0, 0.0 };
-    double local_values[5] = {
+    double global_values[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    double local_values[6] = {
         local_left_out,
         local_right_out,
-        local_left_charge_residual,
-        local_right_charge_residual,
-        local_beam_injected
+        local_left_charge_residual_sum,
+        local_left_charge_residual_count,
+        local_right_charge_residual_sum,
+        local_right_charge_residual_count
     };
-    MPI_Allreduce(local_values, global_values, 5, MPI_DOUBLE, MPI_SUM,
+    MPI_Allreduce(local_values, global_values, 6, MPI_DOUBLE, MPI_SUM,
                   MPI_COMM_WORLD);
 
-    const double charge_scale =
-        Param::background_reservoir_charge_feedback * sg.dx / control_dt;
-    const double left_charge_flux = global_values[2] * charge_scale;
-    const double right_charge_flux = global_values[3] * charge_scale;
-    const double beam_injected_flux = std::max(0.0, global_values[4] / control_dt);
+    const double left_avg_residual =
+        (global_values[3] > 0.0) ? global_values[2] / global_values[3] : 0.0;
+    const double right_avg_residual =
+        (global_values[5] > 0.0) ? global_values[4] / global_values[5] : 0.0;
+    const double left_layer_width = global_values[3] * sg.dx;
+    const double right_layer_width = global_values[5] * sg.dx;
+    const double unit_flux_left =
+        cached_incoming_flux_per_density(sp, true);
+    const double unit_flux_right =
+        cached_incoming_flux_per_density(sp, false);
+
+    double left_charge_flux =
+        Param::background_reservoir_charge_feedback
+        * left_avg_residual * left_layer_width / control_dt;
+    double right_charge_flux =
+        Param::background_reservoir_charge_feedback
+        * right_avg_residual * right_layer_width / control_dt;
+
+    const double left_feedback_ref =
+        std::max(global_values[0], unit_flux_left * sp.reservoir_density_left);
+    const double right_feedback_ref =
+        std::max(global_values[1], unit_flux_right * sp.reservoir_density_right);
+    const double left_feedback_limit =
+        Param::background_reservoir_feedback_limit_fraction
+        * std::max(left_feedback_ref, 1.0e-30);
+    const double right_feedback_limit =
+        Param::background_reservoir_feedback_limit_fraction
+        * std::max(right_feedback_ref, 1.0e-30);
+    left_charge_flux =
+        std::max(-left_feedback_limit,
+                 std::min(left_feedback_limit, left_charge_flux));
+    right_charge_flux =
+        std::max(-right_feedback_limit,
+                 std::min(right_feedback_limit, right_charge_flux));
 
     const double target_left =
-        std::max(0.0, global_values[0] + beam_injected_flux + left_charge_flux);
+        global_values[0] + left_charge_flux;
     const double target_right =
-        std::max(0.0, global_values[1] + right_charge_flux);
+        global_values[1] + right_charge_flux;
+    const double min_target_left =
+        (global_values[0] > 0.0)
+        ? Param::background_reservoir_min_flux_fraction * global_values[0]
+        : 0.0;
+    const double min_target_right =
+        (global_values[1] > 0.0)
+        ? Param::background_reservoir_min_flux_fraction * global_values[1]
+        : 0.0;
+    const double bounded_target_left =
+        std::max(min_target_left, target_left);
+    const double bounded_target_right =
+        std::max(min_target_right, target_right);
+
+    const double target_density_left =
+        bounded_density_from_flux(sp, bounded_target_left, true);
+    const double target_density_right =
+        bounded_density_from_flux(sp, bounded_target_right, false);
+    const double relaxation =
+        std::max(0.0,
+                 std::min(1.0,
+                          Param::background_reservoir_density_relaxation));
 
     sp.reservoir_density_left =
-        bounded_density_from_flux(sp, target_left, true);
+        sp.reservoir_density_left
+        + relaxation * (target_density_left - sp.reservoir_density_left);
     sp.reservoir_density_right =
-        bounded_density_from_flux(sp, target_right, false);
+        sp.reservoir_density_right
+        + relaxation * (target_density_right - sp.reservoir_density_right);
 }
 
 void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
@@ -398,6 +481,10 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
     last_loss_v_ = 0.0;
     last_loss_v_low_ = 0.0;
     last_loss_v_high_ = 0.0;
+    last_loss_v_high_local_max_ = 0.0;
+    last_x_at_max_loss_v_high_ = 0.0;
+    last_f_umax_at_max_loss_v_high_ = 0.0;
+    last_integral_f_u_gt_8_at_max_loss_v_high_ = 0.0;
     last_mass_error_v_ = 0.0;
     last_momentum_delta_v_ = 0.0;
     last_energy_delta_v_ = 0.0;
@@ -405,14 +492,23 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
     const int ng = sg.nghost;
     const int nxl = sg.nx_local;
     double max_cfl = 0.0;
-    const double cfl_scale = dt * sp.vgrid.inv_dv * sp.vgrid.max_abs_mu;
+    const bool track_high_loss_location = step_diagnostics_enabled_;
+    std::vector<double> loss_high_by_x;
+    if (track_high_loss_location) {
+        loss_high_by_x.assign(static_cast<size_t>(nxl), 0.0);
+    }
 
-    #pragma omp parallel for schedule(static) reduction(max:max_cfl)
+    #pragma omp parallel for collapse(2) schedule(static) reduction(max:max_cfl)
     for (int ix = 0; ix < nxl; ++ix) {
-        const int ix_g = ix + ng;
-        const double udot_abs =
-            std::fabs(sp.charge * fields.Ex[ix_g] / (sp.mass * Const::c));
-        max_cfl = std::max(max_cfl, udot_abs * cfl_scale);
+        for (int iv = 0; iv < Param::Nv; ++iv) {
+            const int ix_g = ix + ng;
+            const double udot_abs =
+                std::fabs(sp.charge * fields.Ex[ix_g] / (sp.mass * Const::c));
+            const double cfl =
+                dt * udot_abs * sp.vgrid.max_abs_mu
+                * sp.vgrid.inv_v_widths[iv];
+            max_cfl = std::max(max_cfl, cfl);
+        }
     }
 
     last_nsub_v_ = substeps_from_cfl(max_cfl, Param::velocity_space_cfl);
@@ -483,9 +579,7 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
 
                 if (vdot > 0.0) {
                     const double f_face =
-                        std::max(0.0, f_v_line(sp, xbase, Param::Nv - 1, imu)
-                                      + 0.5 * slope_v_line(sp, xbase,
-                                                           Param::Nv - 1, imu));
+                        reconstruct_v_face(sp, xbase, Param::Nv, imu, vdot);
                     flux[static_cast<size_t>(Param::Nv)] =
                         face_weight_base * sp.vgrid.v2_faces[Param::Nv] * vdot * f_face;
                     outgoing[static_cast<size_t>(Param::Nv - 1)] +=
@@ -519,7 +613,13 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
                     const double ff = flux[static_cast<size_t>(Param::Nv)];
                     new_mass[static_cast<size_t>(Param::Nv - 1)] -= dt_sub * ff;
                     if (track_step_diagnostics || track_vmax_loss) {
-                        loss_high_sub += dt_sub * ff * sg.dx;
+                        const double loss_high = dt_sub * ff * sg.dx;
+                        loss_high_sub += loss_high;
+                        if (track_high_loss_location) {
+                            #pragma omp atomic
+                            loss_high_by_x[static_cast<size_t>(ix)] +=
+                                loss_high;
+                        }
                     }
                 }
 
@@ -560,6 +660,49 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
             last_energy_delta_v_ += ke_after_sub - ke_before_sub;
         }
     }
+
+    if (track_high_loss_location) {
+        int ix_at_max = -1;
+        for (int ix = 0; ix < nxl; ++ix) {
+            const double loss = loss_high_by_x[static_cast<size_t>(ix)];
+            if (loss > last_loss_v_high_local_max_) {
+                last_loss_v_high_local_max_ = loss;
+                ix_at_max = ix;
+            }
+        }
+        if (ix_at_max >= 0) {
+            const int ix_g = ix_at_max + ng;
+            const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
+            const int iv_umax = Param::Nv - 1;
+            const size_t row_umax =
+                xbase + static_cast<size_t>(iv_umax) * Param::Nmu;
+            double f_umax_mu_integral = 0.0;
+            for (int imu = 0; imu < Param::Nmu; ++imu) {
+                f_umax_mu_integral +=
+                    std::max(0.0, sp.f[row_umax + static_cast<size_t>(imu)])
+                    * sp.vgrid.dmu;
+            }
+
+            double tail_density = 0.0;
+            for (int iv = 0; iv < Param::Nv; ++iv) {
+                if (sp.vgrid.v_cells[iv] <= Param::diagnostic_tail_u_min) {
+                    continue;
+                }
+                const double shell = sp.vgrid.moment_weight[iv];
+                const size_t row =
+                    xbase + static_cast<size_t>(iv) * Param::Nmu;
+                for (int imu = 0; imu < Param::Nmu; ++imu) {
+                    tail_density +=
+                        std::max(0.0, sp.f[row + static_cast<size_t>(imu)])
+                        * shell;
+                }
+            }
+
+            last_x_at_max_loss_v_high_ = sg.x(ix_g);
+            last_f_umax_at_max_loss_v_high_ = 0.5 * f_umax_mu_integral;
+            last_integral_f_u_gt_8_at_max_loss_v_high_ = tail_density;
+        }
+    }
 }
 
 void VlasovSolver::advect_mu(Species& sp, const SpatialGrid& sg,
@@ -574,21 +717,21 @@ void VlasovSolver::advect_mu(Species& sp, const SpatialGrid& sg,
     const int ng = sg.nghost;
     const int nxl = sg.nx_local;
     double max_cfl = 0.0;
-    const double cfl_scale =
-        dt * sp.vgrid.max_mu_face_factor * sp.vgrid.max_inv_v * sp.vgrid.inv_dmu;
 
-    #pragma omp parallel for schedule(static) reduction(max:max_cfl)
+    #pragma omp parallel for collapse(2) schedule(static) reduction(max:max_cfl)
     for (int ix = 0; ix < nxl; ++ix) {
-        const int ix_g = ix + ng;
-        const double udot_abs =
-            std::fabs(sp.charge * fields.Ex[ix_g] / (sp.mass * Const::c));
-        max_cfl = std::max(max_cfl, udot_abs * cfl_scale);
+        for (int iv = 0; iv < Param::Nv; ++iv) {
+            const int ix_g = ix + ng;
+            const double udot_abs =
+                std::fabs(sp.charge * fields.Ex[ix_g] / (sp.mass * Const::c));
+            max_cfl = std::max(max_cfl,
+                               dt * udot_abs * sp.vgrid.mu_cfl_factor[iv]);
+        }
     }
 
     last_nsub_mu_ = substeps_from_cfl(max_cfl, Param::velocity_space_cfl);
     last_cfl_mu_ = max_cfl / last_nsub_mu_;
     const double dt_sub = dt / last_nsub_mu_;
-    const double face_weight_base = 2.0 * Const::pi * sp.vgrid.dv;
 
     for (int isub = 0; isub < last_nsub_mu_; ++isub) {
         double n_before_sub = 0.0;
@@ -610,7 +753,7 @@ void VlasovSolver::advect_mu(Species& sp, const SpatialGrid& sg,
                     sp.charge * fields.Ex[ix_g] / (sp.mass * Const::c);
                 const double u = sp.vgrid.v_cells[iv];
                 const double u_eff = std::max(u, Param::u_floor);
-                const double mu_flux_scale = face_weight_base * u * u;
+                const double mu_flux_scale = sp.vgrid.mu_flux_scale[iv];
                 std::array<double, Param::Nmu> mass;
                 std::array<double, Param::Nmu> new_mass;
                 std::array<double, Param::Nmu + 1> flux;

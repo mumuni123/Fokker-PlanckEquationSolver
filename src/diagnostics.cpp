@@ -22,7 +22,8 @@ Diagnostics::Diagnostics()
       debug_enabled(false),
       step_enabled(false),
       has_energy_reference(false),
-      energy_reference(0.0)
+      energy_reference(0.0),
+      initial_ke_per_particle_eV(0.0)
 {}
 
 namespace {
@@ -107,6 +108,45 @@ void gather_max_ex_location(double local_max_abs_Ex,
         }
     }
 }
+
+void gather_max_loss_u_high_location(double local_max_loss,
+                                     double local_x,
+                                     double local_f_u_max_x,
+                                     double local_integral_f_u_gt_8_x,
+                                     int mpi_rank,
+                                     int mpi_size,
+                                     double& global_x,
+                                     double& global_f_u_max_x,
+                                     double& global_integral_f_u_gt_8_x)
+{
+    double local_values[4] = {
+        local_max_loss,
+        local_x,
+        local_f_u_max_x,
+        local_integral_f_u_gt_8_x
+    };
+    std::vector<double> gathered;
+    if (mpi_rank == 0) gathered.assign(static_cast<size_t>(4 * mpi_size), 0.0);
+    MPI_Gather(local_values, 4, MPI_DOUBLE,
+               mpi_rank == 0 ? gathered.data() : static_cast<double*>(0),
+               4, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    if (mpi_rank == 0) {
+        double best_loss = -1.0;
+        global_x = 0.0;
+        global_f_u_max_x = 0.0;
+        global_integral_f_u_gt_8_x = 0.0;
+        for (int r = 0; r < mpi_size; ++r) {
+            const size_t base = static_cast<size_t>(4 * r);
+            if (gathered[base] > best_loss) {
+                best_loss = gathered[base];
+                global_x = gathered[base + 1];
+                global_f_u_max_x = gathered[base + 2];
+                global_integral_f_u_gt_8_x = gathered[base + 3];
+            }
+        }
+    }
+}
 }
 
 void Diagnostics::init(const std::string& dir, int mpi_rank,
@@ -173,7 +213,12 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                       << "E_src_in[J/m2]  E_src_out[J/m2]  "
                       << "E_collision_step[J/m2]  E_balance_step[J/m2]  "
                       << "E_beam_injected_cum[J/m2]  "
-                      << "E_beam_outflow_cum[J/m2]  E_collision_cum[J/m2]\n";
+                      << "E_beam_outflow_cum[J/m2]  E_collision_cum[J/m2]  "
+                      << "initial_KE_per_particle_eV  "
+                      << "effective_T_eV  "
+                      << "x_at_max_loss_u_high[m]  "
+                      << "f_u_max_x_mu_avg[u^-3_m^-3]  "
+                      << "integral_f_u_gt_8_x[m^-3]\n";
             step_file << std::scientific << std::setprecision(8);
         }
     }
@@ -267,6 +312,10 @@ void Diagnostics::write_scalars(double time, int step,
             has_energy_reference = true;
         }
         const double balance_error = accounted_energy - energy_reference;
+        if (step == 0 && global_values[0] > 0.0) {
+            initial_ke_per_particle_eV =
+                global_values[1] / global_values[0] / Const::eV;
+        }
 
         scalar_file << step << "  "
                     << time / Const::femto << "  "
@@ -421,7 +470,11 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                                          double mu_energy_delta_step,
                                          double E_src_in_step,
                                          double E_src_out_step,
-                                         double E_balance_step)
+                                         double E_balance_step,
+                                         double local_max_loss_u_high,
+                                         double local_x_at_max_loss_u_high,
+                                         double local_f_u_max_x,
+                                         double local_integral_f_u_gt_8_x)
 {
     if (!step_enabled) return;
 
@@ -510,12 +563,23 @@ void Diagnostics::write_step_diagnostics(int step, double time,
     double global_N_bkg_e = 0.0;
     double global_N_beam_macro = 0.0;
     double global_N_beam_weighted = 0.0;
+    double global_x_at_max_loss_u_high = 0.0;
+    double global_f_u_max_x = 0.0;
+    double global_integral_f_u_gt_8_x = 0.0;
     int local_nsub[4] = { nsub_v1, nsub_mu1, nsub_v2, nsub_mu2 };
     int global_nsub[4] = { 0, 0, 0, 0 };
 
     gather_max_ex_location(local_max_abs_Ex, local_x_at_max_abs_Ex,
                            mpi_rank, mpi_size,
                            global_max_abs_Ex, global_x_at_max_abs_Ex);
+    gather_max_loss_u_high_location(local_max_loss_u_high,
+                                    local_x_at_max_loss_u_high,
+                                    local_f_u_max_x,
+                                    local_integral_f_u_gt_8_x,
+                                    mpi_rank, mpi_size,
+                                    global_x_at_max_loss_u_high,
+                                    global_f_u_max_x,
+                                    global_integral_f_u_gt_8_x);
     MPI_Reduce(&local_charge_residual_int, &global_charge_residual_int, 1,
                MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_charge_residual_abs_max,
@@ -538,6 +602,13 @@ void Diagnostics::write_step_diagnostics(int step, double time,
     MPI_Reduce(local_energy, global_energy, 22, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
     if (mpi_rank == 0) {
+        const double current_ke_per_particle_eV =
+            (global_N_bkg_e > 0.0)
+            ? global_energy[0] / global_N_bkg_e / Const::eV
+            : 0.0;
+        const double effective_T_eV =
+            (2.0 / 3.0) * current_ke_per_particle_eV;
+
         step_file << step << "  "
                   << time / Const::femto << "  "
                   << global_max_abs_Ex << "  "
@@ -588,7 +659,12 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << global_energy[18] << "  "
                   << global_energy[19] << "  "
                   << global_energy[20] << "  "
-                  << global_energy[21] << "\n";
+                  << global_energy[21] << "  "
+                  << initial_ke_per_particle_eV << "  "
+                  << effective_T_eV << "  "
+                  << global_x_at_max_loss_u_high << "  "
+                  << global_f_u_max_x << "  "
+                  << global_integral_f_u_gt_8_x << "\n";
         step_file.flush();
     }
 }

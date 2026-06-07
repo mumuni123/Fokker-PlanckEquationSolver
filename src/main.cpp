@@ -22,7 +22,13 @@ double compute_dt(const Species& electron, const SpatialGrid& sg)
     double udot_est = std::abs(electron.charge) * e_est /
                     (electron.mass * Const::c);
     if (udot_est > 1.0e-30) {
-        dt_min = std::min(dt_min, 0.25 * electron.vgrid.dv / udot_est);
+        double min_du = electron.vgrid.v_widths.empty()
+                      ? electron.vgrid.dv
+                      : electron.vgrid.v_widths[0];
+        for (size_t iv = 1; iv < electron.vgrid.v_widths.size(); ++iv) {
+            min_du = std::min(min_du, electron.vgrid.v_widths[iv]);
+        }
+        dt_min = std::min(dt_min, 0.25 * min_du / udot_est);
     }
     dt_min *= Param::dt_multiplier;
     return std::min(dt_min, 0.01 * Const::femto);
@@ -36,6 +42,103 @@ const char* poisson_solver_name()
 std::vector<double> build_local_ion_density_profile(const SpatialGrid& sg)
 {
     return std::vector<double>(static_cast<size_t>(sg.nx_local), Param::dens);
+}
+
+double cell_number_density_from_distribution(const Species& electrons,
+                                             const SpatialGrid& sg,
+                                             int ix)
+{
+    const size_t xbase =
+        static_cast<size_t>(ix + sg.nghost) * Param::Nvmu;
+    double density = 0.0;
+    for (int iv = 0; iv < Param::Nv; ++iv) {
+        const double shell = electrons.vgrid.moment_weight[iv];
+        const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
+        for (int imu = 0; imu < Param::Nmu; ++imu) {
+            density += std::max(0.0, electrons.f[row + imu]) * shell;
+        }
+    }
+    return density;
+}
+
+void apply_background_density_delta(Species& electrons,
+                                    const SpatialGrid& sg,
+                                    const std::vector<double>& delta_nb)
+{
+    if (electrons.type != SpeciesType::BACKGROUND_ELECTRON ||
+        delta_nb.empty() ||
+        Param::beam_charge_compensation_alpha == 0.0) {
+        return;
+    }
+
+    std::vector<double> unit_maxwellian;
+    electrons.fill_maxwellian_velocity_slice(unit_maxwellian, 1.0,
+                                             electrons.temperature, 0.0);
+
+    #pragma omp parallel for schedule(static)
+    for (int ix = 0; ix < sg.nx_local; ++ix) {
+        if (ix >= static_cast<int>(delta_nb.size())) continue;
+        const double delta_ne =
+            -Param::beam_charge_compensation_alpha
+            * delta_nb[static_cast<size_t>(ix)];
+        if (delta_ne == 0.0) continue;
+
+        const size_t xbase =
+            static_cast<size_t>(ix + sg.nghost) * Param::Nvmu;
+        if (delta_ne > 0.0) {
+            for (size_t k = 0; k < Param::Nvmu; ++k) {
+                electrons.f[xbase + k] += delta_ne * unit_maxwellian[k];
+            }
+        } else {
+            const double current_density =
+                cell_number_density_from_distribution(electrons, sg, ix);
+            if (!(current_density > 0.0)) continue;
+            const double target_density =
+                std::max(0.0, current_density + delta_ne);
+            const double scale = target_density / current_density;
+            for (size_t k = 0; k < Param::Nvmu; ++k) {
+                electrons.f[xbase + k] *= scale;
+            }
+        }
+    }
+}
+
+void apply_beam_charge_compensation(Species& electrons,
+                                    const BeamPIC& beam,
+                                    const SpatialGrid& sg,
+                                    std::vector<double>& previous_source_delta,
+                                    std::vector<double>& previous_path_delta,
+                                    std::vector<double>& previous_absorber_delta,
+                                    bool include_boundary_injection)
+{
+    if (previous_source_delta.size() != static_cast<size_t>(sg.nx_local)) {
+        previous_source_delta.assign(sg.nx_local, 0.0);
+        previous_path_delta.assign(sg.nx_local, 0.0);
+        previous_absorber_delta.assign(sg.nx_local, 0.0);
+    }
+
+    std::vector<double> delta_nb(static_cast<size_t>(sg.nx_local), 0.0);
+    bool has_delta = false;
+    for (int ix = 0; ix < sg.nx_local; ++ix) {
+        const size_t i = static_cast<size_t>(ix);
+        double delta = beam.source_density_delta[i] - previous_source_delta[i];
+        if (include_boundary_injection &&
+            Param::enable_beam_boundary_injection) {
+            const double path_inc =
+                beam.path_density_delta[i] - previous_path_delta[i];
+            if (path_inc > 0.0) delta += path_inc;
+        }
+        delta -= beam.absorber_density_delta[i] - previous_absorber_delta[i];
+        delta_nb[i] = delta;
+        has_delta = has_delta || (delta != 0.0);
+    }
+
+    if (has_delta) {
+        apply_background_density_delta(electrons, sg, delta_nb);
+    }
+    previous_source_delta = beam.source_density_delta;
+    previous_path_delta = beam.path_density_delta;
+    previous_absorber_delta = beam.absorber_density_delta;
 }
 
 void sync_moments_and_fields(Species& electrons,
@@ -181,22 +284,33 @@ int main(int argc, char** argv)
                Param::nx, Param::dx, Param::Lx);
         printf("Density profile: uniform plasma over full domain, n0 = %.3e /m^3\n",
                Param::dens);
-        printf("Electron momentum grid: Nu x Nmu = %d x %d\n", Param::Nv, Param::Nmu);
+        printf("Electron momentum grid: Nu x Nmu = %d x %d, nonuniform u with %d cells below u = %.3f\n",
+               Param::Nv, Param::Nmu,
+               Param::momentum_refined_cells,
+               Param::momentum_refined_u);
         printf("Electron momentum domain: 0 <= u <= %.3f, vx = c u mu / sqrt(1+u^2)\n",
                Param::momentum_umax);
         printf("Electrostatic boundary: grounded Dirichlet phi(0)=phi(L)=0\n");
         printf("Poisson solver: %s\n", poisson_solver_name());
         printf("Fixed ions: uniform Z*n_i = %.3e /m^3\n", Param::dens);
-        printf("Background electrons: dynamic boundary reservoir/open ghosts, T_e = %.1f eV, u_return = %.6e m/s\n",
+        printf("Background electrons: dynamic boundary reservoir/open ghosts, T_e = %.1f eV, reservoir drift left/right = %.6e / %.6e m/s\n",
                Param::temperature_e / Const::eV,
-               Param::background_reservoir_u_return);
-        printf("Reservoir control: boundary outflow + beam injection + local charge residual, density clamp = [%.2f, %.2f] n0\n",
+               Param::background_reservoir_drift_speed,
+               -Param::background_reservoir_drift_speed);
+        printf("Reservoir control: background boundary outflow balance + weak averaged residual feedback, density clamp = [%.2f, %.2f] n0\n",
                Param::background_reservoir_min_density_factor,
                Param::background_reservoir_max_density_factor);
+        printf("Reservoir feedback: %d-cell boundary average, limit %.2f, relaxation %.2f, min flux %.2f outflow\n",
+               Param::background_reservoir_feedback_cells,
+               Param::background_reservoir_feedback_limit_fraction,
+               Param::background_reservoir_density_relaxation,
+               Param::background_reservoir_min_flux_fraction);
         printf("PIC beam: gamma*beta = %.2f, beta = %.4f, n_b = %.3e /m^3\n",
                Param::gambetab, Param::betab, Param::densb);
         printf("Beam source: quiet-start left boundary injection at x = 0\n");
         printf("Beam injection: charge-conserving path current, centered before Poisson\n");
+        printf("Beam charge compensation: Delta n_e = -%.3f Delta n_b for injection and right absorber\n",
+               Param::beam_charge_compensation_alpha);
         printf("Beam boundary: particles crossing the domain edge are deleted and counted in the energy ledger\n");
         printf("Return current: boundary reservoir and Vlasov response\n");
         printf("Beam macro weight: %.6e particles/m^2\n", Param::beam_macro_weight);
@@ -275,6 +389,9 @@ int main(int argc, char** argv)
     double next_snapshot = Param::dt_snapshot;
     int stdout_freq = 1000;
     int last_snapshot_step = 0;
+    std::vector<double> previous_beam_source_delta;
+    std::vector<double> previous_beam_path_delta;
+    std::vector<double> previous_beam_absorber_delta;
 
     for (int step = 1; step <= nsteps; ++step) {
         double time = step * dt;
@@ -313,6 +430,10 @@ int main(int argc, char** argv)
         double E_src_in_step = 0.0;
         double E_src_out_step = 0.0;
         double E_balance_step = 0.0;
+        double max_loss_u_high_step = 0.0;
+        double x_at_max_loss_u_high_step = 0.0;
+        double f_u_max_x_step = 0.0;
+        double integral_f_u_gt_8_x_step = 0.0;
         double beam_push_ke_before = 0.0;
         double bkg_ke_step_start = 0.0;
         double beam_ke_step_start = 0.0;
@@ -324,6 +445,9 @@ int main(int argc, char** argv)
         vlasov.set_step_diagnostics_enabled(collect_step_diagnostics);
 
         beam.begin_step(sgrid, dt);
+        previous_beam_source_delta.assign(sgrid.nx_local, 0.0);
+        previous_beam_path_delta.assign(sgrid.nx_local, 0.0);
+        previous_beam_absorber_delta.assign(sgrid.nx_local, 0.0);
 
         if (collect_step_diagnostics) {
             bkg_ke_step_start = bkg_e.total_kinetic_energy();
@@ -358,6 +482,13 @@ int main(int argc, char** argv)
         loss_v1 = vlasov.last_loss_v();
         loss_v1_low = vlasov.last_loss_v_low();
         loss_v1_high = vlasov.last_loss_v_high();
+        if (vlasov.last_loss_v_high_local_max() > max_loss_u_high_step) {
+            max_loss_u_high_step = vlasov.last_loss_v_high_local_max();
+            x_at_max_loss_u_high_step = vlasov.last_x_at_max_loss_v_high();
+            f_u_max_x_step = vlasov.last_f_umax_at_max_loss_v_high();
+            integral_f_u_gt_8_x_step =
+                vlasov.last_integral_f_u_gt_8_at_max_loss_v_high();
+        }
         v_mass_error_step += vlasov.last_mass_error_v();
         v_momentum_delta_step += vlasov.last_momentum_delta_v();
         v_energy_delta_step += vlasov.last_energy_delta_v();
@@ -395,12 +526,22 @@ int main(int argc, char** argv)
             beam_push_ke_before = beam.total_kinetic_energy();
         }
         beam.push(sgrid, fields, 0.5 * dt, mpi_rank, mpi_size);
+        apply_beam_charge_compensation(bkg_e, beam, sgrid,
+                                       previous_beam_source_delta,
+                                       previous_beam_path_delta,
+                                       previous_beam_absorber_delta,
+                                       false);
         if (collect_step_diagnostics) {
             dke_beam_push += beam.total_kinetic_energy() - beam_push_ke_before;
         }
         trace_progress(config, mpi_rank, step, "after beam half 1 push");
         trace_progress(config, mpi_rank, step, "before beam half 1 inject");
         beam.inject(sgrid, fields, 0.5 * dt, time_center, mpi_rank, mpi_size);
+        apply_beam_charge_compensation(bkg_e, beam, sgrid,
+                                       previous_beam_source_delta,
+                                       previous_beam_path_delta,
+                                       previous_beam_absorber_delta,
+                                       true);
         trace_progress(config, mpi_rank, step, "after beam half 1 inject");
         trace_progress(config, mpi_rank, step, "before beam center deposit");
         beam.deposit_density(sgrid, mpi_rank, mpi_size);
@@ -438,12 +579,22 @@ int main(int argc, char** argv)
             beam_push_ke_before = beam.total_kinetic_energy();
         }
         beam.push(sgrid, fields, 0.5 * dt, mpi_rank, mpi_size);
+        apply_beam_charge_compensation(bkg_e, beam, sgrid,
+                                       previous_beam_source_delta,
+                                       previous_beam_path_delta,
+                                       previous_beam_absorber_delta,
+                                       false);
         if (collect_step_diagnostics) {
             dke_beam_push += beam.total_kinetic_energy() - beam_push_ke_before;
         }
         trace_progress(config, mpi_rank, step, "after beam half 2 push");
         trace_progress(config, mpi_rank, step, "before beam half 2 inject");
         beam.inject(sgrid, fields, 0.5 * dt, time, mpi_rank, mpi_size);
+        apply_beam_charge_compensation(bkg_e, beam, sgrid,
+                                       previous_beam_source_delta,
+                                       previous_beam_path_delta,
+                                       previous_beam_absorber_delta,
+                                       true);
         trace_progress(config, mpi_rank, step, "after beam half 2 inject");
         trace_progress(config, mpi_rank, step, "before beam end deposit");
         beam.deposit_density(sgrid, mpi_rank, mpi_size);
@@ -484,6 +635,13 @@ int main(int argc, char** argv)
         loss_v2 = vlasov.last_loss_v();
         loss_v2_low = vlasov.last_loss_v_low();
         loss_v2_high = vlasov.last_loss_v_high();
+        if (vlasov.last_loss_v_high_local_max() > max_loss_u_high_step) {
+            max_loss_u_high_step = vlasov.last_loss_v_high_local_max();
+            x_at_max_loss_u_high_step = vlasov.last_x_at_max_loss_v_high();
+            f_u_max_x_step = vlasov.last_f_umax_at_max_loss_v_high();
+            integral_f_u_gt_8_x_step =
+                vlasov.last_integral_f_u_gt_8_at_max_loss_v_high();
+        }
         v_mass_error_step += vlasov.last_mass_error_v();
         v_momentum_delta_step += vlasov.last_momentum_delta_v();
         v_energy_delta_step += vlasov.last_energy_delta_v();
@@ -579,7 +737,11 @@ int main(int argc, char** argv)
                                         v_energy_delta_step,
                                         mu_energy_delta_step,
                                         E_src_in_step, E_src_out_step,
-                                        E_balance_step);
+                                        E_balance_step,
+                                        max_loss_u_high_step,
+                                        x_at_max_loss_u_high_step,
+                                        f_u_max_x_step,
+                                        integral_f_u_gt_8_x_step);
         }
 
         if (step % stdout_freq == 0) {
