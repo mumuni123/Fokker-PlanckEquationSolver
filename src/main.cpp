@@ -44,103 +44,6 @@ std::vector<double> build_local_ion_density_profile(const SpatialGrid& sg)
     return std::vector<double>(static_cast<size_t>(sg.nx_local), Param::dens);
 }
 
-double cell_number_density_from_distribution(const Species& electrons,
-                                             const SpatialGrid& sg,
-                                             int ix)
-{
-    const size_t xbase =
-        static_cast<size_t>(ix + sg.nghost) * Param::Nvmu;
-    double density = 0.0;
-    for (int iv = 0; iv < Param::Nv; ++iv) {
-        const double shell = electrons.vgrid.moment_weight[iv];
-        const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
-        for (int imu = 0; imu < Param::Nmu; ++imu) {
-            density += std::max(0.0, electrons.f[row + imu]) * shell;
-        }
-    }
-    return density;
-}
-
-void apply_background_density_delta(Species& electrons,
-                                    const SpatialGrid& sg,
-                                    const std::vector<double>& delta_nb)
-{
-    if (electrons.type != SpeciesType::BACKGROUND_ELECTRON ||
-        delta_nb.empty() ||
-        Param::beam_charge_compensation_alpha == 0.0) {
-        return;
-    }
-
-    std::vector<double> unit_maxwellian;
-    electrons.fill_maxwellian_velocity_slice(unit_maxwellian, 1.0,
-                                             electrons.temperature, 0.0);
-
-    #pragma omp parallel for schedule(static)
-    for (int ix = 0; ix < sg.nx_local; ++ix) {
-        if (ix >= static_cast<int>(delta_nb.size())) continue;
-        const double delta_ne =
-            -Param::beam_charge_compensation_alpha
-            * delta_nb[static_cast<size_t>(ix)];
-        if (delta_ne == 0.0) continue;
-
-        const size_t xbase =
-            static_cast<size_t>(ix + sg.nghost) * Param::Nvmu;
-        if (delta_ne > 0.0) {
-            for (size_t k = 0; k < Param::Nvmu; ++k) {
-                electrons.f[xbase + k] += delta_ne * unit_maxwellian[k];
-            }
-        } else {
-            const double current_density =
-                cell_number_density_from_distribution(electrons, sg, ix);
-            if (!(current_density > 0.0)) continue;
-            const double target_density =
-                std::max(0.0, current_density + delta_ne);
-            const double scale = target_density / current_density;
-            for (size_t k = 0; k < Param::Nvmu; ++k) {
-                electrons.f[xbase + k] *= scale;
-            }
-        }
-    }
-}
-
-void apply_beam_charge_compensation(Species& electrons,
-                                    const BeamPIC& beam,
-                                    const SpatialGrid& sg,
-                                    std::vector<double>& previous_source_delta,
-                                    std::vector<double>& previous_path_delta,
-                                    std::vector<double>& previous_absorber_delta,
-                                    bool include_boundary_injection)
-{
-    if (previous_source_delta.size() != static_cast<size_t>(sg.nx_local)) {
-        previous_source_delta.assign(sg.nx_local, 0.0);
-        previous_path_delta.assign(sg.nx_local, 0.0);
-        previous_absorber_delta.assign(sg.nx_local, 0.0);
-    }
-
-    std::vector<double> delta_nb(static_cast<size_t>(sg.nx_local), 0.0);
-    bool has_delta = false;
-    for (int ix = 0; ix < sg.nx_local; ++ix) {
-        const size_t i = static_cast<size_t>(ix);
-        double delta = beam.source_density_delta[i] - previous_source_delta[i];
-        if (include_boundary_injection &&
-            Param::enable_beam_boundary_injection) {
-            const double path_inc =
-                beam.path_density_delta[i] - previous_path_delta[i];
-            if (path_inc > 0.0) delta += path_inc;
-        }
-        delta -= beam.absorber_density_delta[i] - previous_absorber_delta[i];
-        delta_nb[i] = delta;
-        has_delta = has_delta || (delta != 0.0);
-    }
-
-    if (has_delta) {
-        apply_background_density_delta(electrons, sg, delta_nb);
-    }
-    previous_source_delta = beam.source_density_delta;
-    previous_path_delta = beam.path_density_delta;
-    previous_absorber_delta = beam.absorber_density_delta;
-}
-
 void sync_moments_and_fields(Species& electrons,
                              const BeamPIC& beam,
                              EMFields& fields,
@@ -149,33 +52,47 @@ void sync_moments_and_fields(Species& electrons,
                              int mpi_size,
                              bool& moments_current)
 {
-    electrons.compute_moments();
-    moments_current = true;
-    fields.set_charge_density(electrons, beam.density, ion_density_profile);
-    fields.solve_poisson(mpi_rank, mpi_size);
-}
-
-void refresh_dynamic_reservoir(VlasovSolver& vlasov,
-                               Species& electrons,
-                               const BeamPIC& beam,
-                               EMFields& fields,
-                               const std::vector<double>& ion_density_profile,
-                               const SpatialGrid& sgrid,
-                               double control_dt,
-                               int mpi_rank,
-                               int mpi_size,
-                               bool& moments_current)
-{
-    if (!Param::enable_dynamic_background_reservoir) return;
     if (!moments_current) {
         electrons.compute_moments();
         moments_current = true;
     }
     fields.set_charge_density(electrons, beam.density, ion_density_profile);
-    vlasov.update_dynamic_reservoir(electrons, sgrid, fields,
-                                    beam.last_injected_number(),
-                                    beam.last_outflow_number(),
-                                    control_dt, mpi_rank, mpi_size);
+    fields.solve_poisson(mpi_rank, mpi_size);
+}
+
+void configure_reservoir_boundary_inflow(VlasovSolver& vlasov,
+                                         Species& electrons,
+                                         const SpatialGrid& sg,
+                                         double dt,
+                                         double local_loss_backlog,
+                                         int mpi_rank,
+                                         int mpi_size)
+{
+    double target_number = std::max(0.0, local_loss_backlog);
+    MPI_Allreduce(MPI_IN_PLACE, &target_number, 1, MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+    vlasov.configure_boundary_reservoir_inflow(electrons, target_number, dt,
+                                               mpi_rank, mpi_size);
+}
+
+void consume_reservoir_loss_backlog(double& local_loss_backlog,
+                                    double local_boundary_inflow)
+{
+    double values[2] = {
+        std::max(0.0, local_loss_backlog),
+        std::max(0.0, local_boundary_inflow)
+    };
+    MPI_Allreduce(MPI_IN_PLACE, values, 2, MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+    const double global_loss_backlog = values[0];
+    const double global_inflow = values[1];
+    if (!(global_loss_backlog > 0.0) || !(global_inflow > 0.0)) return;
+
+    const double replaced_loss =
+        std::min(global_loss_backlog, global_inflow);
+    const double remaining_fraction =
+        std::max(0.0, 1.0 - replaced_loss / global_loss_backlog);
+    local_loss_backlog *= remaining_fraction;
 }
 
 void abort_if_vmax_loss(const VlasovSolver& vlasov,
@@ -293,24 +210,16 @@ int main(int argc, char** argv)
         printf("Electrostatic boundary: grounded Dirichlet phi(0)=phi(L)=0\n");
         printf("Poisson solver: %s\n", poisson_solver_name());
         printf("Fixed ions: uniform Z*n_i = %.3e /m^3\n", Param::dens);
-        printf("Background electrons: dynamic boundary reservoir/open ghosts, T_e = %.1f eV, reservoir drift left/right = %.6e / %.6e m/s\n",
-               Param::temperature_e / Const::eV,
-               Param::background_reservoir_drift_speed,
-               -Param::background_reservoir_drift_speed);
-        printf("Reservoir control: background boundary outflow balance + weak averaged residual feedback, density clamp = [%.2f, %.2f] n0\n",
-               Param::background_reservoir_min_density_factor,
-               Param::background_reservoir_max_density_factor);
-        printf("Reservoir feedback: %d-cell boundary average, limit %.2f, relaxation %.2f, min flux %.2f outflow\n",
-               Param::background_reservoir_feedback_cells,
-               Param::background_reservoir_feedback_limit_fraction,
-               Param::background_reservoir_density_relaxation,
-               Param::background_reservoir_min_flux_fraction);
+        printf("Background electrons: extrapolated open ghosts plus dynamic reservoir boundary inflow, T_e = %.1f eV\n",
+               Param::temperature_e / Const::eV);
+        printf("Reservoir target: boundary inflow closes only the true boundary-loss backlog; no internal quasineutrality feedback\n");
+        printf("Reservoir inflow velocity distribution: Maxwellian thermal bath with drift %.6e m/s; no beam-compensation electron source is applied\n",
+               Param::background_reservoir_source_drift_speed);
         printf("PIC beam: gamma*beta = %.2f, beta = %.4f, n_b = %.3e /m^3\n",
                Param::gambetab, Param::betab, Param::densb);
         printf("Beam source: quiet-start left boundary injection at x = 0\n");
         printf("Beam injection: charge-conserving path current, centered before Poisson\n");
-        printf("Beam charge compensation: Delta n_e = -%.3f Delta n_b for injection and right absorber\n",
-               Param::beam_charge_compensation_alpha);
+        printf("Beam charge compensation: OFF; background response is only Poisson/Vlasov plus true boundary reservoir inflow\n");
         printf("Beam boundary: particles crossing the domain edge are deleted and counted in the energy ledger\n");
         printf("Return current: boundary reservoir and Vlasov response\n");
         printf("Beam macro weight: %.6e particles/m^2\n", Param::beam_macro_weight);
@@ -327,6 +236,7 @@ int main(int argc, char** argv)
         if (config.enable_step_diagnostics) {
             printf("Step diagnostics interval: every %d steps\n",
                    config.step_diagnostics_interval);
+            printf("Conservation ledger: every step\n");
         }
         printf("Progress trace: %s\n",
                config.enable_progress_trace ? "ON" : "OFF");
@@ -341,6 +251,8 @@ int main(int argc, char** argv)
     bkg_e.init("bkg_e", SpeciesType::BACKGROUND_ELECTRON,
                -Const::qe, Const::me,
                Param::dens, Param::temperature_e, false, sgrid);
+    bkg_e.reservoir_drift_left = Param::background_reservoir_source_drift_speed;
+    bkg_e.reservoir_drift_right = Param::background_reservoir_source_drift_speed;
     bkg_e.initialize_maxwellian();
 
     BeamPIC beam;
@@ -368,12 +280,10 @@ int main(int argc, char** argv)
     }
 
     double cumulative_collision_energy_delta = 0.0;
-    bool moments_current = true;
+    double reservoir_loss_backlog = 0.0;
+    bool moments_current = false;
     sync_moments_and_fields(bkg_e, beam, fields, ion_density_profile,
                             mpi_rank, mpi_size, moments_current);
-    refresh_dynamic_reservoir(vlasov, bkg_e, beam, fields,
-                              ion_density_profile, sgrid, dt,
-                              mpi_rank, mpi_size, moments_current);
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
     if (config.enable_debug_diagnostics) {
         diag.write_debug_state(0, 0.0, "initial", bkg_e, beam, fields,
@@ -389,10 +299,6 @@ int main(int argc, char** argv)
     double next_snapshot = Param::dt_snapshot;
     int stdout_freq = 1000;
     int last_snapshot_step = 0;
-    std::vector<double> previous_beam_source_delta;
-    std::vector<double> previous_beam_path_delta;
-    std::vector<double> previous_beam_absorber_delta;
-
     for (int step = 1; step <= nsteps; ++step) {
         double time = step * dt;
         const double time_start = time - dt;
@@ -413,6 +319,11 @@ int main(int argc, char** argv)
         double loss_x1_right = 0.0;
         double loss_x2_left = 0.0;
         double loss_x2_right = 0.0;
+        double loss_x_momentum_step = 0.0;
+        double loss_x_energy_step = 0.0;
+        double reservoir_added_ne_step = 0.0;
+        double boundary_inflow_ne_step = 0.0;
+        double net_nb_change_step = 0.0;
         double collision_energy_step = 0.0;
         const bool collect_step_diagnostics =
             should_write_step_diagnostics(config, step);
@@ -445,10 +356,6 @@ int main(int argc, char** argv)
         vlasov.set_step_diagnostics_enabled(collect_step_diagnostics);
 
         beam.begin_step(sgrid, dt);
-        previous_beam_source_delta.assign(sgrid.nx_local, 0.0);
-        previous_beam_path_delta.assign(sgrid.nx_local, 0.0);
-        previous_beam_absorber_delta.assign(sgrid.nx_local, 0.0);
-
         if (collect_step_diagnostics) {
             bkg_ke_step_start = bkg_e.total_kinetic_energy();
             beam_ke_step_start = beam.total_kinetic_energy();
@@ -457,16 +364,22 @@ int main(int argc, char** argv)
             ex_step_start = copy_local_ex(fields, sgrid);
         }
 
-        trace_progress(config, mpi_rank, step, "before reservoir update 1");
-        refresh_dynamic_reservoir(vlasov, bkg_e, beam, fields,
-                                  ion_density_profile, sgrid, dt,
-                                  mpi_rank, mpi_size, moments_current);
-        trace_progress(config, mpi_rank, step, "after reservoir update 1");
         trace_progress(config, mpi_rank, step, "before x half 1");
+        configure_reservoir_boundary_inflow(vlasov, bkg_e, sgrid,
+                                            0.5 * dt,
+                                            reservoir_loss_backlog,
+                                            mpi_rank, mpi_size);
         vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size);
         trace_progress(config, mpi_rank, step, "after x half 1");
+        boundary_inflow_ne_step += vlasov.last_boundary_inflow();
+        reservoir_added_ne_step += vlasov.last_boundary_inflow();
+        consume_reservoir_loss_backlog(reservoir_loss_backlog,
+                                       vlasov.last_boundary_inflow());
         loss_x1_left = vlasov.last_loss_x_left();
         loss_x1_right = vlasov.last_loss_x_right();
+        reservoir_loss_backlog += loss_x1_left + loss_x1_right;
+        loss_x_momentum_step += vlasov.last_loss_x_momentum();
+        loss_x_energy_step += vlasov.last_loss_x_energy();
         moments_current = false;
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
         if (config.enable_debug_diagnostics) {
@@ -526,22 +439,12 @@ int main(int argc, char** argv)
             beam_push_ke_before = beam.total_kinetic_energy();
         }
         beam.push(sgrid, fields, 0.5 * dt, mpi_rank, mpi_size);
-        apply_beam_charge_compensation(bkg_e, beam, sgrid,
-                                       previous_beam_source_delta,
-                                       previous_beam_path_delta,
-                                       previous_beam_absorber_delta,
-                                       false);
         if (collect_step_diagnostics) {
             dke_beam_push += beam.total_kinetic_energy() - beam_push_ke_before;
         }
         trace_progress(config, mpi_rank, step, "after beam half 1 push");
         trace_progress(config, mpi_rank, step, "before beam half 1 inject");
         beam.inject(sgrid, fields, 0.5 * dt, time_center, mpi_rank, mpi_size);
-        apply_beam_charge_compensation(bkg_e, beam, sgrid,
-                                       previous_beam_source_delta,
-                                       previous_beam_path_delta,
-                                       previous_beam_absorber_delta,
-                                       true);
         trace_progress(config, mpi_rank, step, "after beam half 1 inject");
         trace_progress(config, mpi_rank, step, "before beam center deposit");
         beam.deposit_density(sgrid, mpi_rank, mpi_size);
@@ -579,22 +482,12 @@ int main(int argc, char** argv)
             beam_push_ke_before = beam.total_kinetic_energy();
         }
         beam.push(sgrid, fields, 0.5 * dt, mpi_rank, mpi_size);
-        apply_beam_charge_compensation(bkg_e, beam, sgrid,
-                                       previous_beam_source_delta,
-                                       previous_beam_path_delta,
-                                       previous_beam_absorber_delta,
-                                       false);
         if (collect_step_diagnostics) {
             dke_beam_push += beam.total_kinetic_energy() - beam_push_ke_before;
         }
         trace_progress(config, mpi_rank, step, "after beam half 2 push");
         trace_progress(config, mpi_rank, step, "before beam half 2 inject");
         beam.inject(sgrid, fields, 0.5 * dt, time, mpi_rank, mpi_size);
-        apply_beam_charge_compensation(bkg_e, beam, sgrid,
-                                       previous_beam_source_delta,
-                                       previous_beam_path_delta,
-                                       previous_beam_absorber_delta,
-                                       true);
         trace_progress(config, mpi_rank, step, "after beam half 2 inject");
         trace_progress(config, mpi_rank, step, "before beam end deposit");
         beam.deposit_density(sgrid, mpi_rank, mpi_size);
@@ -656,16 +549,22 @@ int main(int argc, char** argv)
         }
 #endif
 
-        trace_progress(config, mpi_rank, step, "before reservoir update 2");
-        refresh_dynamic_reservoir(vlasov, bkg_e, beam, fields,
-                                  ion_density_profile, sgrid, dt,
-                                  mpi_rank, mpi_size, moments_current);
-        trace_progress(config, mpi_rank, step, "after reservoir update 2");
         trace_progress(config, mpi_rank, step, "before x half 2");
+        configure_reservoir_boundary_inflow(vlasov, bkg_e, sgrid,
+                                            0.5 * dt,
+                                            reservoir_loss_backlog,
+                                            mpi_rank, mpi_size);
         vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size);
         trace_progress(config, mpi_rank, step, "after x half 2");
+        boundary_inflow_ne_step += vlasov.last_boundary_inflow();
+        reservoir_added_ne_step += vlasov.last_boundary_inflow();
+        consume_reservoir_loss_backlog(reservoir_loss_backlog,
+                                       vlasov.last_boundary_inflow());
         loss_x2_left = vlasov.last_loss_x_left();
         loss_x2_right = vlasov.last_loss_x_right();
+        reservoir_loss_backlog += loss_x2_left + loss_x2_right;
+        loss_x_momentum_step += vlasov.last_loss_x_momentum();
+        loss_x_energy_step += vlasov.last_loss_x_energy();
         moments_current = false;
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
         if (config.enable_debug_diagnostics) {
@@ -675,11 +574,9 @@ int main(int argc, char** argv)
 #endif
 
         if (collect_step_diagnostics) {
-            bkg_e.compute_moments();
             W_bkg_E +=
                 integrate_current_work(bkg_current_mid, bkg_e.current_x,
                                        ex_center, sgrid, 0.5 * dt);
-            moments_current = true;
         }
 
         if (bkg_e.collisions_enabled) {
@@ -700,6 +597,17 @@ int main(int argc, char** argv)
         sync_moments_and_fields(bkg_e, beam, fields, ion_density_profile,
                                 mpi_rank, mpi_size, moments_current);
         trace_progress(config, mpi_rank, step, "after end sync");
+
+        net_nb_change_step = beam.last_injected_number()
+                           - beam.last_outflow_number();
+        diag.write_conservation_ledger(
+            step, time,
+            0.0,
+            reservoir_added_ne_step,
+            loss_x1_left + loss_x1_right + loss_x2_left + loss_x2_right,
+            boundary_inflow_ne_step,
+            net_nb_change_step,
+            mpi_rank);
 
         if (collect_step_diagnostics) {
             const double bkg_ke_step_end = bkg_e.total_kinetic_energy();
@@ -726,6 +634,14 @@ int main(int argc, char** argv)
                                         loss_v2_low, loss_v2_high,
                                         loss_x1_left, loss_x1_right,
                                         loss_x2_left, loss_x2_right,
+                                        loss_x_momentum_step,
+                                        loss_x_energy_step,
+                                        0.0,
+                                        reservoir_added_ne_step,
+                                        loss_x1_left + loss_x1_right
+                                            + loss_x2_left + loss_x2_right,
+                                        boundary_inflow_ne_step,
+                                        net_nb_change_step,
                                         collision_energy_step,
                                         cumulative_collision_energy_delta,
                                         dke_bkg_step, dke_beam_push,

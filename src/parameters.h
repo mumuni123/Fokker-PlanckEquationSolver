@@ -55,21 +55,27 @@ namespace Param {
     const bool   abort_on_vmax_loss = true;
     const double umax_loss_abort_fraction = 1.0e-12;
     const double vmax_loss_abort_fraction = umax_loss_abort_fraction;
+
     const int    beam_macro_particles_per_cell = 1000; // 1000
     const double beam_macro_weight = densb * dx / beam_macro_particles_per_cell;
     const double beam_source_x_start = 0.5 * Const::micro;
     const double beam_source_length  = 0.3 * Const::micro;
-    const double beam_charge_compensation_alpha = 0.9;
+    const double beam_charge_compensation_alpha = 1.0;
+    const double beam_charge_compensation_smoothing_skin_depths = 1.5;
+
     const double background_reservoir_drift_speed = jb / (Const::qe * dens);
     const double background_reservoir_u_return = -jb / (Const::qe * dens);
     const bool   enable_dynamic_background_reservoir = true;
-    const double background_reservoir_charge_feedback = 1.0;
-    const int    background_reservoir_feedback_cells = 8;
-    const double background_reservoir_feedback_limit_fraction = 0.35;
     const double background_reservoir_density_relaxation = 0.25;
-    const double background_reservoir_min_flux_fraction = 0.05;
     const double background_reservoir_min_density_factor = 0.0;
     const double background_reservoir_max_density_factor = 8.0;
+    const double background_reservoir_injection_skin_depths = 1.0;
+    const double background_reservoir_source_length = 0.3 * Const::micro;
+    const double background_reservoir_edge_exclusion = 0.0;
+    const double background_reservoir_source_drift_speed = 0.0;
+    const double background_reservoir_source_eta = 0.08;
+    const double background_reservoir_feedback_beta = 0.05;
+    const double background_reservoir_feedback_tau = 2.0 * Const::femto;
 
     // Axisymmetric spherical momentum grid: (u, mu), u = p / (m c).
     // The distribution is normalized with d3u = 2*pi*u^2 du dmu.

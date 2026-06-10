@@ -39,15 +39,6 @@ void compute_background_boundary_fluxes(const Species& electrons,
         return;
     }
 
-    std::vector<double> reservoir_left;
-    std::vector<double> reservoir_right;
-    electrons.fill_maxwellian_velocity_slice(
-        reservoir_left, electrons.reservoir_density_left,
-        electrons.temperature, electrons.reservoir_drift_left);
-    electrons.fill_maxwellian_velocity_slice(
-        reservoir_right, electrons.reservoir_density_right,
-        electrons.temperature, electrons.reservoir_drift_right);
-
     const int ng = sg.nghost;
     if (mpi_rank == 0) {
         const size_t xbase = static_cast<size_t>(ng) * Param::Nvmu;
@@ -56,8 +47,8 @@ void compute_background_boundary_fluxes(const Species& electrons,
             const int iv = static_cast<int>(k / Param::Nmu);
             const double weight = electrons.vgrid.moment_weight[iv];
             if (vx > 0.0) {
-                values[0] += vx * reservoir_left[k] * weight;
-                values[4] += electrons.charge * vx * reservoir_left[k] * weight;
+                values[0] += vx * electrons.f[xbase + k] * weight;
+                values[4] += electrons.charge * vx * electrons.f[xbase + k] * weight;
             } else if (vx < 0.0) {
                 values[1] += -vx * electrons.f[xbase + k] * weight;
             }
@@ -72,8 +63,8 @@ void compute_background_boundary_fluxes(const Species& electrons,
             const int iv = static_cast<int>(k / Param::Nmu);
             const double weight = electrons.vgrid.moment_weight[iv];
             if (vx < 0.0) {
-                values[2] += -vx * reservoir_right[k] * weight;
-                values[5] += electrons.charge * vx * reservoir_right[k] * weight;
+                values[2] += -vx * electrons.f[xbase + k] * weight;
+                values[5] += electrons.charge * vx * electrons.f[xbase + k] * weight;
             } else if (vx > 0.0) {
                 values[3] += vx * electrons.f[xbase + k] * weight;
             }
@@ -172,7 +163,8 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                     << "E_beam_outflow_cum[J/m2]  E_collision_cum[J/m2]  "
                     << "E_accounted[J/m2]  E_balance_error[J/m2]  "
                     << "Q_total[C/m2]  charge_residual_int[m^-2]  "
-                    << "charge_residual_abs_max[m^-3]  N_bkg_minus_n0  "
+                    << "charge_residual_abs_max[m^-3]  "
+                    << "charge_residual_abs_max_over_n0  N_bkg_minus_n0  "
                     << "Gamma_bkg_in_left  Gamma_bkg_out_left  "
                     << "Gamma_bkg_in_right  Gamma_bkg_out_right  "
                     << "J_bkg_in_left[A/m2]  J_bkg_in_right[A/m2]  "
@@ -194,6 +186,7 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
             step_file.open((output_dir + "/step_diagnostics.dat").c_str());
             step_file << "# step  time[fs]  max_abs_Ex[V/m]  x_at_max_abs_Ex[m]  "
                       << "charge_residual_int[m^-2]  charge_residual_abs_max[m^-3]  "
+                      << "charge_residual_abs_max_over_n0  "
                       << "N_bkg_e  "
                       << "N_beam_macro  N_beam_weighted  "
                       << "N_beam_absorb_step  J_beam_absorb_int[A/m]  "
@@ -204,6 +197,13 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                       << "loss_u2_low  loss_u2_high  "
                       << "loss_x1_left  loss_x1_right  "
                       << "loss_x2_left  loss_x2_right  "
+                      << "loss_x_momentum[kg_m_s^-1_m^-2]  "
+                      << "loss_x_energy[J/m2]  "
+                      << "beam_compensation_delta_Ne[m^-2]  "
+                      << "reservoir_added_Ne[m^-2]  "
+                      << "boundary_loss_Ne[m^-2]  "
+                      << "boundary_inflow_Ne[m^-2]  "
+                      << "net_Nb_change[m^-2]  "
                       << "KE_bkg_e[J/m2]  KE_beam[J/m2]  E_field[J/m2]  "
                       << "E_total[J/m2]  dKE_bkg[J/m2]  dKE_beam[J/m2]  "
                       << "dE_field[J/m2]  W_bkg_E[J/m2]  W_beam_E[J/m2]  "
@@ -220,6 +220,15 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                       << "f_u_max_x_mu_avg[u^-3_m^-3]  "
                       << "integral_f_u_gt_8_x[m^-3]\n";
             step_file << std::scientific << std::setprecision(8);
+
+            ledger_file.open((output_dir + "/conservation_ledger.dat").c_str());
+            ledger_file << "# step  time[fs]  "
+                        << "beam_compensation_delta_Ne[m^-2]  "
+                        << "reservoir_added_Ne[m^-2]  "
+                        << "boundary_loss_Ne[m^-2]  "
+                        << "boundary_inflow_Ne[m^-2]  "
+                        << "net_Nb_change[m^-2]\n";
+            ledger_file << std::scientific << std::setprecision(8);
         }
     }
     MPI_Barrier(MPI_COMM_WORLD);
@@ -333,6 +342,7 @@ void Diagnostics::write_scalars(double time, int step,
                     << global_values[8] << "  "
                     << global_values[9] << "  "
                     << global_charge_residual_abs_max << "  "
+                    << global_charge_residual_abs_max / Param::dens << "  "
                     << global_values[10] << "  "
                     << global_boundary[0] << "  "
                     << global_boundary[1] << "  "
@@ -455,6 +465,13 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                                          double loss_x1_right,
                                          double loss_x2_left,
                                          double loss_x2_right,
+                                         double loss_x_momentum,
+                                         double loss_x_energy,
+                                         double beam_compensation_delta_Ne,
+                                         double reservoir_added_Ne,
+                                         double boundary_loss_Ne,
+                                         double boundary_inflow_Ne,
+                                         double net_Nb_change,
                                          double collision_energy_step,
                                          double cumulative_collision_energy_delta,
                                          double dke_bkg_step,
@@ -513,14 +530,19 @@ void Diagnostics::write_step_diagnostics(int step, double time,
     double global_beam_continuity_l1 = 0.0;
     double global_beam_continuity_linf = 0.0;
 
-    double local_losses[12] = {
+    double local_losses[19] = {
         loss_v1, loss_mu1, loss_v2, loss_mu2,
         loss_v1_low, loss_v1_high, loss_v2_low, loss_v2_high,
-        loss_x1_left, loss_x1_right, loss_x2_left, loss_x2_right
+        loss_x1_left, loss_x1_right, loss_x2_left, loss_x2_right,
+        loss_x_momentum, loss_x_energy,
+        beam_compensation_delta_Ne, reservoir_added_Ne,
+        boundary_loss_Ne, boundary_inflow_Ne, net_Nb_change
     };
-    double global_losses[12] = {
+    double global_losses[19] = {
         0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0
     };
     const double local_bkg_ke = electrons.total_kinetic_energy();
     const double local_beam_ke = beam.total_kinetic_energy();
@@ -598,7 +620,7 @@ void Diagnostics::write_step_diagnostics(int step, double time,
     MPI_Reduce(&local_beam_continuity[1], &global_beam_continuity_linf,
                1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(local_nsub, global_nsub, 4, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(local_losses, global_losses, 12, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local_losses, global_losses, 19, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(local_energy, global_energy, 22, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
     if (mpi_rank == 0) {
@@ -615,6 +637,7 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << global_x_at_max_abs_Ex << "  "
                   << global_charge_residual_int << "  "
                   << global_charge_residual_abs_max << "  "
+                  << global_charge_residual_abs_max / Param::dens << "  "
                   << global_N_bkg_e << "  "
                   << global_N_beam_macro << "  "
                   << global_N_beam_weighted << "  "
@@ -638,6 +661,13 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << global_losses[9] << "  "
                   << global_losses[10] << "  "
                   << global_losses[11] << "  "
+                  << global_losses[12] << "  "
+                  << global_losses[13] << "  "
+                  << global_losses[14] << "  "
+                  << global_losses[15] << "  "
+                  << global_losses[16] << "  "
+                  << global_losses[17] << "  "
+                  << global_losses[18] << "  "
                   << global_energy[0] << "  "
                   << global_energy[1] << "  "
                   << global_energy[2] << "  "
@@ -666,6 +696,41 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << global_f_u_max_x << "  "
                   << global_integral_f_u_gt_8_x << "\n";
         step_file.flush();
+    }
+}
+
+void Diagnostics::write_conservation_ledger(int step, double time,
+                                            double beam_compensation_delta_Ne,
+                                            double reservoir_added_Ne,
+                                            double boundary_loss_Ne,
+                                            double boundary_inflow_Ne,
+                                            double net_Nb_change,
+                                            int mpi_rank)
+{
+    if (!step_enabled) return;
+
+    double local_values[5] = {
+        beam_compensation_delta_Ne,
+        reservoir_added_Ne,
+        boundary_loss_Ne,
+        boundary_inflow_Ne,
+        net_Nb_change
+    };
+    double global_values[5] = { 0.0, 0.0, 0.0, 0.0, 0.0 };
+    MPI_Reduce(local_values, global_values, 5, MPI_DOUBLE, MPI_SUM,
+               0, MPI_COMM_WORLD);
+
+    if (mpi_rank == 0) {
+        ledger_file << step << "  "
+                    << time / Const::femto << "  "
+                    << global_values[0] << "  "
+                    << global_values[1] << "  "
+                    << global_values[2] << "  "
+                    << global_values[3] << "  "
+                    << global_values[4] << "\n";
+        if (step % 100 == 0) {
+            ledger_file.flush();
+        }
     }
 }
 

@@ -32,6 +32,7 @@ struct VelocityGrid {
     std::vector<double> speed_cells;
     std::vector<double> mu_face_factor;
     std::vector<double> moment_weight;
+    std::vector<double> inv_moment_weight;
     std::vector<double> mu_flux_scale;
     std::vector<double> mu_cfl_factor;
     std::vector<double> vx_cells;
@@ -64,6 +65,7 @@ struct VelocityGrid {
         speed_cells.resize(Param::Nv);
         mu_face_factor.resize(Param::Nmu + 1);
         moment_weight.resize(Param::Nv);
+        inv_moment_weight.resize(Param::Nv);
         mu_flux_scale.resize(Param::Nv);
         mu_cfl_factor.resize(Param::Nv);
         vx_cells.resize(Param::Nvmu);
@@ -114,6 +116,8 @@ struct VelocityGrid {
                 2.0 * Const::pi * dmu
                 * (u_right * u_right * u_right
                    - u_left * u_left * u_left) / 3.0;
+            inv_moment_weight[iv] =
+                (moment_weight[iv] > 0.0) ? 1.0 / moment_weight[iv] : 0.0;
             mu_flux_scale[iv] = moment_weight[iv] * inv_dmu;
             max_inv_v = std::max(max_inv_v, inv_v_cells[iv]);
             max_speed = std::max(max_speed, speed_cells[iv]);

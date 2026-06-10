@@ -25,15 +25,17 @@ public:
                 double dt, int mpi_rank, int mpi_size);
     void update_dynamic_reservoir(Species& sp,
                                   const SpatialGrid& sg,
-                                  const EMFields& fields,
-                                  double beam_injected_number,
-                                  double beam_outflow_number,
                                   double control_dt,
                                   int mpi_rank,
                                   int mpi_size);
 
     void advect_x(Species& sp, const SpatialGrid& sg, double dt,
                   int mpi_rank, int mpi_size);
+    void configure_boundary_reservoir_inflow(Species& sp,
+                                             double target_number,
+                                             double dt,
+                                             int mpi_rank,
+                                             int mpi_size);
     void advect_v(Species& sp, const SpatialGrid& sg, const EMFields& fields,
                   double dt);
     void advect_mu(Species& sp, const SpatialGrid& sg, const EMFields& fields,
@@ -61,6 +63,13 @@ public:
     double last_loss_mu() const { return last_loss_mu_; }
     double last_loss_x_left() const { return last_loss_x_left_; }
     double last_loss_x_right() const { return last_loss_x_right_; }
+    double last_inflow_x_left() const { return last_inflow_x_left_; }
+    double last_inflow_x_right() const { return last_inflow_x_right_; }
+    double last_boundary_inflow() const {
+        return last_inflow_x_left_ + last_inflow_x_right_;
+    }
+    double last_loss_x_momentum() const { return last_loss_x_momentum_; }
+    double last_loss_x_energy() const { return last_loss_x_energy_; }
     double last_mass_error_v() const { return last_mass_error_v_; }
     double last_mass_error_mu() const { return last_mass_error_mu_; }
     double last_momentum_delta_v() const { return last_momentum_delta_v_; }
@@ -71,7 +80,6 @@ public:
 private:
     void exchange_ghosts_x(Species& sp, const SpatialGrid& sg,
                            int mpi_rank, int mpi_size);
-    void update_reservoir_cache(const Species& sp);
     double cached_incoming_flux_per_density(const Species& sp,
                                             bool left_boundary);
     double bounded_density_from_flux(const Species& sp,
@@ -86,15 +94,16 @@ private:
     std::vector<double> reservoir_right_;
     std::vector<double> unit_reservoir_;
     std::vector<RemapStencil> x_stencil_;
+    std::vector<double> x_cfl_;
 
-    double cached_reservoir_density_left_;
-    double cached_reservoir_density_right_;
-    double cached_reservoir_drift_left_;
-    double cached_reservoir_drift_right_;
     double cached_unit_flux_left_;
     double cached_unit_flux_right_;
     double cached_unit_flux_drift_left_;
     double cached_unit_flux_drift_right_;
+    double cached_global_unit_flux_sum_;
+    double cached_global_unit_flux_drift_left_;
+    double cached_global_unit_flux_drift_right_;
+    int cached_global_unit_flux_mpi_size_;
     double last_cfl_v_;
     double last_cfl_mu_;
     double last_loss_v_;
@@ -107,6 +116,10 @@ private:
     double last_loss_mu_;
     double last_loss_x_left_;
     double last_loss_x_right_;
+    double last_inflow_x_left_;
+    double last_inflow_x_right_;
+    double last_loss_x_momentum_;
+    double last_loss_x_energy_;
     double last_mass_error_v_;
     double last_mass_error_mu_;
     double last_momentum_delta_v_;
@@ -115,9 +128,9 @@ private:
     double last_energy_delta_mu_;
     int last_nsub_v_;
     int last_nsub_mu_;
-    bool reservoir_cache_valid_;
     bool unit_flux_left_valid_;
     bool unit_flux_right_valid_;
+    bool global_unit_flux_valid_;
     bool step_diagnostics_enabled_;
 };
 
