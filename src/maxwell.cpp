@@ -67,6 +67,29 @@ void remove_global_mean_charge_source(EMFields& fields)
     }
 }
 
+void apply_boundary_reservoir_taper(EMFields& fields)
+{
+    if (!Param::poisson_taper_boundary_reservoir ||
+        fields.global_rhs.empty()) {
+        return;
+    }
+
+    const double length = Param::boundary_reservoir_length;
+    if (!(length > 0.0)) return;
+
+    const int n = static_cast<int>(fields.global_rhs.size());
+    for (int i = 0; i < n; ++i) {
+        const double x = (static_cast<double>(i) + 0.5) * fields.dx;
+        const double dist = std::min(x, Param::Lx - x);
+        double w = 1.0;
+        if (dist < length) {
+            const double s = std::max(0.0, std::min(1.0, dist / length));
+            w = s * s * (3.0 - 2.0 * s);
+        }
+        fields.global_rhs[static_cast<size_t>(i)] *= w;
+    }
+}
+
 void compute_dirichlet_poisson(EMFields& fields,
                                bool compute_ex,
                                bool compute_phi)
@@ -123,6 +146,61 @@ void compute_dirichlet_poisson(EMFields& fields,
     }
 
     if (!compute_phi) {
+        std::fill(fields.global_phi.begin(), fields.global_phi.end(), 0.0);
+    }
+}
+
+void compute_neumann_poisson(EMFields& fields,
+                             bool compute_ex,
+                             bool compute_phi)
+{
+    const int n = Param::nx;
+    if (n <= 0) return;
+
+    fields.global_ex.assign(static_cast<size_t>(n), 0.0);
+    fields.global_phi.assign(static_cast<size_t>(n), 0.0);
+
+    std::vector<double> face_e(static_cast<size_t>(n + 1), 0.0);
+    face_e[0] = Param::poisson_left_external_field;
+    const double scale = fields.dx / Const::eps0;
+    for (int i = 0; i < n; ++i) {
+        face_e[static_cast<size_t>(i + 1)] =
+            face_e[static_cast<size_t>(i)] +
+            fields.global_rhs[static_cast<size_t>(i)] * scale;
+    }
+
+    const double right_error =
+        face_e[static_cast<size_t>(n)] - Param::poisson_right_external_field;
+    const double denom = std::max(1, n);
+    for (int i = 0; i <= n; ++i) {
+        face_e[static_cast<size_t>(i)] -=
+            right_error * static_cast<double>(i) / static_cast<double>(denom);
+    }
+
+    if (compute_ex) {
+        for (int i = 0; i < n; ++i) {
+            fields.global_ex[static_cast<size_t>(i)] =
+                0.5 * (face_e[static_cast<size_t>(i)] +
+                       face_e[static_cast<size_t>(i + 1)]);
+        }
+    }
+
+    if (compute_phi) {
+        for (int i = 1; i < n; ++i) {
+            fields.global_phi[static_cast<size_t>(i)] =
+                fields.global_phi[static_cast<size_t>(i - 1)] -
+                0.5 * (fields.global_ex[static_cast<size_t>(i - 1)] +
+                       fields.global_ex[static_cast<size_t>(i)]) * fields.dx;
+        }
+        double mean_phi = 0.0;
+        for (int i = 0; i < n; ++i) {
+            mean_phi += fields.global_phi[static_cast<size_t>(i)];
+        }
+        mean_phi /= static_cast<double>(n);
+        for (int i = 0; i < n; ++i) {
+            fields.global_phi[static_cast<size_t>(i)] -= mean_phi;
+        }
+    } else {
         std::fill(fields.global_phi.begin(), fields.global_phi.end(), 0.0);
     }
 }
@@ -237,8 +315,13 @@ void EMFields::solve_poisson(int mpi_rank, int mpi_size)
     gather_rho(*this, mpi_size);
 
     if (mpi_rank == 0) {
+        apply_boundary_reservoir_taper(*this);
         remove_global_mean_charge_source(*this);
-        compute_dirichlet_poisson(*this, true, false);
+        if (Param::poisson_use_neumann_open_boundary) {
+            compute_neumann_poisson(*this, true, false);
+        } else {
+            compute_dirichlet_poisson(*this, true, false);
+        }
     }
 
     MPI_Scatterv(global_ex.data(), counts.data(), displs.data(), MPI_DOUBLE,
@@ -254,8 +337,13 @@ void EMFields::compute_potential(int mpi_rank, int mpi_size)
     gather_rho(*this, mpi_size);
 
     if (mpi_rank == 0) {
+        apply_boundary_reservoir_taper(*this);
         remove_global_mean_charge_source(*this);
-        compute_dirichlet_poisson(*this, false, true);
+        if (Param::poisson_use_neumann_open_boundary) {
+            compute_neumann_poisson(*this, true, true);
+        } else {
+            compute_dirichlet_poisson(*this, false, true);
+        }
     }
 
     MPI_Scatterv(global_phi.data(), counts.data(), displs.data(), MPI_DOUBLE,

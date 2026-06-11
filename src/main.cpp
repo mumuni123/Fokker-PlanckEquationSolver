@@ -36,9 +36,14 @@ double compute_dt(const Species& electron, const SpatialGrid& sg)
 
 const char* poisson_solver_name()
 {
+    if (Param::poisson_use_neumann_open_boundary) {
+        return Param::poisson_remove_global_mean_charge
+            ? "open Neumann Poisson with mean-charge removal"
+            : "open Neumann Poisson";
+    }
     return Param::poisson_remove_global_mean_charge
-        ? "grounded Dirichlet tridiagonal Poisson with mean-charge removal"
-        : "grounded Dirichlet tridiagonal Poisson";
+        ? "grounded Dirichlet Poisson with mean-charge removal"
+        : "grounded Dirichlet Poisson";
 }
 
 std::vector<double> build_local_ion_density_profile(const SpatialGrid& sg)
@@ -174,33 +179,31 @@ int main(int argc, char** argv)
                Param::momentum_refined_u);
         printf("Electron momentum domain: 0 <= u <= %.3f, vx = c u mu / sqrt(1+u^2)\n",
                Param::momentum_umax);
-        printf("Electrostatic boundary: grounded Dirichlet phi(0)=phi(L)=0; Poisson mean-charge removal: %s\n",
+        printf("Electrostatic boundary: open Neumann Ex_ext(L/R) = %.3e / %.3e V/m; Poisson mean-charge removal: %s\n",
+               Param::poisson_left_external_field,
+               Param::poisson_right_external_field,
                Param::poisson_remove_global_mean_charge ? "ON" : "OFF");
         printf("Poisson solver: %s\n", poisson_solver_name());
+        printf("Poisson reservoir-layer charge taper: %s, length = %.3e m\n",
+               Param::poisson_taper_boundary_reservoir ? "ON" : "OFF",
+               Param::boundary_reservoir_length);
         printf("Fixed ions: uniform Z*n_i = %.3e /m^3\n", Param::dens);
-        printf("Background electrons: upstream/open boundary model, T_e = %.1f eV\n",
+        printf("Background electrons: dynamic boundary reservoir model, T_e = %.1f eV\n",
                Param::temperature_e / Const::eV);
-        printf("Left boundary: v_x > 0 ghost cells use fitted upstream wake f0+dn+dJ+dT, return drift %.6e m/s, density wake %.6e, temperature wake %.6e\n",
-               Param::upstream_left_drift_speed,
-               Param::upstream_left_density_wake_fraction,
-               Param::upstream_left_temperature_wake_fraction);
-        printf("Left inflow balance: slow long-time flux feedback, tau = %.3e s, gain = %.3e, scale range = [%.3e, %.3e]\n",
-               Param::upstream_flux_balance_tau,
-               Param::upstream_flux_balance_gain,
-               Param::upstream_flux_balance_min_scale,
-               Param::upstream_flux_balance_max_scale);
-        printf("Left wake phase lock: weak ne/Ex feedback, gain = %.3e, max phase step = %.3e rad\n",
-               Param::upstream_phase_lock_gain,
-               Param::upstream_phase_lock_max_step);
-        printf("Right boundary: open/absorbing outflow; v_x < 0 inflow uses downstream background drift %.6e m/s\n",
-               Param::upstream_right_drift_speed);
+        printf("Boundary reservoir: ghost inflow f_in = A*f0, zero drift, A from %.3e m boundary density average, range = [%.2f, %.2f], gain = %.2f\n",
+               Param::boundary_reservoir_length,
+               Param::boundary_reservoir_min_scale,
+               Param::boundary_reservoir_max_scale,
+               Param::boundary_reservoir_feedback_gain);
+        printf("Boundary sponge: df/dt = -nu(x)*(f-f0), tau_edge = %.3e s, active only in boundary reservoir layer\n",
+               Param::boundary_sponge_tau);
         printf("PIC beam: gamma*beta = %.2f, beta = %.4f, n_b = %.3e /m^3\n",
                Param::gambetab, Param::betab, Param::densb);
         printf("Beam source: quiet-start left boundary injection at x = 0\n");
         printf("Beam injection: charge-conserving path current, centered before Poisson\n");
         printf("Beam charge compensation source: OFF; background density perturbations are produced only by Poisson/Vlasov dynamics\n");
         printf("Beam boundary: particles crossing the domain edge are deleted and counted in the energy ledger\n");
-        printf("Background boundary: no instantaneous left/right reflow; upstream inflow is independent of local electron deficit or boundary loss\n");
+        printf("Background boundary: no preset wake, no left/right reflow, no direct reset of physical boundary cells by ghosts\n");
         printf("Beam macro weight: %.6e particles/m^2\n", Param::beam_macro_weight);
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
         printf("Debug diagnostics: %s\n",
@@ -341,12 +344,6 @@ int main(int argc, char** argv)
         }
 
         trace_progress(config, mpi_rank, step, "before x half 1");
-        if (mpi_rank == 0 && sgrid.nx_local > 0) {
-            vlasov.update_upstream_phase_feedback(
-                time_start,
-                fields.Ex[sgrid.nghost],
-                bkg_e.number_density[0]);
-        }
         vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size,
                         time_start);
         trace_progress(config, mpi_rank, step, "after x half 1");

@@ -78,25 +78,17 @@ namespace Param {
     const double background_reservoir_feedback_tau = 2.0 * Const::femto;
 
     const bool   poisson_remove_global_mean_charge = true;
+    const bool   poisson_use_neumann_open_boundary = true;
+    const double poisson_left_external_field = 0.0;
+    const double poisson_right_external_field = 0.0;
+    const double boundary_reservoir_length = 0.1 * Const::micro;
+    const double boundary_reservoir_feedback_gain = 0.5;
+    const double boundary_reservoir_min_scale = 0.2;
+    const double boundary_reservoir_max_scale = 3.0;
+    const double boundary_sponge_tau = 2.0 * Const::femto;
+    const bool   poisson_taper_boundary_reservoir = true;
     const double omega_pe = std::sqrt(dens * Const::qe * Const::qe /
                                       (Const::eps0 * Const::me));
-    const double upstream_left_return_current_fraction = 1.0;
-    const double upstream_left_drift_speed =
-        -upstream_left_return_current_fraction * jb / (Const::qe * dens);
-    const double upstream_left_density_wake_fraction = densb / dens;
-    const double upstream_left_temperature_wake_fraction = 0.05;
-    const double upstream_left_wake_frequency = omega_pe;
-    const double upstream_left_wake_phase = 0.0;
-    const double upstream_phase_lock_gain = 0.03;
-    const double upstream_phase_lock_max_step = 0.02;
-    const double upstream_phase_lock_ex_weight = 0.25;
-    const double upstream_flux_balance_tau = 2.0 * Const::femto;
-    const double upstream_flux_balance_gain = 0.25;
-    const double upstream_flux_balance_min_scale = 0.05;
-    const double upstream_flux_balance_max_scale = 64.0;
-    const double upstream_right_density_wake_fraction = 0.0;
-    const double upstream_right_temperature_wake_fraction = 0.0;
-    const double upstream_right_drift_speed = 0.0;
 
     // Axisymmetric spherical momentum grid: (u, mu), u = p / (m c).
     // The distribution is normalized with d3u = 2*pi*u^2 du dmu.

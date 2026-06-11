@@ -29,9 +29,6 @@ public:
                   double dt);
     void advect_mu(Species& sp, const SpatialGrid& sg, const EMFields& fields,
                    double dt);
-    void update_upstream_phase_feedback(double time,
-                                        double ex_left,
-                                        double ne_left);
 
     double last_cfl_v() const { return last_cfl_v_; }
     double last_cfl_mu() const { return last_cfl_mu_; }
@@ -72,40 +69,34 @@ public:
 private:
     void exchange_ghosts_x(Species& sp, const SpatialGrid& sg,
                            int mpi_rank, int mpi_size);
-    void update_open_boundary_inflow(const Species& sp, double time,
+    void update_open_boundary_inflow(const Species& sp,
+                                     const SpatialGrid& sg,
                                      bool owns_left_boundary,
                                      bool owns_right_boundary);
-    void ensure_upstream_basis(const Species& sp);
-    void update_flux_balance(double in_left, double in_right,
-                             double out_left, double out_right,
-                             double dt_sub, int mpi_size);
+    void ensure_reservoir_basis(const Species& sp);
+    double boundary_density_average(const Species& sp,
+                                    const SpatialGrid& sg,
+                                    bool left_boundary) const;
+    void apply_boundary_sponge(Species& sp, const SpatialGrid& sg,
+                               double dt_sub,
+                               bool owns_left_boundary,
+                               bool owns_right_boundary);
 
     std::vector<double> send_left_;
     std::vector<double> send_right_;
     std::vector<double> recv_left_;
     std::vector<double> recv_right_;
-    std::vector<double> upstream_left_;
-    std::vector<double> upstream_right_;
-    std::vector<double> upstream_base_;
-    std::vector<double> upstream_current_shape_;
-    std::vector<double> upstream_temperature_shape_;
-    double upstream_basis_density_;
-    double upstream_basis_temperature_;
-    double upstream_basis_mass_;
-    double upstream_left_cached_density_;
-    double upstream_left_cached_temperature_;
-    double upstream_left_cached_drift_;
-    double upstream_right_cached_density_;
-    double upstream_right_cached_temperature_;
-    double upstream_right_cached_drift_;
-    bool upstream_left_cache_valid_;
-    bool upstream_right_cache_valid_;
-    bool upstream_basis_valid_;
-    double upstream_flux_in_left_avg_;
-    double upstream_flux_in_right_avg_;
-    double upstream_flux_out_avg_;
-    double upstream_flux_correction_;
-    double upstream_phase_feedback_;
+    std::vector<double> reservoir_left_;
+    std::vector<double> reservoir_right_;
+    std::vector<double> reservoir_base_;
+    double reservoir_basis_density_;
+    double reservoir_basis_temperature_;
+    double reservoir_basis_mass_;
+    double reservoir_left_cached_scale_;
+    double reservoir_right_cached_scale_;
+    bool reservoir_left_cache_valid_;
+    bool reservoir_right_cache_valid_;
+    bool reservoir_basis_valid_;
     std::vector<RemapStencil> x_stencil_;
     std::vector<double> x_cfl_;
 
