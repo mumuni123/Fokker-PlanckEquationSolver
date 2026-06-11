@@ -36,7 +36,9 @@ double compute_dt(const Species& electron, const SpatialGrid& sg)
 
 const char* poisson_solver_name()
 {
-    return "grounded Dirichlet tridiagonal Poisson";
+    return Param::poisson_remove_global_mean_charge
+        ? "grounded Dirichlet tridiagonal Poisson with mean-charge removal"
+        : "grounded Dirichlet tridiagonal Poisson";
 }
 
 std::vector<double> build_local_ion_density_profile(const SpatialGrid& sg)
@@ -58,41 +60,6 @@ void sync_moments_and_fields(Species& electrons,
     }
     fields.set_charge_density(electrons, beam.density, ion_density_profile);
     fields.solve_poisson(mpi_rank, mpi_size);
-}
-
-void configure_reservoir_boundary_inflow(VlasovSolver& vlasov,
-                                         Species& electrons,
-                                         const SpatialGrid& sg,
-                                         double dt,
-                                         double local_loss_backlog,
-                                         int mpi_rank,
-                                         int mpi_size)
-{
-    double target_number = std::max(0.0, local_loss_backlog);
-    MPI_Allreduce(MPI_IN_PLACE, &target_number, 1, MPI_DOUBLE, MPI_SUM,
-                  MPI_COMM_WORLD);
-    vlasov.configure_boundary_reservoir_inflow(electrons, target_number, dt,
-                                               mpi_rank, mpi_size);
-}
-
-void consume_reservoir_loss_backlog(double& local_loss_backlog,
-                                    double local_boundary_inflow)
-{
-    double values[2] = {
-        std::max(0.0, local_loss_backlog),
-        std::max(0.0, local_boundary_inflow)
-    };
-    MPI_Allreduce(MPI_IN_PLACE, values, 2, MPI_DOUBLE, MPI_SUM,
-                  MPI_COMM_WORLD);
-    const double global_loss_backlog = values[0];
-    const double global_inflow = values[1];
-    if (!(global_loss_backlog > 0.0) || !(global_inflow > 0.0)) return;
-
-    const double replaced_loss =
-        std::min(global_loss_backlog, global_inflow);
-    const double remaining_fraction =
-        std::max(0.0, 1.0 - replaced_loss / global_loss_backlog);
-    local_loss_backlog *= remaining_fraction;
 }
 
 void abort_if_vmax_loss(const VlasovSolver& vlasov,
@@ -207,21 +174,33 @@ int main(int argc, char** argv)
                Param::momentum_refined_u);
         printf("Electron momentum domain: 0 <= u <= %.3f, vx = c u mu / sqrt(1+u^2)\n",
                Param::momentum_umax);
-        printf("Electrostatic boundary: grounded Dirichlet phi(0)=phi(L)=0\n");
+        printf("Electrostatic boundary: grounded Dirichlet phi(0)=phi(L)=0; Poisson mean-charge removal: %s\n",
+               Param::poisson_remove_global_mean_charge ? "ON" : "OFF");
         printf("Poisson solver: %s\n", poisson_solver_name());
         printf("Fixed ions: uniform Z*n_i = %.3e /m^3\n", Param::dens);
-        printf("Background electrons: extrapolated open ghosts plus dynamic reservoir boundary inflow, T_e = %.1f eV\n",
+        printf("Background electrons: upstream/open boundary model, T_e = %.1f eV\n",
                Param::temperature_e / Const::eV);
-        printf("Reservoir target: boundary inflow closes only the true boundary-loss backlog; no internal quasineutrality feedback\n");
-        printf("Reservoir inflow velocity distribution: Maxwellian thermal bath with drift %.6e m/s; no beam-compensation electron source is applied\n",
-               Param::background_reservoir_source_drift_speed);
+        printf("Left boundary: v_x > 0 ghost cells use fitted upstream wake f0+dn+dJ+dT, return drift %.6e m/s, density wake %.6e, temperature wake %.6e\n",
+               Param::upstream_left_drift_speed,
+               Param::upstream_left_density_wake_fraction,
+               Param::upstream_left_temperature_wake_fraction);
+        printf("Left inflow balance: slow long-time flux feedback, tau = %.3e s, gain = %.3e, scale range = [%.3e, %.3e]\n",
+               Param::upstream_flux_balance_tau,
+               Param::upstream_flux_balance_gain,
+               Param::upstream_flux_balance_min_scale,
+               Param::upstream_flux_balance_max_scale);
+        printf("Left wake phase lock: weak ne/Ex feedback, gain = %.3e, max phase step = %.3e rad\n",
+               Param::upstream_phase_lock_gain,
+               Param::upstream_phase_lock_max_step);
+        printf("Right boundary: open/absorbing outflow; v_x < 0 inflow uses downstream background drift %.6e m/s\n",
+               Param::upstream_right_drift_speed);
         printf("PIC beam: gamma*beta = %.2f, beta = %.4f, n_b = %.3e /m^3\n",
                Param::gambetab, Param::betab, Param::densb);
         printf("Beam source: quiet-start left boundary injection at x = 0\n");
         printf("Beam injection: charge-conserving path current, centered before Poisson\n");
-        printf("Beam charge compensation: OFF; background response is only Poisson/Vlasov plus true boundary reservoir inflow\n");
+        printf("Beam charge compensation source: OFF; background density perturbations are produced only by Poisson/Vlasov dynamics\n");
         printf("Beam boundary: particles crossing the domain edge are deleted and counted in the energy ledger\n");
-        printf("Return current: boundary reservoir and Vlasov response\n");
+        printf("Background boundary: no instantaneous left/right reflow; upstream inflow is independent of local electron deficit or boundary loss\n");
         printf("Beam macro weight: %.6e particles/m^2\n", Param::beam_macro_weight);
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
         printf("Debug diagnostics: %s\n",
@@ -251,8 +230,6 @@ int main(int argc, char** argv)
     bkg_e.init("bkg_e", SpeciesType::BACKGROUND_ELECTRON,
                -Const::qe, Const::me,
                Param::dens, Param::temperature_e, false, sgrid);
-    bkg_e.reservoir_drift_left = Param::background_reservoir_source_drift_speed;
-    bkg_e.reservoir_drift_right = Param::background_reservoir_source_drift_speed;
     bkg_e.initialize_maxwellian();
 
     BeamPIC beam;
@@ -280,7 +257,6 @@ int main(int argc, char** argv)
     }
 
     double cumulative_collision_energy_delta = 0.0;
-    double reservoir_loss_backlog = 0.0;
     bool moments_current = false;
     sync_moments_and_fields(bkg_e, beam, fields, ion_density_profile,
                             mpi_rank, mpi_size, moments_current);
@@ -365,19 +341,18 @@ int main(int argc, char** argv)
         }
 
         trace_progress(config, mpi_rank, step, "before x half 1");
-        configure_reservoir_boundary_inflow(vlasov, bkg_e, sgrid,
-                                            0.5 * dt,
-                                            reservoir_loss_backlog,
-                                            mpi_rank, mpi_size);
-        vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size);
+        if (mpi_rank == 0 && sgrid.nx_local > 0) {
+            vlasov.update_upstream_phase_feedback(
+                time_start,
+                fields.Ex[sgrid.nghost],
+                bkg_e.number_density[0]);
+        }
+        vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size,
+                        time_start);
         trace_progress(config, mpi_rank, step, "after x half 1");
         boundary_inflow_ne_step += vlasov.last_boundary_inflow();
-        reservoir_added_ne_step += vlasov.last_boundary_inflow();
-        consume_reservoir_loss_backlog(reservoir_loss_backlog,
-                                       vlasov.last_boundary_inflow());
         loss_x1_left = vlasov.last_loss_x_left();
         loss_x1_right = vlasov.last_loss_x_right();
-        reservoir_loss_backlog += loss_x1_left + loss_x1_right;
         loss_x_momentum_step += vlasov.last_loss_x_momentum();
         loss_x_energy_step += vlasov.last_loss_x_energy();
         moments_current = false;
@@ -550,19 +525,12 @@ int main(int argc, char** argv)
 #endif
 
         trace_progress(config, mpi_rank, step, "before x half 2");
-        configure_reservoir_boundary_inflow(vlasov, bkg_e, sgrid,
-                                            0.5 * dt,
-                                            reservoir_loss_backlog,
-                                            mpi_rank, mpi_size);
-        vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size);
+        vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size,
+                        time_center);
         trace_progress(config, mpi_rank, step, "after x half 2");
         boundary_inflow_ne_step += vlasov.last_boundary_inflow();
-        reservoir_added_ne_step += vlasov.last_boundary_inflow();
-        consume_reservoir_loss_backlog(reservoir_loss_backlog,
-                                       vlasov.last_boundary_inflow());
         loss_x2_left = vlasov.last_loss_x_left();
         loss_x2_right = vlasov.last_loss_x_right();
-        reservoir_loss_backlog += loss_x2_left + loss_x2_right;
         loss_x_momentum_step += vlasov.last_loss_x_momentum();
         loss_x_energy_step += vlasov.last_loss_x_energy();
         moments_current = false;

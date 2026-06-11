@@ -50,6 +50,23 @@ void gather_rho(EMFields& fields, int mpi_size)
                 fields.displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
 }
 
+void remove_global_mean_charge_source(EMFields& fields)
+{
+    if (!Param::poisson_remove_global_mean_charge ||
+        fields.global_rhs.empty()) {
+        return;
+    }
+
+    double sum = 0.0;
+    for (size_t i = 0; i < fields.global_rhs.size(); ++i) {
+        sum += fields.global_rhs[i];
+    }
+    const double mean = sum / static_cast<double>(fields.global_rhs.size());
+    for (size_t i = 0; i < fields.global_rhs.size(); ++i) {
+        fields.global_rhs[i] -= mean;
+    }
+}
+
 void compute_dirichlet_poisson(EMFields& fields,
                                bool compute_ex,
                                bool compute_phi)
@@ -220,6 +237,7 @@ void EMFields::solve_poisson(int mpi_rank, int mpi_size)
     gather_rho(*this, mpi_size);
 
     if (mpi_rank == 0) {
+        remove_global_mean_charge_source(*this);
         compute_dirichlet_poisson(*this, true, false);
     }
 
@@ -236,6 +254,7 @@ void EMFields::compute_potential(int mpi_rank, int mpi_size)
     gather_rho(*this, mpi_size);
 
     if (mpi_rank == 0) {
+        remove_global_mean_charge_source(*this);
         compute_dirichlet_poisson(*this, false, true);
     }
 

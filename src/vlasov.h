@@ -23,23 +23,15 @@ public:
 
     void advect(Species& sp, const SpatialGrid& sg, const EMFields& fields,
                 double dt, int mpi_rank, int mpi_size);
-    void update_dynamic_reservoir(Species& sp,
-                                  const SpatialGrid& sg,
-                                  double control_dt,
-                                  int mpi_rank,
-                                  int mpi_size);
-
     void advect_x(Species& sp, const SpatialGrid& sg, double dt,
-                  int mpi_rank, int mpi_size);
-    void configure_boundary_reservoir_inflow(Species& sp,
-                                             double target_number,
-                                             double dt,
-                                             int mpi_rank,
-                                             int mpi_size);
+                  int mpi_rank, int mpi_size, double time = 0.0);
     void advect_v(Species& sp, const SpatialGrid& sg, const EMFields& fields,
                   double dt);
     void advect_mu(Species& sp, const SpatialGrid& sg, const EMFields& fields,
                    double dt);
+    void update_upstream_phase_feedback(double time,
+                                        double ex_left,
+                                        double ne_left);
 
     double last_cfl_v() const { return last_cfl_v_; }
     double last_cfl_mu() const { return last_cfl_mu_; }
@@ -80,30 +72,43 @@ public:
 private:
     void exchange_ghosts_x(Species& sp, const SpatialGrid& sg,
                            int mpi_rank, int mpi_size);
-    double cached_incoming_flux_per_density(const Species& sp,
-                                            bool left_boundary);
-    double bounded_density_from_flux(const Species& sp,
-                                     double target_flux,
-                                     bool left_boundary);
+    void update_open_boundary_inflow(const Species& sp, double time,
+                                     bool owns_left_boundary,
+                                     bool owns_right_boundary);
+    void ensure_upstream_basis(const Species& sp);
+    void update_flux_balance(double in_left, double in_right,
+                             double out_left, double out_right,
+                             double dt_sub, int mpi_size);
 
     std::vector<double> send_left_;
     std::vector<double> send_right_;
     std::vector<double> recv_left_;
     std::vector<double> recv_right_;
-    std::vector<double> reservoir_left_;
-    std::vector<double> reservoir_right_;
-    std::vector<double> unit_reservoir_;
+    std::vector<double> upstream_left_;
+    std::vector<double> upstream_right_;
+    std::vector<double> upstream_base_;
+    std::vector<double> upstream_current_shape_;
+    std::vector<double> upstream_temperature_shape_;
+    double upstream_basis_density_;
+    double upstream_basis_temperature_;
+    double upstream_basis_mass_;
+    double upstream_left_cached_density_;
+    double upstream_left_cached_temperature_;
+    double upstream_left_cached_drift_;
+    double upstream_right_cached_density_;
+    double upstream_right_cached_temperature_;
+    double upstream_right_cached_drift_;
+    bool upstream_left_cache_valid_;
+    bool upstream_right_cache_valid_;
+    bool upstream_basis_valid_;
+    double upstream_flux_in_left_avg_;
+    double upstream_flux_in_right_avg_;
+    double upstream_flux_out_avg_;
+    double upstream_flux_correction_;
+    double upstream_phase_feedback_;
     std::vector<RemapStencil> x_stencil_;
     std::vector<double> x_cfl_;
 
-    double cached_unit_flux_left_;
-    double cached_unit_flux_right_;
-    double cached_unit_flux_drift_left_;
-    double cached_unit_flux_drift_right_;
-    double cached_global_unit_flux_sum_;
-    double cached_global_unit_flux_drift_left_;
-    double cached_global_unit_flux_drift_right_;
-    int cached_global_unit_flux_mpi_size_;
     double last_cfl_v_;
     double last_cfl_mu_;
     double last_loss_v_;
@@ -128,9 +133,6 @@ private:
     double last_energy_delta_mu_;
     int last_nsub_v_;
     int last_nsub_mu_;
-    bool unit_flux_left_valid_;
-    bool unit_flux_right_valid_;
-    bool global_unit_flux_valid_;
     bool step_diagnostics_enabled_;
 };
 
