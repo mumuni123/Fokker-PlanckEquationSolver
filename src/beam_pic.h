@@ -22,8 +22,6 @@ public:
     std::vector<double> source_density_delta;
     std::vector<double> source_current_x;
     std::vector<double>& source_current_delta;
-    std::vector<double> absorber_density_delta;
-    std::vector<double> absorber_current_x;
 
     BeamPIC();
 
@@ -75,14 +73,8 @@ private:
     std::vector<std::vector<BeamParticle> > thread_send_left_;
     std::vector<std::vector<BeamParticle> > thread_send_right_;
     std::vector<std::vector<double> > thread_path_density_delta_;
-    std::vector<std::vector<double> > thread_absorber_density_delta_;
-    std::vector<std::vector<double> > thread_absorber_current_delta_;
     std::vector<std::vector<double> > thread_path_send_left_density_;
     std::vector<std::vector<double> > thread_path_send_right_density_;
-    std::vector<std::vector<double> > thread_absorber_send_left_density_;
-    std::vector<std::vector<double> > thread_absorber_send_right_density_;
-    std::vector<std::vector<double> > thread_absorber_send_left_current_;
-    std::vector<std::vector<double> > thread_absorber_send_right_current_;
     std::vector<std::vector<double> > thread_density_;
     std::vector<std::vector<double> > thread_current_;
     std::vector<double> thread_send_left_density_;
@@ -101,14 +93,7 @@ private:
     std::vector<double> path_send_right_density_;
     std::vector<double> path_recv_left_density_;
     std::vector<double> path_recv_right_density_;
-    std::vector<double> absorber_send_left_density_;
-    std::vector<double> absorber_send_right_density_;
-    std::vector<double> absorber_recv_left_density_;
-    std::vector<double> absorber_recv_right_density_;
-    std::vector<double> absorber_send_left_current_;
-    std::vector<double> absorber_send_right_current_;
-    std::vector<double> absorber_recv_left_current_;
-    std::vector<double> absorber_recv_right_current_;
+    std::vector<double> all_path_numbers_;
 
     void exchange_particles(const SpatialGrid& sg, int mpi_rank, int mpi_size);
     void exchange_continuity_contributions(const SpatialGrid& sg,
@@ -118,9 +103,6 @@ private:
                                         double x,
                                         double weight,
                                         double vx);
-    void add_absorber_density(const SpatialGrid& sg, double x, double weight);
-    void add_absorber_source(const SpatialGrid& sg,
-                             double x, double weight, double vx);
     void add_path_density_delta(const SpatialGrid& sg,
                                 double x0, double x1, double weight);
     void add_path_density_delta_to(const SpatialGrid& sg,
@@ -128,19 +110,11 @@ private:
                                    std::vector<double>& send_left,
                                    std::vector<double>& send_right,
                                    double x0, double x1, double weight);
-    void add_absorber_density_to(const SpatialGrid& sg,
-                                 std::vector<double>& local,
-                                 std::vector<double>& send_left,
-                                 std::vector<double>& send_right,
-                                 double x, double weight);
-    void add_absorber_source_to(const SpatialGrid& sg,
-                                std::vector<double>& density_local,
-                                std::vector<double>& density_send_left,
-                                std::vector<double>& density_send_right,
-                                std::vector<double>& current_local,
-                                std::vector<double>& current_send_left,
-                                std::vector<double>& current_send_right,
-                                double x, double weight, double vx);
+    void add_density_to(const SpatialGrid& sg,
+                        std::vector<double>& local,
+                        std::vector<double>& send_left,
+                        std::vector<double>& send_right,
+                        double x, double weight);
     void add_source_to_cell(const SpatialGrid& sg, int target_ig,
                             double density_delta, double current_delta);
     void add_number_to_cell(const SpatialGrid& sg,

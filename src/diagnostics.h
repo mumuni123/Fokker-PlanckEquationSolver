@@ -58,16 +58,6 @@ public:
                                 double loss_v1_high,
                                 double loss_v2_low,
                                 double loss_v2_high,
-                                double loss_x1_left,
-                                double loss_x1_right,
-                                double loss_x2_left,
-                                double loss_x2_right,
-                                double loss_x_momentum,
-                                double loss_x_energy,
-                                double beam_compensation_delta_Ne,
-                                double reservoir_added_Ne,
-                                double boundary_loss_Ne,
-                                double boundary_inflow_Ne,
                                 double net_Nb_change,
                                 double collision_energy_step,
                                 double cumulative_collision_energy_delta,
@@ -89,14 +79,6 @@ public:
                                 double local_x_at_max_loss_u_high,
                                 double local_f_u_max_x,
                                 double local_integral_f_u_gt_8_x);
-
-    void write_conservation_ledger(int step, double time,
-                                   double beam_compensation_delta_Ne,
-                                   double reservoir_added_Ne,
-                                   double boundary_loss_Ne,
-                                   double boundary_inflow_Ne,
-                                   double net_Nb_change,
-                                   int mpi_rank);
 
     void write_fields(double time,
                       const EMFields& fields,
@@ -127,7 +109,6 @@ private:
     std::ofstream debug_file;
 #endif
     std::ofstream step_file;
-    std::ofstream ledger_file;
     bool debug_enabled;
     bool step_enabled;
     bool has_energy_reference;

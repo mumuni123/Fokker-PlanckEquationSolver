@@ -72,6 +72,30 @@ void compute_background_boundary_fluxes(const Species& electrons,
     }
 }
 
+double compute_global_mean_rho(const EMFields& fields, const SpatialGrid& sg)
+{
+    double local_charge = 0.0;
+    for (int ix = 0; ix < sg.nx_local; ++ix) {
+        local_charge += fields.rho[ix + sg.nghost] * sg.dx;
+    }
+
+    double global_charge = 0.0;
+    MPI_Allreduce(&local_charge, &global_charge, 1,
+                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    return global_charge / Param::Lx;
+}
+
+double gauss_charge_residual(const EMFields& fields,
+                             const SpatialGrid& sg,
+                             int ix,
+                             double mean_rho)
+{
+    const int ix_g = ix + sg.nghost;
+    const double dEx_dx =
+        (fields.Ex[ix_g + 1] - fields.Ex[ix_g - 1]) / (2.0 * sg.dx);
+    return (Const::eps0 * dEx_dx - (fields.rho[ix_g] - mean_rho)) / Const::qe;
+}
+
 void gather_max_ex_location(double local_max_abs_Ex,
                             double local_x_at_max_abs_Ex,
                             int mpi_rank,
@@ -162,9 +186,9 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                     << "E_total[J/m2]  E_beam_injected_cum[J/m2]  "
                     << "E_beam_outflow_cum[J/m2]  E_collision_cum[J/m2]  "
                     << "E_accounted[J/m2]  E_balance_error[J/m2]  "
-                    << "Q_total[C/m2]  charge_residual_int[m^-2]  "
-                    << "charge_residual_abs_max[m^-3]  "
-                    << "charge_residual_abs_max_over_n0  N_bkg_minus_n0  "
+                    << "Q_total[C/m2]  gauss_residual_int[m^-2]  "
+                    << "gauss_residual_abs_max[m^-3]  "
+                    << "gauss_residual_abs_max_over_n0  N_bkg_minus_n0  "
                     << "Gamma_bkg_in_left  Gamma_bkg_out_left  "
                     << "Gamma_bkg_in_right  Gamma_bkg_out_right  "
                     << "J_bkg_in_left[A/m2]  J_bkg_in_right[A/m2]  "
@@ -185,24 +209,15 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
         if (step_enabled) {
             step_file.open((output_dir + "/step_diagnostics.dat").c_str());
             step_file << "# step  time[fs]  max_abs_Ex[V/m]  x_at_max_abs_Ex[m]  "
-                      << "charge_residual_int[m^-2]  charge_residual_abs_max[m^-3]  "
-                      << "charge_residual_abs_max_over_n0  "
+                      << "gauss_residual_int[m^-2]  gauss_residual_abs_max[m^-3]  "
+                      << "gauss_residual_abs_max_over_n0  "
                       << "N_bkg_e  "
                       << "N_beam_macro  N_beam_weighted  "
-                      << "N_beam_absorb_step  J_beam_absorb_int[A/m]  "
                       << "beam_cont_l1  beam_cont_linf  "
                       << "nsub_u1  nsub_mu1  nsub_u2  nsub_mu2  "
                       << "loss_u1  loss_mu1  loss_u2  loss_mu2  "
                       << "loss_u1_low  loss_u1_high  "
                       << "loss_u2_low  loss_u2_high  "
-                      << "loss_x1_left  loss_x1_right  "
-                      << "loss_x2_left  loss_x2_right  "
-                      << "loss_x_momentum[kg_m_s^-1_m^-2]  "
-                      << "loss_x_energy[J/m2]  "
-                      << "beam_compensation_delta_Ne[m^-2]  "
-                      << "reservoir_added_Ne[m^-2]  "
-                      << "boundary_loss_Ne[m^-2]  "
-                      << "boundary_inflow_Ne[m^-2]  "
                       << "net_Nb_change[m^-2]  "
                       << "KE_bkg_e[J/m2]  KE_beam[J/m2]  E_field[J/m2]  "
                       << "E_total[J/m2]  dKE_bkg[J/m2]  dKE_beam[J/m2]  "
@@ -211,8 +226,8 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                       << "u_px_delta[kg/m/s/m2]  mu_px_delta[kg/m/s/m2]  "
                       << "u_energy_delta[J/m2]  mu_energy_delta[J/m2]  "
                       << "E_src_in[J/m2]  E_src_out[J/m2]  "
-                      << "E_collision_step[J/m2]  E_balance_step[J/m2]  "
-                      << "E_beam_injected_cum[J/m2]  "
+                      << "E_collision_step[J/m2]  "
+                      << "E_balance_step[J/m2]  E_beam_injected_cum[J/m2]  "
                       << "E_beam_outflow_cum[J/m2]  E_collision_cum[J/m2]  "
                       << "initial_KE_per_particle_eV  "
                       << "effective_T_eV  "
@@ -220,15 +235,6 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                       << "f_u_max_x_mu_avg[u^-3_m^-3]  "
                       << "integral_f_u_gt_8_x[m^-3]\n";
             step_file << std::scientific << std::setprecision(8);
-
-            ledger_file.open((output_dir + "/conservation_ledger.dat").c_str());
-            ledger_file << "# step  time[fs]  "
-                        << "beam_compensation_delta_Ne[m^-2]  "
-                        << "reservoir_added_Ne[m^-2]  "
-                        << "boundary_loss_Ne[m^-2]  "
-                        << "boundary_inflow_Ne[m^-2]  "
-                        << "net_Nb_change[m^-2]\n";
-            ledger_file << std::scientific << std::setprecision(8);
         }
     }
     MPI_Barrier(MPI_COMM_WORLD);
@@ -252,8 +258,11 @@ void Diagnostics::write_scalars(double time, int step,
     double local_max_abs_Ex = 0.0;
     double local_x_at_max_abs_Ex = 0.0;
     const int ng = electrons.sgrid->nghost;
+    const double mean_rho =
+        compute_global_mean_rho(fields, *electrons.sgrid);
     for (int ix = 0; ix < electrons.sgrid->nx_local; ++ix) {
-        const double charge_residual = fields.rho[ix + ng] / Const::qe;
+        const double charge_residual =
+            gauss_charge_residual(fields, *electrons.sgrid, ix, mean_rho);
         local_q_total += fields.rho[ix + ng] * electrons.sgrid->dx;
         local_charge_residual_int += charge_residual * electrons.sgrid->dx;
         local_charge_residual_abs_max =
@@ -461,16 +470,6 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                                          double loss_v1_high,
                                          double loss_v2_low,
                                          double loss_v2_high,
-                                         double loss_x1_left,
-                                         double loss_x1_right,
-                                         double loss_x2_left,
-                                         double loss_x2_right,
-                                         double loss_x_momentum,
-                                         double loss_x_energy,
-                                         double beam_compensation_delta_Ne,
-                                         double reservoir_added_Ne,
-                                         double boundary_loss_Ne,
-                                         double boundary_inflow_Ne,
                                          double net_Nb_change,
                                          double collision_energy_step,
                                          double cumulative_collision_energy_delta,
@@ -499,9 +498,11 @@ void Diagnostics::write_step_diagnostics(int step, double time,
     double local_x_at_max_abs_Ex = 0.0;
     double local_charge_residual_int = 0.0;
     double local_charge_residual_abs_max = 0.0;
+    const double mean_rho = compute_global_mean_rho(fields, sg);
     for (int ix = 0; ix < sg.nx_local; ++ix) {
         const int ix_g = ix + sg.nghost;
-        const double charge_residual = fields.rho[ix_g] / Const::qe;
+        const double charge_residual =
+            gauss_charge_residual(fields, sg, ix, mean_rho);
         local_charge_residual_int += charge_residual * sg.dx;
         local_charge_residual_abs_max =
             std::max(local_charge_residual_abs_max, std::fabs(charge_residual));
@@ -515,14 +516,6 @@ void Diagnostics::write_step_diagnostics(int step, double time,
     const double local_N_bkg_e = electrons.total_particle_number();
     const double local_N_beam_macro = static_cast<double>(beam.particles.size());
     const double local_N_beam_weighted = beam.total_particle_number(sg);
-    double local_beam_absorber[2] = { 0.0, 0.0 };
-    for (int ix = 0; ix < sg.nx_local; ++ix) {
-        local_beam_absorber[0] +=
-            beam.absorber_density_delta[static_cast<size_t>(ix)] * sg.dx;
-        local_beam_absorber[1] +=
-            beam.absorber_current_x[static_cast<size_t>(ix)] * sg.dx;
-    }
-    double global_beam_absorber[2] = { 0.0, 0.0 };
     double local_beam_continuity[2] = {
         beam.last_continuity_l1_error(),
         beam.last_continuity_linf_error()
@@ -530,19 +523,13 @@ void Diagnostics::write_step_diagnostics(int step, double time,
     double global_beam_continuity_l1 = 0.0;
     double global_beam_continuity_linf = 0.0;
 
-    double local_losses[19] = {
+    double local_losses[9] = {
         loss_v1, loss_mu1, loss_v2, loss_mu2,
         loss_v1_low, loss_v1_high, loss_v2_low, loss_v2_high,
-        loss_x1_left, loss_x1_right, loss_x2_left, loss_x2_right,
-        loss_x_momentum, loss_x_energy,
-        beam_compensation_delta_Ne, reservoir_added_Ne,
-        boundary_loss_Ne, boundary_inflow_Ne, net_Nb_change
+        net_Nb_change
     };
-    double global_losses[19] = {
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0
+    double global_losses[9] = {
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     };
     const double local_bkg_ke = electrons.total_kinetic_energy();
     const double local_beam_ke = beam.total_kinetic_energy();
@@ -613,14 +600,12 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_N_beam_weighted, &global_N_beam_weighted, 1,
                MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(local_beam_absorber, global_beam_absorber, 2,
-               MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_beam_continuity[0], &global_beam_continuity_l1,
                1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_beam_continuity[1], &global_beam_continuity_linf,
                1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(local_nsub, global_nsub, 4, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(local_losses, global_losses, 19, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local_losses, global_losses, 9, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(local_energy, global_energy, 22, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
     if (mpi_rank == 0) {
@@ -641,8 +626,6 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << global_N_bkg_e << "  "
                   << global_N_beam_macro << "  "
                   << global_N_beam_weighted << "  "
-                  << global_beam_absorber[0] << "  "
-                  << global_beam_absorber[1] << "  "
                   << global_beam_continuity_l1 << "  "
                   << global_beam_continuity_linf << "  "
                   << global_nsub[0] << "  "
@@ -658,16 +641,6 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << global_losses[6] << "  "
                   << global_losses[7] << "  "
                   << global_losses[8] << "  "
-                  << global_losses[9] << "  "
-                  << global_losses[10] << "  "
-                  << global_losses[11] << "  "
-                  << global_losses[12] << "  "
-                  << global_losses[13] << "  "
-                  << global_losses[14] << "  "
-                  << global_losses[15] << "  "
-                  << global_losses[16] << "  "
-                  << global_losses[17] << "  "
-                  << global_losses[18] << "  "
                   << global_energy[0] << "  "
                   << global_energy[1] << "  "
                   << global_energy[2] << "  "
@@ -696,41 +669,6 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << global_f_u_max_x << "  "
                   << global_integral_f_u_gt_8_x << "\n";
         step_file.flush();
-    }
-}
-
-void Diagnostics::write_conservation_ledger(int step, double time,
-                                            double beam_compensation_delta_Ne,
-                                            double reservoir_added_Ne,
-                                            double boundary_loss_Ne,
-                                            double boundary_inflow_Ne,
-                                            double net_Nb_change,
-                                            int mpi_rank)
-{
-    if (!step_enabled) return;
-
-    double local_values[5] = {
-        beam_compensation_delta_Ne,
-        reservoir_added_Ne,
-        boundary_loss_Ne,
-        boundary_inflow_Ne,
-        net_Nb_change
-    };
-    double global_values[5] = { 0.0, 0.0, 0.0, 0.0, 0.0 };
-    MPI_Reduce(local_values, global_values, 5, MPI_DOUBLE, MPI_SUM,
-               0, MPI_COMM_WORLD);
-
-    if (mpi_rank == 0) {
-        ledger_file << step << "  "
-                    << time / Const::femto << "  "
-                    << global_values[0] << "  "
-                    << global_values[1] << "  "
-                    << global_values[2] << "  "
-                    << global_values[3] << "  "
-                    << global_values[4] << "\n";
-        if (step % 100 == 0) {
-            ledger_file.flush();
-        }
     }
 }
 

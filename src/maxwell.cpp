@@ -1,7 +1,6 @@
 #include "maxwell.h"
 #include "species.h"
 #include <algorithm>
-#include <cmath>
 #include <mpi.h>
 #include <vector>
 
@@ -50,142 +49,41 @@ void gather_rho(EMFields& fields, int mpi_size)
                 fields.displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
 }
 
-void remove_global_mean_charge_source(EMFields& fields)
-{
-    if (!Param::poisson_remove_global_mean_charge ||
-        fields.global_rhs.empty()) {
-        return;
-    }
-
-    double sum = 0.0;
-    for (size_t i = 0; i < fields.global_rhs.size(); ++i) {
-        sum += fields.global_rhs[i];
-    }
-    const double mean = sum / static_cast<double>(fields.global_rhs.size());
-    for (size_t i = 0; i < fields.global_rhs.size(); ++i) {
-        fields.global_rhs[i] -= mean;
-    }
-}
-
-void apply_boundary_reservoir_taper(EMFields& fields)
-{
-    if (!Param::poisson_taper_boundary_reservoir ||
-        fields.global_rhs.empty()) {
-        return;
-    }
-
-    const double length = Param::boundary_reservoir_length;
-    if (!(length > 0.0)) return;
-
-    const int n = static_cast<int>(fields.global_rhs.size());
-    for (int i = 0; i < n; ++i) {
-        const double x = (static_cast<double>(i) + 0.5) * fields.dx;
-        const double dist = std::min(x, Param::Lx - x);
-        double w = 1.0;
-        if (dist < length) {
-            const double s = std::max(0.0, std::min(1.0, dist / length));
-            w = s * s * (3.0 - 2.0 * s);
-        }
-        fields.global_rhs[static_cast<size_t>(i)] *= w;
-    }
-}
-
-void compute_dirichlet_poisson(EMFields& fields,
-                               bool compute_ex,
-                               bool compute_phi)
+void compute_gauss_field(EMFields& fields, bool compute_phi)
 {
     const int n = Param::nx;
     if (n <= 0) return;
 
-    fields.tri_work_a.assign(static_cast<size_t>(n), -1.0);
-    fields.tri_work_b.assign(static_cast<size_t>(n), 2.0);
-    fields.tri_work_c.assign(static_cast<size_t>(n), -1.0);
-    fields.tri_work_d.assign(static_cast<size_t>(n), 0.0);
-    fields.tri_work_a[0] = 0.0;
-    fields.tri_work_c[static_cast<size_t>(n - 1)] = 0.0;
-
-    const double rhs_scale = fields.dx * fields.dx / Const::eps0;
+    double mean_rho = 0.0;
     for (int i = 0; i < n; ++i) {
-        fields.tri_work_d[static_cast<size_t>(i)] =
-            fields.global_rhs[static_cast<size_t>(i)] * rhs_scale;
+        mean_rho += fields.global_rhs[static_cast<size_t>(i)];
     }
-
-    for (int i = 1; i < n; ++i) {
-        const size_t im = static_cast<size_t>(i - 1);
-        const size_t ii = static_cast<size_t>(i);
-        const double m = fields.tri_work_a[ii] / fields.tri_work_b[im];
-        fields.tri_work_b[ii] -= m * fields.tri_work_c[im];
-        fields.tri_work_d[ii] -= m * fields.tri_work_d[im];
-    }
-
-    fields.global_phi.assign(static_cast<size_t>(n), 0.0);
-    fields.global_phi[static_cast<size_t>(n - 1)] =
-        fields.tri_work_d[static_cast<size_t>(n - 1)] /
-        fields.tri_work_b[static_cast<size_t>(n - 1)];
-    for (int i = n - 2; i >= 0; --i) {
-        const size_t ii = static_cast<size_t>(i);
-        fields.global_phi[ii] =
-            (fields.tri_work_d[ii] -
-             fields.tri_work_c[ii] * fields.global_phi[ii + 1]) /
-            fields.tri_work_b[ii];
-    }
-
-    if (compute_ex) {
-        fields.global_ex.assign(static_cast<size_t>(n), 0.0);
-        if (n > 1) {
-            fields.global_ex[0] = -fields.global_phi[1] / fields.dx;
-            for (int i = 1; i < n - 1; ++i) {
-                fields.global_ex[static_cast<size_t>(i)] =
-                    -(fields.global_phi[static_cast<size_t>(i + 1)] -
-                      fields.global_phi[static_cast<size_t>(i - 1)]) /
-                    (2.0 * fields.dx);
-            }
-            fields.global_ex[static_cast<size_t>(n - 1)] =
-                fields.global_phi[static_cast<size_t>(n - 2)] / fields.dx;
-        }
-    }
-
-    if (!compute_phi) {
-        std::fill(fields.global_phi.begin(), fields.global_phi.end(), 0.0);
-    }
-}
-
-void compute_neumann_poisson(EMFields& fields,
-                             bool compute_ex,
-                             bool compute_phi)
-{
-    const int n = Param::nx;
-    if (n <= 0) return;
+    mean_rho /= static_cast<double>(n);
 
     fields.global_ex.assign(static_cast<size_t>(n), 0.0);
-    fields.global_phi.assign(static_cast<size_t>(n), 0.0);
+    fields.all_interfaces.assign(static_cast<size_t>(n + 1), 0.0);
 
-    std::vector<double> face_e(static_cast<size_t>(n + 1), 0.0);
-    face_e[0] = Param::poisson_left_external_field;
     const double scale = fields.dx / Const::eps0;
     for (int i = 0; i < n; ++i) {
-        face_e[static_cast<size_t>(i + 1)] =
-            face_e[static_cast<size_t>(i)] +
-            fields.global_rhs[static_cast<size_t>(i)] * scale;
+        fields.all_interfaces[static_cast<size_t>(i + 1)] =
+            fields.all_interfaces[static_cast<size_t>(i)] +
+            (fields.global_rhs[static_cast<size_t>(i)] - mean_rho) * scale;
     }
 
-    const double right_error =
-        face_e[static_cast<size_t>(n)] - Param::poisson_right_external_field;
-    const double denom = std::max(1, n);
-    for (int i = 0; i <= n; ++i) {
-        face_e[static_cast<size_t>(i)] -=
-            right_error * static_cast<double>(i) / static_cast<double>(denom);
+    double mean_ex = 0.0;
+    for (int i = 0; i < n; ++i) {
+        fields.global_ex[static_cast<size_t>(i)] =
+            0.5 * (fields.all_interfaces[static_cast<size_t>(i)] +
+                   fields.all_interfaces[static_cast<size_t>(i + 1)]);
+        mean_ex += fields.global_ex[static_cast<size_t>(i)];
     }
-
-    if (compute_ex) {
-        for (int i = 0; i < n; ++i) {
-            fields.global_ex[static_cast<size_t>(i)] =
-                0.5 * (face_e[static_cast<size_t>(i)] +
-                       face_e[static_cast<size_t>(i + 1)]);
-        }
+    mean_ex /= static_cast<double>(n);
+    for (int i = 0; i < n; ++i) {
+        fields.global_ex[static_cast<size_t>(i)] -= mean_ex;
     }
 
     if (compute_phi) {
+        fields.global_phi.assign(static_cast<size_t>(n), 0.0);
         for (int i = 1; i < n; ++i) {
             fields.global_phi[static_cast<size_t>(i)] =
                 fields.global_phi[static_cast<size_t>(i - 1)] -
@@ -200,8 +98,6 @@ void compute_neumann_poisson(EMFields& fields,
         for (int i = 0; i < n; ++i) {
             fields.global_phi[static_cast<size_t>(i)] -= mean_phi;
         }
-    } else {
-        std::fill(fields.global_phi.begin(), fields.global_phi.end(), 0.0);
     }
 }
 
@@ -221,13 +117,12 @@ void exchange_scalar_ghosts(EMFields& fields,
         fields.recv_right.resize(ng);
     }
 
-    const int left = mpi_rank - 1;
-    const int right = mpi_rank + 1;
-
     if (mpi_size == 1) {
         for (int g = 0; g < ng; ++g) {
-            a[g] = a[ng];
-            a[ng + nxl + g] = a[ng + nxl - 1];
+            const int left_src = ng + ((nxl - ng + g) % nxl);
+            const int right_src = ng + (g % nxl);
+            a[g] = a[left_src];
+            a[ng + nxl + g] = a[right_src];
         }
         return;
     }
@@ -239,24 +134,22 @@ void exchange_scalar_ghosts(EMFields& fields,
 
     MPI_Request reqs[4];
     int nreq = 0;
-    if (left >= 0) {
-        MPI_Isend(fields.send_left.data(), ng, MPI_DOUBLE, left, tag_base,
-                  MPI_COMM_WORLD, &reqs[nreq++]);
-        MPI_Irecv(fields.recv_left.data(), ng, MPI_DOUBLE, left, tag_base + 1,
-                  MPI_COMM_WORLD, &reqs[nreq++]);
-    }
-    if (right < mpi_size) {
-        MPI_Isend(fields.send_right.data(), ng, MPI_DOUBLE, right, tag_base + 1,
-                  MPI_COMM_WORLD, &reqs[nreq++]);
-        MPI_Irecv(fields.recv_right.data(), ng, MPI_DOUBLE, right, tag_base,
-                  MPI_COMM_WORLD, &reqs[nreq++]);
-    }
+    const int left_peer = (mpi_rank + mpi_size - 1) % mpi_size;
+    const int right_peer = (mpi_rank + 1) % mpi_size;
+
+    MPI_Isend(fields.send_left.data(), ng, MPI_DOUBLE, left_peer, tag_base,
+              MPI_COMM_WORLD, &reqs[nreq++]);
+    MPI_Irecv(fields.recv_left.data(), ng, MPI_DOUBLE, left_peer, tag_base + 1,
+              MPI_COMM_WORLD, &reqs[nreq++]);
+    MPI_Isend(fields.send_right.data(), ng, MPI_DOUBLE, right_peer, tag_base + 1,
+              MPI_COMM_WORLD, &reqs[nreq++]);
+    MPI_Irecv(fields.recv_right.data(), ng, MPI_DOUBLE, right_peer, tag_base,
+              MPI_COMM_WORLD, &reqs[nreq++]);
     if (nreq > 0) MPI_Waitall(nreq, reqs, MPI_STATUSES_IGNORE);
 
     for (int g = 0; g < ng; ++g) {
-        a[g] = (left >= 0) ? fields.recv_left[g] : a[ng];
-        a[ng + nxl + g] =
-            (right < mpi_size) ? fields.recv_right[g] : a[ng + nxl - 1];
+        a[g] = fields.recv_left[g];
+        a[ng + nxl + g] = fields.recv_right[g];
     }
 }
 }
@@ -297,14 +190,27 @@ void EMFields::set_charge_density(const Species& electrons,
     const int ng = electrons.sgrid->nghost;
     const int nxl = electrons.sgrid->nx_local;
     std::fill(rho.begin(), rho.end(), 0.0);
-    for (int ix = 0; ix < nxl; ++ix) {
-        const double zni = (ix < static_cast<int>(ion_density_profile.size()))
-                         ? ion_density_profile[static_cast<size_t>(ix)]
-                         : 0.0;
-        const double nb = (ix < static_cast<int>(beam_density.size()))
-                        ? beam_density[static_cast<size_t>(ix)]
-                        : 0.0;
-        rho[ix + ng] = Const::qe * (zni - electrons.number_density[ix] - nb);
+    const bool inputs_sized =
+        ion_density_profile.size() >= static_cast<size_t>(nxl) &&
+        beam_density.size() >= static_cast<size_t>(nxl);
+    if (inputs_sized) {
+        for (int ix = 0; ix < nxl; ++ix) {
+            const size_t slot = static_cast<size_t>(ix);
+            rho[ix + ng] =
+                Const::qe * (ion_density_profile[slot]
+                           - electrons.number_density[slot]
+                           - beam_density[slot]);
+        }
+    } else {
+        for (int ix = 0; ix < nxl; ++ix) {
+            const size_t slot = static_cast<size_t>(ix);
+            const double zni = (slot < ion_density_profile.size())
+                             ? ion_density_profile[slot] : 0.0;
+            const double nb = (slot < beam_density.size())
+                            ? beam_density[slot] : 0.0;
+            rho[ix + ng] =
+                Const::qe * (zni - electrons.number_density[slot] - nb);
+        }
     }
 }
 
@@ -315,18 +221,73 @@ void EMFields::solve_poisson(int mpi_rank, int mpi_size)
     gather_rho(*this, mpi_size);
 
     if (mpi_rank == 0) {
-        apply_boundary_reservoir_taper(*this);
-        remove_global_mean_charge_source(*this);
-        if (Param::poisson_use_neumann_open_boundary) {
-            compute_neumann_poisson(*this, true, false);
-        } else {
-            compute_dirichlet_poisson(*this, true, false);
-        }
+        compute_gauss_field(*this, false);
     }
 
     MPI_Scatterv(global_ex.data(), counts.data(), displs.data(), MPI_DOUBLE,
                  local_rhs.data(), nxl, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     for (int ix = 0; ix < nxl; ++ix) Ex[ng + ix] = local_rhs[static_cast<size_t>(ix)];
+    exchange_ex_ghosts(mpi_rank, mpi_size);
+}
+
+void EMFields::advance_ampere(const std::vector<double>& background_current,
+                              const std::vector<double>& beam_current,
+                              double dt,
+                              int mpi_rank,
+                              int mpi_size)
+{
+    const int ng = Param::Nghost;
+    const int nxl = nx_total - 2 * ng;
+    if (dt <= 0.0 || nxl <= 0) return;
+
+    double local_current_integral = 0.0;
+    for (int ix = 0; ix < nxl; ++ix) {
+        const size_t slot = static_cast<size_t>(ix);
+        const double jb = (slot < background_current.size())
+                        ? background_current[slot] : 0.0;
+        const double jbeam = (slot < beam_current.size())
+                           ? beam_current[slot] : 0.0;
+        local_current_integral += (jb + jbeam) * dx;
+    }
+
+    double global_current_integral = 0.0;
+    MPI_Allreduce(&local_current_integral, &global_current_integral, 1,
+                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    const double mean_current = global_current_integral / Param::Lx;
+
+    double local_e_integral = 0.0;
+    const bool currents_sized =
+        background_current.size() >= static_cast<size_t>(nxl) &&
+        beam_current.size() >= static_cast<size_t>(nxl);
+    if (currents_sized) {
+        for (int ix = 0; ix < nxl; ++ix) {
+            const size_t slot = static_cast<size_t>(ix);
+            const double j_eff =
+                background_current[slot] + beam_current[slot] - mean_current;
+            Ex[ng + ix] += -dt * j_eff / Const::eps0;
+            local_e_integral += Ex[ng + ix] * dx;
+        }
+    } else {
+        for (int ix = 0; ix < nxl; ++ix) {
+            const size_t slot = static_cast<size_t>(ix);
+            const double jb = (slot < background_current.size())
+                            ? background_current[slot] : 0.0;
+            const double jbeam = (slot < beam_current.size())
+                               ? beam_current[slot] : 0.0;
+            const double j_eff = jb + jbeam - mean_current;
+            Ex[ng + ix] += -dt * j_eff / Const::eps0;
+            local_e_integral += Ex[ng + ix] * dx;
+        }
+    }
+
+    double global_e_integral = 0.0;
+    MPI_Allreduce(&local_e_integral, &global_e_integral, 1,
+                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    const double mean_e = global_e_integral / Param::Lx;
+    for (int ix = 0; ix < nxl; ++ix) {
+        Ex[ng + ix] -= mean_e;
+    }
+
     exchange_ex_ghosts(mpi_rank, mpi_size);
 }
 
@@ -337,13 +298,7 @@ void EMFields::compute_potential(int mpi_rank, int mpi_size)
     gather_rho(*this, mpi_size);
 
     if (mpi_rank == 0) {
-        apply_boundary_reservoir_taper(*this);
-        remove_global_mean_charge_source(*this);
-        if (Param::poisson_use_neumann_open_boundary) {
-            compute_neumann_poisson(*this, true, true);
-        } else {
-            compute_dirichlet_poisson(*this, false, true);
-        }
+        compute_gauss_field(*this, true);
     }
 
     MPI_Scatterv(global_phi.data(), counts.data(), displs.data(), MPI_DOUBLE,

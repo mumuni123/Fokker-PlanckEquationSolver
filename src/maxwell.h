@@ -20,19 +20,7 @@ struct EMFields {
     std::vector<double> global_rhs;
     std::vector<double> global_ex;
     std::vector<double> global_phi;
-    std::vector<double> tri_a;
-    std::vector<double> tri_b;
-    std::vector<double> tri_c;
-    std::vector<double> tri_rhs;
-    std::vector<double> tri_y;
-    std::vector<double> tri_left_response;
-    std::vector<double> tri_right_response;
-    std::vector<double> tri_work_a;
-    std::vector<double> tri_work_b;
-    std::vector<double> tri_work_c;
-    std::vector<double> tri_work_d;
     std::vector<double> all_interfaces;
-    std::vector<double> interface_values;
 
     int nx_total;
     int counts_mpi_size;
@@ -46,8 +34,13 @@ struct EMFields {
                             const std::vector<double>& beam_density,
                             const std::vector<double>& ion_density_profile);
 
-    // Main-step electrostatic solve. Default model uses grounded Dirichlet boundaries.
+    // Periodic Gauss solve for initialization or low-frequency correction.
     void solve_poisson(int mpi_rank, int mpi_size);
+    void advance_ampere(const std::vector<double>& background_current,
+                        const std::vector<double>& beam_current,
+                        double dt,
+                        int mpi_rank,
+                        int mpi_size);
     // Snapshot-only potential reconstruction.
     void compute_potential(int mpi_rank, int mpi_size);
     void exchange_ex_ghosts(int mpi_rank, int mpi_size);

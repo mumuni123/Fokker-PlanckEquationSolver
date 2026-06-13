@@ -34,16 +34,9 @@ double compute_dt(const Species& electron, const SpatialGrid& sg)
     return std::min(dt_min, 0.01 * Const::femto);
 }
 
-const char* poisson_solver_name()
+const char* field_solver_name()
 {
-    if (Param::poisson_use_neumann_open_boundary) {
-        return Param::poisson_remove_global_mean_charge
-            ? "open Neumann Poisson with mean-charge removal"
-            : "open Neumann Poisson";
-    }
-    return Param::poisson_remove_global_mean_charge
-        ? "grounded Dirichlet Poisson with mean-charge removal"
-        : "grounded Dirichlet Poisson";
+    return "periodic Vlasov-Ampere update with <J> compensation and <E> = 0";
 }
 
 std::vector<double> build_local_ion_density_profile(const SpatialGrid& sg)
@@ -51,12 +44,10 @@ std::vector<double> build_local_ion_density_profile(const SpatialGrid& sg)
     return std::vector<double>(static_cast<size_t>(sg.nx_local), Param::dens);
 }
 
-void sync_moments_and_fields(Species& electrons,
+void sync_moments_and_charge(Species& electrons,
                              const BeamPIC& beam,
                              EMFields& fields,
                              const std::vector<double>& ion_density_profile,
-                             int mpi_rank,
-                             int mpi_size,
                              bool& moments_current)
 {
     if (!moments_current) {
@@ -64,7 +55,6 @@ void sync_moments_and_fields(Species& electrons,
         moments_current = true;
     }
     fields.set_charge_density(electrons, beam.density, ion_density_profile);
-    fields.solve_poisson(mpi_rank, mpi_size);
 }
 
 void abort_if_vmax_loss(const VlasovSolver& vlasov,
@@ -179,31 +169,19 @@ int main(int argc, char** argv)
                Param::momentum_refined_u);
         printf("Electron momentum domain: 0 <= u <= %.3f, vx = c u mu / sqrt(1+u^2)\n",
                Param::momentum_umax);
-        printf("Electrostatic boundary: open Neumann Ex_ext(L/R) = %.3e / %.3e V/m; Poisson mean-charge removal: %s\n",
-               Param::poisson_left_external_field,
-               Param::poisson_right_external_field,
-               Param::poisson_remove_global_mean_charge ? "ON" : "OFF");
-        printf("Poisson solver: %s\n", poisson_solver_name());
-        printf("Poisson reservoir-layer charge taper: %s, length = %.3e m\n",
-               Param::poisson_taper_boundary_reservoir ? "ON" : "OFF",
-               Param::boundary_reservoir_length);
+        printf("Spatial boundary: periodic in x for background electrons and electrostatic field; beam is open\n");
+        printf("Electrostatic update: dE/dt = -(J_total - <J_total>)/eps0 with <E> = 0\n");
+        printf("Field solver: %s\n", field_solver_name());
         printf("Fixed ions: uniform Z*n_i = %.3e /m^3\n", Param::dens);
-        printf("Background electrons: dynamic boundary reservoir model, T_e = %.1f eV\n",
+        printf("Background electrons: periodic Vlasov transport, T_e = %.1f eV\n",
                Param::temperature_e / Const::eV);
-        printf("Boundary reservoir: ghost inflow f_in = A*f0, zero drift, A from %.3e m boundary density average, range = [%.2f, %.2f], gain = %.2f\n",
-               Param::boundary_reservoir_length,
-               Param::boundary_reservoir_min_scale,
-               Param::boundary_reservoir_max_scale,
-               Param::boundary_reservoir_feedback_gain);
-        printf("Boundary sponge: df/dt = -nu(x)*(f-f0), tau_edge = %.3e s, active only in boundary reservoir layer\n",
-               Param::boundary_sponge_tau);
         printf("PIC beam: gamma*beta = %.2f, beta = %.4f, n_b = %.3e /m^3\n",
                Param::gambetab, Param::betab, Param::densb);
         printf("Beam source: quiet-start left boundary injection at x = 0\n");
         printf("Beam injection: charge-conserving path current, centered before Poisson\n");
         printf("Beam charge compensation source: OFF; background density perturbations are produced only by Poisson/Vlasov dynamics\n");
-        printf("Beam boundary: particles crossing the domain edge are deleted and counted in the energy ledger\n");
-        printf("Background boundary: no preset wake, no left/right reflow, no direct reset of physical boundary cells by ghosts\n");
+        printf("Beam boundary: particles crossing either global edge leave the domain\n");
+        printf("Background boundary: periodic ghost cells\n");
         printf("Beam macro weight: %.6e particles/m^2\n", Param::beam_macro_weight);
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
         printf("Debug diagnostics: %s\n",
@@ -218,7 +196,6 @@ int main(int argc, char** argv)
         if (config.enable_step_diagnostics) {
             printf("Step diagnostics interval: every %d steps\n",
                    config.step_diagnostics_interval);
-            printf("Conservation ledger: every step\n");
         }
         printf("Progress trace: %s\n",
                config.enable_progress_trace ? "ON" : "OFF");
@@ -261,8 +238,9 @@ int main(int argc, char** argv)
 
     double cumulative_collision_energy_delta = 0.0;
     bool moments_current = false;
-    sync_moments_and_fields(bkg_e, beam, fields, ion_density_profile,
-                            mpi_rank, mpi_size, moments_current);
+    sync_moments_and_charge(bkg_e, beam, fields, ion_density_profile,
+                            moments_current);
+    fields.solve_poisson(mpi_rank, mpi_size);
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
     if (config.enable_debug_diagnostics) {
         diag.write_debug_state(0, 0.0, "initial", bkg_e, beam, fields,
@@ -294,14 +272,6 @@ int main(int argc, char** argv)
         double loss_v2_low = 0.0;
         double loss_v2_high = 0.0;
         double loss_mu2 = 0.0;
-        double loss_x1_left = 0.0;
-        double loss_x1_right = 0.0;
-        double loss_x2_left = 0.0;
-        double loss_x2_right = 0.0;
-        double loss_x_momentum_step = 0.0;
-        double loss_x_energy_step = 0.0;
-        double reservoir_added_ne_step = 0.0;
-        double boundary_inflow_ne_step = 0.0;
         double net_nb_change_step = 0.0;
         double collision_energy_step = 0.0;
         const bool collect_step_diagnostics =
@@ -347,11 +317,6 @@ int main(int argc, char** argv)
         vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size,
                         time_start);
         trace_progress(config, mpi_rank, step, "after x half 1");
-        boundary_inflow_ne_step += vlasov.last_boundary_inflow();
-        loss_x1_left = vlasov.last_loss_x_left();
-        loss_x1_right = vlasov.last_loss_x_right();
-        loss_x_momentum_step += vlasov.last_loss_x_momentum();
-        loss_x_energy_step += vlasov.last_loss_x_energy();
         moments_current = false;
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
         if (config.enable_debug_diagnostics) {
@@ -434,16 +399,16 @@ int main(int argc, char** argv)
                                        ex_step_start, sgrid, 0.5 * dt);
             bkg_current_mid = bkg_e.current_x;
         }
-        trace_progress(config, mpi_rank, step, "before center Ex solve");
-        fields.set_charge_density(bkg_e, beam.density, ion_density_profile);
-        fields.solve_poisson(mpi_rank, mpi_size);
-        trace_progress(config, mpi_rank, step, "after center Ex solve");
+        trace_progress(config, mpi_rank, step, "before center Ampere update");
+        fields.advance_ampere(bkg_e.current_x, beam.current_x,
+                              0.5 * dt, mpi_rank, mpi_size);
+        trace_progress(config, mpi_rank, step, "after center Ampere update");
         if (collect_step_diagnostics) {
             ex_center = copy_local_ex(fields, sgrid);
         }
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
         if (config.enable_debug_diagnostics) {
-            diag.write_debug_state(step, time, "center_solve_Ex",
+            diag.write_debug_state(step, time, "center_ampere_E",
                                    bkg_e, beam, fields,
                                    sgrid, mpi_rank, mpi_size);
         }
@@ -468,9 +433,9 @@ int main(int argc, char** argv)
         bkg_e.compute_moments();
         moments_current = true;
         trace_progress(config, mpi_rank, step, "after beam end deposit");
-        fields.set_charge_density(bkg_e, beam.density, ion_density_profile);
-        fields.solve_poisson(mpi_rank, mpi_size);
-        trace_progress(config, mpi_rank, step, "after beam end Ex solve");
+        fields.advance_ampere(bkg_e.current_x, beam.current_x,
+                              0.5 * dt, mpi_rank, mpi_size);
+        trace_progress(config, mpi_rank, step, "after beam end Ampere update");
         if (collect_step_diagnostics) {
             W_beam_E = beam.last_field_work();
         }
@@ -525,11 +490,6 @@ int main(int argc, char** argv)
         vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size,
                         time_center);
         trace_progress(config, mpi_rank, step, "after x half 2");
-        boundary_inflow_ne_step += vlasov.last_boundary_inflow();
-        loss_x2_left = vlasov.last_loss_x_left();
-        loss_x2_right = vlasov.last_loss_x_right();
-        loss_x_momentum_step += vlasov.last_loss_x_momentum();
-        loss_x_energy_step += vlasov.last_loss_x_energy();
         moments_current = false;
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
         if (config.enable_debug_diagnostics) {
@@ -559,20 +519,15 @@ int main(int argc, char** argv)
         }
 
         trace_progress(config, mpi_rank, step, "before end sync");
-        sync_moments_and_fields(bkg_e, beam, fields, ion_density_profile,
-                                mpi_rank, mpi_size, moments_current);
+        if (!moments_current) {
+            bkg_e.compute_moments();
+            moments_current = true;
+        }
+        fields.set_charge_density(bkg_e, beam.density, ion_density_profile);
         trace_progress(config, mpi_rank, step, "after end sync");
 
         net_nb_change_step = beam.last_injected_number()
                            - beam.last_outflow_number();
-        diag.write_conservation_ledger(
-            step, time,
-            0.0,
-            reservoir_added_ne_step,
-            loss_x1_left + loss_x1_right + loss_x2_left + loss_x2_right,
-            boundary_inflow_ne_step,
-            net_nb_change_step,
-            mpi_rank);
 
         if (collect_step_diagnostics) {
             const double bkg_ke_step_end = bkg_e.total_kinetic_energy();
@@ -597,15 +552,6 @@ int main(int argc, char** argv)
                                         loss_v2, loss_mu2,
                                         loss_v1_low, loss_v1_high,
                                         loss_v2_low, loss_v2_high,
-                                        loss_x1_left, loss_x1_right,
-                                        loss_x2_left, loss_x2_right,
-                                        loss_x_momentum_step,
-                                        loss_x_energy_step,
-                                        0.0,
-                                        reservoir_added_ne_step,
-                                        loss_x1_left + loss_x1_right
-                                            + loss_x2_left + loss_x2_right,
-                                        boundary_inflow_ne_step,
                                         net_nb_change_step,
                                         collision_energy_step,
                                         cumulative_collision_energy_delta,
@@ -617,7 +563,8 @@ int main(int argc, char** argv)
                                         mu_momentum_delta_step,
                                         v_energy_delta_step,
                                         mu_energy_delta_step,
-                                        E_src_in_step, E_src_out_step,
+                                        E_src_in_step,
+                                        E_src_out_step,
                                         E_balance_step,
                                         max_loss_u_high_step,
                                         x_at_max_loss_u_high_step,
@@ -642,8 +589,8 @@ int main(int argc, char** argv)
         }
     }
 
-    sync_moments_and_fields(bkg_e, beam, fields, ion_density_profile,
-                            mpi_rank, mpi_size, moments_current);
+    sync_moments_and_charge(bkg_e, beam, fields, ion_density_profile,
+                            moments_current);
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
     if (config.enable_debug_diagnostics) {
         diag.write_debug_state(nsteps, Param::t_end, "final", bkg_e, beam, fields,

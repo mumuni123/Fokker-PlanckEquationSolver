@@ -37,8 +37,6 @@ double discrete_maxwellian_sum(const Species& sp,
 
 Species::Species()
     : charge(0.0), mass(0.0), density0(0.0), temperature(0.0),
-      reservoir_density_left(0.0), reservoir_density_right(0.0),
-      reservoir_drift_left(0.0), reservoir_drift_right(0.0),
       collisions_enabled(true), relativistic_push(false), sgrid(NULL)
 {}
 
@@ -54,10 +52,6 @@ void Species::init(const std::string& n, SpeciesType t,
     mass = m;
     density0 = dens;
     temperature = temp;
-    reservoir_density_left = dens;
-    reservoir_density_right = dens;
-    reservoir_drift_left = 0.0;
-    reservoir_drift_right = 0.0;
     collisions_enabled = coll;
     relativistic_push = (type == SpeciesType::BEAM);
     sgrid = &sg;

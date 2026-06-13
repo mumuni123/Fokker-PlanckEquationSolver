@@ -2,4 +2,5 @@ submit.pbs
 results/
 output/
 EPOCH-Compare/
+full-FP-Compare/
 CLAUDE.md

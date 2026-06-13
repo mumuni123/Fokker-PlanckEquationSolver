@@ -8,139 +8,22 @@
 #include <omp.h>
 
 namespace {
-void fill_left_physical_ghosts(Species& sp, const SpatialGrid& sg,
-                               const std::vector<double>& incoming)
+void fill_periodic_ghosts_single_rank(Species& sp, const SpatialGrid& sg)
 {
     const int ng = sg.nghost;
     const int nxl = sg.nx_local;
     if (nxl <= 0) return;
-    const size_t source = static_cast<size_t>(ng) * Param::Nvmu;
-    const bool has_incoming = incoming.size() == Param::Nvmu;
+
+    const size_t slice_size = Param::Nvmu;
     for (int g = 0; g < ng; ++g) {
-        const size_t dst = static_cast<size_t>(ng - 1 - g) * Param::Nvmu;
-        std::memcpy(&sp.f[dst], &sp.f[source], Param::Nvmu * sizeof(double));
-        for (size_t k = 0; k < Param::Nvmu; ++k) {
-            if (sp.vgrid.vx_cells[k] > 0.0) {
-                sp.f[dst + k] = has_incoming ? incoming[k] : 0.0;
-            }
-        }
-    }
-}
-
-void fill_right_physical_ghosts(Species& sp, const SpatialGrid& sg,
-                                const std::vector<double>& incoming)
-{
-    const int ng = sg.nghost;
-    const int nxl = sg.nx_local;
-    if (nxl <= 0) return;
-    const size_t source = static_cast<size_t>(ng + nxl - 1) * Param::Nvmu;
-    const bool has_incoming = incoming.size() == Param::Nvmu;
-    for (int g = 0; g < ng; ++g) {
-        const size_t dst = static_cast<size_t>(ng + nxl + g) * Param::Nvmu;
-        std::memcpy(&sp.f[dst], &sp.f[source], Param::Nvmu * sizeof(double));
-        for (size_t k = 0; k < Param::Nvmu; ++k) {
-            if (sp.vgrid.vx_cells[k] < 0.0) {
-                sp.f[dst + k] = has_incoming ? incoming[k] : 0.0;
-            }
-        }
-    }
-}
-
-void local_boundary_outflow_moments(const Species& sp,
-                                    const SpatialGrid& sg,
-                                    int mpi_rank,
-                                    int mpi_size,
-                                    double& left_out,
-                                    double& right_out,
-                                    double& px_out,
-                                    double& energy_out)
-{
-    left_out = 0.0;
-    right_out = 0.0;
-    px_out = 0.0;
-    energy_out = 0.0;
-    if (sp.type != SpeciesType::BACKGROUND_ELECTRON || sg.nx_local <= 0) {
-        return;
-    }
-
-    const int ng = sg.nghost;
-    if (mpi_rank == 0) {
-        const size_t xbase = static_cast<size_t>(ng) * Param::Nvmu;
-        for (size_t k = 0; k < Param::Nvmu; ++k) {
-            const double vx = sp.vgrid.vx_cells[k];
-            if (vx >= 0.0) continue;
-            const int iv = static_cast<int>(k / Param::Nmu);
-            const int imu = static_cast<int>(k % Param::Nmu);
-            const double flux =
-                -vx * sp.f[xbase + k] * sp.vgrid.moment_weight[iv];
-            const double u = sp.vgrid.v_cells[iv];
-            const double px =
-                sp.mass * Const::c * u * sp.vgrid.mu_cells[imu];
-            const double ke =
-                (sp.vgrid.gamma_cells[iv] - 1.0)
-                * sp.mass * Const::c * Const::c;
-            left_out += flux;
-            px_out += flux * px;
-            energy_out += flux * ke;
-        }
-    }
-
-    if (mpi_rank == mpi_size - 1) {
-        const size_t xbase =
-            static_cast<size_t>(ng + sg.nx_local - 1) * Param::Nvmu;
-        for (size_t k = 0; k < Param::Nvmu; ++k) {
-            const double vx = sp.vgrid.vx_cells[k];
-            if (vx <= 0.0) continue;
-            const int iv = static_cast<int>(k / Param::Nmu);
-            const int imu = static_cast<int>(k % Param::Nmu);
-            const double flux =
-                vx * sp.f[xbase + k] * sp.vgrid.moment_weight[iv];
-            const double u = sp.vgrid.v_cells[iv];
-            const double px =
-                sp.mass * Const::c * u * sp.vgrid.mu_cells[imu];
-            const double ke =
-                (sp.vgrid.gamma_cells[iv] - 1.0)
-                * sp.mass * Const::c * Const::c;
-            right_out += flux;
-            px_out += flux * px;
-            energy_out += flux * ke;
-        }
-    }
-}
-
-void local_boundary_inflow_fluxes(const Species& sp,
-                                  const SpatialGrid& sg,
-                                  int mpi_rank,
-                                  int mpi_size,
-                                  double& left_in,
-                                  double& right_in)
-{
-    left_in = 0.0;
-    right_in = 0.0;
-    if (sp.type != SpeciesType::BACKGROUND_ELECTRON || sg.nx_local <= 0) {
-        return;
-    }
-
-    const int ng = sg.nghost;
-    if (mpi_rank == 0) {
-        const size_t xbase = static_cast<size_t>(ng - 1) * Param::Nvmu;
-        for (size_t k = 0; k < Param::Nvmu; ++k) {
-            const double vx = sp.vgrid.vx_cells[k];
-            if (vx <= 0.0) continue;
-            const int iv = static_cast<int>(k / Param::Nmu);
-            left_in += vx * sp.f[xbase + k] * sp.vgrid.moment_weight[iv];
-        }
-    }
-
-    if (mpi_rank == mpi_size - 1) {
-        const size_t xbase =
-            static_cast<size_t>(ng + sg.nx_local) * Param::Nvmu;
-        for (size_t k = 0; k < Param::Nvmu; ++k) {
-            const double vx = sp.vgrid.vx_cells[k];
-            if (vx >= 0.0) continue;
-            const int iv = static_cast<int>(k / Param::Nmu);
-            right_in += -vx * sp.f[xbase + k] * sp.vgrid.moment_weight[iv];
-        }
+        const int left_src = ng + ((nxl - ng + g) % nxl);
+        const int right_src = ng + (g % nxl);
+        std::memcpy(&sp.f[static_cast<size_t>(g) * slice_size],
+                    &sp.f[static_cast<size_t>(left_src) * slice_size],
+                    slice_size * sizeof(double));
+        std::memcpy(&sp.f[static_cast<size_t>(ng + nxl + g) * slice_size],
+                    &sp.f[static_cast<size_t>(right_src) * slice_size],
+                    slice_size * sizeof(double));
     }
 }
 
@@ -237,15 +120,7 @@ inline double reconstruct_mu_face(const Species& sp, size_t row,
 }
 
 VlasovSolver::VlasovSolver()
-    : reservoir_basis_density_(0.0),
-      reservoir_basis_temperature_(0.0),
-      reservoir_basis_mass_(0.0),
-      reservoir_left_cached_scale_(0.0),
-      reservoir_right_cached_scale_(0.0),
-      reservoir_left_cache_valid_(false),
-      reservoir_right_cache_valid_(false),
-      reservoir_basis_valid_(false),
-      last_cfl_v_(0.0),
+    : last_cfl_v_(0.0),
       last_cfl_mu_(0.0),
       last_loss_v_(0.0),
       last_loss_v_low_(0.0),
@@ -255,12 +130,6 @@ VlasovSolver::VlasovSolver()
       last_f_umax_at_max_loss_v_high_(0.0),
       last_integral_f_u_gt_8_at_max_loss_v_high_(0.0),
       last_loss_mu_(0.0),
-      last_loss_x_left_(0.0),
-      last_loss_x_right_(0.0),
-      last_inflow_x_left_(0.0),
-      last_inflow_x_right_(0.0),
-      last_loss_x_momentum_(0.0),
-      last_loss_x_energy_(0.0),
       last_mass_error_v_(0.0),
       last_mass_error_mu_(0.0),
       last_momentum_delta_v_(0.0),
@@ -283,194 +152,6 @@ void VlasovSolver::advect(Species& sp, const SpatialGrid& sg,
     advect_x(sp, sg, 0.5 * dt, mpi_rank, mpi_size);
 }
 
-void VlasovSolver::ensure_reservoir_basis(const Species& sp)
-{
-    if (reservoir_basis_valid_ &&
-        reservoir_basis_density_ == sp.density0 &&
-        reservoir_basis_temperature_ == sp.temperature &&
-        reservoir_basis_mass_ == sp.mass) {
-        return;
-    }
-
-    sp.fill_maxwellian_velocity_slice(reservoir_base_,
-                                      sp.density0,
-                                      sp.temperature,
-                                      0.0);
-
-    reservoir_basis_density_ = sp.density0;
-    reservoir_basis_temperature_ = sp.temperature;
-    reservoir_basis_mass_ = sp.mass;
-    reservoir_basis_valid_ = true;
-    reservoir_left_cache_valid_ = false;
-    reservoir_right_cache_valid_ = false;
-}
-
-double VlasovSolver::boundary_density_average(const Species& sp,
-                                              const SpatialGrid& sg,
-                                              bool left_boundary) const
-{
-    if (sp.type != SpeciesType::BACKGROUND_ELECTRON || sg.nx_local <= 0) {
-        return sp.density0;
-    }
-
-    const double length =
-        std::max(Param::dx, Param::boundary_reservoir_length);
-    const int ng = sg.nghost;
-    const int edge_cells =
-        std::max(1, static_cast<int>(std::ceil(length / sg.dx)));
-    const int ix_begin = left_boundary
-        ? 0
-        : std::max(0, Param::nx - edge_cells - sg.ix_start);
-    const int ix_end = left_boundary
-        ? std::min(sg.nx_local, edge_cells - sg.ix_start)
-        : sg.nx_local;
-    double n_sum = 0.0;
-    int count = 0;
-
-    for (int ix = ix_begin; ix < ix_end; ++ix) {
-        const int ix_g = ix + ng;
-        const double x = sg.x(ix_g);
-        const double dist = left_boundary ? x : (Param::Lx - x);
-        if (dist > length) continue;
-
-        const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
-        double n = 0.0;
-        for (int iv = 0; iv < Param::Nv; ++iv) {
-            const double shell = sp.vgrid.moment_weight[iv];
-            const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
-            for (int imu = 0; imu < Param::Nmu; ++imu) {
-                n += std::max(0.0, sp.f[row + static_cast<size_t>(imu)])
-                   * shell;
-            }
-        }
-        n_sum += n;
-        ++count;
-    }
-
-    return (count > 0) ? n_sum / static_cast<double>(count) : sp.density0;
-}
-
-void VlasovSolver::update_open_boundary_inflow(const Species& sp,
-                                               const SpatialGrid& sg,
-                                               bool owns_left_boundary,
-                                               bool owns_right_boundary)
-{
-    if (sp.type != SpeciesType::BACKGROUND_ELECTRON) {
-        reservoir_left_.assign(Param::Nvmu, 0.0);
-        reservoir_right_.assign(Param::Nvmu, 0.0);
-        reservoir_left_cache_valid_ = false;
-        reservoir_right_cache_valid_ = false;
-        reservoir_basis_valid_ = false;
-        return;
-    }
-
-    ensure_reservoir_basis(sp);
-
-    if (owns_left_boundary) {
-        const double avg_n = boundary_density_average(sp, sg, true);
-        const double ratio =
-            (avg_n > 0.0) ? sp.density0 / avg_n
-                           : Param::boundary_reservoir_max_scale;
-        const double gain =
-            std::max(0.0, std::min(1.0,
-                                   Param::boundary_reservoir_feedback_gain));
-        double scale = 1.0 + gain * (ratio - 1.0);
-        scale = std::max(Param::boundary_reservoir_min_scale,
-                 std::min(Param::boundary_reservoir_max_scale, scale));
-        if (!reservoir_left_cache_valid_ ||
-            reservoir_left_cached_scale_ != scale) {
-            reservoir_left_.assign(Param::Nvmu, 0.0);
-            for (size_t k = 0; k < Param::Nvmu; ++k) {
-                reservoir_left_[k] = scale * reservoir_base_[k];
-            }
-            reservoir_left_cached_scale_ = scale;
-            reservoir_left_cache_valid_ = true;
-        }
-    }
-
-    if (owns_right_boundary) {
-        const double avg_n = boundary_density_average(sp, sg, false);
-        const double ratio =
-            (avg_n > 0.0) ? sp.density0 / avg_n
-                           : Param::boundary_reservoir_max_scale;
-        const double gain =
-            std::max(0.0, std::min(1.0,
-                                   Param::boundary_reservoir_feedback_gain));
-        double scale = 1.0 + gain * (ratio - 1.0);
-        scale = std::max(Param::boundary_reservoir_min_scale,
-                 std::min(Param::boundary_reservoir_max_scale, scale));
-        if (!reservoir_right_cache_valid_ ||
-            reservoir_right_cached_scale_ != scale) {
-            reservoir_right_.assign(Param::Nvmu, 0.0);
-            for (size_t k = 0; k < Param::Nvmu; ++k) {
-                reservoir_right_[k] = scale * reservoir_base_[k];
-            }
-            reservoir_right_cached_scale_ = scale;
-            reservoir_right_cache_valid_ = true;
-        }
-    }
-}
-
-void VlasovSolver::apply_boundary_sponge(Species& sp, const SpatialGrid& sg,
-                                         double dt_sub,
-                                         bool owns_left_boundary,
-                                         bool owns_right_boundary)
-{
-    if (sp.type != SpeciesType::BACKGROUND_ELECTRON || sg.nx_local <= 0) {
-        return;
-    }
-
-    ensure_reservoir_basis(sp);
-    const double length =
-        std::max(Param::dx, Param::boundary_reservoir_length);
-    const double tau = std::max(Param::boundary_sponge_tau, dt_sub);
-    const int ng = sg.nghost;
-    const int edge_cells =
-        std::max(1, static_cast<int>(std::ceil(length / sg.dx)));
-
-    const auto relax_cell = [&](int ix, double dist) {
-        const int ix_g = ix + ng;
-        const double s = std::max(0.0, std::min(1.0, dist / length));
-        const double profile = (1.0 - s) * (1.0 - s);
-        if (profile <= 0.0) return;
-
-        const double relax =
-            std::max(0.0, std::min(1.0,
-                1.0 - std::exp(-dt_sub * profile / tau)));
-        const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
-        for (size_t k = 0; k < Param::Nvmu; ++k) {
-            const double f0 = reservoir_base_[k];
-            sp.f[xbase + k] += relax * (f0 - sp.f[xbase + k]);
-            if (sp.f[xbase + k] < 0.0) {
-                sp.f[xbase + k] = 0.0;
-            }
-        }
-    };
-
-    if (owns_left_boundary) {
-        const int ix_end = std::min(sg.nx_local, edge_cells - sg.ix_start);
-        #pragma omp parallel for schedule(static)
-        for (int ix = 0; ix < ix_end; ++ix) {
-            const double dist = sg.x(ix + ng);
-            if (dist <= length) {
-                relax_cell(ix, dist);
-            }
-        }
-    }
-
-    if (owns_right_boundary) {
-        const int ix_begin =
-            std::max(0, Param::nx - edge_cells - sg.ix_start);
-        #pragma omp parallel for schedule(static)
-        for (int ix = ix_begin; ix < sg.nx_local; ++ix) {
-            const double dist = Param::Lx - sg.x(ix + ng);
-            if (dist <= length) {
-                relax_cell(ix, dist);
-            }
-        }
-    }
-}
-
 void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
                             int mpi_rank, int mpi_size, double time)
 {
@@ -486,38 +167,10 @@ void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
     for (size_t k = 0; k < Param::Nvmu; ++k) {
         x_cfl_[k] = sp.vgrid.vx_cells[k] * dt_sub / sg.dx;
     }
-    last_loss_x_left_ = 0.0;
-    last_loss_x_right_ = 0.0;
-    last_inflow_x_left_ = 0.0;
-    last_inflow_x_right_ = 0.0;
-    last_loss_x_momentum_ = 0.0;
-    last_loss_x_energy_ = 0.0;
-    const bool owns_left_boundary = (mpi_rank == 0);
-    const bool owns_right_boundary = (mpi_rank == mpi_size - 1);
     (void)time;
 
     for (int isub = 0; isub < nsub_x; ++isub) {
-        update_open_boundary_inflow(sp, sg,
-                                    owns_left_boundary,
-                                    owns_right_boundary);
         exchange_ghosts_x(sp, sg, mpi_rank, mpi_size);
-        double out_left = 0.0;
-        double out_right = 0.0;
-        double px_out = 0.0;
-        double energy_out = 0.0;
-        double in_left = 0.0;
-        double in_right = 0.0;
-        local_boundary_inflow_fluxes(sp, sg, mpi_rank, mpi_size,
-                                     in_left, in_right);
-        local_boundary_outflow_moments(sp, sg, mpi_rank, mpi_size,
-                                       out_left, out_right,
-                                       px_out, energy_out);
-        last_inflow_x_left_ += in_left * dt_sub;
-        last_inflow_x_right_ += in_right * dt_sub;
-        last_loss_x_left_ += out_left * dt_sub;
-        last_loss_x_right_ += out_right * dt_sub;
-        last_loss_x_momentum_ += px_out * dt_sub;
-        last_loss_x_energy_ += energy_out * dt_sub;
 
         #pragma omp parallel for collapse(2) schedule(static)
         for (int ix = ng; ix < ng + nxl; ++ix) {
@@ -545,9 +198,6 @@ void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
         }
 
         sp.f.swap(sp.f_tmp);
-        apply_boundary_sponge(sp, sg, dt_sub,
-                              owns_left_boundary,
-                              owns_right_boundary);
     }
 }
 
@@ -948,8 +598,13 @@ void VlasovSolver::exchange_ghosts_x(Species& sp, const SpatialGrid& sg,
     int ng = sg.nghost;
     int nxl = sg.nx_local;
     size_t slice_size = Param::Nvmu;
-    int left_rank = mpi_rank - 1;
-    int right_rank = mpi_rank + 1;
+    int left_rank = (mpi_rank + mpi_size - 1) % mpi_size;
+    int right_rank = (mpi_rank + 1) % mpi_size;
+
+    if (mpi_size == 1) {
+        fill_periodic_ghosts_single_rank(sp, sg);
+        return;
+    }
 
     size_t buffer_size = static_cast<size_t>(ng) * slice_size;
     if (send_left_.size() != buffer_size) {
@@ -968,30 +623,17 @@ void VlasovSolver::exchange_ghosts_x(Species& sp, const SpatialGrid& sg,
 
     MPI_Request reqs[4];
     int nreq = 0;
-    if (left_rank >= 0) {
-        MPI_Isend(send_left_.data(), (int)buffer_size, MPI_DOUBLE,
-                  left_rank, 101, MPI_COMM_WORLD, &reqs[nreq++]);
-        MPI_Irecv(recv_left_.data(), (int)buffer_size, MPI_DOUBLE,
-                  left_rank, 102, MPI_COMM_WORLD, &reqs[nreq++]);
-    }
-    if (right_rank < mpi_size) {
-        MPI_Isend(send_right_.data(), (int)buffer_size, MPI_DOUBLE,
-                  right_rank, 102, MPI_COMM_WORLD, &reqs[nreq++]);
-        MPI_Irecv(recv_right_.data(), (int)buffer_size, MPI_DOUBLE,
-                  right_rank, 101, MPI_COMM_WORLD, &reqs[nreq++]);
-    }
+    MPI_Isend(send_left_.data(), (int)buffer_size, MPI_DOUBLE,
+              left_rank, 101, MPI_COMM_WORLD, &reqs[nreq++]);
+    MPI_Irecv(recv_left_.data(), (int)buffer_size, MPI_DOUBLE,
+              left_rank, 102, MPI_COMM_WORLD, &reqs[nreq++]);
+    MPI_Isend(send_right_.data(), (int)buffer_size, MPI_DOUBLE,
+              right_rank, 102, MPI_COMM_WORLD, &reqs[nreq++]);
+    MPI_Irecv(recv_right_.data(), (int)buffer_size, MPI_DOUBLE,
+              right_rank, 101, MPI_COMM_WORLD, &reqs[nreq++]);
     if (nreq > 0) MPI_Waitall(nreq, reqs, MPI_STATUSES_IGNORE);
 
-    if (left_rank >= 0) {
-        std::memcpy(&sp.f[0], recv_left_.data(), buffer_size * sizeof(double));
-    } else {
-        fill_left_physical_ghosts(sp, sg, reservoir_left_);
-    }
-
-    if (right_rank < mpi_size) {
-        std::memcpy(&sp.f[static_cast<size_t>(ng + nxl) * slice_size],
-                    recv_right_.data(), buffer_size * sizeof(double));
-    } else {
-        fill_right_physical_ghosts(sp, sg, reservoir_right_);
-    }
+    std::memcpy(&sp.f[0], recv_left_.data(), buffer_size * sizeof(double));
+    std::memcpy(&sp.f[static_cast<size_t>(ng + nxl) * slice_size],
+                recv_right_.data(), buffer_size * sizeof(double));
 }

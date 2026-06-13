@@ -55,7 +55,6 @@ namespace Param {
     const bool   abort_on_vmax_loss = true;
     const double umax_loss_abort_fraction = 1.0e-12;
     const double vmax_loss_abort_fraction = umax_loss_abort_fraction;
-
     const int    beam_macro_particles_per_cell = 1000; // 1000
     const double beam_macro_weight = densb * dx / beam_macro_particles_per_cell;
     const double beam_source_x_start = 0.5 * Const::micro;
@@ -63,30 +62,6 @@ namespace Param {
     const double beam_charge_compensation_alpha = 1.0;
     const double beam_charge_compensation_smoothing_skin_depths = 1.5;
 
-    const double background_reservoir_drift_speed = jb / (Const::qe * dens);
-    const double background_reservoir_u_return = -jb / (Const::qe * dens);
-    const bool   enable_dynamic_background_reservoir = true;
-    const double background_reservoir_density_relaxation = 0.25;
-    const double background_reservoir_min_density_factor = 0.0;
-    const double background_reservoir_max_density_factor = 8.0;
-    const double background_reservoir_injection_skin_depths = 1.0;
-    const double background_reservoir_source_length = 0.3 * Const::micro;
-    const double background_reservoir_edge_exclusion = 0.0;
-    const double background_reservoir_source_drift_speed = 0.0;
-    const double background_reservoir_source_eta = 0.08;
-    const double background_reservoir_feedback_beta = 0.05;
-    const double background_reservoir_feedback_tau = 2.0 * Const::femto;
-
-    const bool   poisson_remove_global_mean_charge = true;
-    const bool   poisson_use_neumann_open_boundary = true;
-    const double poisson_left_external_field = 0.0;
-    const double poisson_right_external_field = 0.0;
-    const double boundary_reservoir_length = 0.1 * Const::micro;
-    const double boundary_reservoir_feedback_gain = 0.5;
-    const double boundary_reservoir_min_scale = 0.2;
-    const double boundary_reservoir_max_scale = 3.0;
-    const double boundary_sponge_tau = 2.0 * Const::femto;
-    const bool   poisson_taper_boundary_reservoir = true;
     const double omega_pe = std::sqrt(dens * Const::qe * Const::qe /
                                       (Const::eps0 * Const::me));
 
