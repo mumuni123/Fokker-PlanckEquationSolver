@@ -19,23 +19,23 @@ TIME_COLUMNS = ["Ex[V/m]"]
 TIME_X_AXIS_RANGE = None
 
 # Settings for plot_space_profile.py.
-SPACE_FILE = DATA_DIR / "fields_00040.dat"
+SPACE_FILE = DATA_DIR / "fields_00035.dat"
 SPACE_COLUMNS = ["Ex[V/m]"]
 # Use None to plot the full available range, or set (min, max) to restrict it.
 # Bounds can also be None individually, e.g. (1.0, None).
 SPACE_X_AXIS_RANGE = None
 
+# Settings for plot_background_density_evolution.py.
+BACKGROUND_DENSITY_FILES = [
+    DATA_DIR / "density_00005.dat",
+]
+BACKGROUND_DENSITY_COLUMN = "n_bkg_e[m^-3]"
+BACKGROUND_DENSITY_X_AXIS_RANGE = None
+
 # Settings for plot_beam_density_profile.py.
 DENSITY_FILE = DATA_DIR / "density_00010.dat"
 DENSITY_COLUMNS = ["n_beam[m^-3]"]
 DENSITY_X_AXIS_RANGE = None
-
-# Settings for plot_background_density_evolution.py.
-BACKGROUND_DENSITY_FILES = [
-    DATA_DIR / "density_00040.dat",
-]
-BACKGROUND_DENSITY_COLUMN = "n_bkg_e[m^-3]"
-BACKGROUND_DENSITY_X_AXIS_RANGE = None
 
 # Settings for plot_fv_profile.py.
 FV_FILE = DATA_DIR / "fv_bkg_e_00005.dat"

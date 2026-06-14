@@ -146,9 +146,13 @@ void BeamPIC::begin_step(const SpatialGrid& sg, double dt)
     left_boundary_number_flux_ = 0.0;
     last_continuity_l1_error_ = 0.0;
     last_continuity_linf_error_ = 0.0;
+    begin_current_interval(sg);
+}
+
+void BeamPIC::begin_current_interval(const SpatialGrid& sg)
+{
     density_step_start = density;
     if (source_density_delta.size() != static_cast<size_t>(sg.nx_local)) {
-        density_step_start.assign(sg.nx_local, 0.0);
         path_density_delta.assign(sg.nx_local, 0.0);
         source_density_delta.assign(sg.nx_local, 0.0);
         source_current_x.assign(sg.nx_local, 0.0);
@@ -158,8 +162,8 @@ void BeamPIC::begin_step(const SpatialGrid& sg, double dt)
         std::fill(path_density_delta.begin(), path_density_delta.end(), 0.0);
         std::fill(source_density_delta.begin(), source_density_delta.end(), 0.0);
         std::fill(source_current_x.begin(), source_current_x.end(), 0.0);
-        std::fill(current_face_x.begin(), current_face_x.end(), 0.0);
     }
+    left_boundary_number_flux_ = 0.0;
 }
 
 void BeamPIC::inject(const SpatialGrid& sg, const EMFields& fields,
@@ -277,6 +281,12 @@ void BeamPIC::push(const SpatialGrid& sg, const EMFields& fields, double dt,
     const double x_left = sg.ix_start * sg.dx;
     const double x_right = (sg.ix_start + sg.nx_local) * sg.dx;
     const long long np = static_cast<long long>(particles.size());
+    if (np == 0 && mpi_size == 1) {
+        send_left_.clear();
+        send_right_.clear();
+        keep_.clear();
+        return;
+    }
     const int nthreads = std::max(1, omp_get_max_threads());
 
     if (thread_keep_.size() != static_cast<size_t>(nthreads) ||
@@ -677,17 +687,18 @@ void BeamPIC::exchange_continuity_contributions(const SpatialGrid& sg,
 
 void BeamPIC::deposit_density(const SpatialGrid& sg, int mpi_rank, int mpi_size)
 {
+    if (particles.empty() && mpi_size == 1) {
+        resize_or_zero(density, static_cast<size_t>(sg.nx_local));
+        resize_or_zero(current_x, static_cast<size_t>(sg.nx_local));
+        return;
+    }
+
     const int nthreads = std::max(1, omp_get_max_threads());
     if (thread_density_.size() != static_cast<size_t>(nthreads)) {
         thread_density_.resize(nthreads);
         thread_current_.resize(nthreads);
         thread_send_left_density_.resize(nthreads);
         thread_send_right_density_.resize(nthreads);
-        thread_send_left_current_.resize(nthreads);
-        thread_send_right_current_.resize(nthreads);
-    }
-    if (thread_current_.size() != static_cast<size_t>(nthreads)) {
-        thread_current_.resize(nthreads);
         thread_send_left_current_.resize(nthreads);
         thread_send_right_current_.resize(nthreads);
     }

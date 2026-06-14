@@ -27,6 +27,7 @@ public:
 
     void init(const SpatialGrid& sg);
     void begin_step(const SpatialGrid& sg, double dt);
+    void begin_current_interval(const SpatialGrid& sg);
     void inject(const SpatialGrid& sg, const EMFields& fields,
                 double dt, double time, int mpi_rank, int mpi_size);
     void push(const SpatialGrid& sg, const EMFields& fields, double dt,

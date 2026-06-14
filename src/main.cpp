@@ -403,6 +403,7 @@ int main(int argc, char** argv)
         fields.advance_ampere(bkg_e.current_x, beam.current_x,
                               0.5 * dt, mpi_rank, mpi_size);
         trace_progress(config, mpi_rank, step, "after center Ampere update");
+        beam.begin_current_interval(sgrid);
         if (collect_step_diagnostics) {
             ex_center = copy_local_ex(fields, sgrid);
         }
@@ -428,7 +429,7 @@ int main(int argc, char** argv)
         trace_progress(config, mpi_rank, step, "after beam half 2 inject");
         trace_progress(config, mpi_rank, step, "before beam end deposit");
         beam.deposit_density(sgrid, mpi_rank, mpi_size);
-        beam.finalize_charge_conserving_current(sgrid, dt,
+        beam.finalize_charge_conserving_current(sgrid, 0.5 * dt,
                                                 mpi_rank, mpi_size);
         bkg_e.compute_moments();
         moments_current = true;
