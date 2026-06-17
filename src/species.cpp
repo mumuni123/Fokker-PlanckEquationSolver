@@ -230,10 +230,9 @@ double Species::total_kinetic_energy() const
         const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
         double e = 0.0;
         for (int iv = 0; iv < Param::Nv; ++iv) {
-            const double u = vgrid.v_cells[iv];
             const double shell = vgrid.moment_weight[iv];
             const double ke =
-                (gamma_from_u(u) - 1.0) * mass * Const::c * Const::c;
+                (vgrid.gamma_cells[iv] - 1.0) * mass * Const::c * Const::c;
             const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
             for (int imu = 0; imu < Param::Nmu; ++imu) {
                 e += f[row + imu] * ke * shell;
@@ -259,10 +258,9 @@ void Species::total_particle_number_and_energy(double& number,
         double n = 0.0;
         double e = 0.0;
         for (int iv = 0; iv < Param::Nv; ++iv) {
-            const double u = vgrid.v_cells[iv];
             const double shell = vgrid.moment_weight[iv];
             const double ke =
-                (gamma_from_u(u) - 1.0) * mass * Const::c * Const::c;
+                (vgrid.gamma_cells[iv] - 1.0) * mass * Const::c * Const::c;
             const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
             for (int imu = 0; imu < Param::Nmu; ++imu) {
                 const double weighted_f = f[row + imu] * shell;

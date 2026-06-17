@@ -124,6 +124,7 @@ void write_snapshot(Diagnostics& diag,
 {
     fields.compute_potential(mpi_rank, mpi_size);
     diag.write_fields(time, fields, sgrid, mpi_rank, mpi_size);
+    diag.write_current_density(time, bkg_e, beam, sgrid, mpi_rank, mpi_size);
     diag.write_density_profile(time, bkg_e, beam.density, ion_density_profile,
                                sgrid, mpi_rank, mpi_size);
     diag.write_px_distribution(time, bkg_e, mpi_rank, mpi_size);

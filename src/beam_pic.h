@@ -3,6 +3,7 @@
 
 #include "grid.h"
 #include "maxwell.h"
+#include <cstddef>
 #include <vector>
 
 struct BeamParticle {
@@ -95,6 +96,9 @@ private:
     std::vector<double> path_recv_left_density_;
     std::vector<double> path_recv_right_density_;
     std::vector<double> all_path_numbers_;
+    std::vector<size_t> keep_offsets_;
+    std::vector<size_t> left_offsets_;
+    std::vector<size_t> right_offsets_;
 
     void exchange_particles(const SpatialGrid& sg, int mpi_rank, int mpi_size);
     void exchange_continuity_contributions(const SpatialGrid& sg,

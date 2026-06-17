@@ -717,6 +717,66 @@ void Diagnostics::write_fields(double time,
     }
 }
 
+void Diagnostics::write_current_density(double time,
+                                        const Species& electrons,
+                                        const BeamPIC& beam,
+                                        const SpatialGrid& sg,
+                                        int mpi_rank, int mpi_size)
+{
+    int nxl = sg.nx_local;
+
+    std::vector<double> local_J_bkg(nxl, 0.0);
+    std::vector<double> local_J_beam(nxl, 0.0);
+    std::vector<double> local_J_total(nxl, 0.0);
+    for (int i = 0; i < nxl; ++i) {
+        const size_t slot = static_cast<size_t>(i);
+        const double J_bkg =
+            (slot < electrons.current_x.size()) ? electrons.current_x[slot] : 0.0;
+        const double J_beam =
+            (slot < beam.current_x.size()) ? beam.current_x[slot] : 0.0;
+        local_J_bkg[slot] = J_bkg;
+        local_J_beam[slot] = J_beam;
+        local_J_total[slot] = J_bkg + J_beam;
+    }
+
+    std::vector<int> counts(mpi_size);
+    std::vector<int> displs(mpi_size);
+    MPI_Gather(&nxl, 1, MPI_INT, counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (mpi_rank == 0) {
+        displs[0] = 0;
+        for (int r = 1; r < mpi_size; ++r) displs[r] = displs[r - 1] + counts[r - 1];
+    }
+
+    std::vector<double> global_J_bkg(sg.nx_global);
+    std::vector<double> global_J_beam(sg.nx_global);
+    std::vector<double> global_J_total(sg.nx_global);
+    MPI_Gatherv(local_J_bkg.data(), nxl, MPI_DOUBLE,
+                global_J_bkg.data(), counts.data(), displs.data(), MPI_DOUBLE,
+                0, MPI_COMM_WORLD);
+    MPI_Gatherv(local_J_beam.data(), nxl, MPI_DOUBLE,
+                global_J_beam.data(), counts.data(), displs.data(), MPI_DOUBLE,
+                0, MPI_COMM_WORLD);
+    MPI_Gatherv(local_J_total.data(), nxl, MPI_DOUBLE,
+                global_J_total.data(), counts.data(), displs.data(), MPI_DOUBLE,
+                0, MPI_COMM_WORLD);
+
+    if (mpi_rank == 0) {
+        std::ostringstream fname;
+        fname << output_dir << "/current_" << std::setw(5) << std::setfill('0')
+              << snapshot_count << ".dat";
+        std::ofstream out(fname.str().c_str());
+        out << "# time[fs] = " << time / Const::femto << "\n";
+        out << "# x[um]  J_bkg_e[A/m2]  J_beam[A/m2]  J_total[A/m2]\n";
+        out << std::scientific << std::setprecision(8);
+        for (int i = 0; i < sg.nx_global; ++i) {
+            out << (i + 0.5) * sg.dx / Const::micro
+                << "  " << global_J_bkg[i]
+                << "  " << global_J_beam[i]
+                << "  " << global_J_total[i] << "\n";
+        }
+    }
+}
+
 void Diagnostics::write_px_distribution(double time,
                                         const Species& sp,
                                         int mpi_rank, int mpi_size)

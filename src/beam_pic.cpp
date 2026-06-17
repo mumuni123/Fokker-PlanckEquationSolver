@@ -97,6 +97,15 @@ void resize_or_zero(std::vector<double>& values, size_t n)
     }
 }
 
+void resize_or_zero(std::vector<size_t>& values, size_t n)
+{
+    if (values.size() != n) {
+        values.assign(n, 0);
+    } else {
+        std::fill(values.begin(), values.end(), 0);
+    }
+}
+
 }
 
 void BeamPIC::init(const SpatialGrid& sg)
@@ -393,17 +402,17 @@ void BeamPIC::push(const SpatialGrid& sg, const EMFields& fields, double dt,
     size_t keep_total = 0;
     size_t left_total = 0;
     size_t right_total = 0;
-    std::vector<size_t> keep_offsets(nthreads + 1, 0);
-    std::vector<size_t> left_offsets(nthreads + 1, 0);
-    std::vector<size_t> right_offsets(nthreads + 1, 0);
+    resize_or_zero(keep_offsets_, static_cast<size_t>(nthreads + 1));
+    resize_or_zero(left_offsets_, static_cast<size_t>(nthreads + 1));
+    resize_or_zero(right_offsets_, static_cast<size_t>(nthreads + 1));
     for (int t = 0; t < nthreads; ++t) {
-        keep_offsets[t + 1] = keep_offsets[t] + thread_keep_[t].size();
-        left_offsets[t + 1] = left_offsets[t] + thread_send_left_[t].size();
-        right_offsets[t + 1] = right_offsets[t] + thread_send_right_[t].size();
+        keep_offsets_[t + 1] = keep_offsets_[t] + thread_keep_[t].size();
+        left_offsets_[t + 1] = left_offsets_[t] + thread_send_left_[t].size();
+        right_offsets_[t + 1] = right_offsets_[t] + thread_send_right_[t].size();
     }
-    keep_total = keep_offsets[nthreads];
-    left_total = left_offsets[nthreads];
-    right_total = right_offsets[nthreads];
+    keep_total = keep_offsets_[nthreads];
+    left_total = left_offsets_[nthreads];
+    right_total = right_offsets_[nthreads];
 
     keep_.clear();
     send_left_.clear();
@@ -415,11 +424,11 @@ void BeamPIC::push(const SpatialGrid& sg, const EMFields& fields, double dt,
     #pragma omp parallel for schedule(static)
     for (int t = 0; t < nthreads; ++t) {
         std::copy(thread_keep_[t].begin(), thread_keep_[t].end(),
-                  keep_.begin() + static_cast<std::ptrdiff_t>(keep_offsets[t]));
+                  keep_.begin() + static_cast<std::ptrdiff_t>(keep_offsets_[t]));
         std::copy(thread_send_left_[t].begin(), thread_send_left_[t].end(),
-                  send_left_.begin() + static_cast<std::ptrdiff_t>(left_offsets[t]));
+                  send_left_.begin() + static_cast<std::ptrdiff_t>(left_offsets_[t]));
         std::copy(thread_send_right_[t].begin(), thread_send_right_[t].end(),
-                  send_right_.begin() + static_cast<std::ptrdiff_t>(right_offsets[t]));
+                  send_right_.begin() + static_cast<std::ptrdiff_t>(right_offsets_[t]));
     }
 
     particles.swap(keep_);

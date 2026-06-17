@@ -85,6 +85,12 @@ public:
                       const SpatialGrid& sg,
                       int mpi_rank, int mpi_size);
 
+    void write_current_density(double time,
+                               const Species& electrons,
+                               const BeamPIC& beam,
+                               const SpatialGrid& sg,
+                               int mpi_rank, int mpi_size);
+
     void write_px_distribution(double time,
                                const Species& sp,
                                int mpi_rank, int mpi_size);

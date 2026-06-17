@@ -1,10 +1,20 @@
 #include "maxwell.h"
 #include "species.h"
 #include <algorithm>
+#include <cstddef>
 #include <mpi.h>
 #include <vector>
 
 namespace {
+void resize_or_zero(std::vector<double>& values, size_t n)
+{
+    if (values.size() != n) {
+        values.assign(n, 0.0);
+    } else {
+        std::fill(values.begin(), values.end(), 0.0);
+    }
+}
+
 void prepare_mpi_layout(EMFields& fields, int mpi_size)
 {
     const int ng = Param::Nghost;
@@ -60,8 +70,8 @@ void compute_gauss_field(EMFields& fields, bool compute_phi)
     }
     mean_rho /= static_cast<double>(n);
 
-    fields.global_ex.assign(static_cast<size_t>(n), 0.0);
-    fields.all_interfaces.assign(static_cast<size_t>(n + 1), 0.0);
+    resize_or_zero(fields.global_ex, static_cast<size_t>(n));
+    resize_or_zero(fields.all_interfaces, static_cast<size_t>(n + 1));
 
     const double scale = fields.dx / Const::eps0;
     for (int i = 0; i < n; ++i) {
@@ -83,7 +93,7 @@ void compute_gauss_field(EMFields& fields, bool compute_phi)
     }
 
     if (compute_phi) {
-        fields.global_phi.assign(static_cast<size_t>(n), 0.0);
+        resize_or_zero(fields.global_phi, static_cast<size_t>(n));
         for (int i = 1; i < n; ++i) {
             fields.global_phi[static_cast<size_t>(i)] =
                 fields.global_phi[static_cast<size_t>(i - 1)] -
