@@ -19,7 +19,7 @@ TIME_COLUMNS = ["Ex[V/m]"]
 TIME_X_AXIS_RANGE = None
 
 # Settings for plot_space_profile.py.
-SPACE_FILE = DATA_DIR / "fields_00035.dat"
+SPACE_FILE = DATA_DIR / "fields_00020.dat"
 SPACE_COLUMNS = ["Ex[V/m]"]
 # Use None to plot the full available range, or set (min, max) to restrict it.
 # Bounds can also be None individually, e.g. (1.0, None).
@@ -27,13 +27,13 @@ SPACE_X_AXIS_RANGE = None
 
 # Settings for plot_background_density_evolution.py.
 BACKGROUND_DENSITY_FILES = [
-    DATA_DIR / "density_00005.dat",
+    DATA_DIR / "density_00020.dat",
 ]
 BACKGROUND_DENSITY_COLUMN = "n_bkg_e[m^-3]"
 BACKGROUND_DENSITY_X_AXIS_RANGE = None
 
 # Settings for plot_beam_density_profile.py.
-DENSITY_FILE = DATA_DIR / "density_00010.dat"
+DENSITY_FILE = DATA_DIR / "density_00005.dat"
 DENSITY_COLUMNS = ["n_beam[m^-3]"]
 DENSITY_X_AXIS_RANGE = None
 
@@ -41,6 +41,19 @@ DENSITY_X_AXIS_RANGE = None
 FV_FILE = DATA_DIR / "fv_bkg_e_00005.dat"
 FV_COLUMNS = ["F(u)"]
 FV_X_AXIS_RANGE = (0.0, 3.0e8)
+
+# Settings for plot_current_density_profile.py.
+FACE_CURRENT_FILES = DATA_DIR / "face_current_00015.dat"
+# Use None to plot every current column in FACE_CURRENT_FILES.
+# Column names may omit units, e.g. "J_total_smoothed" matches "J_total_smoothed[A/m2]".
+FACE_CURRENT_COLUMNS = [
+    "J_bkg_face",
+    "J_bkg_moment",
+    "J_beam_face",
+    "J_total_raw",
+    "J_total_smoothed",
+]
+FACE_CURRENT_X_AXIS_RANGE = None
 
 # Plot style and output quality.
 FIGSIZE = (7.2, 4.5)
