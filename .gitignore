@@ -3,4 +3,6 @@ results/
 output/
 EPOCH-Compare/
 full-FP-Compare/
+noCollision_Beam_denstiy/
+noCollision_current_Jx/
 CLAUDE.md
