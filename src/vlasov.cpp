@@ -117,6 +117,39 @@ inline double reconstruct_mu_face(const Species& sp, size_t row,
                          - 0.5 * slope_mu_line(sp, row, imu));
 }
 
+void resize_or_zero(std::vector<double>& values, size_t n)
+{
+    if (values.size() != n) {
+        values.assign(n, 0.0);
+    } else {
+        std::fill(values.begin(), values.end(), 0.0);
+    }
+}
+
+void close_periodic_right_face(std::vector<double>& face,
+                               int nxl,
+                               int mpi_rank,
+                               int mpi_size)
+{
+    if (nxl <= 0 || face.size() < static_cast<size_t>(nxl + 1)) return;
+    if (mpi_size == 1) {
+        face[static_cast<size_t>(nxl)] = face[0];
+        return;
+    }
+
+    const int left_peer = (mpi_rank + mpi_size - 1) % mpi_size;
+    const int right_peer = (mpi_rank + 1) % mpi_size;
+    const double send_left_face = face[0];
+    double recv_right_face = 0.0;
+    MPI_Request reqs[2];
+    MPI_Isend(&send_left_face, 1, MPI_DOUBLE, left_peer, 611,
+              MPI_COMM_WORLD, &reqs[0]);
+    MPI_Irecv(&recv_right_face, 1, MPI_DOUBLE, right_peer, 611,
+              MPI_COMM_WORLD, &reqs[1]);
+    MPI_Waitall(2, reqs, MPI_STATUSES_IGNORE);
+    face[static_cast<size_t>(nxl)] = recv_right_face;
+}
+
 }
 
 VlasovSolver::VlasovSolver()
@@ -167,10 +200,28 @@ void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
     for (size_t k = 0; k < Param::Nvmu; ++k) {
         x_cfl_[k] = sp.vgrid.vx_cells[k] * dt_sub / sg.dx;
     }
+    resize_or_zero(sp.current_face_x, static_cast<size_t>(nxl + 1));
     (void)time;
 
     for (int isub = 0; isub < nsub_x; ++isub) {
         exchange_ghosts_x(sp, sg, mpi_rank, mpi_size);
+
+        #pragma omp parallel for schedule(static)
+        for (int iface = 0; iface < nxl; ++iface) {
+            const int ix_left = ng + iface - 1;
+            const int ix_right = ng + iface;
+            double flux_moment = 0.0;
+            for (size_t k = 0; k < Param::Nvmu; ++k) {
+                const double vx = sp.vgrid.vx_cells[k];
+                const int ix_upwind = (vx >= 0.0) ? ix_left : ix_right;
+                const double f_upwind =
+                    std::max(0.0,
+                             sp.f[static_cast<size_t>(ix_upwind) * Param::Nvmu + k]);
+                flux_moment += f_upwind * sp.vgrid.current_weight[k];
+            }
+            sp.current_face_x[static_cast<size_t>(iface)] +=
+                sp.charge * flux_moment * dt_sub;
+        }
 
         #pragma omp parallel for collapse(2) schedule(static)
         for (int ix = ng; ix < ng + nxl; ++ix) {
@@ -199,6 +250,15 @@ void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
 
         sp.f.swap(sp.f_tmp);
     }
+
+    if (dt > 0.0) {
+        const double inv_dt = 1.0 / dt;
+        #pragma omp parallel for schedule(static)
+        for (int iface = 0; iface < nxl; ++iface) {
+            sp.current_face_x[static_cast<size_t>(iface)] *= inv_dt;
+        }
+    }
+    close_periodic_right_face(sp.current_face_x, nxl, mpi_rank, mpi_size);
 }
 
 void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,

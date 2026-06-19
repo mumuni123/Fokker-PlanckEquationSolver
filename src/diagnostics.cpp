@@ -91,8 +91,15 @@ double gauss_charge_residual(const EMFields& fields,
                              double mean_rho)
 {
     const int ix_g = ix + sg.nghost;
-    const double dEx_dx =
-        (fields.Ex[ix_g + 1] - fields.Ex[ix_g - 1]) / (2.0 * sg.dx);
+    double dEx_dx = 0.0;
+    if (fields.Ex_face.size() >= static_cast<size_t>(sg.nx_local + 1)) {
+        dEx_dx =
+            (fields.Ex_face[static_cast<size_t>(ix + 1)]
+           - fields.Ex_face[static_cast<size_t>(ix)]) / sg.dx;
+    } else {
+        dEx_dx =
+            (fields.Ex[ix_g + 1] - fields.Ex[ix_g - 1]) / (2.0 * sg.dx);
+    }
     return (Const::eps0 * dEx_dx - (fields.rho[ix_g] - mean_rho)) / Const::qe;
 }
 
@@ -715,6 +722,41 @@ void Diagnostics::write_fields(double time,
                 << global_phi[i] << "\n";
         }
     }
+
+    const int local_face_count = nxl + ((mpi_rank == 0) ? 1 : 0);
+    std::vector<double> local_Ex_face(static_cast<size_t>(local_face_count), 0.0);
+    for (int i = 0; i < local_face_count; ++i) {
+        const int local_face = i + ((mpi_rank == 0) ? 0 : 1);
+        const size_t slot = static_cast<size_t>(local_face);
+        local_Ex_face[static_cast<size_t>(i)] =
+            (slot < fields.Ex_face.size()) ? fields.Ex_face[slot] : 0.0;
+    }
+
+    MPI_Gather(&local_face_count, 1, MPI_INT, counts.data(), 1, MPI_INT,
+               0, MPI_COMM_WORLD);
+    if (mpi_rank == 0) {
+        displs[0] = 0;
+        for (int r = 1; r < mpi_size; ++r) displs[r] = displs[r - 1] + counts[r - 1];
+    }
+
+    std::vector<double> global_Ex_face(sg.nx_global + 1);
+    MPI_Gatherv(local_Ex_face.data(), local_face_count, MPI_DOUBLE,
+                global_Ex_face.data(), counts.data(), displs.data(), MPI_DOUBLE,
+                0, MPI_COMM_WORLD);
+
+    if (mpi_rank == 0) {
+        std::ostringstream fname;
+        fname << output_dir << "/fields_face_" << std::setw(5) << std::setfill('0')
+              << snapshot_count << ".dat";
+        std::ofstream out(fname.str().c_str());
+        out << "# time[fs] = " << time / Const::femto << "\n";
+        out << "# x_face[um]  Ex_face[V/m]\n";
+        out << std::scientific << std::setprecision(8);
+        for (int i = 0; i <= sg.nx_global; ++i) {
+            out << i * sg.dx / Const::micro << "  "
+                << global_Ex_face[i] << "\n";
+        }
+    }
 }
 
 void Diagnostics::write_current_density(double time,
@@ -724,39 +766,41 @@ void Diagnostics::write_current_density(double time,
                                         int mpi_rank, int mpi_size)
 {
     int nxl = sg.nx_local;
-
-    std::vector<double> local_J_bkg(nxl, 0.0);
-    std::vector<double> local_J_beam(nxl, 0.0);
-    std::vector<double> local_J_total(nxl, 0.0);
-    for (int i = 0; i < nxl; ++i) {
-        const size_t slot = static_cast<size_t>(i);
-        const double J_bkg =
-            (slot < electrons.current_x.size()) ? electrons.current_x[slot] : 0.0;
-        const double J_beam =
-            (slot < beam.current_x.size()) ? beam.current_x[slot] : 0.0;
-        local_J_bkg[slot] = J_bkg;
-        local_J_beam[slot] = J_beam;
-        local_J_total[slot] = J_bkg + J_beam;
+    const int local_face_count = nxl + ((mpi_rank == 0) ? 1 : 0);
+    std::vector<double> local_J_bkg(static_cast<size_t>(local_face_count), 0.0);
+    std::vector<double> local_J_beam(static_cast<size_t>(local_face_count), 0.0);
+    std::vector<double> local_J_total(static_cast<size_t>(local_face_count), 0.0);
+    for (int i = 0; i < local_face_count; ++i) {
+        const int local_face = i + ((mpi_rank == 0) ? 0 : 1);
+        const size_t slot = static_cast<size_t>(local_face);
+        const double J_bkg = (slot < electrons.current_face_x.size())
+                           ? electrons.current_face_x[slot] : 0.0;
+        const double J_beam = (slot < beam.current_face_x.size())
+                            ? beam.current_face_x[slot] : 0.0;
+        local_J_bkg[static_cast<size_t>(i)] = J_bkg;
+        local_J_beam[static_cast<size_t>(i)] = J_beam;
+        local_J_total[static_cast<size_t>(i)] = J_bkg + J_beam;
     }
 
     std::vector<int> counts(mpi_size);
     std::vector<int> displs(mpi_size);
-    MPI_Gather(&nxl, 1, MPI_INT, counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Gather(&local_face_count, 1, MPI_INT, counts.data(), 1, MPI_INT,
+               0, MPI_COMM_WORLD);
     if (mpi_rank == 0) {
         displs[0] = 0;
         for (int r = 1; r < mpi_size; ++r) displs[r] = displs[r - 1] + counts[r - 1];
     }
 
-    std::vector<double> global_J_bkg(sg.nx_global);
-    std::vector<double> global_J_beam(sg.nx_global);
-    std::vector<double> global_J_total(sg.nx_global);
-    MPI_Gatherv(local_J_bkg.data(), nxl, MPI_DOUBLE,
+    std::vector<double> global_J_bkg(sg.nx_global + 1);
+    std::vector<double> global_J_beam(sg.nx_global + 1);
+    std::vector<double> global_J_total(sg.nx_global + 1);
+    MPI_Gatherv(local_J_bkg.data(), local_face_count, MPI_DOUBLE,
                 global_J_bkg.data(), counts.data(), displs.data(), MPI_DOUBLE,
                 0, MPI_COMM_WORLD);
-    MPI_Gatherv(local_J_beam.data(), nxl, MPI_DOUBLE,
+    MPI_Gatherv(local_J_beam.data(), local_face_count, MPI_DOUBLE,
                 global_J_beam.data(), counts.data(), displs.data(), MPI_DOUBLE,
                 0, MPI_COMM_WORLD);
-    MPI_Gatherv(local_J_total.data(), nxl, MPI_DOUBLE,
+    MPI_Gatherv(local_J_total.data(), local_face_count, MPI_DOUBLE,
                 global_J_total.data(), counts.data(), displs.data(), MPI_DOUBLE,
                 0, MPI_COMM_WORLD);
 
@@ -766,10 +810,10 @@ void Diagnostics::write_current_density(double time,
               << snapshot_count << ".dat";
         std::ofstream out(fname.str().c_str());
         out << "# time[fs] = " << time / Const::femto << "\n";
-        out << "# x[um]  J_bkg_e[A/m2]  J_beam[A/m2]  J_total[A/m2]\n";
+        out << "# x_face[um]  J_bkg_face[A/m2]  J_beam_face[A/m2]  J_total_face[A/m2]\n";
         out << std::scientific << std::setprecision(8);
-        for (int i = 0; i < sg.nx_global; ++i) {
-            out << (i + 0.5) * sg.dx / Const::micro
+        for (int i = 0; i <= sg.nx_global; ++i) {
+            out << i * sg.dx / Const::micro
                 << "  " << global_J_bkg[i]
                 << "  " << global_J_beam[i]
                 << "  " << global_J_total[i] << "\n";

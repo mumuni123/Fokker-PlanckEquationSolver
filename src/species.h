@@ -33,6 +33,7 @@ public:
     std::vector<double> number_density;
     std::vector<double> charge_density;
     std::vector<double> current_x;
+    std::vector<double> current_face_x;
 
     Species();
 

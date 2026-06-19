@@ -1,6 +1,7 @@
 submit.pbs
 results/
 output/
+build/
 noCollision_EPOCH-Compare/
 noCollision_full-FP-Compare/
 noCollision_Beam_denstiy/

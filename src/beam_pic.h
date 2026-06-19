@@ -66,6 +66,7 @@ private:
     double left_boundary_number_flux_;
     double last_continuity_l1_error_;
     double last_continuity_linf_error_;
+    unsigned long long rng_state_;
     std::vector<BeamParticle> send_left_;
     std::vector<BeamParticle> send_right_;
     std::vector<BeamParticle> keep_;
@@ -104,10 +105,6 @@ private:
     void exchange_continuity_contributions(const SpatialGrid& sg,
                                            int mpi_rank, int mpi_size);
     void reset_continuity_exchange_buffers(const SpatialGrid& sg);
-    void add_source_density_and_current(const SpatialGrid& sg,
-                                        double x,
-                                        double weight,
-                                        double vx);
     void add_path_density_delta(const SpatialGrid& sg,
                                 double x0, double x1, double weight);
     void add_path_density_delta_to(const SpatialGrid& sg,
@@ -120,8 +117,6 @@ private:
                         std::vector<double>& send_left,
                         std::vector<double>& send_right,
                         double x, double weight);
-    void add_source_to_cell(const SpatialGrid& sg, int target_ig,
-                            double density_delta, double current_delta);
     void add_number_to_cell(const SpatialGrid& sg,
                             std::vector<double>& local,
                             std::vector<double>& send_left,

@@ -2,6 +2,7 @@
 #include "species.h"
 #include <algorithm>
 #include <cstddef>
+#include <cmath>
 #include <mpi.h>
 #include <vector>
 
@@ -30,17 +31,27 @@ void prepare_mpi_layout(EMFields& fields, int mpi_size)
     fields.counts_nx_local = nxl;
     fields.counts.assign(static_cast<size_t>(mpi_size), 0);
     fields.displs.assign(static_cast<size_t>(mpi_size), 0);
+    fields.face_counts.assign(static_cast<size_t>(mpi_size), 0);
+    fields.face_displs.assign(static_cast<size_t>(mpi_size), 0);
     MPI_Allgather(&nxl, 1, MPI_INT, fields.counts.data(), 1, MPI_INT,
                   MPI_COMM_WORLD);
+    for (int r = 0; r < mpi_size; ++r) {
+        fields.face_counts[static_cast<size_t>(r)] =
+            fields.counts[static_cast<size_t>(r)] + 1;
+    }
     for (int r = 1; r < mpi_size; ++r) {
         fields.displs[static_cast<size_t>(r)] =
             fields.displs[static_cast<size_t>(r - 1)] +
             fields.counts[static_cast<size_t>(r - 1)];
+        fields.face_displs[static_cast<size_t>(r)] =
+            fields.displs[static_cast<size_t>(r)];
     }
 
     fields.local_rhs.assign(static_cast<size_t>(nxl), 0.0);
+    fields.local_face_rhs.assign(static_cast<size_t>(nxl + 1), 0.0);
     fields.global_rhs.assign(static_cast<size_t>(Param::nx), 0.0);
     fields.global_ex.assign(static_cast<size_t>(Param::nx), 0.0);
+    fields.global_face.assign(static_cast<size_t>(Param::nx + 1), 0.0);
     fields.global_phi.assign(static_cast<size_t>(Param::nx), 0.0);
 }
 
@@ -91,6 +102,9 @@ void compute_gauss_field(EMFields& fields, bool compute_phi)
     for (int i = 0; i < n; ++i) {
         fields.global_ex[static_cast<size_t>(i)] -= mean_ex;
     }
+    for (int i = 0; i <= n; ++i) {
+        fields.all_interfaces[static_cast<size_t>(i)] -= mean_ex;
+    }
 
     if (compute_phi) {
         resize_or_zero(fields.global_phi, static_cast<size_t>(n));
@@ -109,6 +123,54 @@ void compute_gauss_field(EMFields& fields, bool compute_phi)
             fields.global_phi[static_cast<size_t>(i)] -= mean_phi;
         }
     }
+}
+
+void exchange_scalar_ghosts(EMFields& fields,
+                            std::vector<double>& a,
+                            int tag_base,
+                            int mpi_rank,
+                            int mpi_size);
+
+void close_periodic_right_face(std::vector<double>& face,
+                               int nxl,
+                               int mpi_rank,
+                               int mpi_size,
+                               int tag)
+{
+    if (nxl <= 0 || face.size() < static_cast<size_t>(nxl + 1)) return;
+    if (mpi_size == 1) {
+        face[static_cast<size_t>(nxl)] = face[0];
+        return;
+    }
+
+    const int left_peer = (mpi_rank + mpi_size - 1) % mpi_size;
+    const int right_peer = (mpi_rank + 1) % mpi_size;
+    const double send_left_face = face[0];
+    double recv_right_face = 0.0;
+    MPI_Request reqs[2];
+    MPI_Isend(&send_left_face, 1, MPI_DOUBLE, left_peer, tag,
+              MPI_COMM_WORLD, &reqs[0]);
+    MPI_Irecv(&recv_right_face, 1, MPI_DOUBLE, right_peer, tag,
+              MPI_COMM_WORLD, &reqs[1]);
+    MPI_Waitall(2, reqs, MPI_STATUSES_IGNORE);
+    face[static_cast<size_t>(nxl)] = recv_right_face;
+}
+
+void update_cell_ex_from_faces(EMFields& fields,
+                               int mpi_rank,
+                               int mpi_size)
+{
+    const int ng = Param::Nghost;
+    const int nxl = fields.nx_total - 2 * ng;
+    if (fields.Ex_face.size() != static_cast<size_t>(nxl + 1)) {
+        fields.Ex_face.assign(static_cast<size_t>(nxl + 1), 0.0);
+    }
+    for (int ix = 0; ix < nxl; ++ix) {
+        fields.Ex[ng + ix] =
+            0.5 * (fields.Ex_face[static_cast<size_t>(ix)]
+                 + fields.Ex_face[static_cast<size_t>(ix + 1)]);
+    }
+    exchange_scalar_ghosts(fields, fields.Ex, 201, mpi_rank, mpi_size);
 }
 
 void exchange_scalar_ghosts(EMFields& fields,
@@ -171,12 +233,15 @@ void EMFields::init(const SpatialGrid& sg)
     counts_nx_local = -1;
     dx = sg.dx;
     Ex.assign(nx_total, 0.0);
+    Ex_face.assign(sg.nx_local + 1, 0.0);
     phi.assign(nx_total, 0.0);
     rho.assign(nx_total, 0.0);
     send_left.assign(sg.nghost, 0.0);
     send_right.assign(sg.nghost, 0.0);
     recv_left.assign(sg.nghost, 0.0);
     recv_right.assign(sg.nghost, 0.0);
+    last_gauss_residual_l1 = 0.0;
+    last_gauss_residual_linf = 0.0;
 }
 
 void EMFields::zero_currents()
@@ -234,71 +299,98 @@ void EMFields::solve_poisson(int mpi_rank, int mpi_size)
         compute_gauss_field(*this, false);
     }
 
-    MPI_Scatterv(global_ex.data(), counts.data(), displs.data(), MPI_DOUBLE,
-                 local_rhs.data(), nxl, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-    for (int ix = 0; ix < nxl; ++ix) Ex[ng + ix] = local_rhs[static_cast<size_t>(ix)];
-    exchange_ex_ghosts(mpi_rank, mpi_size);
+    MPI_Scatterv(all_interfaces.data(), face_counts.data(),
+                 face_displs.data(), MPI_DOUBLE,
+                 local_face_rhs.data(), nxl + 1, MPI_DOUBLE,
+                 0, MPI_COMM_WORLD);
+    if (Ex_face.size() != static_cast<size_t>(nxl + 1)) {
+        Ex_face.assign(static_cast<size_t>(nxl + 1), 0.0);
+    }
+    for (int ix = 0; ix <= nxl; ++ix) {
+        Ex_face[static_cast<size_t>(ix)] =
+            local_face_rhs[static_cast<size_t>(ix)];
+    }
+    close_periodic_right_face(Ex_face, nxl, mpi_rank, mpi_size, 301);
+    update_cell_ex_from_faces(*this, mpi_rank, mpi_size);
 }
 
-void EMFields::advance_ampere(const std::vector<double>& background_current,
-                              const std::vector<double>& beam_current,
-                              double dt,
-                              int mpi_rank,
-                              int mpi_size)
+void EMFields::advance_ampere_face(const std::vector<double>& background_current_face,
+                                   const std::vector<double>& beam_current_face,
+                                   double dt,
+                                   int mpi_rank,
+                                   int mpi_size)
+{
+    const int nxl = nx_total - 2 * Param::Nghost;
+    if (dt <= 0.0 || nxl <= 0) return;
+    if (Ex_face.size() != static_cast<size_t>(nxl + 1)) {
+        Ex_face.assign(static_cast<size_t>(nxl + 1), 0.0);
+    }
+    const bool currents_sized =
+        background_current_face.size() >= static_cast<size_t>(nxl) &&
+        beam_current_face.size() >= static_cast<size_t>(nxl);
+    const double ampere_scale = -dt / Const::eps0;
+
+    if (currents_sized) {
+        for (int iface = 0; iface < nxl; ++iface) {
+            const size_t slot = static_cast<size_t>(iface);
+            Ex_face[slot] +=
+                ampere_scale * (background_current_face[slot]
+                              + beam_current_face[slot]);
+        }
+    } else {
+        for (int iface = 0; iface < nxl; ++iface) {
+            const size_t slot = static_cast<size_t>(iface);
+            const double jb = (slot < background_current_face.size())
+                            ? background_current_face[slot] : 0.0;
+            const double jbeam = (slot < beam_current_face.size())
+                               ? beam_current_face[slot] : 0.0;
+            Ex_face[slot] +=
+                ampere_scale * (jb + jbeam);
+        }
+    }
+
+    close_periodic_right_face(Ex_face, nxl, mpi_rank, mpi_size, 302);
+    update_cell_ex_from_faces(*this, mpi_rank, mpi_size);
+}
+
+void EMFields::update_gauss_residual_diagnostics(int mpi_rank, int mpi_size)
 {
     const int ng = Param::Nghost;
     const int nxl = nx_total - 2 * ng;
-    if (dt <= 0.0 || nxl <= 0) return;
+    if (nxl <= 0) return;
+    if (Ex_face.size() != static_cast<size_t>(nxl + 1)) {
+        Ex_face.assign(static_cast<size_t>(nxl + 1), 0.0);
+    }
+    close_periodic_right_face(Ex_face, nxl, mpi_rank, mpi_size, 303);
 
-    double local_current_integral = 0.0;
+    double local_charge = 0.0;
     for (int ix = 0; ix < nxl; ++ix) {
-        const size_t slot = static_cast<size_t>(ix);
-        const double jb = (slot < background_current.size())
-                        ? background_current[slot] : 0.0;
-        const double jbeam = (slot < beam_current.size())
-                           ? beam_current[slot] : 0.0;
-        local_current_integral += (jb + jbeam) * dx;
+        local_charge += rho[ng + ix] * dx;
     }
-
-    double global_current_integral = 0.0;
-    MPI_Allreduce(&local_current_integral, &global_current_integral, 1,
+    double global_charge = 0.0;
+    MPI_Allreduce(&local_charge, &global_charge, 1,
                   MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-    const double mean_current = global_current_integral / Param::Lx;
+    const double mean_rho = global_charge / Param::Lx;
 
-    double local_e_integral = 0.0;
-    const bool currents_sized =
-        background_current.size() >= static_cast<size_t>(nxl) &&
-        beam_current.size() >= static_cast<size_t>(nxl);
-    if (currents_sized) {
-        for (int ix = 0; ix < nxl; ++ix) {
-            const size_t slot = static_cast<size_t>(ix);
-            const double j_eff =
-                background_current[slot] + beam_current[slot] - mean_current;
-            Ex[ng + ix] += -dt * j_eff / Const::eps0;
-            local_e_integral += Ex[ng + ix] * dx;
-        }
-    } else {
-        for (int ix = 0; ix < nxl; ++ix) {
-            const size_t slot = static_cast<size_t>(ix);
-            const double jb = (slot < background_current.size())
-                            ? background_current[slot] : 0.0;
-            const double jbeam = (slot < beam_current.size())
-                               ? beam_current[slot] : 0.0;
-            const double j_eff = jb + jbeam - mean_current;
-            Ex[ng + ix] += -dt * j_eff / Const::eps0;
-            local_e_integral += Ex[ng + ix] * dx;
-        }
-    }
-
-    double global_e_integral = 0.0;
-    MPI_Allreduce(&local_e_integral, &global_e_integral, 1,
-                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-    const double mean_e = global_e_integral / Param::Lx;
+    double local_l1 = 0.0;
+    double local_linf = 0.0;
     for (int ix = 0; ix < nxl; ++ix) {
-        Ex[ng + ix] -= mean_e;
+        const double div_e =
+            (Ex_face[static_cast<size_t>(ix + 1)]
+           - Ex_face[static_cast<size_t>(ix)]) / dx;
+        const double residual =
+            div_e - (rho[ng + ix] - mean_rho) / Const::eps0;
+        const double abs_residual = std::fabs(residual);
+        local_l1 += abs_residual * dx;
+        local_linf = std::max(local_linf, abs_residual);
     }
 
-    exchange_ex_ghosts(mpi_rank, mpi_size);
+    MPI_Allreduce(&local_l1, &last_gauss_residual_l1, 1,
+                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(&local_linf, &last_gauss_residual_linf, 1,
+                  MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    (void)mpi_rank;
+    (void)mpi_size;
 }
 
 void EMFields::compute_potential(int mpi_rank, int mpi_size)

@@ -372,6 +372,9 @@ int main(int argc, char** argv)
         }
 #endif
 
+        trace_progress(config, mpi_rank, step, "before beam half 1 inject");
+        beam.inject(sgrid, fields, 0.5 * dt, time_center, mpi_rank, mpi_size);
+        trace_progress(config, mpi_rank, step, "after beam half 1 inject");
         trace_progress(config, mpi_rank, step, "before beam half 1 push");
         if (collect_step_diagnostics) {
             beam_push_ke_before = beam.total_kinetic_energy();
@@ -381,9 +384,6 @@ int main(int argc, char** argv)
             dke_beam_push += beam.total_kinetic_energy() - beam_push_ke_before;
         }
         trace_progress(config, mpi_rank, step, "after beam half 1 push");
-        trace_progress(config, mpi_rank, step, "before beam half 1 inject");
-        beam.inject(sgrid, fields, 0.5 * dt, time_center, mpi_rank, mpi_size);
-        trace_progress(config, mpi_rank, step, "after beam half 1 inject");
         trace_progress(config, mpi_rank, step, "before beam center deposit");
         beam.deposit_density(sgrid, mpi_rank, mpi_size);
         beam.finalize_charge_conserving_current(sgrid, 0.5 * dt,
@@ -401,8 +401,8 @@ int main(int argc, char** argv)
             bkg_current_mid = bkg_e.current_x;
         }
         trace_progress(config, mpi_rank, step, "before center Ampere update");
-        fields.advance_ampere(bkg_e.current_x, beam.current_x,
-                              0.5 * dt, mpi_rank, mpi_size);
+        fields.advance_ampere_face(bkg_e.current_face_x, beam.current_face_x,
+                                   0.5 * dt, mpi_rank, mpi_size);
         trace_progress(config, mpi_rank, step, "after center Ampere update");
         beam.begin_current_interval(sgrid);
         if (collect_step_diagnostics) {
@@ -416,6 +416,9 @@ int main(int argc, char** argv)
         }
 #endif
 
+        trace_progress(config, mpi_rank, step, "before beam half 2 inject");
+        beam.inject(sgrid, fields, 0.5 * dt, time, mpi_rank, mpi_size);
+        trace_progress(config, mpi_rank, step, "after beam half 2 inject");
         trace_progress(config, mpi_rank, step, "before beam half 2 push");
         if (collect_step_diagnostics) {
             beam_push_ke_before = beam.total_kinetic_energy();
@@ -425,9 +428,6 @@ int main(int argc, char** argv)
             dke_beam_push += beam.total_kinetic_energy() - beam_push_ke_before;
         }
         trace_progress(config, mpi_rank, step, "after beam half 2 push");
-        trace_progress(config, mpi_rank, step, "before beam half 2 inject");
-        beam.inject(sgrid, fields, 0.5 * dt, time, mpi_rank, mpi_size);
-        trace_progress(config, mpi_rank, step, "after beam half 2 inject");
         trace_progress(config, mpi_rank, step, "before beam end deposit");
         beam.deposit_density(sgrid, mpi_rank, mpi_size);
         beam.finalize_charge_conserving_current(sgrid, 0.5 * dt,
@@ -435,9 +435,6 @@ int main(int argc, char** argv)
         bkg_e.compute_moments();
         moments_current = true;
         trace_progress(config, mpi_rank, step, "after beam end deposit");
-        fields.advance_ampere(bkg_e.current_x, beam.current_x,
-                              0.5 * dt, mpi_rank, mpi_size);
-        trace_progress(config, mpi_rank, step, "after beam end Ampere update");
         if (collect_step_diagnostics) {
             W_beam_E = beam.last_field_work();
         }
@@ -506,6 +503,11 @@ int main(int argc, char** argv)
                                        ex_center, sgrid, 0.5 * dt);
         }
 
+        trace_progress(config, mpi_rank, step, "before end Ampere update");
+        fields.advance_ampere_face(bkg_e.current_face_x, beam.current_face_x,
+                                   0.5 * dt, mpi_rank, mpi_size);
+        trace_progress(config, mpi_rank, step, "after end Ampere update");
+
         if (bkg_e.collisions_enabled) {
             trace_progress(config, mpi_rank, step, "before collisions");
             collision_energy_step +=
@@ -526,6 +528,7 @@ int main(int argc, char** argv)
             moments_current = true;
         }
         fields.set_charge_density(bkg_e, beam.density, ion_density_profile);
+        fields.update_gauss_residual_diagnostics(mpi_rank, mpi_size);
         trace_progress(config, mpi_rank, step, "after end sync");
 
         net_nb_change_step = beam.last_injected_number()
@@ -593,6 +596,7 @@ int main(int argc, char** argv)
 
     sync_moments_and_charge(bkg_e, beam, fields, ion_density_profile,
                             moments_current);
+    fields.update_gauss_residual_diagnostics(mpi_rank, mpi_size);
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
     if (config.enable_debug_diagnostics) {
         diag.write_debug_state(nsteps, Param::t_end, "final", bkg_e, beam, fields,

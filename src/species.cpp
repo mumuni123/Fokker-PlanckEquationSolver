@@ -64,6 +64,7 @@ void Species::init(const std::string& n, SpeciesType t,
     number_density.assign(sgrid->nx_local, 0.0);
     charge_density.assign(sgrid->nx_local, 0.0);
     current_x.assign(sgrid->nx_local, 0.0);
+    current_face_x.assign(sgrid->nx_local + 1, 0.0);
 }
 
 void Species::initialize_maxwellian(double drift_vx)
