@@ -315,7 +315,7 @@ void EMFields::solve_poisson(int mpi_rank, int mpi_size)
 }
 
 void EMFields::advance_ampere_face(const std::vector<double>& background_current_face,
-                                   const std::vector<double>& beam_current_face,
+                                   const std::vector<double>& open_beam_current_face,
                                    double dt,
                                    int mpi_rank,
                                    int mpi_size)
@@ -327,28 +327,31 @@ void EMFields::advance_ampere_face(const std::vector<double>& background_current
     }
     const bool currents_sized =
         background_current_face.size() >= static_cast<size_t>(nxl) &&
-        beam_current_face.size() >= static_cast<size_t>(nxl);
+        open_beam_current_face.size() >= static_cast<size_t>(nxl);
     const double ampere_scale = -dt / Const::eps0;
 
     if (currents_sized) {
+        // Only unique periodic field faces are advanced. Beam guard/outside
+        // currents have already been cleared and are never folded or wrapped.
         for (int iface = 0; iface < nxl; ++iface) {
             const size_t slot = static_cast<size_t>(iface);
             Ex_face[slot] +=
                 ampere_scale * (background_current_face[slot]
-                              + beam_current_face[slot]);
+                              + open_beam_current_face[slot]);
         }
     } else {
         for (int iface = 0; iface < nxl; ++iface) {
             const size_t slot = static_cast<size_t>(iface);
             const double jb = (slot < background_current_face.size())
                             ? background_current_face[slot] : 0.0;
-            const double jbeam = (slot < beam_current_face.size())
-                               ? beam_current_face[slot] : 0.0;
+            const double jbeam = (slot < open_beam_current_face.size())
+                                ? open_beam_current_face[slot] : 0.0;
             Ex_face[slot] +=
                 ampere_scale * (jb + jbeam);
         }
     }
 
+    // Periodicity is applied only to Ex after the local Ampere update.
     close_periodic_right_face(Ex_face, nxl, mpi_rank, mpi_size, 302);
     update_cell_ex_from_faces(*this, mpi_rank, mpi_size);
 }

@@ -36,7 +36,7 @@ double compute_dt(const Species& electron, const SpatialGrid& sg)
 
 const char* field_solver_name()
 {
-    return "periodic Vlasov-Ampere update with <J> compensation and <E> = 0";
+    return "face-centered periodic Vlasov-Ampere update";
 }
 
 std::vector<double> build_local_ion_density_profile(const SpatialGrid& sg)
@@ -178,8 +178,8 @@ int main(int argc, char** argv)
                Param::temperature_e / Const::eV);
         printf("PIC beam: gamma*beta = %.2f, beta = %.4f, n_b = %.3e /m^3\n",
                Param::gambetab, Param::betab, Param::densb);
-        printf("Beam source: quiet-start left boundary injection at x = 0\n");
-        printf("Beam injection: charge-conserving path current, centered before Poisson\n");
+        printf("Beam source: sampled left-boundary crossings at x = 0\n");
+        printf("Beam injection: remaining-time push with charge-conserving face current\n");
         printf("Beam charge compensation source: OFF; background density perturbations are produced only by Poisson/Vlasov dynamics\n");
         printf("Beam boundary: particles crossing either global edge leave the domain\n");
         printf("Background boundary: periodic ghost cells\n");

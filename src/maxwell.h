@@ -43,8 +43,10 @@ struct EMFields {
 
     // Periodic Gauss solve for initialization or low-frequency correction.
     void solve_poisson(int mpi_rank, int mpi_size);
+    // Ex_face[nxl] is a periodic ghost. Beam face 0 and face nxl are open
+    // boundary currents and are never averaged or periodically identified.
     void advance_ampere_face(const std::vector<double>& background_current_face,
-                             const std::vector<double>& beam_current_face,
+                             const std::vector<double>& open_beam_current_face,
                              double dt,
                              int mpi_rank,
                              int mpi_size);

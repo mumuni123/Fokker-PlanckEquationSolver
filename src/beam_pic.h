@@ -19,10 +19,6 @@ public:
     std::vector<double> current_x;
     std::vector<double> current_face_x;
     std::vector<double> density_step_start;
-    std::vector<double> path_density_delta;
-    std::vector<double> source_density_delta;
-    std::vector<double> source_current_x;
-    std::vector<double>& source_current_delta;
 
     BeamPIC();
 
@@ -49,8 +45,18 @@ public:
     double last_injected_current() const { return last_injected_current_; }
     double last_outflow_current() const { return last_outflow_current_; }
     double last_field_work() const { return last_field_work_; }
+    double last_continuity_abs_l1_residual() const {
+        return last_continuity_abs_l1_residual_;
+    }
+    double last_continuity_abs_linf_residual() const {
+        return last_continuity_abs_linf_residual_;
+    }
     double last_continuity_l1_error() const { return last_continuity_l1_error_; }
     double last_continuity_linf_error() const { return last_continuity_linf_error_; }
+    double last_boundary_flux_error() const { return last_boundary_flux_error_; }
+    double last_trajectory_reconstruction_error() const {
+        return last_trajectory_reconstruction_error_;
+    }
 
 private:
     double injection_remainder_;
@@ -63,10 +69,22 @@ private:
     double last_injected_current_;
     double last_outflow_current_;
     double last_field_work_;
-    double left_boundary_number_flux_;
+    double step_dt_;
+    double step_signed_outflow_number_;
+    double interval_injected_number_;
+    double interval_left_outflow_signed_number_;
+    double interval_right_outflow_number_;
+    double interval_left_guard_path_number_;
+    double interval_right_guard_path_number_;
+    double last_continuity_abs_l1_residual_;
+    double last_continuity_abs_linf_residual_;
     double last_continuity_l1_error_;
     double last_continuity_linf_error_;
+    double last_boundary_flux_error_;
+    double last_trajectory_reconstruction_error_;
     unsigned long long rng_state_;
+    size_t injected_begin_;
+    std::vector<double> injected_push_dt_;
     std::vector<BeamParticle> send_left_;
     std::vector<BeamParticle> send_right_;
     std::vector<BeamParticle> keep_;
@@ -75,54 +93,28 @@ private:
     std::vector<std::vector<BeamParticle> > thread_keep_;
     std::vector<std::vector<BeamParticle> > thread_send_left_;
     std::vector<std::vector<BeamParticle> > thread_send_right_;
-    std::vector<std::vector<double> > thread_path_density_delta_;
-    std::vector<std::vector<double> > thread_path_send_left_density_;
-    std::vector<std::vector<double> > thread_path_send_right_density_;
     std::vector<std::vector<double> > thread_density_;
-    std::vector<std::vector<double> > thread_current_;
+    std::vector<std::vector<double> > thread_trajectory_density_delta_;
     std::vector<double> thread_send_left_density_;
     std::vector<double> thread_send_right_density_;
-    std::vector<double> thread_send_left_current_;
-    std::vector<double> thread_send_right_current_;
-    std::vector<double> source_send_left_density_;
-    std::vector<double> source_send_right_density_;
-    std::vector<double> source_recv_left_density_;
-    std::vector<double> source_recv_right_density_;
-    std::vector<double> source_send_left_current_;
-    std::vector<double> source_send_right_current_;
-    std::vector<double> source_recv_left_current_;
-    std::vector<double> source_recv_right_current_;
-    std::vector<double> path_send_left_density_;
-    std::vector<double> path_send_right_density_;
-    std::vector<double> path_recv_left_density_;
-    std::vector<double> path_recv_right_density_;
-    std::vector<double> all_path_numbers_;
+    std::vector<double> thread_send_left_trajectory_;
+    std::vector<double> thread_send_right_trajectory_;
+    std::vector<double> trajectory_density_delta_;
+    std::vector<double> boundary_source_density_delta_;
+    std::vector<double> reconstructed_current_face_x_;
     std::vector<size_t> keep_offsets_;
     std::vector<size_t> left_offsets_;
     std::vector<size_t> right_offsets_;
 
     void exchange_particles(const SpatialGrid& sg, int mpi_rank, int mpi_size);
-    void exchange_continuity_contributions(const SpatialGrid& sg,
-                                           int mpi_rank, int mpi_size);
-    void reset_continuity_exchange_buffers(const SpatialGrid& sg);
-    void add_path_density_delta(const SpatialGrid& sg,
-                                double x0, double x1, double weight);
-    void add_path_density_delta_to(const SpatialGrid& sg,
-                                   std::vector<double>& local,
-                                   std::vector<double>& send_left,
-                                   std::vector<double>& send_right,
-                                   double x0, double x1, double weight);
-    void add_density_to(const SpatialGrid& sg,
-                        std::vector<double>& local,
-                        std::vector<double>& send_left,
-                        std::vector<double>& send_right,
-                        double x, double weight);
-    void add_number_to_cell(const SpatialGrid& sg,
-                            std::vector<double>& local,
-                            std::vector<double>& send_left,
-                            std::vector<double>& send_right,
-                            int target_ig,
-                            double value);
+    void add_shape_density(const SpatialGrid& sg,
+                           std::vector<double>& local,
+                           double& send_left,
+                           double& send_right,
+                           double x, double weight) const;
+    void exchange_trajectory_density(const SpatialGrid& sg,
+                                     int mpi_rank, int mpi_size,
+                                     double send_left, double send_right);
 };
 
 #endif

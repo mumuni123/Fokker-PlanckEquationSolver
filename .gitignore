@@ -2,8 +2,10 @@ submit.pbs
 results/
 output/
 build/
-noCollision_EPOCH-Compare/
-noCollision_full-FP-Compare/
+noCollision_full_fields/
+noCollision_fields/
 noCollision_Beam_denstiy/
+noCollision_Bkgelectron_denstiy/
+noCollision_full_Bkgelectron_denstiy/
 noCollision_current_Jx/
 CLAUDE.md

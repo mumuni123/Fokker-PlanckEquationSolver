@@ -6,8 +6,7 @@
 #include <omp.h>
 
 BeamPIC::BeamPIC()
-    : source_current_delta(source_current_x),
-      injection_remainder_(0.0),
+    : injection_remainder_(0.0),
       last_injected_energy_(0.0),
       cumulative_injected_energy_(0.0),
       last_outflow_energy_(0.0),
@@ -17,10 +16,21 @@ BeamPIC::BeamPIC()
       last_injected_current_(0.0),
       last_outflow_current_(0.0),
       last_field_work_(0.0),
-      left_boundary_number_flux_(0.0),
+      step_dt_(0.0),
+      step_signed_outflow_number_(0.0),
+      interval_injected_number_(0.0),
+      interval_left_outflow_signed_number_(0.0),
+      interval_right_outflow_number_(0.0),
+      interval_left_guard_path_number_(0.0),
+      interval_right_guard_path_number_(0.0),
+      last_continuity_abs_l1_residual_(0.0),
+      last_continuity_abs_linf_residual_(0.0),
       last_continuity_l1_error_(0.0),
       last_continuity_linf_error_(0.0),
-      rng_state_(0x9e3779b97f4a7c15ULL)
+      last_boundary_flux_error_(0.0),
+      last_trajectory_reconstruction_error_(0.0),
+      rng_state_(0x9e3779b97f4a7c15ULL),
+      injected_begin_(0)
 {}
 
 namespace {
@@ -28,7 +38,7 @@ size_t initial_particle_capacity(const SpatialGrid& sg)
 {
     const double active_time = std::max(
         0.0, std::min(Param::t_end, Param::t_inject_end) - Param::t_inject_start);
-    const double downstream_length = std::max(0.0, Param::Lx - Param::beam_source_x_start);
+    const double downstream_length = Param::Lx;
     const double active_length = std::min(downstream_length, Param::beam_v0 * active_time);
     const int active_cells = std::max(1, static_cast<int>(std::ceil(active_length / sg.dx)) + 4);
     const int local_capacity_cells = std::max(1, std::min(sg.nx_local + 2 * sg.nghost,
@@ -42,31 +52,39 @@ int particle_byte_count(int particle_count)
     return static_cast<int>(static_cast<size_t>(particle_count) * sizeof(BeamParticle));
 }
 
-inline double gather_cic_ex(double x, const SpatialGrid& sg, const EMFields& fields)
+inline double gather_staggered_ex(double x,
+                                  const SpatialGrid& sg,
+                                  const EMFields& fields)
 {
     if (x < 0.0 || x >= Param::Lx) return 0.0;
 
-    double s = x / sg.dx - 0.5;
-    int i0 = static_cast<int>(std::floor(s));
-    double frac = s - i0;
-    double w0 = 1.0 - frac;
-    double w1 = frac;
+    // Ex is x-face centered. Relative to the nearest face, the shifted CIC
+    // weights are h_x(-1), h_x(0), h_x(1); only two are nonzero.
+    const double face_coordinate = x * (1.0 / sg.dx);
+    const int center_global =
+        static_cast<int>(std::floor(face_coordinate + 0.5));
+    const double shift = face_coordinate - center_global;
+    const double h_center = 1.0 - std::fabs(shift);
+    const int center_local = center_global - sg.ix_start;
+    const size_t face_count = fields.Ex_face.size();
+
     double ex = 0.0;
-
-    int target_ig = i0;
-    int il = target_ig - sg.ix_start;
-    int ix = il + sg.nghost;
-    if (ix >= 0 && ix < sg.nx_total) {
-        ex += w0 * fields.Ex[ix];
+    if (center_local >= 0 &&
+        static_cast<size_t>(center_local) < face_count) {
+        ex = h_center * fields.Ex_face[static_cast<size_t>(center_local)];
     }
-
-    target_ig = i0 + 1;
-    il = target_ig - sg.ix_start;
-    ix = il + sg.nghost;
-    if (ix >= 0 && ix < sg.nx_total) {
-        ex += w1 * fields.Ex[ix];
+    if (shift < 0.0) {
+        const int left_local = center_local - 1;
+        if (left_local >= 0 && static_cast<size_t>(left_local) < face_count) {
+            ex += (-shift) * fields.Ex_face[static_cast<size_t>(left_local)];
+        }
+    } else if (shift > 0.0) {
+        const int right_local = center_local + 1;
+        if (right_local >= 0 &&
+            static_cast<size_t>(right_local) < face_count) {
+            ex += shift * fields.Ex_face[static_cast<size_t>(right_local)];
+        }
     }
-
     return ex;
 }
 
@@ -82,27 +100,69 @@ inline double beam_kinetic_energy(const BeamParticle& p)
     return p.weight * beam_kinetic_energy_per_particle(p.px);
 }
 
-inline double beam_velocity_from_px(double px)
-{
-    const double pnorm = px / (Const::me * Const::c);
-    const double gamma = std::sqrt(1.0 + pnorm * pnorm);
-    return px / (gamma * Const::me);
-}
-
 inline double push_particle(BeamParticle& p,
                             const SpatialGrid& sg,
                             const EMFields& fields,
                             double dt,
-                            double& vx_after)
+                            int& boundary_crossing)
 {
-    const double ex = gather_cic_ex(p.x, sg, fields);
-    const double ke_before = beam_kinetic_energy(p);
+    const double ex = gather_staggered_ex(p.x, sg, fields);
+    const double inv_mec = 1.0 / (Const::me * Const::c);
+    const double px_before = p.px;
+    const double x_before = p.x;
+    const double pnorm_before = p.px * inv_mec;
+    const double gamma_before = std::sqrt(1.0 + pnorm_before * pnorm_before);
 
-    p.px += (-Const::qe) * ex * dt;
-    vx_after = beam_velocity_from_px(p.px);
-    p.x += vx_after * dt;
+    const double force_x = (-Const::qe) * ex;
+    const double px_trial = px_before + force_x * dt;
+    const double pnorm_trial = px_trial * inv_mec;
+    const double gamma_trial = std::sqrt(1.0 + pnorm_trial * pnorm_trial);
+    const double vx_trial = Const::c * pnorm_trial / gamma_trial;
+    const double x_trial = x_before + vx_trial * dt;
 
-    return beam_kinetic_energy(p) - ke_before;
+    boundary_crossing = 0;
+    double pushed_dt = dt;
+    double x_after = x_trial;
+    if (x_trial < 0.0 || x_trial >= Param::Lx) {
+        boundary_crossing = (x_trial < 0.0) ? -1 : 1;
+        const double boundary = (boundary_crossing < 0) ? 0.0 : Param::Lx;
+
+        if (force_x == 0.0) {
+            pushed_dt = std::max(
+                0.0, std::min(dt, (boundary - x_before) / vx_trial));
+        } else {
+            // Solve x(t) = x_boundary for the same kick-drift substep map used
+            // by the ordinary pusher. This work is restricted to outflow.
+            double t_inside = 0.0;
+            double t_outside = dt;
+            for (int iter = 0; iter < 48; ++iter) {
+                const double t_mid = 0.5 * (t_inside + t_outside);
+                const double px_mid = px_before + force_x * t_mid;
+                const double pnorm_mid = px_mid * inv_mec;
+                const double gamma_mid =
+                    std::sqrt(1.0 + pnorm_mid * pnorm_mid);
+                const double x_mid =
+                    x_before + Const::c * pnorm_mid / gamma_mid * t_mid;
+                const bool is_outside = (boundary_crossing < 0)
+                    ? (x_mid <= boundary) : (x_mid >= boundary);
+                if (is_outside) {
+                    t_outside = t_mid;
+                } else {
+                    t_inside = t_mid;
+                }
+            }
+            pushed_dt = t_outside;
+        }
+        x_after = boundary;
+    }
+
+    p.px = px_before + force_x * pushed_dt;
+    p.x = x_after;
+    const double pnorm_after = p.px * inv_mec;
+    const double gamma_after = std::sqrt(1.0 + pnorm_after * pnorm_after);
+
+    return p.weight * (gamma_after - gamma_before)
+         * Const::me * Const::c * Const::c;
 }
 
 inline double random_unit(unsigned long long& state)
@@ -139,20 +199,33 @@ void BeamPIC::init(const SpatialGrid& sg)
     current_x.assign(sg.nx_local, 0.0);
     current_face_x.assign(sg.nx_local + 1, 0.0);
     density_step_start.assign(sg.nx_local, 0.0);
-    path_density_delta.assign(sg.nx_local, 0.0);
-    source_density_delta.assign(sg.nx_local, 0.0);
-    source_current_x.assign(sg.nx_local, 0.0);
+    boundary_source_density_delta_.assign(sg.nx_local, 0.0);
     injection_remainder_ = 0.0;
     last_injected_energy_ = 0.0;
     cumulative_injected_energy_ = 0.0;
     last_outflow_energy_ = 0.0;
     cumulative_outflow_energy_ = 0.0;
+    last_injected_number_ = 0.0;
     last_outflow_number_ = 0.0;
+    last_injected_current_ = 0.0;
     last_outflow_current_ = 0.0;
     last_field_work_ = 0.0;
-    left_boundary_number_flux_ = 0.0;
+    step_dt_ = 0.0;
+    step_signed_outflow_number_ = 0.0;
+    interval_injected_number_ = 0.0;
+    interval_left_outflow_signed_number_ = 0.0;
+    interval_right_outflow_number_ = 0.0;
+    interval_left_guard_path_number_ = 0.0;
+    interval_right_guard_path_number_ = 0.0;
+    last_continuity_abs_l1_residual_ = 0.0;
+    last_continuity_abs_linf_residual_ = 0.0;
     last_continuity_l1_error_ = 0.0;
     last_continuity_linf_error_ = 0.0;
+    last_boundary_flux_error_ = 0.0;
+    last_trajectory_reconstruction_error_ = 0.0;
+    rng_state_ = 0x9e3779b97f4a7c15ULL;
+    injected_begin_ = 0;
+    injected_push_dt_.clear();
 
     const size_t capacity = initial_particle_capacity(sg);
     const size_t boundary_capacity = std::max(
@@ -168,7 +241,7 @@ void BeamPIC::init(const SpatialGrid& sg)
 
 void BeamPIC::begin_step(const SpatialGrid& sg, double dt)
 {
-    (void)dt;
+    step_dt_ = dt;
     last_injected_energy_ = 0.0;
     last_outflow_energy_ = 0.0;
     last_injected_number_ = 0.0;
@@ -176,55 +249,64 @@ void BeamPIC::begin_step(const SpatialGrid& sg, double dt)
     last_injected_current_ = 0.0;
     last_outflow_current_ = 0.0;
     last_field_work_ = 0.0;
-    left_boundary_number_flux_ = 0.0;
+    step_signed_outflow_number_ = 0.0;
+    interval_injected_number_ = 0.0;
+    interval_left_outflow_signed_number_ = 0.0;
+    interval_right_outflow_number_ = 0.0;
+    interval_left_guard_path_number_ = 0.0;
+    interval_right_guard_path_number_ = 0.0;
+    last_continuity_abs_l1_residual_ = 0.0;
+    last_continuity_abs_linf_residual_ = 0.0;
     last_continuity_l1_error_ = 0.0;
     last_continuity_linf_error_ = 0.0;
-    rng_state_ = 0x9e3779b97f4a7c15ULL;
+    last_boundary_flux_error_ = 0.0;
+    last_trajectory_reconstruction_error_ = 0.0;
+    injected_begin_ = 0;
+    injected_push_dt_.clear();
     begin_current_interval(sg);
 }
 
 void BeamPIC::begin_current_interval(const SpatialGrid& sg)
 {
     density_step_start = density;
-    if (source_density_delta.size() != static_cast<size_t>(sg.nx_local)) {
-        path_density_delta.assign(sg.nx_local, 0.0);
-        source_density_delta.assign(sg.nx_local, 0.0);
-        source_current_x.assign(sg.nx_local, 0.0);
+    if (current_face_x.size() != static_cast<size_t>(sg.nx_local + 1)) {
         current_face_x.assign(sg.nx_local + 1, 0.0);
         current_x.assign(sg.nx_local, 0.0);
-    } else {
-        std::fill(path_density_delta.begin(), path_density_delta.end(), 0.0);
-        std::fill(source_density_delta.begin(), source_density_delta.end(), 0.0);
-        std::fill(source_current_x.begin(), source_current_x.end(), 0.0);
     }
-    left_boundary_number_flux_ = 0.0;
+    resize_or_zero(trajectory_density_delta_,
+                   static_cast<size_t>(sg.nx_local));
+    resize_or_zero(boundary_source_density_delta_,
+                   static_cast<size_t>(sg.nx_local));
+    if (reconstructed_current_face_x_.size() !=
+        static_cast<size_t>(sg.nx_local + 1)) {
+        reconstructed_current_face_x_.resize(
+            static_cast<size_t>(sg.nx_local + 1));
+    }
+    interval_injected_number_ = 0.0;
+    interval_left_outflow_signed_number_ = 0.0;
+    interval_right_outflow_number_ = 0.0;
+    interval_left_guard_path_number_ = 0.0;
+    interval_right_guard_path_number_ = 0.0;
+    injected_begin_ = particles.size();
+    injected_push_dt_.clear();
 }
 
 void BeamPIC::inject(const SpatialGrid& sg, const EMFields& fields,
                      double dt, double time, int mpi_rank, int mpi_size)
 {
     (void)fields;
+    (void)mpi_size;
+    injected_begin_ = particles.size();
+    injected_push_dt_.clear();
+
     const double step_start = time - dt;
     const double active_start = std::max(step_start, Param::t_inject_start);
     const double active_end = std::min(time, Param::t_inject_end);
     const double active_dt = active_end - active_start;
     if (active_dt <= 0.0) return;
-    reset_continuity_exchange_buffers(sg);
-    send_left_.clear();
-    send_right_.clear();
-
-    const double x_left = sg.ix_start * sg.dx;
-    const double x_right = (sg.ix_start + sg.nx_local) * sg.dx;
-    const double x_src = Param::enable_beam_boundary_injection
-        ? 0.0
-        : std::max(0.0, std::min(Param::Lx, Param::beam_source_x_start));
-    const bool owns_source = Param::enable_beam_boundary_injection
-        ? (mpi_rank == 0)
-        : ((x_src >= x_left && x_src < x_right)
-           || (mpi_rank == mpi_size - 1 && x_src == Param::Lx));
 
     int n_new = 0;
-    if (owns_source) {
+    if (mpi_rank == 0) {
         const double depth_cells =
             injection_remainder_ + Param::beam_v0 * active_dt / sg.dx;
         const double macro_depth =
@@ -237,60 +319,48 @@ void BeamPIC::inject(const SpatialGrid& sg, const EMFields& fields,
     }
 
     particles.reserve(particles.size() + static_cast<size_t>(std::max(0, n_new)));
+    injected_push_dt_.reserve(static_cast<size_t>(std::max(0, n_new)));
     const double source_ke_per_particle =
         beam_kinetic_energy_per_particle(Param::beam_p0);
     double injected_energy_call = 0.0;
-    const double injection_depth =
-        std::min(Param::Lx, std::max(0.0, Param::beam_v0 * active_dt));
-    const double boundary_offset = 0.5 * sg.dx;
-    const double raw_birth_min = Param::enable_beam_boundary_injection
-        ? boundary_offset : x_src;
-    const double x_birth_min =
-        std::max(boundary_offset,
-                 std::min(Param::Lx - boundary_offset, raw_birth_min));
-    const double x_birth_max_global = std::max(
-        x_birth_min,
-        std::min(Param::Lx - boundary_offset, x_birth_min + injection_depth));
-    const double local_birth_min =
-        std::max(x_birth_min, x_left + boundary_offset);
-    const double local_birth_max =
-        std::max(local_birth_min,
-                 std::min(x_birth_max_global, x_right - boundary_offset));
+    double injected_number_call = 0.0;
     for (int i = 0; i < n_new; ++i) {
-        const double xi = random_unit(rng_state_);
-        const double x_birth =
-            local_birth_min + xi * (local_birth_max - local_birth_min);
+        // The particle does not exist before this sampled boundary crossing.
+        const double t_cross = active_start + random_unit(rng_state_) * active_dt;
+        const double remaining_dt = std::max(0.0, time - t_cross);
 
         BeamParticle p;
-        p.x = x_birth;
+        p.x = 0.0;
         p.px = Param::beam_p0;
         p.weight = Param::beam_macro_weight;
 
-        add_density_to(sg, source_density_delta,
-                       source_send_left_density_,
-                       source_send_right_density_,
-                       x_birth, p.weight);
-
         last_injected_number_ += p.weight;
-        last_injected_current_ += -Const::qe * Param::beam_v0 * p.weight;
+        interval_injected_number_ += p.weight;
+        injected_number_call += p.weight;
         injected_energy_call += p.weight * source_ke_per_particle;
 
-        if (p.weight <= 0.0) {
-            continue;
-        } else if (p.x >= x_left && p.x < x_right) {
+        if (p.weight > 0.0) {
             particles.push_back(p);
+            injected_push_dt_.push_back(remaining_dt);
         }
     }
+    if (mpi_rank == 0 && !boundary_source_density_delta_.empty()) {
+        double source_guard_left = 0.0;
+        double source_guard_right = 0.0;
+        add_shape_density(sg, boundary_source_density_delta_,
+                          source_guard_left, source_guard_right,
+                          0.0, injected_number_call);
+    }
+    last_injected_current_ = (step_dt_ > 0.0)
+        ? -Const::qe * last_injected_number_ / step_dt_
+        : 0.0;
     last_injected_energy_ += injected_energy_call;
     cumulative_injected_energy_ += injected_energy_call;
-
-    exchange_continuity_contributions(sg, mpi_rank, mpi_size);
 }
 
 void BeamPIC::push(const SpatialGrid& sg, const EMFields& fields, double dt,
                    int mpi_rank, int mpi_size)
 {
-    reset_continuity_exchange_buffers(sg);
     const double x_left = sg.ix_start * sg.dx;
     const double x_right = (sg.ix_start + sg.nx_local) * sg.dx;
     const long long np = static_cast<long long>(particles.size());
@@ -302,14 +372,13 @@ void BeamPIC::push(const SpatialGrid& sg, const EMFields& fields, double dt,
     }
     const int nthreads = std::max(1, omp_get_max_threads());
 
-    if (thread_keep_.size() != static_cast<size_t>(nthreads) ||
-        thread_path_density_delta_.size() != static_cast<size_t>(nthreads)) {
+    if (thread_keep_.size() != static_cast<size_t>(nthreads)) {
         thread_keep_.resize(nthreads);
         thread_send_left_.resize(nthreads);
         thread_send_right_.resize(nthreads);
-        thread_path_density_delta_.resize(nthreads);
-        thread_path_send_left_density_.resize(nthreads);
-        thread_path_send_right_density_.resize(nthreads);
+        thread_trajectory_density_delta_.resize(nthreads);
+        thread_send_left_trajectory_.resize(nthreads);
+        thread_send_right_trajectory_.resize(nthreads);
     }
     const size_t reserve_each = static_cast<size_t>(np / nthreads + 1);
     for (int t = 0; t < nthreads; ++t) {
@@ -319,48 +388,65 @@ void BeamPIC::push(const SpatialGrid& sg, const EMFields& fields, double dt,
         thread_keep_[t].reserve(reserve_each);
         thread_send_left_[t].reserve(std::max<size_t>(1, reserve_each / 16));
         thread_send_right_[t].reserve(std::max<size_t>(1, reserve_each / 16));
-        resize_or_zero(thread_path_density_delta_[t],
+        resize_or_zero(thread_trajectory_density_delta_[t],
                        static_cast<size_t>(sg.nx_local));
-        resize_or_zero(thread_path_send_left_density_[t],
-                       static_cast<size_t>(sg.nghost));
-        resize_or_zero(thread_path_send_right_density_[t],
-                       static_cast<size_t>(sg.nghost));
+        thread_send_left_trajectory_[t] = 0.0;
+        thread_send_right_trajectory_[t] = 0.0;
     }
 
     double field_work = 0.0;
     double outflow_energy = 0.0;
-    double outflow_number = 0.0;
-    double outflow_current = 0.0;
+    double left_outflow_number = 0.0;
+    double right_outflow_number = 0.0;
 
-    #pragma omp parallel reduction(+:field_work,outflow_energy,outflow_number,outflow_current)
+    #pragma omp parallel reduction(+:field_work,outflow_energy,left_outflow_number,right_outflow_number)
     {
         const int tid = omp_get_thread_num();
         std::vector<BeamParticle>& local_keep = thread_keep_[tid];
         std::vector<BeamParticle>& local_left = thread_send_left_[tid];
         std::vector<BeamParticle>& local_right = thread_send_right_[tid];
-        std::vector<double>& local_path = thread_path_density_delta_[tid];
-        std::vector<double>& local_path_left = thread_path_send_left_density_[tid];
-        std::vector<double>& local_path_right = thread_path_send_right_density_[tid];
-
+        std::vector<double>& local_trajectory =
+            thread_trajectory_density_delta_[tid];
+        double local_trajectory_send_left = 0.0;
+        double local_trajectory_send_right = 0.0;
         #pragma omp for schedule(static)
         for (long long i = 0; i < np; ++i) {
             BeamParticle p = particles[static_cast<size_t>(i)];
             const double x_old = p.x;
-            double vx = beam_velocity_from_px(p.px);
-            field_work += push_particle(p, sg, fields, dt, vx);
-            const bool leaves_domain = (p.x < 0.0 || p.x >= Param::Lx);
+            double particle_dt = dt;
+            if (static_cast<size_t>(i) >= injected_begin_) {
+                const size_t injected_slot =
+                    static_cast<size_t>(i) - injected_begin_;
+                if (injected_slot < injected_push_dt_.size()) {
+                    particle_dt = injected_push_dt_[injected_slot];
+                }
+            }
+            int boundary_crossing = 0;
+            field_work += push_particle(p, sg, fields, particle_dt,
+                                        boundary_crossing);
+            const bool leaves_domain = boundary_crossing != 0;
+            const double x_path_end = p.x;
+
+            // This pair is the discrete shape change h_x - g_x. The face
+            // current is reconstructed from continuity below; no q*v moment
+            // is deposited or substituted for the trajectory current.
+            add_shape_density(sg, local_trajectory,
+                              local_trajectory_send_left,
+                              local_trajectory_send_right,
+                              x_old, -p.weight);
+            add_shape_density(sg, local_trajectory,
+                              local_trajectory_send_left,
+                              local_trajectory_send_right,
+                              x_path_end, p.weight);
 
             if (leaves_domain) {
-                add_density_to(sg, local_path, local_path_left,
-                               local_path_right, x_old, -p.weight);
                 outflow_energy += beam_kinetic_energy(p);
-                outflow_number += p.weight;
-                outflow_current += -Const::qe * vx * p.weight;
+                if (boundary_crossing < 0) {
+                    left_outflow_number += p.weight;
+                } else {
+                    right_outflow_number += p.weight;
+                }
                 continue;
-            } else {
-                add_path_density_delta_to(sg, local_path, local_path_left,
-                                          local_path_right, x_old, p.x,
-                                          p.weight);
             }
 
             if (p.weight <= 0.0) continue;
@@ -373,29 +459,35 @@ void BeamPIC::push(const SpatialGrid& sg, const EMFields& fields, double dt,
                 local_keep.push_back(p);
             }
         }
+        thread_send_left_trajectory_[tid] = local_trajectory_send_left;
+        thread_send_right_trajectory_[tid] = local_trajectory_send_right;
     }
 
     #pragma omp parallel for schedule(static)
     for (int ix = 0; ix < sg.nx_local; ++ix) {
-        double path_sum = 0.0;
+        double trajectory_sum = 0.0;
         for (int t = 0; t < nthreads; ++t) {
-            path_sum += thread_path_density_delta_[t][static_cast<size_t>(ix)];
+            trajectory_sum +=
+                thread_trajectory_density_delta_[t][static_cast<size_t>(ix)];
         }
-        path_density_delta[static_cast<size_t>(ix)] += path_sum;
+        trajectory_density_delta_[static_cast<size_t>(ix)] += trajectory_sum;
     }
 
-    for (int g = 0; g < sg.nghost; ++g) {
-        double path_left_sum = 0.0;
-        double path_right_sum = 0.0;
-        for (int t = 0; t < nthreads; ++t) {
-            const size_t slot = static_cast<size_t>(g);
-            path_left_sum += thread_path_send_left_density_[t][slot];
-            path_right_sum += thread_path_send_right_density_[t][slot];
-        }
-        const size_t slot = static_cast<size_t>(g);
-        path_send_left_density_[slot] += path_left_sum;
-        path_send_right_density_[slot] += path_right_sum;
+    double trajectory_send_left = 0.0;
+    double trajectory_send_right = 0.0;
+    for (int t = 0; t < nthreads; ++t) {
+        trajectory_send_left += thread_send_left_trajectory_[t];
+        trajectory_send_right += thread_send_right_trajectory_[t];
     }
+    if (mpi_rank == 0) {
+        interval_left_guard_path_number_ += trajectory_send_left * sg.dx;
+    }
+    if (mpi_rank == mpi_size - 1) {
+        interval_right_guard_path_number_ += trajectory_send_right * sg.dx;
+    }
+    exchange_trajectory_density(sg, mpi_rank, mpi_size,
+                                trajectory_send_left,
+                                trajectory_send_right);
 
     size_t keep_total = 0;
     size_t left_total = 0;
@@ -432,12 +524,36 @@ void BeamPIC::push(const SpatialGrid& sg, const EMFields& fields, double dt,
     particles.swap(keep_);
 
     exchange_particles(sg, mpi_rank, mpi_size);
-    exchange_continuity_contributions(sg, mpi_rank, mpi_size);
+    injected_begin_ = particles.size();
+    injected_push_dt_.clear();
     last_outflow_energy_ += outflow_energy;
     cumulative_outflow_energy_ += outflow_energy;
-    last_outflow_number_ += outflow_number;
-    last_outflow_current_ += outflow_current;
+    // The step scalar counts particles leaving either open boundary.
+    last_outflow_number_ += left_outflow_number + right_outflow_number;
+    step_signed_outflow_number_ += right_outflow_number - left_outflow_number;
+    last_outflow_current_ = (step_dt_ > 0.0)
+        ? -Const::qe * step_signed_outflow_number_ / step_dt_
+        : 0.0;
     last_field_work_ += field_work;
+    // Left-going crossings carry negative x-directed number flux.
+    interval_left_outflow_signed_number_ -= left_outflow_number;
+    interval_right_outflow_number_ += right_outflow_number;
+    if (!boundary_source_density_delta_.empty()) {
+        if (mpi_rank == 0) {
+            double source_guard_left = 0.0;
+            double source_guard_right = 0.0;
+            add_shape_density(sg, boundary_source_density_delta_,
+                              source_guard_left, source_guard_right,
+                              0.0, -left_outflow_number);
+        }
+        if (mpi_rank == mpi_size - 1) {
+            double source_guard_left = 0.0;
+            double source_guard_right = 0.0;
+            add_shape_density(sg, boundary_source_density_delta_,
+                              source_guard_left, source_guard_right,
+                              Param::Lx, -right_outflow_number);
+        }
+    }
 }
 
 void BeamPIC::exchange_particles(const SpatialGrid& sg, int mpi_rank, int mpi_size)
@@ -497,173 +613,63 @@ void BeamPIC::exchange_particles(const SpatialGrid& sg, int mpi_rank, int mpi_si
     particles.insert(particles.end(), recv_right_.begin(), recv_right_.end());
 }
 
-void BeamPIC::add_number_to_cell(const SpatialGrid& sg,
-                                 std::vector<double>& local,
-                                 std::vector<double>& send_left,
-                                 std::vector<double>& send_right,
-                                 int target_ig,
-                                 double value)
+void BeamPIC::add_shape_density(const SpatialGrid& sg,
+                                std::vector<double>& local,
+                                double& send_left,
+                                double& send_right,
+                                double x, double weight) const
 {
-    if (value == 0.0) return;
-
-    const int ng = sg.nghost;
-    const int il = target_ig - sg.ix_start;
-    if (il >= 0 && il < sg.nx_local) {
-        local[static_cast<size_t>(il)] += value;
-    } else if (il < 0 && il >= -ng) {
-        send_left[static_cast<size_t>(il + ng)] += value;
-    } else if (il >= sg.nx_local && il < sg.nx_local + ng) {
-        send_right[static_cast<size_t>(il - sg.nx_local)] += value;
-    }
-}
-
-void BeamPIC::add_density_to(const SpatialGrid& sg,
-                             std::vector<double>& local,
-                             std::vector<double>& send_left,
-                             std::vector<double>& send_right,
-                             double x, double weight)
-{
-    if (x < 0.0 || x > Param::Lx) return;
-
-    const double s = x / sg.dx - 0.5;
+    const double inv_dx = 1.0 / sg.dx;
+    const double s = x * inv_dx - 0.5;
     const int i0 = static_cast<int>(std::floor(s));
     const double frac = s - i0;
-    add_number_to_cell(sg, local, send_left, send_right,
-                       i0, weight * (1.0 - frac) / sg.dx);
-    add_number_to_cell(sg, local, send_left, send_right,
-                       i0 + 1, weight * frac / sg.dx);
-}
+    const int targets[2] = { i0, i0 + 1 };
+    const double values[2] = {
+        weight * (1.0 - frac) * inv_dx,
+        weight * frac * inv_dx
+    };
 
-void BeamPIC::add_path_density_delta(const SpatialGrid& sg,
-                                     double x0, double x1, double weight)
-{
-    add_path_density_delta_to(sg, path_density_delta,
-                              path_send_left_density_,
-                              path_send_right_density_,
-                              x0, x1, weight);
-}
-
-void BeamPIC::add_path_density_delta_to(const SpatialGrid& sg,
-                                        std::vector<double>& local,
-                                        std::vector<double>& send_left,
-                                        std::vector<double>& send_right,
-                                        double x0, double x1, double weight)
-{
-    if (x0 < 0.0 || x0 > Param::Lx) return;
-    if (x1 < 0.0 || x1 > Param::Lx) return;
-
-    const double s0 = x0 / sg.dx - 0.5;
-    const int i00 = static_cast<int>(std::floor(s0));
-    const double f0 = s0 - i00;
-    add_number_to_cell(sg, local, send_left, send_right,
-                       i00, -weight * (1.0 - f0) / sg.dx);
-    add_number_to_cell(sg, local, send_left, send_right,
-                       i00 + 1, -weight * f0 / sg.dx);
-
-    const double s1 = x1 / sg.dx - 0.5;
-    const int i10 = static_cast<int>(std::floor(s1));
-    const double f1 = s1 - i10;
-    add_number_to_cell(sg, local, send_left, send_right,
-                       i10, weight * (1.0 - f1) / sg.dx);
-    add_number_to_cell(sg, local, send_left, send_right,
-                       i10 + 1, weight * f1 / sg.dx);
-}
-
-void BeamPIC::reset_continuity_exchange_buffers(const SpatialGrid& sg)
-{
-    const int ng = sg.nghost;
-    if (source_send_left_density_.size() != static_cast<size_t>(ng)) {
-        source_send_left_density_.assign(ng, 0.0);
-        source_send_right_density_.assign(ng, 0.0);
-        source_recv_left_density_.assign(ng, 0.0);
-        source_recv_right_density_.assign(ng, 0.0);
-        source_send_left_current_.assign(ng, 0.0);
-        source_send_right_current_.assign(ng, 0.0);
-        source_recv_left_current_.assign(ng, 0.0);
-        source_recv_right_current_.assign(ng, 0.0);
-        path_send_left_density_.assign(ng, 0.0);
-        path_send_right_density_.assign(ng, 0.0);
-        path_recv_left_density_.assign(ng, 0.0);
-        path_recv_right_density_.assign(ng, 0.0);
-    } else {
-        std::fill(source_send_left_density_.begin(), source_send_left_density_.end(), 0.0);
-        std::fill(source_send_right_density_.begin(), source_send_right_density_.end(), 0.0);
-        std::fill(source_recv_left_density_.begin(), source_recv_left_density_.end(), 0.0);
-        std::fill(source_recv_right_density_.begin(), source_recv_right_density_.end(), 0.0);
-        std::fill(source_send_left_current_.begin(), source_send_left_current_.end(), 0.0);
-        std::fill(source_send_right_current_.begin(), source_send_right_current_.end(), 0.0);
-        std::fill(source_recv_left_current_.begin(), source_recv_left_current_.end(), 0.0);
-        std::fill(source_recv_right_current_.begin(), source_recv_right_current_.end(), 0.0);
-        std::fill(path_send_left_density_.begin(), path_send_left_density_.end(), 0.0);
-        std::fill(path_send_right_density_.begin(), path_send_right_density_.end(), 0.0);
-        std::fill(path_recv_left_density_.begin(), path_recv_left_density_.end(), 0.0);
-        std::fill(path_recv_right_density_.begin(), path_recv_right_density_.end(), 0.0);
+    for (int k = 0; k < 2; ++k) {
+        const int il = targets[k] - sg.ix_start;
+        if (il >= 0 && il < sg.nx_local) {
+            local[static_cast<size_t>(il)] += values[k];
+        } else if (il < 0) {
+            send_left += values[k];
+        } else {
+            send_right += values[k];
+        }
     }
 }
 
-void BeamPIC::exchange_continuity_contributions(const SpatialGrid& sg,
-                                                int mpi_rank, int mpi_size)
+void BeamPIC::exchange_trajectory_density(const SpatialGrid& sg,
+                                          int mpi_rank, int mpi_size,
+                                          double send_left,
+                                          double send_right)
 {
-    const int ng = sg.nghost;
-    if (ng <= 0) return;
-    if (mpi_size == 1) {
-        return;
-    }
+    if (mpi_size == 1) return;
 
-    const int left = mpi_rank - 1;
-    const int right = mpi_rank + 1;
-    MPI_Request reqs[12];
+    double recv_left = 0.0;
+    double recv_right = 0.0;
+    MPI_Request reqs[4];
     int nreq = 0;
-
-    if (left >= 0) {
-        MPI_Isend(source_send_left_density_.data(), ng, MPI_DOUBLE,
-                  left, 501, MPI_COMM_WORLD, &reqs[nreq++]);
-        MPI_Irecv(source_recv_left_density_.data(), ng, MPI_DOUBLE,
-                  left, 502, MPI_COMM_WORLD, &reqs[nreq++]);
-        MPI_Isend(source_send_left_current_.data(), ng, MPI_DOUBLE,
-                  left, 503, MPI_COMM_WORLD, &reqs[nreq++]);
-        MPI_Irecv(source_recv_left_current_.data(), ng, MPI_DOUBLE,
-                  left, 504, MPI_COMM_WORLD, &reqs[nreq++]);
-        MPI_Isend(path_send_left_density_.data(), ng, MPI_DOUBLE,
-                  left, 505, MPI_COMM_WORLD, &reqs[nreq++]);
-        MPI_Irecv(path_recv_left_density_.data(), ng, MPI_DOUBLE,
-                  left, 506, MPI_COMM_WORLD, &reqs[nreq++]);
+    if (mpi_rank > 0) {
+        MPI_Isend(&send_left, 1, MPI_DOUBLE, mpi_rank - 1, 451,
+                  MPI_COMM_WORLD, &reqs[nreq++]);
+        MPI_Irecv(&recv_left, 1, MPI_DOUBLE, mpi_rank - 1, 452,
+                  MPI_COMM_WORLD, &reqs[nreq++]);
     }
-    if (right < mpi_size) {
-        MPI_Isend(source_send_right_density_.data(), ng, MPI_DOUBLE,
-                  right, 502, MPI_COMM_WORLD, &reqs[nreq++]);
-        MPI_Irecv(source_recv_right_density_.data(), ng, MPI_DOUBLE,
-                  right, 501, MPI_COMM_WORLD, &reqs[nreq++]);
-        MPI_Isend(source_send_right_current_.data(), ng, MPI_DOUBLE,
-                  right, 504, MPI_COMM_WORLD, &reqs[nreq++]);
-        MPI_Irecv(source_recv_right_current_.data(), ng, MPI_DOUBLE,
-                  right, 503, MPI_COMM_WORLD, &reqs[nreq++]);
-        MPI_Isend(path_send_right_density_.data(), ng, MPI_DOUBLE,
-                  right, 506, MPI_COMM_WORLD, &reqs[nreq++]);
-        MPI_Irecv(path_recv_right_density_.data(), ng, MPI_DOUBLE,
-                  right, 505, MPI_COMM_WORLD, &reqs[nreq++]);
+    if (mpi_rank + 1 < mpi_size) {
+        MPI_Isend(&send_right, 1, MPI_DOUBLE, mpi_rank + 1, 452,
+                  MPI_COMM_WORLD, &reqs[nreq++]);
+        MPI_Irecv(&recv_right, 1, MPI_DOUBLE, mpi_rank + 1, 451,
+                  MPI_COMM_WORLD, &reqs[nreq++]);
     }
-
     if (nreq > 0) MPI_Waitall(nreq, reqs, MPI_STATUSES_IGNORE);
 
-    if (left >= 0) {
-        for (int g = 0; g < ng && g < sg.nx_local; ++g) {
-            const size_t slot = static_cast<size_t>(g);
-            source_density_delta[slot] += source_recv_left_density_[slot];
-            source_current_x[slot] += source_recv_left_current_[slot];
-            path_density_delta[slot] += path_recv_left_density_[slot];
-        }
-    }
-    if (right < mpi_size) {
-        for (int g = 0; g < ng; ++g) {
-            const int il = sg.nx_local - ng + g;
-            if (il < 0 || il >= sg.nx_local) continue;
-            const size_t dst = static_cast<size_t>(il);
-            const size_t src = static_cast<size_t>(g);
-            source_density_delta[dst] += source_recv_right_density_[src];
-            source_current_x[dst] += source_recv_right_current_[src];
-            path_density_delta[dst] += path_recv_right_density_[src];
-        }
+    if (sg.nx_local > 0) {
+        trajectory_density_delta_[0] += recv_left;
+        trajectory_density_delta_[static_cast<size_t>(sg.nx_local - 1)] +=
+            recv_right;
     }
 }
 
@@ -671,122 +677,89 @@ void BeamPIC::deposit_density(const SpatialGrid& sg, int mpi_rank, int mpi_size)
 {
     if (particles.empty() && mpi_size == 1) {
         resize_or_zero(density, static_cast<size_t>(sg.nx_local));
-        resize_or_zero(current_x, static_cast<size_t>(sg.nx_local));
         return;
     }
 
     const int nthreads = std::max(1, omp_get_max_threads());
     if (thread_density_.size() != static_cast<size_t>(nthreads)) {
         thread_density_.resize(nthreads);
-        thread_current_.resize(nthreads);
         thread_send_left_density_.resize(nthreads);
         thread_send_right_density_.resize(nthreads);
-        thread_send_left_current_.resize(nthreads);
-        thread_send_right_current_.resize(nthreads);
     }
     for (int t = 0; t < nthreads; ++t) {
-        if (thread_density_[t].size() != static_cast<size_t>(sg.nx_local) ||
-            thread_current_[t].size() != static_cast<size_t>(sg.nx_local)) {
+        if (thread_density_[t].size() != static_cast<size_t>(sg.nx_local)) {
             thread_density_[t].assign(sg.nx_local, 0.0);
-            thread_current_[t].assign(sg.nx_local, 0.0);
         } else {
             std::fill(thread_density_[t].begin(), thread_density_[t].end(), 0.0);
-            std::fill(thread_current_[t].begin(), thread_current_[t].end(), 0.0);
         }
         thread_send_left_density_[t] = 0.0;
         thread_send_right_density_[t] = 0.0;
-        thread_send_left_current_[t] = 0.0;
-        thread_send_right_current_[t] = 0.0;
     }
 
     double send_left_density = 0.0;
     double send_right_density = 0.0;
-    double send_left_current = 0.0;
-    double send_right_current = 0.0;
     const long long np = static_cast<long long>(particles.size());
+    const double inv_dx = 1.0 / sg.dx;
 
     #pragma omp parallel
     {
         const int tid = omp_get_thread_num();
         std::vector<double>& local_density = thread_density_[tid];
-        std::vector<double>& local_current = thread_current_[tid];
         double local_send_left_density = 0.0;
         double local_send_right_density = 0.0;
-        double local_send_left_current = 0.0;
-        double local_send_right_current = 0.0;
 
         #pragma omp for schedule(static)
         for (long long i = 0; i < np; ++i) {
             const BeamParticle& p = particles[static_cast<size_t>(i)];
-            double s = p.x / sg.dx - 0.5;
-            int i0 = static_cast<int>(std::floor(s));
-            double frac = s - i0;
-            const double pnorm = p.px / (Const::me * Const::c);
-            const double gamma = std::sqrt(1.0 + pnorm * pnorm);
-            const double vx = p.px / (gamma * Const::me);
+            const double s = p.x * inv_dx - 0.5;
+            const int i0 = static_cast<int>(std::floor(s));
+            const double frac = s - i0;
 
-            double contribution = p.weight * (1.0 - frac) / sg.dx;
-            double current_contribution = -Const::qe * vx * contribution;
+            double contribution = p.weight * (1.0 - frac) * inv_dx;
             int target_ig = i0;
             int il = target_ig - sg.ix_start;
             if (il >= 0 && il < sg.nx_local) {
                 local_density[il] += contribution;
-                local_current[il] += current_contribution;
             } else if (target_ig < sg.ix_start && mpi_rank > 0) {
                 local_send_left_density += contribution;
-                local_send_left_current += current_contribution;
             } else if (target_ig >= sg.ix_start + sg.nx_local &&
                        mpi_rank + 1 < mpi_size) {
                 local_send_right_density += contribution;
-                local_send_right_current += current_contribution;
             }
 
-            contribution = p.weight * frac / sg.dx;
-            current_contribution = -Const::qe * vx * contribution;
+            contribution = p.weight * frac * inv_dx;
             target_ig = i0 + 1;
             il = target_ig - sg.ix_start;
             if (il >= 0 && il < sg.nx_local) {
                 local_density[il] += contribution;
-                local_current[il] += current_contribution;
             } else if (target_ig < sg.ix_start && mpi_rank > 0) {
                 local_send_left_density += contribution;
-                local_send_left_current += current_contribution;
             } else if (target_ig >= sg.ix_start + sg.nx_local &&
                        mpi_rank + 1 < mpi_size) {
                 local_send_right_density += contribution;
-                local_send_right_current += current_contribution;
             }
         }
 
         thread_send_left_density_[tid] = local_send_left_density;
         thread_send_right_density_[tid] = local_send_right_density;
-        thread_send_left_current_[tid] = local_send_left_current;
-        thread_send_right_current_[tid] = local_send_right_current;
     }
 
     #pragma omp parallel for schedule(static)
     for (int ix = 0; ix < sg.nx_local; ++ix) {
         double density_sum = 0.0;
-        double current_sum = 0.0;
         for (int t = 0; t < nthreads; ++t) {
             density_sum += thread_density_[t][ix];
-            current_sum += thread_current_[t][ix];
         }
         density[ix] = density_sum;
-        current_x[ix] = current_sum;
     }
 
     for (int t = 0; t < nthreads; ++t) {
         send_left_density += thread_send_left_density_[t];
         send_right_density += thread_send_right_density_[t];
-        send_left_current += thread_send_left_current_[t];
-        send_right_current += thread_send_right_current_[t];
     }
 
-    double send_left_payload[2] = { send_left_density, send_left_current };
-    double send_right_payload[2] = { send_right_density, send_right_current };
-    double recv_left_payload[2] = { 0.0, 0.0 };
-    double recv_right_payload[2] = { 0.0, 0.0 };
+    double recv_left_density = 0.0;
+    double recv_right_density = 0.0;
     int left = mpi_rank - 1;
     int right = mpi_rank + 1;
 
@@ -796,22 +769,20 @@ void BeamPIC::deposit_density(const SpatialGrid& sg, int mpi_rank, int mpi_size)
         return;
     }
     if (left >= 0) {
-        MPI_Isend(send_left_payload, 2, MPI_DOUBLE, left, 401, MPI_COMM_WORLD, &reqs[nreq++]);
-        MPI_Irecv(recv_left_payload, 2, MPI_DOUBLE, left, 402, MPI_COMM_WORLD, &reqs[nreq++]);
+        MPI_Isend(&send_left_density, 1, MPI_DOUBLE, left, 401, MPI_COMM_WORLD, &reqs[nreq++]);
+        MPI_Irecv(&recv_left_density, 1, MPI_DOUBLE, left, 402, MPI_COMM_WORLD, &reqs[nreq++]);
     }
     if (right < mpi_size) {
-        MPI_Isend(send_right_payload, 2, MPI_DOUBLE, right, 402, MPI_COMM_WORLD, &reqs[nreq++]);
-        MPI_Irecv(recv_right_payload, 2, MPI_DOUBLE, right, 401, MPI_COMM_WORLD, &reqs[nreq++]);
+        MPI_Isend(&send_right_density, 1, MPI_DOUBLE, right, 402, MPI_COMM_WORLD, &reqs[nreq++]);
+        MPI_Irecv(&recv_right_density, 1, MPI_DOUBLE, right, 401, MPI_COMM_WORLD, &reqs[nreq++]);
     }
     if (nreq > 0) MPI_Waitall(nreq, reqs, MPI_STATUSES_IGNORE);
 
     if (left >= 0 && sg.nx_local > 0) {
-        density[0] += recv_left_payload[0];
-        current_x[0] += recv_left_payload[1];
+        density[0] += recv_left_density;
     }
     if (right < mpi_size && sg.nx_local > 0) {
-        density[sg.nx_local - 1] += recv_right_payload[0];
-        current_x[sg.nx_local - 1] += recv_right_payload[1];
+        density[sg.nx_local - 1] += recv_right_density;
     }
 }
 
@@ -825,51 +796,206 @@ void BeamPIC::finalize_charge_conserving_current(const SpatialGrid& sg,
         current_face_x.assign(sg.nx_local + 1, 0.0);
     }
 
-    double local_path_number = 0.0;
+    double local_changes[2] = { 0.0, 0.0 };
+    double local_corrections[2] = { 0.0, 0.0 };
     for (int ix = 0; ix < sg.nx_local; ++ix) {
-        local_path_number += path_density_delta[static_cast<size_t>(ix)] * sg.dx;
+        const size_t slot = static_cast<size_t>(ix);
+        const double density_change =
+            (density[slot] - density_step_start[slot]
+             - boundary_source_density_delta_[slot]) * sg.dx;
+        const double density_corrected =
+            density_change - local_corrections[0];
+        const double density_updated = local_changes[0] + density_corrected;
+        local_corrections[0] =
+            (density_updated - local_changes[0]) - density_corrected;
+        local_changes[0] = density_updated;
+
+        const double trajectory_change =
+            trajectory_density_delta_[slot] * sg.dx;
+        const double trajectory_corrected =
+            trajectory_change - local_corrections[1];
+        const double trajectory_updated =
+            local_changes[1] + trajectory_corrected;
+        local_corrections[1] =
+            (trajectory_updated - local_changes[1]) - trajectory_corrected;
+        local_changes[1] = trajectory_updated;
     }
 
-    if (all_path_numbers_.size() != static_cast<size_t>(mpi_size)) {
-        all_path_numbers_.assign(static_cast<size_t>(mpi_size), 0.0);
-    }
-    MPI_Allgather(&local_path_number, 1, MPI_DOUBLE,
-                  all_path_numbers_.data(), 1, MPI_DOUBLE, MPI_COMM_WORLD);
-
-    double global_left_boundary_number = 0.0;
-    MPI_Allreduce(&left_boundary_number_flux_, &global_left_boundary_number,
-                  1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-
-    double number_flux = global_left_boundary_number / elapsed_dt;
-    for (int r = 0; r < mpi_rank; ++r) {
-        number_flux -= all_path_numbers_[static_cast<size_t>(r)] / elapsed_dt;
+    double preceding_changes[2] = { 0.0, 0.0 };
+    if (mpi_size > 1) {
+        MPI_Exscan(local_changes, preceding_changes,
+                   2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        if (mpi_rank == 0) {
+            preceding_changes[0] = 0.0;
+            preceding_changes[1] = 0.0;
+        }
     }
 
-    current_face_x[0] = -Const::qe * number_flux;
+    double local_boundary_source_number = 0.0;
+    if (!boundary_source_density_delta_.empty()) {
+        local_boundary_source_number =
+            boundary_source_density_delta_.front() * sg.dx;
+        if (boundary_source_density_delta_.size() > 1) {
+            local_boundary_source_number +=
+                boundary_source_density_delta_.back() * sg.dx;
+        }
+    }
+    const double local_boundary_numbers[6] = {
+        interval_injected_number_,
+        interval_left_outflow_signed_number_,
+        interval_right_outflow_number_,
+        local_boundary_source_number,
+        interval_left_guard_path_number_,
+        interval_right_guard_path_number_
+    };
+    double global_boundary_numbers[6] = {
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    };
+    MPI_Allreduce(local_boundary_numbers, global_boundary_numbers,
+                  6, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    const double inv_dt = 1.0 / elapsed_dt;
+    const double dx_over_dt = sg.dx * inv_dt;
+    const double inv_dx = 1.0 / sg.dx;
+
+    // Guard shape changes determine the physical open-boundary face current.
+    // Guard current arrays themselves are discarded and never periodic-wrapped.
+    double trajectory_flux =
+        (-global_boundary_numbers[4] - preceding_changes[1]) * inv_dt;
+    double trajectory_flux_correction = 0.0;
+    current_face_x[0] = -Const::qe * trajectory_flux;
     for (int ix = 0; ix < sg.nx_local; ++ix) {
-        number_flux -= path_density_delta[static_cast<size_t>(ix)]
-                     * sg.dx / elapsed_dt;
-        current_face_x[static_cast<size_t>(ix + 1)] = -Const::qe * number_flux;
+        const size_t slot = static_cast<size_t>(ix);
+        const double flux_change =
+            -trajectory_density_delta_[slot] * dx_over_dt;
+        const double corrected =
+            flux_change - trajectory_flux_correction;
+        const double updated = trajectory_flux + corrected;
+        trajectory_flux_correction =
+            (updated - trajectory_flux) - corrected;
+        trajectory_flux = updated;
+        current_face_x[slot + 1] = -Const::qe * trajectory_flux;
     }
 
+    // Scheme 2: independently remove S_inj-S_out from the real density change.
+    double reconstructed_flux =
+        (-global_boundary_numbers[4] - preceding_changes[0]) * inv_dt;
+    double reconstructed_flux_correction = 0.0;
+    reconstructed_current_face_x_[0] = -Const::qe * reconstructed_flux;
+    for (int ix = 0; ix < sg.nx_local; ++ix) {
+        const size_t slot = static_cast<size_t>(ix);
+        const double flux_change =
+            -(density[slot] - density_step_start[slot]
+              - boundary_source_density_delta_[slot]) * dx_over_dt;
+        const double corrected =
+            flux_change - reconstructed_flux_correction;
+        const double updated = reconstructed_flux + corrected;
+        reconstructed_flux_correction =
+            (updated - reconstructed_flux) - corrected;
+        reconstructed_flux = updated;
+        reconstructed_current_face_x_[slot + 1] =
+            -Const::qe * reconstructed_flux;
+    }
+
+    // Internal MPI faces share one Beam current. The two global Beam faces
+    // remain independent open boundaries; there is deliberately no wrap.
+    if (mpi_size > 1) {
+        const double send_left_faces[2] = {
+            current_face_x[0], reconstructed_current_face_x_[0]
+        };
+        double recv_right_faces[2] = { 0.0, 0.0 };
+        MPI_Request reqs[2];
+        int nreq = 0;
+        if (mpi_rank > 0) {
+            MPI_Isend(send_left_faces, 2, MPI_DOUBLE, mpi_rank - 1, 681,
+                      MPI_COMM_WORLD, &reqs[nreq++]);
+        }
+        if (mpi_rank + 1 < mpi_size) {
+            MPI_Irecv(recv_right_faces, 2, MPI_DOUBLE, mpi_rank + 1, 681,
+                      MPI_COMM_WORLD, &reqs[nreq++]);
+        }
+        if (nreq > 0) MPI_Waitall(nreq, reqs, MPI_STATUSES_IGNORE);
+        if (mpi_rank + 1 < mpi_size) {
+            const size_t right_face = static_cast<size_t>(sg.nx_local);
+            current_face_x[right_face] = recv_right_faces[0];
+            reconstructed_current_face_x_[right_face] = recv_right_faces[1];
+        }
+    }
     for (int ix = 0; ix < sg.nx_local; ++ix) {
         current_x[static_cast<size_t>(ix)] =
             0.5 * (current_face_x[static_cast<size_t>(ix)]
                  + current_face_x[static_cast<size_t>(ix + 1)]);
     }
 
-    last_continuity_l1_error_ = 0.0;
-    last_continuity_linf_error_ = 0.0;
+    last_boundary_flux_error_ = 0.0;
+    last_trajectory_reconstruction_error_ = 0.0;
+    const double current_scale = std::max(
+        1.0, Const::qe * global_boundary_numbers[0] * inv_dt);
+    for (size_t iface = 0; iface < current_face_x.size(); ++iface) {
+        const double scale = std::max(
+            current_scale,
+            std::max(std::fabs(current_face_x[iface]),
+                     std::fabs(reconstructed_current_face_x_[iface])));
+        last_trajectory_reconstruction_error_ = std::max(
+            last_trajectory_reconstruction_error_,
+            std::fabs(current_face_x[iface] -
+                      reconstructed_current_face_x_[iface]) / scale);
+    }
     const size_t n = std::min(density.size(), density_step_start.size());
+    double interval_abs_l1 = 0.0;
+    double interval_abs_linf = 0.0;
     for (size_t ix = 0; ix < n; ++ix) {
-        const double expected =
-            density_step_start[ix] + path_density_delta[ix]
-            + source_density_delta[ix];
-        const double err = density[ix] - expected;
+        const double delta_rho =
+            -Const::qe * (density[ix] - density_step_start[ix]) * inv_dt;
+        const double div_j =
+            (current_face_x[ix + 1] - current_face_x[ix]) * inv_dx;
+        const double source_rho =
+            -Const::qe * boundary_source_density_delta_[ix] * inv_dt;
+        const double err = delta_rho + div_j - source_rho;
         const double abs_err = std::fabs(err);
-        last_continuity_l1_error_ += abs_err * sg.dx;
-        last_continuity_linf_error_ =
-            std::max(last_continuity_linf_error_, abs_err);
+        interval_abs_l1 += abs_err * sg.dx;
+        interval_abs_linf = std::max(interval_abs_linf, abs_err);
+    }
+
+    // Normalize against a global injection-current scale, never against a
+    // nearly zero cell-local cancellation. Param::jb provides a stable scale
+    // outside the active injection window.
+    const double interval_injection_current =
+        Const::qe * global_boundary_numbers[0] * inv_dt;
+    const double injection_current_scale =
+        std::max(std::fabs(Param::jb), std::fabs(interval_injection_current));
+    const double interval_weight =
+        (step_dt_ > 0.0) ? elapsed_dt / step_dt_ : 1.0;
+    last_continuity_abs_l1_residual_ += interval_abs_l1 * interval_weight;
+    last_continuity_abs_linf_residual_ =
+        std::max(last_continuity_abs_linf_residual_, interval_abs_linf);
+    last_continuity_l1_error_ +=
+        interval_abs_l1 / injection_current_scale * interval_weight;
+    last_continuity_linf_error_ = std::max(
+        last_continuity_linf_error_,
+        interval_abs_linf * sg.dx / injection_current_scale);
+
+    const double expected_source_number = 0.5 * (
+        global_boundary_numbers[0] + global_boundary_numbers[1]
+        - global_boundary_numbers[2]);
+    const double source_number_scale = std::max(
+        1.0, std::max(std::fabs(expected_source_number),
+                      std::fabs(global_boundary_numbers[3])));
+    last_boundary_flux_error_ =
+        std::fabs(global_boundary_numbers[3] - expected_source_number) /
+        source_number_scale;
+
+    if (mpi_rank == mpi_size - 1) {
+        const double expected_right_flux = global_boundary_numbers[5] * inv_dt;
+        const double flux_scale = std::max(
+            1.0, std::max(global_boundary_numbers[0] * inv_dt,
+                          std::max(std::fabs(trajectory_flux),
+                                   std::max(std::fabs(reconstructed_flux),
+                                             std::fabs(expected_right_flux)))));
+        const double open_face_error = std::max(
+            std::fabs(trajectory_flux - expected_right_flux),
+            std::fabs(reconstructed_flux - expected_right_flux)) / flux_scale;
+        last_boundary_flux_error_ =
+            std::max(last_boundary_flux_error_, open_face_error);
     }
 }
 

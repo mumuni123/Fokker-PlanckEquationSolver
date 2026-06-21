@@ -220,7 +220,12 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                       << "gauss_residual_abs_max_over_n0  "
                       << "N_bkg_e  "
                       << "N_beam_macro  N_beam_weighted  "
-                      << "beam_cont_l1  beam_cont_linf  "
+                      << "beam_cont_abs_l1[A/m2]  "
+                      << "beam_cont_abs_linf[A/m3]  "
+                      << "beam_cont_rel_injection_l1  "
+                      << "beam_cont_rel_injection_linf  "
+                      << "beam_boundary_flux_relative_error  "
+                      << "beam_trajectory_reconstruction_relative_error  "
                       << "nsub_u1  nsub_mu1  nsub_u2  nsub_mu2  "
                       << "loss_u1  loss_mu1  loss_u2  loss_mu2  "
                       << "loss_u1_low  loss_u1_high  "
@@ -523,12 +528,18 @@ void Diagnostics::write_step_diagnostics(int step, double time,
     const double local_N_bkg_e = electrons.total_particle_number();
     const double local_N_beam_macro = static_cast<double>(beam.particles.size());
     const double local_N_beam_weighted = beam.total_particle_number(sg);
-    double local_beam_continuity[2] = {
-        beam.last_continuity_l1_error(),
-        beam.last_continuity_linf_error()
+    double local_beam_continuity_sum[2] = {
+        beam.last_continuity_abs_l1_residual(),
+        beam.last_continuity_l1_error()
     };
-    double global_beam_continuity_l1 = 0.0;
-    double global_beam_continuity_linf = 0.0;
+    double local_beam_continuity_max[4] = {
+        beam.last_continuity_abs_linf_residual(),
+        beam.last_continuity_linf_error(),
+        beam.last_boundary_flux_error(),
+        beam.last_trajectory_reconstruction_error()
+    };
+    double global_beam_continuity_sum[2] = { 0.0, 0.0 };
+    double global_beam_continuity_max[4] = { 0.0, 0.0, 0.0, 0.0 };
 
     double local_losses[9] = {
         loss_v1, loss_mu1, loss_v2, loss_mu2,
@@ -607,10 +618,10 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_N_beam_weighted, &global_N_beam_weighted, 1,
                MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&local_beam_continuity[0], &global_beam_continuity_l1,
-               1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&local_beam_continuity[1], &global_beam_continuity_linf,
-               1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local_beam_continuity_sum, global_beam_continuity_sum,
+               2, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local_beam_continuity_max, global_beam_continuity_max,
+               4, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(local_nsub, global_nsub, 4, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(local_losses, global_losses, 9, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(local_energy, global_energy, 22, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
@@ -633,8 +644,12 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << global_N_bkg_e << "  "
                   << global_N_beam_macro << "  "
                   << global_N_beam_weighted << "  "
-                  << global_beam_continuity_l1 << "  "
-                  << global_beam_continuity_linf << "  "
+                  << global_beam_continuity_sum[0] << "  "
+                  << global_beam_continuity_max[0] << "  "
+                  << global_beam_continuity_sum[1] << "  "
+                  << global_beam_continuity_max[1] << "  "
+                  << global_beam_continuity_max[2] << "  "
+                  << global_beam_continuity_max[3] << "  "
                   << global_nsub[0] << "  "
                   << global_nsub[1] << "  "
                   << global_nsub[2] << "  "
