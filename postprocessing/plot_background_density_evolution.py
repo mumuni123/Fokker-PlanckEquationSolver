@@ -14,6 +14,7 @@ from postprocess_common import (
     apply_x_axis_range,
     figure_output_path,
     filename_token,
+    normalize_density_columns,
     parse_header_labels,
     save_figure,
     validate_selected_data,
@@ -72,6 +73,11 @@ def main() -> None:
     for path in files:
         time_fs, labels, data = read_density_file(path)
         current_col = column_index(labels, config.BACKGROUND_DENSITY_COLUMN)
+
+        # Normalize density by reference density from parameters.h (e.g. n_bkg_e → n_bkg_e / n_e0).
+        labels, data = normalize_density_columns(
+            labels, data, [current_col], config.PARAMETERS_FILE
+        )
 
         if reference_labels is None:
             reference_labels = labels

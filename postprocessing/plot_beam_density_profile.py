@@ -13,6 +13,7 @@ from postprocess_common import (
     apply_x_axis_range,
     filename_token,
     normalize_columns,
+    normalize_density_columns,
     parse_header_labels,
     save_figure,
     validate_selected_data,
@@ -44,6 +45,9 @@ def read_density_file(path: str):
 def main() -> None:
     time_fs, labels, data = read_density_file(str(config.DENSITY_FILE))
     column_indices = normalize_columns(labels, config.DENSITY_COLUMNS)
+    labels, data = normalize_density_columns(
+        labels, data, column_indices, config.PARAMETERS_FILE
+    )
     mask, x_limits = x_range_mask(
         data[:, 0],
         config.DENSITY_X_AXIS_RANGE,

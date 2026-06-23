@@ -292,6 +292,51 @@ def interpolate_at_x(
     return [float(np.interp(x_um, x, data[:, col])) for col in column_indices]
 
 
+def normalize_density_columns(
+    labels: list[str],
+    data: np.ndarray,
+    column_indices: list[int],
+    parameters_file: Path,
+) -> tuple[list[str], np.ndarray]:
+    """Normalize density columns by their reference density from parameters.h.
+
+    Column-to-parameter mapping is inferred from the column name:
+    - Column name containing 'beam' → normalized by ``densb`` (beam initial density).
+    - Column name containing 'bkg'  → normalized by ``dens``  (background density).
+    - Columns that do not match any pattern are left unchanged.
+
+    The y-axis label is updated to reflect the normalization, e.g.
+    ``n_beam[m^-3]`` becomes ``n_beam / densb``.
+    """
+    constants = evaluate_cpp_double_constants(parameters_file)
+
+    # Pattern → (parameter_name, display_label)
+    density_patterns: list[tuple[str, str, str]] = [
+        ("beam", "densb", "n_b0"),
+        ("bkg", "dens", "n_e0"),
+    ]
+
+    plot_labels = list(labels)
+    plot_data = data.copy()
+
+    for col in column_indices:
+        col_name_lower = labels[col].lower()
+        for pattern, param_name, display_name in density_patterns:
+            if pattern in col_name_lower:
+                if param_name not in constants:
+                    raise ValueError(
+                        f"Cannot normalize column {labels[col]!r}: parameter "
+                        f"{param_name!r} not found in {parameters_file}"
+                    )
+                n0 = constants[param_name]
+                plot_data[:, col] = plot_data[:, col] / n0
+                base_name = labels[col].split("[", 1)[0].strip()
+                plot_labels[col] = f"{base_name} / {display_name}"
+                break
+
+    return plot_labels, plot_data
+
+
 def save_figure(fig: plt.Figure, output: Path, dpi: int) -> None:
     fig.tight_layout()
     output.parent.mkdir(parents=True, exist_ok=True)
