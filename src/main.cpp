@@ -85,28 +85,33 @@ void abort_if_vmax_loss(const VlasovSolver& vlasov,
     }
 }
 
-std::vector<double> copy_local_ex(const EMFields& fields,
-                                  const SpatialGrid& sg)
+std::vector<double> copy_local_ex_face(const EMFields& fields,
+                                       const SpatialGrid& sg)
 {
-    std::vector<double> ex(static_cast<size_t>(sg.nx_local), 0.0);
-    for (int ix = 0; ix < sg.nx_local; ++ix) {
-        ex[static_cast<size_t>(ix)] = fields.Ex[ix + sg.nghost];
+    std::vector<double> ex_face(static_cast<size_t>(sg.nx_local), 0.0);
+    const size_t n = std::min(ex_face.size(), fields.Ex_face.size());
+    for (size_t iface = 0; iface < n; ++iface) {
+        ex_face[iface] = fields.Ex_face[iface];
     }
-    return ex;
+    return ex_face;
 }
 
-double integrate_current_work(const std::vector<double>& current_before,
-                              const std::vector<double>& current_after,
-                              const std::vector<double>& ex,
-                              const SpatialGrid& sg,
-                              double dt)
+double integrate_ampere_face_work(const std::vector<double>& current_face,
+                                  const std::vector<double>& ex_face_before,
+                                  const EMFields& fields,
+                                  const SpatialGrid& sg,
+                                  double dt)
 {
     double work = 0.0;
-    const size_t n = std::min(current_before.size(),
-                              std::min(current_after.size(), ex.size()));
-    for (size_t ix = 0; ix < n; ++ix) {
-        const double current_mid = 0.5 * (current_before[ix] + current_after[ix]);
-        work += current_mid * ex[ix] * sg.dx * dt;
+    const size_t unique_faces = static_cast<size_t>(sg.nx_local);
+    const size_t n = std::min(unique_faces,
+                              std::min(current_face.size(),
+                                       std::min(ex_face_before.size(),
+                                                fields.Ex_face.size())));
+    for (size_t iface = 0; iface < n; ++iface) {
+        const double ex_mid =
+            0.5 * (ex_face_before[iface] + fields.Ex_face[iface]);
+        work -= current_face[iface] * ex_mid * sg.dx * dt;
     }
     return work;
 }
@@ -299,10 +304,7 @@ int main(int argc, char** argv)
         double bkg_ke_step_start = 0.0;
         double beam_ke_step_start = 0.0;
         double field_energy_step_start = 0.0;
-        std::vector<double> bkg_current_start;
-        std::vector<double> bkg_current_mid;
-        std::vector<double> ex_step_start;
-        std::vector<double> ex_center;
+        std::vector<double> ex_face_before_ampere;
         vlasov.set_step_diagnostics_enabled(collect_step_diagnostics);
 
         beam.begin_step(sgrid, dt);
@@ -310,8 +312,6 @@ int main(int argc, char** argv)
             bkg_ke_step_start = bkg_e.total_kinetic_energy();
             beam_ke_step_start = beam.total_kinetic_energy();
             field_energy_step_start = fields.total_energy();
-            bkg_current_start = bkg_e.current_x;
-            ex_step_start = copy_local_ex(fields, sgrid);
         }
 
         trace_progress(config, mpi_rank, step, "before x half 1");
@@ -394,20 +394,20 @@ int main(int argc, char** argv)
         bkg_e.compute_moments();
         moments_current = true;
         trace_progress(config, mpi_rank, step, "after center moments");
-        if (collect_step_diagnostics) {
-            W_bkg_E +=
-                integrate_current_work(bkg_current_start, bkg_e.current_x,
-                                       ex_step_start, sgrid, 0.5 * dt);
-            bkg_current_mid = bkg_e.current_x;
-        }
         trace_progress(config, mpi_rank, step, "before center Ampere update");
+        if (collect_step_diagnostics) {
+            ex_face_before_ampere = copy_local_ex_face(fields, sgrid);
+        }
         fields.advance_ampere_face(bkg_e.current_face_x, beam.current_face_x,
                                    0.5 * dt, mpi_rank, mpi_size);
         trace_progress(config, mpi_rank, step, "after center Ampere update");
-        beam.begin_current_interval(sgrid);
         if (collect_step_diagnostics) {
-            ex_center = copy_local_ex(fields, sgrid);
+            W_bkg_E +=
+                integrate_ampere_face_work(bkg_e.current_face_x,
+                                           ex_face_before_ampere,
+                                           fields, sgrid, 0.5 * dt);
         }
+        beam.begin_current_interval(sgrid);
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
         if (config.enable_debug_diagnostics) {
             diag.write_debug_state(step, time, "center_ampere_E",
@@ -497,16 +497,19 @@ int main(int argc, char** argv)
         }
 #endif
 
-        if (collect_step_diagnostics) {
-            W_bkg_E +=
-                integrate_current_work(bkg_current_mid, bkg_e.current_x,
-                                       ex_center, sgrid, 0.5 * dt);
-        }
-
         trace_progress(config, mpi_rank, step, "before end Ampere update");
+        if (collect_step_diagnostics) {
+            ex_face_before_ampere = copy_local_ex_face(fields, sgrid);
+        }
         fields.advance_ampere_face(bkg_e.current_face_x, beam.current_face_x,
                                    0.5 * dt, mpi_rank, mpi_size);
         trace_progress(config, mpi_rank, step, "after end Ampere update");
+        if (collect_step_diagnostics) {
+            W_bkg_E +=
+                integrate_ampere_face_work(bkg_e.current_face_x,
+                                           ex_face_before_ampere,
+                                           fields, sgrid, 0.5 * dt);
+        }
 
         if (bkg_e.collisions_enabled) {
             trace_progress(config, mpi_rank, step, "before collisions");
