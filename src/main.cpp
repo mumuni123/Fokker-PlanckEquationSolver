@@ -153,21 +153,6 @@ void set_midpoint_face_field(EMFields& fields,
     fields.sync_cell_ex_from_faces(mpi_rank, mpi_size);
 }
 
-double relative_face_delta(const std::vector<double>& a,
-                           const std::vector<double>& b,
-                           const SpatialGrid& sg)
-{
-    const size_t n =
-        std::min(static_cast<size_t>(sg.nx_local), std::min(a.size(), b.size()));
-    double num = 0.0;
-    double den = 0.0;
-    for (size_t i = 0; i < n; ++i) {
-        num = std::max(num, std::fabs(a[i] - b[i]));
-        den = std::max(den, std::max(std::fabs(a[i]), std::fabs(b[i])));
-    }
-    return num / std::max(1.0, den);
-}
-
 void write_snapshot(Diagnostics& diag,
                     double time,
                     const Species& bkg_e,
@@ -375,15 +360,33 @@ int main(int argc, char** argv)
         Species accepted_bkg = bkg_step_start;
         BeamPIC accepted_beam = beam_step_start;
         EMFields accepted_fields = fields_step_start;
-        const int max_coupled_iters = 6;
-        const double coupled_tol = 1.0e-8;
+        const int max_coupled_iters = 30;
+        const double field_tol = 1.0e-6;
+        const double field_floor = 1.0;
+        const double current_tol = 1.0e-5;
+        double midpoint_omega = 0.5;
+        double previous_normalized_error = -1.0;
+        int residual_decrease_count = 0;
         std::vector<double> current_trial_prev(
             static_cast<size_t>(sgrid.nx_local), 0.0);
         std::vector<double> current_trial_next(
             static_cast<size_t>(sgrid.nx_local), 0.0);
+        std::vector<double> current_bkg_trial_prev(
+            static_cast<size_t>(sgrid.nx_local), 0.0);
+        std::vector<double> current_bkg_trial_next(
+            static_cast<size_t>(sgrid.nx_local), 0.0);
+        std::vector<double> current_beam_trial_prev(
+            static_cast<size_t>(sgrid.nx_local), 0.0);
+        std::vector<double> current_beam_trial_next(
+            static_cast<size_t>(sgrid.nx_local), 0.0);
         bool have_previous_current_trial = false;
         bool coupled_converged = false;
         double final_coupled_error = 0.0;
+        double final_field_error = 0.0;
+        double final_current_error = 0.0;
+        double final_max_delta_ex = 0.0;
+        double final_e_abs_tol = 0.0;
+        double final_j_abs_tol = 0.0;
 
         for (int coupled_iter = 0; coupled_iter < max_coupled_iters;
              ++coupled_iter) {
@@ -522,6 +525,8 @@ int main(int argc, char** argv)
                 const double jbeam =
                     (slot < beam.current_face_x.size())
                     ? beam.current_face_x[slot] : 0.0;
+                current_bkg_trial_next[slot] = jbkg;
+                current_beam_trial_next[slot] = jbeam;
                 current_trial_next[slot] = jbkg + jbeam;
             }
 
@@ -535,43 +540,287 @@ int main(int argc, char** argv)
                     0.5 * (ex_face_step_start[iface] + ex_face_new[iface]);
             }
 
-            const double local_field_error =
-                relative_face_delta(ex_mid_next, ex_mid_trial, sgrid);
-            double local_current_error = 0.0;
+            double local_max_delta_ex = 0.0;
+            double local_max_abs_ex = 0.0;
+            const size_t field_faces =
+                std::min(static_cast<size_t>(sgrid.nx_local),
+                         std::min(ex_mid_next.size(), ex_mid_trial.size()));
+            for (size_t iface = 0; iface < field_faces; ++iface) {
+                local_max_delta_ex =
+                    std::max(local_max_delta_ex,
+                             std::fabs(ex_mid_next[iface]
+                                     - ex_mid_trial[iface]));
+                local_max_abs_ex =
+                    std::max(local_max_abs_ex,
+                             std::max(std::fabs(ex_mid_next[iface]),
+                                      std::fabs(ex_mid_trial[iface])));
+            }
+            double local_max_delta_j_total = 0.0;
+            double local_max_delta_j_bkg = 0.0;
+            double local_max_delta_j_beam = 0.0;
+            int local_max_delta_j_total_face = 0;
+            int local_max_delta_j_bkg_face = 0;
+            int local_max_delta_j_beam_face = 0;
             if (have_previous_current_trial) {
-                double current_num = 0.0;
-                double current_den = 0.0;
                 for (size_t iface = 0; iface < current_trial_next.size();
                      ++iface) {
-                    current_num = std::max(
-                        current_num,
+                    const double delta_total =
                         std::fabs(current_trial_next[iface]
-                                - current_trial_prev[iface]));
-                    current_den = std::max(
-                        current_den,
-                        std::max(std::fabs(current_trial_next[iface]),
-                                 std::fabs(current_trial_prev[iface])));
+                                - current_trial_prev[iface]);
+                    const double delta_bkg =
+                        std::fabs(current_bkg_trial_next[iface]
+                                - current_bkg_trial_prev[iface]);
+                    const double delta_beam =
+                        std::fabs(current_beam_trial_next[iface]
+                                - current_beam_trial_prev[iface]);
+                    if (delta_total > local_max_delta_j_total) {
+                        local_max_delta_j_total = delta_total;
+                        local_max_delta_j_total_face =
+                            static_cast<int>(iface);
+                    }
+                    if (delta_bkg > local_max_delta_j_bkg) {
+                        local_max_delta_j_bkg = delta_bkg;
+                        local_max_delta_j_bkg_face =
+                            static_cast<int>(iface);
+                    }
+                    if (delta_beam > local_max_delta_j_beam) {
+                        local_max_delta_j_beam = delta_beam;
+                        local_max_delta_j_beam_face =
+                            static_cast<int>(iface);
+                    }
                 }
-                local_current_error = current_num / std::max(1.0, current_den);
             }
-            const double local_coupled_error =
-                have_previous_current_trial
-                ? std::max(local_field_error, local_current_error)
-                : std::max(1.0, local_field_error);
-            double global_coupled_error = 0.0;
-            MPI_Allreduce(&local_coupled_error, &global_coupled_error, 1,
+            double local_max_j_total = 0.0;
+            for (size_t iface = 0; iface < current_trial_next.size(); ++iface) {
+                local_max_j_total =
+                    std::max(local_max_j_total,
+                             std::fabs(current_trial_next[iface]));
+            }
+            double local_max_j_bkg = 0.0;
+            for (size_t iface = 0; iface < bkg_e.current_face_x.size();
+                 ++iface) {
+                local_max_j_bkg =
+                    std::max(local_max_j_bkg,
+                             std::fabs(bkg_e.current_face_x[iface]));
+            }
+            double local_max_j_beam = 0.0;
+            for (size_t iface = 0; iface < beam.current_face_x.size();
+                 ++iface) {
+                local_max_j_beam =
+                    std::max(local_max_j_beam,
+                             std::fabs(beam.current_face_x[iface]));
+            }
+            const double local_iter_errors[8] = {
+                local_max_delta_ex,
+                local_max_abs_ex,
+                local_max_j_total,
+                local_max_j_bkg,
+                local_max_j_beam,
+                local_max_delta_j_total,
+                local_max_delta_j_bkg,
+                local_max_delta_j_beam
+            };
+            double global_iter_errors[8] = {
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            };
+            MPI_Allreduce(local_iter_errors, global_iter_errors, 8,
                           MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            const double global_max_delta_ex = global_iter_errors[0];
+            const double global_max_abs_ex = global_iter_errors[1];
+            const double global_field_error =
+                global_max_delta_ex /
+                std::max(field_floor, global_max_abs_ex);
+            const double global_current_scale =
+                std::max(std::fabs(Param::jb), global_iter_errors[2]);
+            const double global_j_abs_tol =
+                current_tol * std::max(1.0, global_current_scale);
+            const double global_e_abs_tol =
+                std::max(field_tol * field_floor,
+                         0.5 * dt / Const::eps0 * global_j_abs_tol);
+            const double global_max_delta_j_total = global_iter_errors[5];
+            const double global_j_total_error =
+                global_max_delta_j_total / std::max(1.0, global_current_scale);
+            const double global_j_bkg_error =
+                global_iter_errors[6] / std::max(1.0, global_current_scale);
+            const double global_j_beam_error =
+                global_iter_errors[7] / std::max(1.0, global_current_scale);
+            const double global_field_convergence_ratio =
+                std::min(global_field_error / field_tol,
+                         global_max_delta_ex /
+                         std::max(field_tol * field_floor, global_e_abs_tol));
+            const double global_normalized_error =
+                have_previous_current_trial
+                ? std::max(global_field_convergence_ratio,
+                           global_max_delta_j_total /
+                           std::max(1.0, global_j_abs_tol))
+                : std::max(1.0, global_field_convergence_ratio);
 
-            final_coupled_error = global_coupled_error;
-            if (global_coupled_error < coupled_tol) {
+            const int total_global_face =
+                sgrid.ix_start + local_max_delta_j_total_face;
+            const int bkg_global_face =
+                sgrid.ix_start + local_max_delta_j_bkg_face;
+            const int beam_global_face =
+                sgrid.ix_start + local_max_delta_j_beam_face;
+            const double local_location_values[12] = {
+                local_max_delta_j_total,
+                static_cast<double>(local_max_delta_j_total_face),
+                static_cast<double>(total_global_face),
+                total_global_face * sgrid.dx,
+                local_max_delta_j_bkg,
+                static_cast<double>(local_max_delta_j_bkg_face),
+                static_cast<double>(bkg_global_face),
+                bkg_global_face * sgrid.dx,
+                local_max_delta_j_beam,
+                static_cast<double>(local_max_delta_j_beam_face),
+                static_cast<double>(beam_global_face),
+                beam_global_face * sgrid.dx
+            };
+            std::vector<double> gathered_location_values;
+            if (mpi_rank == 0) {
+                gathered_location_values.assign(static_cast<size_t>(mpi_size) * 12,
+                                                0.0);
+            }
+            MPI_Gather(local_location_values, 12, MPI_DOUBLE,
+                       mpi_rank == 0 ? gathered_location_values.data() : NULL,
+                       12, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+            if (mpi_rank == 0) {
+                double global_delta_j_total = -1.0;
+                int global_delta_j_total_rank = 0;
+                int global_delta_j_total_face = 0;
+                int global_delta_j_total_global_face = 0;
+                double global_delta_j_total_x = 0.0;
+                double global_delta_j_bkg = -1.0;
+                int global_delta_j_bkg_rank = 0;
+                int global_delta_j_bkg_face = 0;
+                int global_delta_j_bkg_global_face = 0;
+                double global_delta_j_bkg_x = 0.0;
+                double global_delta_j_beam = -1.0;
+                int global_delta_j_beam_rank = 0;
+                int global_delta_j_beam_face = 0;
+                int global_delta_j_beam_global_face = 0;
+                double global_delta_j_beam_x = 0.0;
+                for (int rank = 0; rank < mpi_size; ++rank) {
+                    const size_t base = static_cast<size_t>(rank) * 12;
+                    if (gathered_location_values[base] >
+                        global_delta_j_total) {
+                        global_delta_j_total =
+                            gathered_location_values[base];
+                        global_delta_j_total_rank = rank;
+                        global_delta_j_total_face =
+                            static_cast<int>(gathered_location_values[base + 1]);
+                        global_delta_j_total_global_face =
+                            static_cast<int>(gathered_location_values[base + 2]);
+                        global_delta_j_total_x =
+                            gathered_location_values[base + 3];
+                    }
+                    if (gathered_location_values[base + 4] >
+                        global_delta_j_bkg) {
+                        global_delta_j_bkg =
+                            gathered_location_values[base + 4];
+                        global_delta_j_bkg_rank = rank;
+                        global_delta_j_bkg_face =
+                            static_cast<int>(gathered_location_values[base + 5]);
+                        global_delta_j_bkg_global_face =
+                            static_cast<int>(gathered_location_values[base + 6]);
+                        global_delta_j_bkg_x =
+                            gathered_location_values[base + 7];
+                    }
+                    if (gathered_location_values[base + 8] >
+                        global_delta_j_beam) {
+                        global_delta_j_beam =
+                            gathered_location_values[base + 8];
+                        global_delta_j_beam_rank = rank;
+                        global_delta_j_beam_face =
+                            static_cast<int>(gathered_location_values[base + 9]);
+                        global_delta_j_beam_global_face =
+                            static_cast<int>(gathered_location_values[base + 10]);
+                        global_delta_j_beam_x =
+                            gathered_location_values[base + 11];
+                    }
+                }
+                std::printf("coupled_iter step=%d iter=%d "
+                            "field_error=%.6e J_total_error=%.6e "
+                            "J_bkg_error=%.6e J_beam_error=%.6e "
+                            "E_abs_tol=%.6e max_delta_Ex=%.6e "
+                            "J_abs_tol=%.6e current_scale=%.6e "
+                            "max_abs_Ex_mid=%.6e max_abs_J_bkg=%.6e "
+                            "max_abs_J_beam=%.6e "
+                            "max_delta_J_total_face=%.6e "
+                            "total_rank=%d total_face=%d "
+                            "total_global_face=%d total_x=%.6e "
+                            "max_delta_J_bkg_face=%.6e "
+                            "bkg_rank=%d bkg_face=%d bkg_global_face=%d "
+                            "bkg_x=%.6e "
+                            "max_delta_J_beam_face=%.6e "
+                            "beam_rank=%d beam_face=%d beam_global_face=%d "
+                            "beam_x=%.6e omega=%.3f\n",
+                            step, coupled_iter + 1,
+                            global_field_error, global_j_total_error,
+                            global_j_bkg_error, global_j_beam_error,
+                            global_e_abs_tol, global_max_delta_ex,
+                            global_j_abs_tol, global_current_scale,
+                            global_iter_errors[1], global_iter_errors[3],
+                            global_iter_errors[4],
+                            global_delta_j_total,
+                            global_delta_j_total_rank,
+                            global_delta_j_total_face,
+                            global_delta_j_total_global_face,
+                            global_delta_j_total_x,
+                            global_delta_j_bkg, global_delta_j_bkg_rank,
+                            global_delta_j_bkg_face,
+                            global_delta_j_bkg_global_face,
+                            global_delta_j_bkg_x,
+                            global_delta_j_beam, global_delta_j_beam_rank,
+                            global_delta_j_beam_face,
+                            global_delta_j_beam_global_face,
+                            global_delta_j_beam_x, midpoint_omega);
+                std::fflush(stdout);
+            }
+
+            final_coupled_error = global_normalized_error;
+            final_field_error = global_field_error;
+            final_current_error = global_j_total_error;
+            final_max_delta_ex = global_max_delta_ex;
+            final_e_abs_tol = global_e_abs_tol;
+            final_j_abs_tol = global_j_abs_tol;
+            if (have_previous_current_trial &&
+                (global_field_error < field_tol ||
+                 global_max_delta_ex < global_e_abs_tol) &&
+                global_max_delta_j_total < global_j_abs_tol) {
                 coupled_converged = true;
                 accepted_bkg = bkg_e;
                 accepted_beam = beam;
                 accepted_fields = fields;
                 break;
             }
-            ex_mid_trial.swap(ex_mid_next);
+            if (previous_normalized_error > 0.0) {
+                if (global_normalized_error < 0.9 * previous_normalized_error) {
+                    ++residual_decrease_count;
+                    const double omega_cap =
+                        (residual_decrease_count >= 2) ? 1.0 : 0.8;
+                    midpoint_omega =
+                        std::min(omega_cap, midpoint_omega + 0.1);
+                } else if (global_normalized_error >
+                           1.02 * previous_normalized_error) {
+                    residual_decrease_count = 0;
+                    midpoint_omega = std::max(0.3, 0.5 * midpoint_omega);
+                } else {
+                    residual_decrease_count = 0;
+                    midpoint_omega = std::max(0.3, 0.8 * midpoint_omega);
+                }
+            }
+            previous_normalized_error = global_normalized_error;
+            const size_t relax_faces =
+                std::min(ex_mid_trial.size(), ex_mid_next.size());
+            for (size_t iface = 0; iface < relax_faces; ++iface) {
+                ex_mid_trial[iface] =
+                    (1.0 - midpoint_omega) * ex_mid_trial[iface]
+                  + midpoint_omega * ex_mid_next[iface];
+            }
             current_trial_prev.swap(current_trial_next);
+            current_bkg_trial_prev.swap(current_bkg_trial_next);
+            current_beam_trial_prev.swap(current_beam_trial_next);
             have_previous_current_trial = true;
         }
 
@@ -579,10 +828,16 @@ int main(int argc, char** argv)
             if (mpi_rank == 0) {
                 std::fprintf(stderr,
                              "ERROR: coupled midpoint iteration failed to "
-                             "converge at step %d, t = %.6e s; residual %.6e "
-                             "after %d iterations. Reduce dt or increase the "
-                             "coupled solve robustness.\n",
+                             "converge at step %d, t = %.6e s; normalized "
+                             "residual %.6e, field_error %.6e, "
+                             "max_delta_Ex %.6e, E_abs_tol %.6e, "
+                             "current_error %.6e, J_abs_tol %.6e after %d "
+                             "iterations. Reduce dt or increase the coupled "
+                             "solve robustness.\n",
                              step, time, final_coupled_error,
+                             final_field_error, final_max_delta_ex,
+                             final_e_abs_tol, final_current_error,
+                             final_j_abs_tol,
                              max_coupled_iters);
             }
             MPI_Abort(MPI_COMM_WORLD, 8);
