@@ -80,6 +80,14 @@ public:
                                 double local_f_u_max_x,
                                 double local_integral_f_u_gt_8_x);
 
+    void write_bkg_stage_diagnostics(int step, double time,
+                                     int coupled_iter,
+                                     const std::string& stage,
+                                     const Species& electrons,
+                                     const SpatialGrid& sg,
+                                     int mpi_rank, int mpi_size,
+                                     double reference_total_mass_raw);
+
     void write_fields(double time,
                       const EMFields& fields,
                       const SpatialGrid& sg,
@@ -115,6 +123,7 @@ private:
     std::ofstream debug_file;
 #endif
     std::ofstream step_file;
+    std::ofstream bkg_stage_file;
     bool debug_enabled;
     bool step_enabled;
     bool has_energy_reference;

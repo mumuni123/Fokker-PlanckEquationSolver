@@ -349,6 +349,16 @@ int main(int argc, char** argv)
         const EMFields fields_step_start = fields;
         const std::vector<double> ex_face_step_start =
             copy_local_ex_face(fields_step_start, sgrid);
+        const bool write_bkg_stage_diagnostics =
+            config.enable_step_diagnostics && (step % 50 == 0);
+        double bkg_stage_reference_N = 0.0;
+        if (write_bkg_stage_diagnostics) {
+            const double local_bkg_stage_reference_N =
+                bkg_step_start.total_particle_number();
+            MPI_Allreduce(&local_bkg_stage_reference_N,
+                          &bkg_stage_reference_N, 1,
+                          MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        }
         if (collect_step_diagnostics) {
             bkg_ke_step_start = bkg_e.total_kinetic_energy();
             beam_ke_step_start = beam.total_kinetic_energy();
@@ -415,10 +425,23 @@ int main(int argc, char** argv)
 
             beam.begin_step(sgrid, dt);
 
+            if (write_bkg_stage_diagnostics) {
+                diag.write_bkg_stage_diagnostics(
+                    step, time, coupled_iter + 1, "step_start",
+                    bkg_e, sgrid, mpi_rank, mpi_size,
+                    bkg_stage_reference_N);
+            }
+
             trace_progress(config, mpi_rank, step, "midpoint before v half 1");
             vlasov.advect_v(bkg_e, sgrid, fields, 0.5 * dt,
                             mpi_rank, mpi_size);
             trace_progress(config, mpi_rank, step, "midpoint after v half 1");
+            if (write_bkg_stage_diagnostics) {
+                diag.write_bkg_stage_diagnostics(
+                    step, time, coupled_iter + 1, "after_v_half_1",
+                    bkg_e, sgrid, mpi_rank, mpi_size,
+                    bkg_stage_reference_N);
+            }
             nsub_v1 = vlasov.last_nsub_v();
             loss_v1 = vlasov.last_loss_v();
             loss_v1_low = vlasov.last_loss_v_low();
@@ -443,6 +466,12 @@ int main(int argc, char** argv)
             trace_progress(config, mpi_rank, step, "midpoint before mu half 1");
             vlasov.advect_mu(bkg_e, sgrid, fields, 0.5 * dt);
             trace_progress(config, mpi_rank, step, "midpoint after mu half 1");
+            if (write_bkg_stage_diagnostics) {
+                diag.write_bkg_stage_diagnostics(
+                    step, time, coupled_iter + 1, "after_mu_half_1",
+                    bkg_e, sgrid, mpi_rank, mpi_size,
+                    bkg_stage_reference_N);
+            }
             nsub_mu1 = vlasov.last_nsub_mu();
             loss_mu1 = vlasov.last_loss_mu();
             mu_mass_error_step += vlasov.last_mass_error_mu();
@@ -452,10 +481,22 @@ int main(int argc, char** argv)
             trace_progress(config, mpi_rank, step, "midpoint before x full");
             vlasov.advect_x(bkg_e, sgrid, dt, mpi_rank, mpi_size, time_center);
             trace_progress(config, mpi_rank, step, "midpoint after x full");
+            if (write_bkg_stage_diagnostics) {
+                diag.write_bkg_stage_diagnostics(
+                    step, time, coupled_iter + 1, "after_x_full",
+                    bkg_e, sgrid, mpi_rank, mpi_size,
+                    bkg_stage_reference_N);
+            }
 
             trace_progress(config, mpi_rank, step, "midpoint before mu half 2");
             vlasov.advect_mu(bkg_e, sgrid, fields, 0.5 * dt);
             trace_progress(config, mpi_rank, step, "midpoint after mu half 2");
+            if (write_bkg_stage_diagnostics) {
+                diag.write_bkg_stage_diagnostics(
+                    step, time, coupled_iter + 1, "after_mu_half_2",
+                    bkg_e, sgrid, mpi_rank, mpi_size,
+                    bkg_stage_reference_N);
+            }
             nsub_mu2 = vlasov.last_nsub_mu();
             loss_mu2 = vlasov.last_loss_mu();
             mu_mass_error_step += vlasov.last_mass_error_mu();
@@ -466,6 +507,12 @@ int main(int argc, char** argv)
             vlasov.advect_v(bkg_e, sgrid, fields, 0.5 * dt,
                             mpi_rank, mpi_size);
             trace_progress(config, mpi_rank, step, "midpoint after v half 2");
+            if (write_bkg_stage_diagnostics) {
+                diag.write_bkg_stage_diagnostics(
+                    step, time, coupled_iter + 1, "after_v_half_2",
+                    bkg_e, sgrid, mpi_rank, mpi_size,
+                    bkg_stage_reference_N);
+            }
             nsub_v2 = vlasov.last_nsub_v();
             loss_v2 = vlasov.last_loss_v();
             loss_v2_low = vlasov.last_loss_v_low();

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <iomanip>
+#include <limits>
 #include <mpi.h>
 #include <sstream>
 #include <sys/stat.h>
@@ -173,6 +174,37 @@ void gather_max_loss_u_high_location(double local_max_loss,
         }
     }
 }
+
+void compute_bkg_distribution_stats(const Species& electrons,
+                                    const SpatialGrid& sg,
+                                    double& min_f,
+                                    double& negative_mass,
+                                    double& positive_mass,
+                                    double& total_mass_raw)
+{
+    min_f = std::numeric_limits<double>::infinity();
+    negative_mass = 0.0;
+    positive_mass = 0.0;
+    total_mass_raw = 0.0;
+
+    const int ng = sg.nghost;
+    for (int ix = 0; ix < sg.nx_local; ++ix) {
+        const int ix_g = ix + ng;
+        const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
+        for (int iv = 0; iv < Param::Nv; ++iv) {
+            const double cell_weight = electrons.vgrid.moment_weight[iv] * sg.dx;
+            const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
+            for (int imu = 0; imu < Param::Nmu; ++imu) {
+                const double fval = electrons.f[row + static_cast<size_t>(imu)];
+                min_f = std::min(min_f, fval);
+                negative_mass += std::min(fval, 0.0) * cell_weight;
+                positive_mass += std::max(fval, 0.0) * cell_weight;
+                total_mass_raw += fval * cell_weight;
+            }
+        }
+    }
+
+}
 }
 
 void Diagnostics::init(const std::string& dir, int mpi_rank,
@@ -251,6 +283,15 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                       << "f_u_max_x_mu_avg[u^-3_m^-3]  "
                       << "integral_f_u_gt_8_x[m^-3]\n";
             step_file << std::scientific << std::setprecision(8);
+
+            bkg_stage_file.open(
+                (output_dir + "/bkg_stage_diagnostics.dat").c_str());
+            bkg_stage_file
+                << "# step  time[fs]  coupled_iter  stage  "
+                << "min_f  negative_mass[m^-2]  positive_mass[m^-2]  "
+                << "total_mass_raw[m^-2]  total_mass_clipped[m^-2]  "
+                << "N_bkg_change[m^-2]\n";
+            bkg_stage_file << std::scientific << std::setprecision(8);
         }
     }
     MPI_Barrier(MPI_COMM_WORLD);
@@ -695,6 +736,70 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << global_f_u_max_x << "  "
                   << global_integral_f_u_gt_8_x << "\n";
         step_file.flush();
+    }
+}
+
+void Diagnostics::write_bkg_stage_diagnostics(
+    int step, double time,
+    int coupled_iter,
+    const std::string& stage,
+    const Species& electrons,
+    const SpatialGrid& sg,
+    int mpi_rank, int mpi_size,
+    double reference_total_mass_raw)
+{
+    (void)mpi_size;
+    if (!step_enabled) {
+        (void)step;
+        (void)time;
+        (void)coupled_iter;
+        (void)stage;
+        (void)electrons;
+        (void)sg;
+        (void)mpi_rank;
+        (void)reference_total_mass_raw;
+        return;
+    }
+
+    double local_min_f = 0.0;
+    double local_negative_mass = 0.0;
+    double local_positive_mass = 0.0;
+    double local_total_mass_raw = 0.0;
+    compute_bkg_distribution_stats(electrons, sg,
+                                   local_min_f,
+                                   local_negative_mass,
+                                   local_positive_mass,
+                                   local_total_mass_raw);
+
+    double global_min_f = 0.0;
+    double local_sums[3] = {
+        local_negative_mass,
+        local_positive_mass,
+        local_total_mass_raw
+    };
+    double global_sums[3] = { 0.0, 0.0, 0.0 };
+    MPI_Reduce(&local_min_f, &global_min_f, 1, MPI_DOUBLE, MPI_MIN,
+               0, MPI_COMM_WORLD);
+    MPI_Reduce(local_sums, global_sums, 3, MPI_DOUBLE, MPI_SUM,
+               0, MPI_COMM_WORLD);
+
+    if (mpi_rank == 0) {
+        if (global_min_f == std::numeric_limits<double>::infinity()) {
+            global_min_f = 0.0;
+        }
+        const double total_mass_clipped = global_sums[1];
+        const double N_bkg_change = global_sums[2] - reference_total_mass_raw;
+        bkg_stage_file << step << "  "
+                       << time / Const::femto << "  "
+                       << coupled_iter << "  "
+                       << stage << "  "
+                       << global_min_f << "  "
+                       << global_sums[0] << "  "
+                       << global_sums[1] << "  "
+                       << global_sums[2] << "  "
+                       << total_mass_clipped << "  "
+                       << N_bkg_change << "\n";
+        bkg_stage_file.flush();
     }
 }
 
