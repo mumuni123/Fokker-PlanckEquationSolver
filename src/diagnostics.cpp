@@ -46,9 +46,11 @@ void compute_background_boundary_fluxes(const Species& electrons,
             const double vx = electrons.vgrid.vx_cells[k];
             const int iv = static_cast<int>(k / Param::Nmu);
             const double weight = electrons.vgrid.moment_weight[iv];
+            const double current_weight = electrons.vgrid.current_weight[k];
             if (vx > 0.0) {
                 values[0] += vx * electrons.f[xbase + k] * weight;
-                values[4] += electrons.charge * vx * electrons.f[xbase + k] * weight;
+                values[4] += electrons.charge * electrons.f[xbase + k]
+                           * current_weight;
             } else if (vx < 0.0) {
                 values[1] += -vx * electrons.f[xbase + k] * weight;
             }
@@ -62,9 +64,11 @@ void compute_background_boundary_fluxes(const Species& electrons,
             const double vx = electrons.vgrid.vx_cells[k];
             const int iv = static_cast<int>(k / Param::Nmu);
             const double weight = electrons.vgrid.moment_weight[iv];
+            const double current_weight = electrons.vgrid.current_weight[k];
             if (vx < 0.0) {
                 values[2] += -vx * electrons.f[xbase + k] * weight;
-                values[5] += electrons.charge * vx * electrons.f[xbase + k] * weight;
+                values[5] += electrons.charge * electrons.f[xbase + k]
+                           * current_weight;
             } else if (vx > 0.0) {
                 values[3] += vx * electrons.f[xbase + k] * weight;
             }

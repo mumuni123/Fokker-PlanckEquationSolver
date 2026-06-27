@@ -356,6 +356,17 @@ void EMFields::advance_ampere_face(const std::vector<double>& background_current
     update_cell_ex_from_faces(*this, mpi_rank, mpi_size);
 }
 
+void EMFields::sync_cell_ex_from_faces(int mpi_rank, int mpi_size)
+{
+    const int nxl = nx_total - 2 * Param::Nghost;
+    if (nxl <= 0) return;
+    if (Ex_face.size() != static_cast<size_t>(nxl + 1)) {
+        Ex_face.assign(static_cast<size_t>(nxl + 1), 0.0);
+    }
+    close_periodic_right_face(Ex_face, nxl, mpi_rank, mpi_size, 304);
+    update_cell_ex_from_faces(*this, mpi_rank, mpi_size);
+}
+
 void EMFields::update_gauss_residual_diagnostics(int mpi_rank, int mpi_size)
 {
     const int ng = Param::Nghost;

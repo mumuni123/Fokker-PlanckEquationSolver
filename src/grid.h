@@ -30,6 +30,8 @@ struct VelocityGrid {
     std::vector<double> gamma_cells;
     std::vector<double> beta_cells;
     std::vector<double> speed_cells;
+    std::vector<double> chain_speed_cells;
+    std::vector<double> chain_speed_faces;
     std::vector<double> mu_face_factor;
     std::vector<double> moment_weight;
     std::vector<double> inv_moment_weight;
@@ -63,6 +65,8 @@ struct VelocityGrid {
         gamma_cells.resize(Param::Nv);
         beta_cells.resize(Param::Nv);
         speed_cells.resize(Param::Nv);
+        chain_speed_cells.resize(Param::Nv);
+        chain_speed_faces.resize(Param::Nv + 1);
         mu_face_factor.resize(Param::Nmu + 1);
         moment_weight.resize(Param::Nv);
         inv_moment_weight.resize(Param::Nv);
@@ -103,6 +107,8 @@ struct VelocityGrid {
             const double u_eff = std::max(u, Param::u_floor);
             const double gamma = std::sqrt(1.0 + u * u);
             const double beta = u / gamma;
+            const double gamma_left = std::sqrt(1.0 + u_left * u_left);
+            const double gamma_right = std::sqrt(1.0 + u_right * u_right);
             v_cells[iv] = u;
             v_widths[iv] = width;
             inv_v_widths[iv] = 1.0 / width;
@@ -112,6 +118,10 @@ struct VelocityGrid {
             gamma_cells[iv] = gamma;
             beta_cells[iv] = beta;
             speed_cells[iv] = Const::c * beta;
+            chain_speed_cells[iv] =
+                (width > 0.0)
+                ? Const::c * (gamma_right - gamma_left) / width
+                : speed_cells[iv];
             moment_weight[iv] =
                 2.0 * Const::pi * dmu
                 * (u_right * u_right * u_right
@@ -130,6 +140,15 @@ struct VelocityGrid {
         }
         for (int iv = 0; iv <= Param::Nv; ++iv) {
             v2_faces[iv] = v_faces[iv] * v_faces[iv];
+        }
+        chain_speed_faces[0] = chain_speed_cells[0];
+        chain_speed_faces[Param::Nv] = chain_speed_cells[Param::Nv - 1];
+        for (int iv = 1; iv < Param::Nv; ++iv) {
+            const double du = v_cells[iv] - v_cells[iv - 1];
+            chain_speed_faces[iv] =
+                (du > 0.0)
+                ? Const::c * (gamma_cells[iv] - gamma_cells[iv - 1]) / du
+                : 0.5 * (speed_cells[iv] + speed_cells[iv - 1]);
         }
         for (int imu = 0; imu < Param::Nmu; ++imu) {
             const double mu = mu_min + (imu + 0.5) * dmu;
@@ -150,7 +169,8 @@ struct VelocityGrid {
             for (int imu = 0; imu < Param::Nmu; ++imu) {
                 const size_t k = static_cast<size_t>(iv) * Param::Nmu + imu;
                 vx_cells[k] = speed_cells[iv] * mu_cells[imu];
-                current_weight[k] = moment_weight[iv] * vx_cells[k];
+                current_weight[k] =
+                    moment_weight[iv] * chain_speed_cells[iv] * mu_cells[imu];
             }
         }
     }

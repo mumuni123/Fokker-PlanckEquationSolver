@@ -3,6 +3,7 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <mpi.h>
 #include <omp.h>
@@ -117,6 +118,16 @@ inline double reconstruct_mu_face(const Species& sp, size_t row,
                          - 0.5 * slope_mu_line(sp, row, imu));
 }
 
+inline double staggered_cell_ex(const EMFields& fields, int ix_local, int ix_g)
+{
+    const size_t left_face = static_cast<size_t>(ix_local);
+    const size_t right_face = static_cast<size_t>(ix_local + 1);
+    if (right_face < fields.Ex_face.size()) {
+        return 0.5 * (fields.Ex_face[left_face] + fields.Ex_face[right_face]);
+    }
+    return fields.Ex[static_cast<size_t>(ix_g)];
+}
+
 void resize_or_zero(std::vector<double>& values, size_t n)
 {
     if (values.size() != n) {
@@ -124,30 +135,6 @@ void resize_or_zero(std::vector<double>& values, size_t n)
     } else {
         std::fill(values.begin(), values.end(), 0.0);
     }
-}
-
-void close_periodic_right_face(std::vector<double>& face,
-                               int nxl,
-                               int mpi_rank,
-                               int mpi_size)
-{
-    if (nxl <= 0 || face.size() < static_cast<size_t>(nxl + 1)) return;
-    if (mpi_size == 1) {
-        face[static_cast<size_t>(nxl)] = face[0];
-        return;
-    }
-
-    const int left_peer = (mpi_rank + mpi_size - 1) % mpi_size;
-    const int right_peer = (mpi_rank + 1) % mpi_size;
-    const double send_left_face = face[0];
-    double recv_right_face = 0.0;
-    MPI_Request reqs[2];
-    MPI_Isend(&send_left_face, 1, MPI_DOUBLE, left_peer, 611,
-              MPI_COMM_WORLD, &reqs[0]);
-    MPI_Irecv(&recv_right_face, 1, MPI_DOUBLE, right_peer, 611,
-              MPI_COMM_WORLD, &reqs[1]);
-    MPI_Waitall(2, reqs, MPI_STATUSES_IGNORE);
-    face[static_cast<size_t>(nxl)] = recv_right_face;
 }
 
 }
@@ -179,9 +166,9 @@ void VlasovSolver::advect(Species& sp, const SpatialGrid& sg,
                           int mpi_rank, int mpi_size)
 {
     advect_x(sp, sg, 0.5 * dt, mpi_rank, mpi_size);
-    advect_v(sp, sg, fields, 0.5 * dt);
+    advect_v(sp, sg, fields, 0.5 * dt, mpi_rank, mpi_size);
     advect_mu(sp, sg, fields, dt);
-    advect_v(sp, sg, fields, 0.5 * dt);
+    advect_v(sp, sg, fields, 0.5 * dt, mpi_rank, mpi_size);
     advect_x(sp, sg, 0.5 * dt, mpi_rank, mpi_size);
 }
 
@@ -190,79 +177,167 @@ void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
 {
     const int ng = sg.nghost;
     const int nxl = sg.nx_local;
+    if (dt <= 0.0 || nxl <= 0) return;
     const double max_cfl = sp.vgrid.max_speed * sp.vgrid.max_abs_mu * dt / sg.dx;
     const double cfl_limit = std::min(0.85, Param::semi_lagrangian_cfl);
     const int nsub_x = substeps_from_cfl(max_cfl, cfl_limit);
     const double dt_sub = dt / nsub_x;
-    if (x_cfl_.size() != Param::Nvmu) {
-        x_cfl_.resize(Param::Nvmu);
-    }
-    for (size_t k = 0; k < Param::Nvmu; ++k) {
-        x_cfl_[k] = sp.vgrid.vx_cells[k] * dt_sub / sg.dx;
-    }
-    resize_or_zero(sp.current_face_x, static_cast<size_t>(nxl + 1));
+    const double dt_dx = dt_sub / sg.dx;
+    const double current_average_weight = dt_sub / dt;
     (void)time;
+
+    resize_or_zero(sp.current_face_x, static_cast<size_t>(nxl + 1));
+    resize_or_zero(sp.current_x, static_cast<size_t>(nxl));
+    const size_t active_faces = static_cast<size_t>(nxl + 1) * Param::Nvmu;
+    std::vector<double> f_old(sp.f.size(), 0.0);
+    std::vector<double> flux_faces(active_faces, 0.0);
+    const int max_midpoint_iters = 24;
+    const double midpoint_tol = 1.0e-11;
 
     for (int isub = 0; isub < nsub_x; ++isub) {
         exchange_ghosts_x(sp, sg, mpi_rank, mpi_size);
+        f_old = sp.f;
 
-        #pragma omp parallel for schedule(static)
-        for (int iface = 0; iface < nxl; ++iface) {
-            const int ix_left = ng + iface - 1;
-            const int ix_right = ng + iface;
-            double flux_moment = 0.0;
-            for (size_t k = 0; k < Param::Nvmu; ++k) {
+        bool midpoint_converged = false;
+        double global_midpoint_error = 0.0;
+        for (int iter = 0; iter < max_midpoint_iters; ++iter) {
+            exchange_ghosts_x(sp, sg, mpi_rank, mpi_size);
+
+            #pragma omp parallel for schedule(static)
+            for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu);
+                 ++k_int) {
+                const size_t k = static_cast<size_t>(k_int);
                 const double vx = sp.vgrid.vx_cells[k];
-                const int ix_upwind = (vx >= 0.0) ? ix_left : ix_right;
-                const double f_upwind =
-                    std::max(0.0,
-                             sp.f[static_cast<size_t>(ix_upwind) * Param::Nvmu + k]);
-                flux_moment += f_upwind * sp.vgrid.current_weight[k];
+                for (int iface = 0; iface < nxl; ++iface) {
+                    const int ix_left = ng + iface - 1;
+                    const int ix_right = ng + iface;
+                    const size_t left_offset =
+                        static_cast<size_t>(ix_left) * Param::Nvmu + k;
+                    const size_t right_offset =
+                        static_cast<size_t>(ix_right) * Param::Nvmu + k;
+                    const double f_left_mid =
+                        0.5 * (f_old[left_offset] + sp.f[left_offset]);
+                    const double f_right_mid =
+                        0.5 * (f_old[right_offset] + sp.f[right_offset]);
+                    flux_faces[static_cast<size_t>(iface) * Param::Nvmu + k] =
+                        0.5 * vx * (f_left_mid + f_right_mid);
+                }
             }
-            sp.current_face_x[static_cast<size_t>(iface)] +=
-                sp.charge * flux_moment * dt_sub;
+
+            if (mpi_size <= 1) {
+                const size_t left_face = 0;
+                const size_t right_face = static_cast<size_t>(nxl) * Param::Nvmu;
+                std::copy(flux_faces.begin() + left_face,
+                          flux_faces.begin() + left_face + Param::Nvmu,
+                          flux_faces.begin() + right_face);
+            } else {
+                const int left_peer = (mpi_rank + mpi_size - 1) % mpi_size;
+                const int right_peer = (mpi_rank + 1) % mpi_size;
+                const size_t right_face =
+                    static_cast<size_t>(nxl) * Param::Nvmu;
+                MPI_Sendrecv(flux_faces.data(), static_cast<int>(Param::Nvmu),
+                             MPI_DOUBLE, left_peer, 731,
+                             flux_faces.data() + right_face,
+                             static_cast<int>(Param::Nvmu), MPI_DOUBLE,
+                             right_peer, 731, MPI_COMM_WORLD,
+                             MPI_STATUS_IGNORE);
+            }
+
+            double local_num = 0.0;
+            double local_den = 0.0;
+            #pragma omp parallel for collapse(2) schedule(static) \
+                reduction(max:local_num,local_den)
+            for (int ix = 0; ix < nxl; ++ix) {
+                for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu);
+                     ++k_int) {
+                    const size_t k = static_cast<size_t>(k_int);
+                    const size_t offset =
+                        static_cast<size_t>(ng + ix) * Param::Nvmu + k;
+                    const double updated =
+                        f_old[offset]
+                      - dt_dx *
+                        (flux_faces[static_cast<size_t>(ix + 1) * Param::Nvmu + k]
+                       - flux_faces[static_cast<size_t>(ix) * Param::Nvmu + k]);
+                    sp.f_tmp[offset] = updated;
+                    local_num = std::max(local_num,
+                                         std::fabs(updated - sp.f[offset]));
+                    local_den = std::max(local_den,
+                                         std::max(std::fabs(updated),
+                                                  std::fabs(sp.f[offset])));
+                }
+            }
+
+            const double local_midpoint_error =
+                local_num / std::max(1.0, local_den);
+            MPI_Allreduce(&local_midpoint_error, &global_midpoint_error, 1,
+                          MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            sp.f.swap(sp.f_tmp);
+            if (global_midpoint_error < midpoint_tol) {
+                midpoint_converged = true;
+                break;
+            }
         }
 
-        #pragma omp parallel for collapse(2) schedule(static)
-        for (int ix = ng; ix < ng + nxl; ++ix) {
-            for (int iv = 0; iv < Param::Nv; ++iv) {
-                const size_t xbase = static_cast<size_t>(ix) * Param::Nvmu;
-                const size_t xbase_left = static_cast<size_t>(ix - 1) * Param::Nvmu;
-                const size_t xbase_right = static_cast<size_t>(ix + 1) * Param::Nvmu;
-                const size_t row = static_cast<size_t>(iv) * Param::Nmu;
-                for (int imu = 0; imu < Param::Nmu; ++imu) {
-                    const size_t k = row + imu;
-                    const size_t offset = xbase + k;
-                    const double cfl = x_cfl_[k];
-                    if (cfl >= 0.0) {
-                        sp.f_tmp[offset] =
-                            std::max(0.0, (1.0 - cfl) * sp.f[offset]
-                                           + cfl * sp.f[xbase_left + k]);
-                    } else {
-                        const double a = -cfl;
-                        sp.f_tmp[offset] =
-                            std::max(0.0, (1.0 - a) * sp.f[offset]
-                                           + a * sp.f[xbase_right + k]);
-                    }
+        if (!midpoint_converged) {
+            if (mpi_rank == 0) {
+                std::fprintf(stderr,
+                             "ERROR: advect_x midpoint iteration failed to "
+                             "converge at x-substep %d/%d; residual %.6e. "
+                             "Reduce dt or tighten the spatial solve.\n",
+                             isub + 1, nsub_x, global_midpoint_error);
+            }
+            MPI_Abort(MPI_COMM_WORLD, 7);
+        }
+
+        #pragma omp parallel
+        {
+            std::vector<double> current_face_local(
+                static_cast<size_t>(nxl + 1), 0.0);
+            #pragma omp for schedule(static)
+            for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu);
+                 ++k_int) {
+                const size_t k = static_cast<size_t>(k_int);
+                const double vx = sp.vgrid.vx_cells[k];
+                if (vx == 0.0) continue;
+                const double current_per_f =
+                    sp.charge * sp.vgrid.current_weight[k] / vx;
+                for (int iface = 0; iface <= nxl; ++iface) {
+                    current_face_local[static_cast<size_t>(iface)] +=
+                        current_average_weight * current_per_f *
+                        flux_faces[static_cast<size_t>(iface) * Param::Nvmu + k];
+                }
+            }
+            #pragma omp critical
+            {
+                for (int iface = 0; iface <= nxl; ++iface) {
+                    sp.current_face_x[static_cast<size_t>(iface)] +=
+                        current_face_local[static_cast<size_t>(iface)];
                 }
             }
         }
-
-        sp.f.swap(sp.f_tmp);
     }
 
-    if (dt > 0.0) {
-        const double inv_dt = 1.0 / dt;
-        #pragma omp parallel for schedule(static)
-        for (int iface = 0; iface < nxl; ++iface) {
-            sp.current_face_x[static_cast<size_t>(iface)] *= inv_dt;
-        }
+    if (mpi_size <= 1 && sp.current_face_x.size() >= static_cast<size_t>(nxl + 1)) {
+        sp.current_face_x[static_cast<size_t>(nxl)] = sp.current_face_x[0];
+    } else if (mpi_size > 1 &&
+               sp.current_face_x.size() >= static_cast<size_t>(nxl + 1)) {
+        const int left_peer = (mpi_rank + mpi_size - 1) % mpi_size;
+        const int right_peer = (mpi_rank + 1) % mpi_size;
+        MPI_Sendrecv(sp.current_face_x.data(), 1, MPI_DOUBLE, left_peer, 732,
+                     &sp.current_face_x[static_cast<size_t>(nxl)], 1,
+                     MPI_DOUBLE, right_peer, 732, MPI_COMM_WORLD,
+                     MPI_STATUS_IGNORE);
     }
-    close_periodic_right_face(sp.current_face_x, nxl, mpi_rank, mpi_size);
+    for (int ix = 0; ix < nxl; ++ix) {
+        sp.current_x[static_cast<size_t>(ix)] =
+            0.5 * (sp.current_face_x[static_cast<size_t>(ix)]
+                 + sp.current_face_x[static_cast<size_t>(ix + 1)]);
+    }
 }
 
 void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
-                            const EMFields& fields, double dt)
+                            const EMFields& fields, double dt,
+                            int mpi_rank, int mpi_size)
 {
     const bool track_step_diagnostics = step_diagnostics_enabled_;
     const bool track_vmax_loss = Param::abort_on_vmax_loss;
@@ -279,6 +354,8 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
 
     const int ng = sg.nghost;
     const int nxl = sg.nx_local;
+    resize_or_zero(last_energy_current_cell_x_, static_cast<size_t>(nxl));
+    resize_or_zero(last_energy_current_face_x_, static_cast<size_t>(nxl + 1));
     double max_cfl = 0.0;
     const bool track_high_loss_location = step_diagnostics_enabled_;
     std::vector<double> loss_high_by_x;
@@ -290,8 +367,9 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
     for (int ix = 0; ix < nxl; ++ix) {
         for (int iv = 0; iv < Param::Nv; ++iv) {
             const int ix_g = ix + ng;
+            const double ex_cell = staggered_cell_ex(fields, ix, ix_g);
             const double udot_abs =
-                std::fabs(sp.charge * fields.Ex[ix_g] / (sp.mass * Const::c));
+                std::fabs(sp.charge * ex_cell / (sp.mass * Const::c));
             const double cfl =
                 dt * udot_abs * sp.vgrid.max_abs_mu
                 * sp.vgrid.inv_v_widths[iv];
@@ -322,11 +400,10 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
         double loss_high_sub = 0.0;
         double px_before_sub = 0.0;
         double px_after_sub = 0.0;
-        double ke_before_sub = 0.0;
-        double ke_after_sub = 0.0;
+        double ke_flux_delta_sub = 0.0;
 
         #pragma omp parallel reduction(+:n_before_sub,n_after_sub,loss_low_sub,loss_high_sub, \
-                                         px_before_sub,px_after_sub,ke_before_sub,ke_after_sub)
+                                         px_before_sub,px_after_sub,ke_flux_delta_sub)
         {
             std::array<double, Param::Nv> mass;
             std::array<double, Param::Nv> new_mass;
@@ -334,13 +411,15 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
             std::array<double, Param::Nv> outgoing;
             std::array<double, Param::Nv> scale;
 
-            #pragma omp for collapse(2) schedule(static)
+            #pragma omp for schedule(static)
             for (int ix = 0; ix < nxl; ++ix) {
+                double energy_current_dt_sum = 0.0;
                 for (int imu = 0; imu < Param::Nmu; ++imu) {
                 const int ix_g = ix + ng;
                 const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
+                const double ex_cell = staggered_cell_ex(fields, ix, ix_g);
                 const double accel_u =
-                    sp.charge * fields.Ex[ix_g] / (sp.mass * Const::c);
+                    sp.charge * ex_cell / (sp.mass * Const::c);
                 const double vdot = accel_u * sp.vgrid.mu_cells[imu];
 
                 flux.fill(0.0);
@@ -358,10 +437,8 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
                         const double px =
                             diag_px_base[static_cast<size_t>(iv)]
                             * sp.vgrid.mu_cells[imu];
-                        const double ke = diag_ke[static_cast<size_t>(iv)];
                         n_before_sub += cell_mass * sg.dx;
                         px_before_sub += cell_mass * px * sg.dx;
-                        ke_before_sub += cell_mass * ke * sg.dx;
                     }
                 }
 
@@ -404,6 +481,23 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
 
                 for (int face = 1; face < Param::Nv; ++face) {
                     const double ff = flux[static_cast<size_t>(face)];
+                    if (ff != 0.0) {
+                        const double du_center =
+                            sp.vgrid.v_cells[face]
+                            - sp.vgrid.v_cells[face - 1];
+                        const double ke_jump =
+                            sp.mass * Const::c
+                            * sp.vgrid.chain_speed_faces[face]
+                            * du_center;
+                        if (track_step_diagnostics) {
+                            ke_flux_delta_sub +=
+                                dt_sub * ff * ke_jump * sg.dx;
+                        }
+                        if (ex_cell != 0.0) {
+                            energy_current_dt_sum +=
+                                dt_sub * ff * ke_jump / ex_cell;
+                        }
+                    }
                     new_mass[static_cast<size_t>(face - 1)] -= dt_sub * ff;
                     new_mass[static_cast<size_t>(face)] += dt_sub * ff;
                 }
@@ -411,9 +505,21 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
                 if (flux[static_cast<size_t>(Param::Nv)] > 0.0) {
                     const double ff = flux[static_cast<size_t>(Param::Nv)];
                     new_mass[static_cast<size_t>(Param::Nv - 1)] -= dt_sub * ff;
+                    if (ex_cell != 0.0) {
+                        const double ke_high =
+                            (sp.vgrid.gamma_cells[Param::Nv - 1] - 1.0)
+                            * sp.mass * Const::c * Const::c;
+                        energy_current_dt_sum -=
+                            dt_sub * ff * ke_high / ex_cell;
+                    }
                     if (track_step_diagnostics || track_vmax_loss) {
                         const double loss_high = dt_sub * ff * sg.dx;
                         loss_high_sub += loss_high;
+                        if (track_step_diagnostics) {
+                            const double ke_high =
+                                diag_ke[static_cast<size_t>(Param::Nv - 1)];
+                            ke_flux_delta_sub -= loss_high * ke_high;
+                        }
                         if (track_high_loss_location) {
                             #pragma omp atomic
                             loss_high_by_x[static_cast<size_t>(ix)] +=
@@ -425,21 +531,21 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
                 for (int iv = 0; iv < Param::Nv; ++iv) {
                     const size_t offset = xbase + static_cast<size_t>(iv) * Param::Nmu
                                         + static_cast<size_t>(imu);
-                    const double cell_mass =
-                        (new_mass[static_cast<size_t>(iv)] > 0.0)
-                        ? new_mass[static_cast<size_t>(iv)] : 0.0;
+                    const double cell_mass = new_mass[static_cast<size_t>(iv)];
                     if (track_step_diagnostics) {
                         const double px =
                             diag_px_base[static_cast<size_t>(iv)]
                             * sp.vgrid.mu_cells[imu];
-                        const double ke = diag_ke[static_cast<size_t>(iv)];
                         n_after_sub += cell_mass * sg.dx;
                         px_after_sub += cell_mass * px * sg.dx;
-                        ke_after_sub += cell_mass * ke * sg.dx;
                     }
                     sp.f_tmp[offset] = cell_mass * sp.vgrid.inv_moment_weight[iv];
                 }
             }
+                if (dt > 0.0) {
+                    last_energy_current_cell_x_[static_cast<size_t>(ix)] +=
+                        energy_current_dt_sum / dt;
+                }
         }
         }
 
@@ -455,9 +561,10 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
             last_mass_error_v_ +=
                 n_after_sub + loss_low_sub + loss_high_sub - n_before_sub;
             last_momentum_delta_v_ += px_after_sub - px_before_sub;
-            last_energy_delta_v_ += ke_after_sub - ke_before_sub;
+            last_energy_delta_v_ += ke_flux_delta_sub;
         }
     }
+    close_energy_current_faces(sg, mpi_rank, mpi_size);
 
     if (track_high_loss_location) {
         int ix_at_max = -1;
@@ -503,6 +610,56 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
     }
 }
 
+void VlasovSolver::close_energy_current_faces(const SpatialGrid& sg,
+                                              int mpi_rank, int mpi_size)
+{
+    const int nxl = sg.nx_local;
+    if (nxl <= 0) return;
+    resize_or_zero(last_energy_current_face_x_, static_cast<size_t>(nxl + 1));
+    if (last_energy_current_cell_x_.size() < static_cast<size_t>(nxl)) {
+        return;
+    }
+
+    if (mpi_size <= 1) {
+        last_energy_current_face_x_[0] =
+            0.5 * (last_energy_current_cell_x_[static_cast<size_t>(nxl - 1)]
+                 + last_energy_current_cell_x_[0]);
+        for (int iface = 1; iface < nxl; ++iface) {
+            last_energy_current_face_x_[static_cast<size_t>(iface)] =
+                0.5 * (last_energy_current_cell_x_[static_cast<size_t>(iface - 1)]
+                     + last_energy_current_cell_x_[static_cast<size_t>(iface)]);
+        }
+        last_energy_current_face_x_[static_cast<size_t>(nxl)] =
+            last_energy_current_face_x_[0];
+        return;
+    }
+
+    const int left_peer = (mpi_rank + mpi_size - 1) % mpi_size;
+    const int right_peer = (mpi_rank + 1) % mpi_size;
+    const double send_left_cell = last_energy_current_cell_x_[0];
+    const double send_right_cell =
+        last_energy_current_cell_x_[static_cast<size_t>(nxl - 1)];
+    double recv_left_cell = 0.0;
+    double recv_right_cell = 0.0;
+    MPI_Sendrecv(&send_right_cell, 1, MPI_DOUBLE, right_peer, 621,
+                 &recv_left_cell, 1, MPI_DOUBLE, left_peer, 621,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    MPI_Sendrecv(&send_left_cell, 1, MPI_DOUBLE, left_peer, 622,
+                 &recv_right_cell, 1, MPI_DOUBLE, right_peer, 622,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    last_energy_current_face_x_[0] =
+        0.5 * (recv_left_cell + last_energy_current_cell_x_[0]);
+    for (int iface = 1; iface < nxl; ++iface) {
+        last_energy_current_face_x_[static_cast<size_t>(iface)] =
+            0.5 * (last_energy_current_cell_x_[static_cast<size_t>(iface - 1)]
+                 + last_energy_current_cell_x_[static_cast<size_t>(iface)]);
+    }
+    last_energy_current_face_x_[static_cast<size_t>(nxl)] =
+        0.5 * (last_energy_current_cell_x_[static_cast<size_t>(nxl - 1)]
+             + recv_right_cell);
+}
+
 void VlasovSolver::advect_mu(Species& sp, const SpatialGrid& sg,
                              const EMFields& fields, double dt)
 {
@@ -520,8 +677,9 @@ void VlasovSolver::advect_mu(Species& sp, const SpatialGrid& sg,
     for (int ix = 0; ix < nxl; ++ix) {
         for (int iv = 0; iv < Param::Nv; ++iv) {
             const int ix_g = ix + ng;
+            const double ex_cell = staggered_cell_ex(fields, ix, ix_g);
             const double udot_abs =
-                std::fabs(sp.charge * fields.Ex[ix_g] / (sp.mass * Const::c));
+                std::fabs(sp.charge * ex_cell / (sp.mass * Const::c));
             max_cfl = std::max(max_cfl,
                                dt * udot_abs * sp.vgrid.mu_cfl_factor[iv]);
         }
@@ -565,8 +723,9 @@ void VlasovSolver::advect_mu(Species& sp, const SpatialGrid& sg,
                 const int ix_g = ix + ng;
                 const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
                 const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
+                const double ex_cell = staggered_cell_ex(fields, ix, ix_g);
                 const double accel_u =
-                    sp.charge * fields.Ex[ix_g] / (sp.mass * Const::c);
+                    sp.charge * ex_cell / (sp.mass * Const::c);
                 const double u = sp.vgrid.v_cells[iv];
                 const double u_eff = std::max(u, Param::u_floor);
                 const double mu_flux_scale = sp.vgrid.mu_flux_scale[iv];

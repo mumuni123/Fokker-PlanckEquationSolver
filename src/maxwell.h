@@ -50,6 +50,7 @@ struct EMFields {
                              double dt,
                              int mpi_rank,
                              int mpi_size);
+    void sync_cell_ex_from_faces(int mpi_rank, int mpi_size);
     void update_gauss_residual_diagnostics(int mpi_rank, int mpi_size);
     // Snapshot-only potential reconstruction.
     void compute_potential(int mpi_rank, int mpi_size);

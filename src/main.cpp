@@ -116,6 +116,58 @@ double integrate_ampere_face_work(const std::vector<double>& current_face,
     return work;
 }
 
+double integrate_static_face_work(const std::vector<double>& current_face,
+                                  const EMFields& fields,
+                                  const SpatialGrid& sg,
+                                  double dt)
+{
+    double work = 0.0;
+    const size_t unique_faces = static_cast<size_t>(sg.nx_local);
+    const size_t n =
+        std::min(unique_faces, std::min(current_face.size(),
+                                        fields.Ex_face.size()));
+    for (size_t iface = 0; iface < n; ++iface) {
+        work += current_face[iface] * fields.Ex_face[iface] * sg.dx * dt;
+    }
+    return work;
+}
+
+void set_midpoint_face_field(EMFields& fields,
+                             const std::vector<double>& ex_old,
+                             const std::vector<double>& ex_mid,
+                             const SpatialGrid& sg,
+                             int mpi_rank,
+                             int mpi_size)
+{
+    const size_t n =
+        std::min(static_cast<size_t>(sg.nx_local), fields.Ex_face.size());
+    for (size_t iface = 0; iface < n; ++iface) {
+        const double old_value = (iface < ex_old.size()) ? ex_old[iface] : 0.0;
+        const double mid_value = (iface < ex_mid.size()) ? ex_mid[iface] : old_value;
+        fields.Ex_face[iface] = mid_value;
+    }
+    if (fields.Ex_face.size() > static_cast<size_t>(sg.nx_local)) {
+        fields.Ex_face[static_cast<size_t>(sg.nx_local)] =
+            (sg.nx_local == 0) ? 0.0 : fields.Ex_face[0];
+    }
+    fields.sync_cell_ex_from_faces(mpi_rank, mpi_size);
+}
+
+double relative_face_delta(const std::vector<double>& a,
+                           const std::vector<double>& b,
+                           const SpatialGrid& sg)
+{
+    const size_t n =
+        std::min(static_cast<size_t>(sg.nx_local), std::min(a.size(), b.size()));
+    double num = 0.0;
+    double den = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        num = std::max(num, std::fabs(a[i] - b[i]));
+        den = std::max(den, std::max(std::fabs(a[i]), std::fabs(b[i])));
+    }
+    return num / std::max(1.0, den);
+}
+
 void write_snapshot(Diagnostics& diag,
                     double time,
                     const Species& bkg_e,
@@ -307,209 +359,239 @@ int main(int argc, char** argv)
         std::vector<double> ex_face_before_ampere;
         vlasov.set_step_diagnostics_enabled(collect_step_diagnostics);
 
-        beam.begin_step(sgrid, dt);
+        const Species bkg_step_start = bkg_e;
+        const BeamPIC beam_step_start = beam;
+        const EMFields fields_step_start = fields;
+        const std::vector<double> ex_face_step_start =
+            copy_local_ex_face(fields_step_start, sgrid);
         if (collect_step_diagnostics) {
             bkg_ke_step_start = bkg_e.total_kinetic_energy();
             beam_ke_step_start = beam.total_kinetic_energy();
             field_energy_step_start = fields.total_energy();
         }
 
-        trace_progress(config, mpi_rank, step, "before x half 1");
-        vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size,
-                        time_start);
-        trace_progress(config, mpi_rank, step, "after x half 1");
-        moments_current = false;
-#if FP_ENABLE_DEBUG_DIAGNOSTICS
-        if (config.enable_debug_diagnostics) {
-            diag.write_debug_state(step, time, "x_half_1", bkg_e, beam, fields,
-                                   sgrid, mpi_rank, mpi_size);
-        }
-#endif
+        std::vector<double> ex_mid_trial = ex_face_step_start;
+        std::vector<double> ex_mid_next = ex_face_step_start;
+        Species accepted_bkg = bkg_step_start;
+        BeamPIC accepted_beam = beam_step_start;
+        EMFields accepted_fields = fields_step_start;
+        const int max_coupled_iters = 6;
+        const double coupled_tol = 1.0e-8;
+        std::vector<double> current_trial_prev(
+            static_cast<size_t>(sgrid.nx_local), 0.0);
+        std::vector<double> current_trial_next(
+            static_cast<size_t>(sgrid.nx_local), 0.0);
+        bool have_previous_current_trial = false;
+        bool coupled_converged = false;
+        double final_coupled_error = 0.0;
 
-        trace_progress(config, mpi_rank, step, "before v half 1");
-        vlasov.advect_v(bkg_e, sgrid, fields, 0.5 * dt);
-        trace_progress(config, mpi_rank, step, "after v half 1");
-        nsub_v1 = vlasov.last_nsub_v();
-        loss_v1 = vlasov.last_loss_v();
-        loss_v1_low = vlasov.last_loss_v_low();
-        loss_v1_high = vlasov.last_loss_v_high();
-        if (vlasov.last_loss_v_high_local_max() > max_loss_u_high_step) {
-            max_loss_u_high_step = vlasov.last_loss_v_high_local_max();
-            x_at_max_loss_u_high_step = vlasov.last_x_at_max_loss_v_high();
-            f_u_max_x_step = vlasov.last_f_umax_at_max_loss_v_high();
-            integral_f_u_gt_8_x_step =
-                vlasov.last_integral_f_u_gt_8_at_max_loss_v_high();
-        }
-        v_mass_error_step += vlasov.last_mass_error_v();
-        v_momentum_delta_step += vlasov.last_momentum_delta_v();
-        v_energy_delta_step += vlasov.last_energy_delta_v();
-        abort_if_vmax_loss(vlasov, step, time, "v_half_1", mpi_rank);
-        moments_current = false;
-#if FP_ENABLE_DEBUG_DIAGNOSTICS
-        if (config.enable_debug_diagnostics) {
-            diag.write_debug_state(step, time, "v_half_1", bkg_e, beam, fields,
-                                   sgrid, mpi_rank, mpi_size,
-                                   vlasov.last_cfl_v(), 0.0,
-                                   vlasov.last_nsub_v(), 0);
-        }
-#endif
+        for (int coupled_iter = 0; coupled_iter < max_coupled_iters;
+             ++coupled_iter) {
+            bkg_e = bkg_step_start;
+            beam = beam_step_start;
+            fields = fields_step_start;
+            set_midpoint_face_field(fields, ex_face_step_start, ex_mid_trial,
+                                    sgrid, mpi_rank, mpi_size);
 
-        trace_progress(config, mpi_rank, step, "before mu half 1");
-        vlasov.advect_mu(bkg_e, sgrid, fields, 0.5 * dt);
-        trace_progress(config, mpi_rank, step, "after mu half 1");
-        nsub_mu1 = vlasov.last_nsub_mu();
-        loss_mu1 = vlasov.last_loss_mu();
-        mu_mass_error_step += vlasov.last_mass_error_mu();
-        mu_momentum_delta_step += vlasov.last_momentum_delta_mu();
-        mu_energy_delta_step += vlasov.last_energy_delta_mu();
-        moments_current = false;
-#if FP_ENABLE_DEBUG_DIAGNOSTICS
-        if (config.enable_debug_diagnostics) {
-            diag.write_debug_state(step, time, "mu_half_1", bkg_e, beam, fields,
-                                   sgrid, mpi_rank, mpi_size,
-                                   0.0, vlasov.last_cfl_mu(),
-                                   0, vlasov.last_nsub_mu());
-        }
-#endif
+            nsub_v1 = nsub_mu1 = nsub_v2 = nsub_mu2 = 0;
+            loss_v1 = loss_v1_low = loss_v1_high = 0.0;
+            loss_mu1 = loss_v2 = loss_v2_low = loss_v2_high = loss_mu2 = 0.0;
+            dke_beam_push = 0.0;
+            W_bkg_E = 0.0;
+            W_beam_E = 0.0;
+            v_mass_error_step = 0.0;
+            mu_mass_error_step = 0.0;
+            v_momentum_delta_step = 0.0;
+            mu_momentum_delta_step = 0.0;
+            v_energy_delta_step = 0.0;
+            mu_energy_delta_step = 0.0;
+            max_loss_u_high_step = 0.0;
+            x_at_max_loss_u_high_step = 0.0;
+            f_u_max_x_step = 0.0;
+            integral_f_u_gt_8_x_step = 0.0;
 
-        trace_progress(config, mpi_rank, step, "before beam half 1 inject");
-        beam.inject(sgrid, fields, 0.5 * dt, time_center, mpi_rank, mpi_size);
-        trace_progress(config, mpi_rank, step, "after beam half 1 inject");
-        trace_progress(config, mpi_rank, step, "before beam half 1 push");
-        if (collect_step_diagnostics) {
-            beam_push_ke_before = beam.total_kinetic_energy();
-        }
-        beam.push(sgrid, fields, 0.5 * dt, mpi_rank, mpi_size);
-        if (collect_step_diagnostics) {
-            dke_beam_push += beam.total_kinetic_energy() - beam_push_ke_before;
-        }
-        trace_progress(config, mpi_rank, step, "after beam half 1 push");
-        trace_progress(config, mpi_rank, step, "before beam center deposit");
-        beam.deposit_density(sgrid, mpi_rank, mpi_size);
-        beam.finalize_charge_conserving_current(sgrid, 0.5 * dt,
-                                                mpi_rank, mpi_size);
-        trace_progress(config, mpi_rank, step, "after beam center deposit");
+            beam.begin_step(sgrid, dt);
 
-        trace_progress(config, mpi_rank, step, "before center moments");
-        bkg_e.compute_moments();
+            trace_progress(config, mpi_rank, step, "midpoint before v half 1");
+            vlasov.advect_v(bkg_e, sgrid, fields, 0.5 * dt,
+                            mpi_rank, mpi_size);
+            trace_progress(config, mpi_rank, step, "midpoint after v half 1");
+            nsub_v1 = vlasov.last_nsub_v();
+            loss_v1 = vlasov.last_loss_v();
+            loss_v1_low = vlasov.last_loss_v_low();
+            loss_v1_high = vlasov.last_loss_v_high();
+            if (vlasov.last_loss_v_high_local_max() > max_loss_u_high_step) {
+                max_loss_u_high_step = vlasov.last_loss_v_high_local_max();
+                x_at_max_loss_u_high_step = vlasov.last_x_at_max_loss_v_high();
+                f_u_max_x_step = vlasov.last_f_umax_at_max_loss_v_high();
+                integral_f_u_gt_8_x_step =
+                    vlasov.last_integral_f_u_gt_8_at_max_loss_v_high();
+            }
+            v_mass_error_step += vlasov.last_mass_error_v();
+            v_momentum_delta_step += vlasov.last_momentum_delta_v();
+            if (collect_step_diagnostics) {
+                v_energy_delta_step +=
+                    integrate_static_face_work(vlasov.last_energy_current_face_x(),
+                                               fields, sgrid, 0.5 * dt);
+            }
+            abort_if_vmax_loss(vlasov, step, time, "midpoint_v_half_1",
+                               mpi_rank);
+
+            trace_progress(config, mpi_rank, step, "midpoint before mu half 1");
+            vlasov.advect_mu(bkg_e, sgrid, fields, 0.5 * dt);
+            trace_progress(config, mpi_rank, step, "midpoint after mu half 1");
+            nsub_mu1 = vlasov.last_nsub_mu();
+            loss_mu1 = vlasov.last_loss_mu();
+            mu_mass_error_step += vlasov.last_mass_error_mu();
+            mu_momentum_delta_step += vlasov.last_momentum_delta_mu();
+            mu_energy_delta_step += vlasov.last_energy_delta_mu();
+
+            trace_progress(config, mpi_rank, step, "midpoint before x full");
+            vlasov.advect_x(bkg_e, sgrid, dt, mpi_rank, mpi_size, time_center);
+            trace_progress(config, mpi_rank, step, "midpoint after x full");
+
+            trace_progress(config, mpi_rank, step, "midpoint before mu half 2");
+            vlasov.advect_mu(bkg_e, sgrid, fields, 0.5 * dt);
+            trace_progress(config, mpi_rank, step, "midpoint after mu half 2");
+            nsub_mu2 = vlasov.last_nsub_mu();
+            loss_mu2 = vlasov.last_loss_mu();
+            mu_mass_error_step += vlasov.last_mass_error_mu();
+            mu_momentum_delta_step += vlasov.last_momentum_delta_mu();
+            mu_energy_delta_step += vlasov.last_energy_delta_mu();
+
+            trace_progress(config, mpi_rank, step, "midpoint before v half 2");
+            vlasov.advect_v(bkg_e, sgrid, fields, 0.5 * dt,
+                            mpi_rank, mpi_size);
+            trace_progress(config, mpi_rank, step, "midpoint after v half 2");
+            nsub_v2 = vlasov.last_nsub_v();
+            loss_v2 = vlasov.last_loss_v();
+            loss_v2_low = vlasov.last_loss_v_low();
+            loss_v2_high = vlasov.last_loss_v_high();
+            if (vlasov.last_loss_v_high_local_max() > max_loss_u_high_step) {
+                max_loss_u_high_step = vlasov.last_loss_v_high_local_max();
+                x_at_max_loss_u_high_step = vlasov.last_x_at_max_loss_v_high();
+                f_u_max_x_step = vlasov.last_f_umax_at_max_loss_v_high();
+                integral_f_u_gt_8_x_step =
+                    vlasov.last_integral_f_u_gt_8_at_max_loss_v_high();
+            }
+            v_mass_error_step += vlasov.last_mass_error_v();
+            v_momentum_delta_step += vlasov.last_momentum_delta_v();
+            if (collect_step_diagnostics) {
+                v_energy_delta_step +=
+                    integrate_static_face_work(vlasov.last_energy_current_face_x(),
+                                               fields, sgrid, 0.5 * dt);
+            }
+            abort_if_vmax_loss(vlasov, step, time, "midpoint_v_half_2",
+                               mpi_rank);
+
+            trace_progress(config, mpi_rank, step, "midpoint before beam");
+            beam.inject(sgrid, fields, dt, time, mpi_rank, mpi_size);
+            if (collect_step_diagnostics) {
+                beam_push_ke_before = beam.total_kinetic_energy();
+            }
+            beam.push(sgrid, fields, dt, mpi_rank, mpi_size);
+            if (collect_step_diagnostics) {
+                dke_beam_push += beam.total_kinetic_energy() - beam_push_ke_before;
+            }
+            beam.deposit_density(sgrid, mpi_rank, mpi_size);
+            beam.finalize_charge_conserving_current(sgrid, dt,
+                                                    mpi_rank, mpi_size);
+            trace_progress(config, mpi_rank, step, "midpoint after beam");
+            W_beam_E = collect_step_diagnostics ? beam.last_field_work() : 0.0;
+
+            bkg_e.compute_moments();
+            fields = fields_step_start;
+            if (collect_step_diagnostics) {
+                ex_face_before_ampere = copy_local_ex_face(fields, sgrid);
+            }
+            fields.advance_ampere_face(bkg_e.current_face_x,
+                                       beam.current_face_x,
+                                       dt, mpi_rank, mpi_size);
+            if (collect_step_diagnostics) {
+                W_bkg_E =
+                    integrate_ampere_face_work(bkg_e.current_face_x,
+                                               ex_face_before_ampere,
+                                               fields, sgrid, dt);
+            }
+
+            for (int iface = 0; iface < sgrid.nx_local; ++iface) {
+                const size_t slot = static_cast<size_t>(iface);
+                const double jbkg =
+                    (slot < bkg_e.current_face_x.size())
+                    ? bkg_e.current_face_x[slot] : 0.0;
+                const double jbeam =
+                    (slot < beam.current_face_x.size())
+                    ? beam.current_face_x[slot] : 0.0;
+                current_trial_next[slot] = jbkg + jbeam;
+            }
+
+            const std::vector<double> ex_face_new =
+                copy_local_ex_face(fields, sgrid);
+            ex_mid_next = ex_face_new;
+            const size_t nface =
+                std::min(ex_mid_next.size(), ex_face_step_start.size());
+            for (size_t iface = 0; iface < nface; ++iface) {
+                ex_mid_next[iface] =
+                    0.5 * (ex_face_step_start[iface] + ex_face_new[iface]);
+            }
+
+            const double local_field_error =
+                relative_face_delta(ex_mid_next, ex_mid_trial, sgrid);
+            double local_current_error = 0.0;
+            if (have_previous_current_trial) {
+                double current_num = 0.0;
+                double current_den = 0.0;
+                for (size_t iface = 0; iface < current_trial_next.size();
+                     ++iface) {
+                    current_num = std::max(
+                        current_num,
+                        std::fabs(current_trial_next[iface]
+                                - current_trial_prev[iface]));
+                    current_den = std::max(
+                        current_den,
+                        std::max(std::fabs(current_trial_next[iface]),
+                                 std::fabs(current_trial_prev[iface])));
+                }
+                local_current_error = current_num / std::max(1.0, current_den);
+            }
+            const double local_coupled_error =
+                have_previous_current_trial
+                ? std::max(local_field_error, local_current_error)
+                : std::max(1.0, local_field_error);
+            double global_coupled_error = 0.0;
+            MPI_Allreduce(&local_coupled_error, &global_coupled_error, 1,
+                          MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+
+            final_coupled_error = global_coupled_error;
+            if (global_coupled_error < coupled_tol) {
+                coupled_converged = true;
+                accepted_bkg = bkg_e;
+                accepted_beam = beam;
+                accepted_fields = fields;
+                break;
+            }
+            ex_mid_trial.swap(ex_mid_next);
+            current_trial_prev.swap(current_trial_next);
+            have_previous_current_trial = true;
+        }
+
+        if (!coupled_converged) {
+            if (mpi_rank == 0) {
+                std::fprintf(stderr,
+                             "ERROR: coupled midpoint iteration failed to "
+                             "converge at step %d, t = %.6e s; residual %.6e "
+                             "after %d iterations. Reduce dt or increase the "
+                             "coupled solve robustness.\n",
+                             step, time, final_coupled_error,
+                             max_coupled_iters);
+            }
+            MPI_Abort(MPI_COMM_WORLD, 8);
+        }
+
+        bkg_e = accepted_bkg;
+        beam = accepted_beam;
+        fields = accepted_fields;
         moments_current = true;
-        trace_progress(config, mpi_rank, step, "after center moments");
-        trace_progress(config, mpi_rank, step, "before center Ampere update");
-        if (collect_step_diagnostics) {
-            ex_face_before_ampere = copy_local_ex_face(fields, sgrid);
-        }
-        fields.advance_ampere_face(bkg_e.current_face_x, beam.current_face_x,
-                                   0.5 * dt, mpi_rank, mpi_size);
-        trace_progress(config, mpi_rank, step, "after center Ampere update");
-        if (collect_step_diagnostics) {
-            W_bkg_E +=
-                integrate_ampere_face_work(bkg_e.current_face_x,
-                                           ex_face_before_ampere,
-                                           fields, sgrid, 0.5 * dt);
-        }
-        beam.begin_current_interval(sgrid);
-#if FP_ENABLE_DEBUG_DIAGNOSTICS
-        if (config.enable_debug_diagnostics) {
-            diag.write_debug_state(step, time, "center_ampere_E",
-                                   bkg_e, beam, fields,
-                                   sgrid, mpi_rank, mpi_size);
-        }
-#endif
-
-        trace_progress(config, mpi_rank, step, "before beam half 2 inject");
-        beam.inject(sgrid, fields, 0.5 * dt, time, mpi_rank, mpi_size);
-        trace_progress(config, mpi_rank, step, "after beam half 2 inject");
-        trace_progress(config, mpi_rank, step, "before beam half 2 push");
-        if (collect_step_diagnostics) {
-            beam_push_ke_before = beam.total_kinetic_energy();
-        }
-        beam.push(sgrid, fields, 0.5 * dt, mpi_rank, mpi_size);
-        if (collect_step_diagnostics) {
-            dke_beam_push += beam.total_kinetic_energy() - beam_push_ke_before;
-        }
-        trace_progress(config, mpi_rank, step, "after beam half 2 push");
-        trace_progress(config, mpi_rank, step, "before beam end deposit");
-        beam.deposit_density(sgrid, mpi_rank, mpi_size);
-        beam.finalize_charge_conserving_current(sgrid, 0.5 * dt,
-                                                mpi_rank, mpi_size);
-        bkg_e.compute_moments();
-        moments_current = true;
-        trace_progress(config, mpi_rank, step, "after beam end deposit");
-        if (collect_step_diagnostics) {
-            W_beam_E = beam.last_field_work();
-        }
-
-        trace_progress(config, mpi_rank, step, "before mu half 2");
-        vlasov.advect_mu(bkg_e, sgrid, fields, 0.5 * dt);
-        trace_progress(config, mpi_rank, step, "after mu half 2");
-        nsub_mu2 = vlasov.last_nsub_mu();
-        loss_mu2 = vlasov.last_loss_mu();
-        mu_mass_error_step += vlasov.last_mass_error_mu();
-        mu_momentum_delta_step += vlasov.last_momentum_delta_mu();
-        mu_energy_delta_step += vlasov.last_energy_delta_mu();
-        moments_current = false;
-#if FP_ENABLE_DEBUG_DIAGNOSTICS
-        if (config.enable_debug_diagnostics) {
-            diag.write_debug_state(step, time, "mu_half_2", bkg_e, beam, fields,
-                                   sgrid, mpi_rank, mpi_size,
-                                   0.0, vlasov.last_cfl_mu(),
-                                   0, vlasov.last_nsub_mu());
-        }
-#endif
-
-        trace_progress(config, mpi_rank, step, "before v half 2");
-        vlasov.advect_v(bkg_e, sgrid, fields, 0.5 * dt);
-        trace_progress(config, mpi_rank, step, "after v half 2");
-        nsub_v2 = vlasov.last_nsub_v();
-        loss_v2 = vlasov.last_loss_v();
-        loss_v2_low = vlasov.last_loss_v_low();
-        loss_v2_high = vlasov.last_loss_v_high();
-        if (vlasov.last_loss_v_high_local_max() > max_loss_u_high_step) {
-            max_loss_u_high_step = vlasov.last_loss_v_high_local_max();
-            x_at_max_loss_u_high_step = vlasov.last_x_at_max_loss_v_high();
-            f_u_max_x_step = vlasov.last_f_umax_at_max_loss_v_high();
-            integral_f_u_gt_8_x_step =
-                vlasov.last_integral_f_u_gt_8_at_max_loss_v_high();
-        }
-        v_mass_error_step += vlasov.last_mass_error_v();
-        v_momentum_delta_step += vlasov.last_momentum_delta_v();
-        v_energy_delta_step += vlasov.last_energy_delta_v();
-        abort_if_vmax_loss(vlasov, step, time, "v_half_2", mpi_rank);
-        moments_current = false;
-#if FP_ENABLE_DEBUG_DIAGNOSTICS
-        if (config.enable_debug_diagnostics) {
-            diag.write_debug_state(step, time, "v_half_2", bkg_e, beam, fields,
-                                   sgrid, mpi_rank, mpi_size,
-                                   vlasov.last_cfl_v(), 0.0,
-                                   vlasov.last_nsub_v(), 0);
-        }
-#endif
-
-        trace_progress(config, mpi_rank, step, "before x half 2");
-        vlasov.advect_x(bkg_e, sgrid, 0.5 * dt, mpi_rank, mpi_size,
-                        time_center);
-        trace_progress(config, mpi_rank, step, "after x half 2");
-        moments_current = false;
-#if FP_ENABLE_DEBUG_DIAGNOSTICS
-        if (config.enable_debug_diagnostics) {
-            diag.write_debug_state(step, time, "x_half_2", bkg_e, beam, fields,
-                                   sgrid, mpi_rank, mpi_size);
-        }
-#endif
-
-        trace_progress(config, mpi_rank, step, "before end Ampere update");
-        if (collect_step_diagnostics) {
-            ex_face_before_ampere = copy_local_ex_face(fields, sgrid);
-        }
-        fields.advance_ampere_face(bkg_e.current_face_x, beam.current_face_x,
-                                   0.5 * dt, mpi_rank, mpi_size);
-        trace_progress(config, mpi_rank, step, "after end Ampere update");
-        if (collect_step_diagnostics) {
-            W_bkg_E +=
-                integrate_ampere_face_work(bkg_e.current_face_x,
-                                           ex_face_before_ampere,
-                                           fields, sgrid, 0.5 * dt);
-        }
 
         if (bkg_e.collisions_enabled) {
             trace_progress(config, mpi_rank, step, "before collisions");

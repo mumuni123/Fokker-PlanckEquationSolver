@@ -26,7 +26,7 @@ public:
     void advect_x(Species& sp, const SpatialGrid& sg, double dt,
                   int mpi_rank, int mpi_size, double time = 0.0);
     void advect_v(Species& sp, const SpatialGrid& sg, const EMFields& fields,
-                  double dt);
+                  double dt, int mpi_rank = 0, int mpi_size = 1);
     void advect_mu(Species& sp, const SpatialGrid& sg, const EMFields& fields,
                    double dt);
 
@@ -56,10 +56,15 @@ public:
     double last_momentum_delta_mu() const { return last_momentum_delta_mu_; }
     double last_energy_delta_v() const { return last_energy_delta_v_; }
     double last_energy_delta_mu() const { return last_energy_delta_mu_; }
+    const std::vector<double>& last_energy_current_face_x() const {
+        return last_energy_current_face_x_;
+    }
 
 private:
     void exchange_ghosts_x(Species& sp, const SpatialGrid& sg,
                            int mpi_rank, int mpi_size);
+    void close_energy_current_faces(const SpatialGrid& sg,
+                                    int mpi_rank, int mpi_size);
 
     std::vector<double> send_left_;
     std::vector<double> send_right_;
@@ -67,6 +72,8 @@ private:
     std::vector<double> recv_right_;
     std::vector<RemapStencil> x_stencil_;
     std::vector<double> x_cfl_;
+    std::vector<double> last_energy_current_cell_x_;
+    std::vector<double> last_energy_current_face_x_;
 
     double last_cfl_v_;
     double last_cfl_mu_;
