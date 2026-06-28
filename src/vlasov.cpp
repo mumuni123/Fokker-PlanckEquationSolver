@@ -137,6 +137,76 @@ void resize_or_zero(std::vector<double>& values, size_t n)
     }
 }
 
+void close_periodic_face_values(std::vector<double>& face_values,
+                                int nxl,
+                                int mpi_rank,
+                                int mpi_size,
+                                int tag)
+{
+    if (face_values.size() <
+        static_cast<size_t>(nxl + 1) * Param::Nvmu) {
+        return;
+    }
+
+    if (mpi_size <= 1) {
+        const size_t left_face = 0;
+        const size_t right_face = static_cast<size_t>(nxl) * Param::Nvmu;
+        std::copy(face_values.begin() + left_face,
+                  face_values.begin() + left_face + Param::Nvmu,
+                  face_values.begin() + right_face);
+        return;
+    }
+
+    const int left_peer = (mpi_rank + mpi_size - 1) % mpi_size;
+    const int right_peer = (mpi_rank + 1) % mpi_size;
+    const size_t right_face = static_cast<size_t>(nxl) * Param::Nvmu;
+    MPI_Sendrecv(face_values.data(), static_cast<int>(Param::Nvmu),
+                 MPI_DOUBLE, left_peer, tag,
+                 face_values.data() + right_face,
+                 static_cast<int>(Param::Nvmu), MPI_DOUBLE,
+                 right_peer, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+}
+
+void exchange_cell_limiter_edges(const std::vector<double>& limiter,
+                                 int nxl,
+                                 int mpi_rank,
+                                 int mpi_size,
+                                 std::vector<double>& left_edge,
+                                 std::vector<double>& right_edge)
+{
+    left_edge.assign(Param::Nvmu, 1.0);
+    right_edge.assign(Param::Nvmu, 1.0);
+    if (nxl <= 0 || limiter.size() <
+        static_cast<size_t>(nxl) * Param::Nvmu) {
+        return;
+    }
+
+    const size_t first = 0;
+    const size_t last = static_cast<size_t>(nxl - 1) * Param::Nvmu;
+    if (mpi_size <= 1) {
+        std::copy(limiter.begin() + last,
+                  limiter.begin() + last + Param::Nvmu,
+                  left_edge.begin());
+        std::copy(limiter.begin() + first,
+                  limiter.begin() + first + Param::Nvmu,
+                  right_edge.begin());
+        return;
+    }
+
+    const int left_peer = (mpi_rank + mpi_size - 1) % mpi_size;
+    const int right_peer = (mpi_rank + 1) % mpi_size;
+    MPI_Sendrecv(limiter.data() + first, static_cast<int>(Param::Nvmu),
+                 MPI_DOUBLE, left_peer, 741,
+                 right_edge.data(), static_cast<int>(Param::Nvmu),
+                 MPI_DOUBLE, right_peer, 741,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    MPI_Sendrecv(limiter.data() + last, static_cast<int>(Param::Nvmu),
+                 MPI_DOUBLE, right_peer, 742,
+                 left_edge.data(), static_cast<int>(Param::Nvmu),
+                 MPI_DOUBLE, left_peer, 742,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+}
+
 }
 
 VlasovSolver::VlasovSolver()
@@ -189,8 +259,16 @@ void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
     resize_or_zero(sp.current_face_x, static_cast<size_t>(nxl + 1));
     resize_or_zero(sp.current_x, static_cast<size_t>(nxl));
     const size_t active_faces = static_cast<size_t>(nxl + 1) * Param::Nvmu;
+    const size_t active_cells = static_cast<size_t>(nxl) * Param::Nvmu;
     std::vector<double> f_old(sp.f.size(), 0.0);
+    std::vector<double> low_flux_faces(active_faces, 0.0);
+    std::vector<double> high_flux_faces(active_faces, 0.0);
     std::vector<double> flux_faces(active_faces, 0.0);
+    std::vector<double> antidiff_flux_faces(active_faces, 0.0);
+    std::vector<double> f_low(active_cells, 0.0);
+    std::vector<double> limiter_cell(active_cells, 1.0);
+    std::vector<double> limiter_left_edge(Param::Nvmu, 1.0);
+    std::vector<double> limiter_right_edge(Param::Nvmu, 1.0);
     const int max_midpoint_iters = 24;
     const double midpoint_tol = 1.0e-11;
 
@@ -215,33 +293,117 @@ void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
                         static_cast<size_t>(ix_left) * Param::Nvmu + k;
                     const size_t right_offset =
                         static_cast<size_t>(ix_right) * Param::Nvmu + k;
+                    const double f_upwind =
+                        (vx >= 0.0) ? f_old[left_offset] : f_old[right_offset];
+                    low_flux_faces[
+                        static_cast<size_t>(iface) * Param::Nvmu + k] =
+                        vx * f_upwind;
                     const double f_left_mid =
                         0.5 * (f_old[left_offset] + sp.f[left_offset]);
                     const double f_right_mid =
                         0.5 * (f_old[right_offset] + sp.f[right_offset]);
-                    flux_faces[static_cast<size_t>(iface) * Param::Nvmu + k] =
+                    high_flux_faces[
+                        static_cast<size_t>(iface) * Param::Nvmu + k] =
                         0.5 * vx * (f_left_mid + f_right_mid);
                 }
             }
 
-            if (mpi_size <= 1) {
-                const size_t left_face = 0;
-                const size_t right_face = static_cast<size_t>(nxl) * Param::Nvmu;
-                std::copy(flux_faces.begin() + left_face,
-                          flux_faces.begin() + left_face + Param::Nvmu,
-                          flux_faces.begin() + right_face);
-            } else {
-                const int left_peer = (mpi_rank + mpi_size - 1) % mpi_size;
-                const int right_peer = (mpi_rank + 1) % mpi_size;
-                const size_t right_face =
-                    static_cast<size_t>(nxl) * Param::Nvmu;
-                MPI_Sendrecv(flux_faces.data(), static_cast<int>(Param::Nvmu),
-                             MPI_DOUBLE, left_peer, 731,
-                             flux_faces.data() + right_face,
-                             static_cast<int>(Param::Nvmu), MPI_DOUBLE,
-                             right_peer, 731, MPI_COMM_WORLD,
-                             MPI_STATUS_IGNORE);
+            close_periodic_face_values(low_flux_faces, nxl,
+                                       mpi_rank, mpi_size, 743);
+            close_periodic_face_values(high_flux_faces, nxl,
+                                       mpi_rank, mpi_size, 744);
+
+            #pragma omp parallel for collapse(2) schedule(static)
+            for (int ix = 0; ix < nxl; ++ix) {
+                for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu);
+                     ++k_int) {
+                    const size_t k = static_cast<size_t>(k_int);
+                    const size_t cell_slot =
+                        static_cast<size_t>(ix) * Param::Nvmu + k;
+                    const size_t offset =
+                        static_cast<size_t>(ng + ix) * Param::Nvmu + k;
+                    f_low[cell_slot] =
+                        f_old[offset]
+                      - dt_dx *
+                        (low_flux_faces[
+                            static_cast<size_t>(ix + 1) * Param::Nvmu + k]
+                       - low_flux_faces[
+                            static_cast<size_t>(ix) * Param::Nvmu + k]);
+                }
             }
+
+            #pragma omp parallel for schedule(static)
+            for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu);
+                 ++k_int) {
+                const size_t k = static_cast<size_t>(k_int);
+                for (int iface = 0; iface <= nxl; ++iface) {
+                    const size_t face_slot =
+                        static_cast<size_t>(iface) * Param::Nvmu + k;
+                    antidiff_flux_faces[face_slot] =
+                        high_flux_faces[face_slot] - low_flux_faces[face_slot];
+                }
+                for (int ix = 0; ix < nxl; ++ix) {
+                    const size_t cell_slot =
+                        static_cast<size_t>(ix) * Param::Nvmu + k;
+                    const double left_anti =
+                        antidiff_flux_faces[
+                            static_cast<size_t>(ix) * Param::Nvmu + k];
+                    const double right_anti =
+                        antidiff_flux_faces[
+                            static_cast<size_t>(ix + 1) * Param::Nvmu + k];
+                    const double outgoing =
+                        dt_dx * (std::max(0.0, right_anti)
+                               + std::max(0.0, -left_anti));
+                    if (outgoing > 0.0) {
+                        limiter_cell[cell_slot] =
+                            std::min(1.0,
+                                     std::max(0.0, f_low[cell_slot]) /
+                                     outgoing);
+                    } else {
+                        limiter_cell[cell_slot] = 1.0;
+                    }
+                }
+            }
+
+            exchange_cell_limiter_edges(limiter_cell, nxl,
+                                        mpi_rank, mpi_size,
+                                        limiter_left_edge,
+                                        limiter_right_edge);
+
+            #pragma omp parallel for schedule(static)
+            for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu);
+                 ++k_int) {
+                const size_t k = static_cast<size_t>(k_int);
+                for (int iface = 0; iface <= nxl; ++iface) {
+                    const size_t face_slot =
+                        static_cast<size_t>(iface) * Param::Nvmu + k;
+                    const double anti = antidiff_flux_faces[face_slot];
+                    double alpha = 1.0;
+                    if (anti > 0.0) {
+                        if (iface == 0) {
+                            alpha = limiter_left_edge[k];
+                        } else {
+                            alpha =
+                                limiter_cell[
+                                    static_cast<size_t>(iface - 1)
+                                  * Param::Nvmu + k];
+                        }
+                    } else if (anti < 0.0) {
+                        if (iface == nxl) {
+                            alpha = limiter_right_edge[k];
+                        } else {
+                            alpha =
+                                limiter_cell[
+                                    static_cast<size_t>(iface)
+                                  * Param::Nvmu + k];
+                        }
+                    }
+                    flux_faces[face_slot] =
+                        low_flux_faces[face_slot] + alpha * anti;
+                }
+            }
+            close_periodic_face_values(flux_faces, nxl,
+                                       mpi_rank, mpi_size, 745);
 
             double local_num = 0.0;
             double local_den = 0.0;
