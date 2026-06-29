@@ -75,6 +75,11 @@ public:
                                 double E_src_in_step,
                                 double E_src_out_step,
                                 double E_balance_step,
+                                double x_limiter_active_fraction,
+                                double x_limiter_min_alpha,
+                                double bkg_energy_residual_step,
+                                double bkg_current_energy_max_abs_diff,
+                                double bkg_current_energy_E_dot_diff,
                                 double local_max_loss_u_high,
                                 double local_x_at_max_loss_u_high,
                                 double local_f_u_max_x,
@@ -97,7 +102,8 @@ public:
                                const Species& electrons,
                                const BeamPIC& beam,
                                const SpatialGrid& sg,
-                               int mpi_rank, int mpi_size);
+                               int mpi_rank, int mpi_size,
+                               const std::vector<double>* bkg_energy_current_face = 0);
 
     void write_px_distribution(double time,
                                const Species& sp,

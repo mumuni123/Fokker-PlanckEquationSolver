@@ -59,6 +59,12 @@ public:
     const std::vector<double>& last_energy_current_face_x() const {
         return last_energy_current_face_x_;
     }
+    double last_x_limiter_active_fraction() const {
+        return last_x_limiter_active_fraction_;
+    }
+    double last_x_limiter_min_alpha() const {
+        return last_x_limiter_min_alpha_;
+    }
 
 private:
     void exchange_ghosts_x(Species& sp, const SpatialGrid& sg,
@@ -91,6 +97,8 @@ private:
     double last_momentum_delta_mu_;
     double last_energy_delta_v_;
     double last_energy_delta_mu_;
+    double last_x_limiter_active_fraction_;
+    double last_x_limiter_min_alpha_;
     int last_nsub_v_;
     int last_nsub_mu_;
     bool step_diagnostics_enabled_;

@@ -270,6 +270,10 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                       << "KE_bkg_e[J/m2]  KE_beam[J/m2]  E_field[J/m2]  "
                       << "E_total[J/m2]  dKE_bkg[J/m2]  dKE_beam[J/m2]  "
                       << "dE_field[J/m2]  W_bkg_E[J/m2]  W_beam_E[J/m2]  "
+                      << "bkg_energy_residual_step[J/m2]  "
+                      << "max_abs_J_bkg_charge_minus_energy[A/m2]  "
+                      << "E_dot_J_bkg_charge_minus_energy[W/m2]  "
+                      << "x_limiter_active_fraction  x_limiter_min_alpha  "
                       << "u_mass_error  mu_mass_error  "
                       << "u_px_delta[kg/m/s/m2]  mu_px_delta[kg/m/s/m2]  "
                       << "u_energy_delta[J/m2]  mu_energy_delta[J/m2]  "
@@ -544,6 +548,11 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                                          double E_src_in_step,
                                          double E_src_out_step,
                                          double E_balance_step,
+                                         double x_limiter_active_fraction,
+                                         double x_limiter_min_alpha,
+                                         double bkg_energy_residual_step,
+                                         double bkg_current_energy_max_abs_diff,
+                                         double bkg_current_energy_E_dot_diff,
                                          double local_max_loss_u_high,
                                          double local_x_at_max_loss_u_high,
                                          double local_f_u_max_x,
@@ -599,7 +608,7 @@ void Diagnostics::write_step_diagnostics(int step, double time,
     const double local_field_energy = fields.total_energy();
     const double local_total_energy =
         local_bkg_ke + local_beam_ke + local_field_energy;
-    double local_energy[22] = {
+    double local_energy[23] = {
         local_bkg_ke,
         local_beam_ke,
         local_field_energy,
@@ -619,14 +628,15 @@ void Diagnostics::write_step_diagnostics(int step, double time,
         E_src_out_step,
         collision_energy_step,
         E_balance_step,
+        bkg_energy_residual_step,
         beam.cumulative_injected_energy(),
         beam.cumulative_outflow_energy(),
         cumulative_collision_energy_delta
     };
-    double global_energy[22] = {
+    double global_energy[23] = {
         0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
         0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     };
     double global_max_abs_Ex = 0.0;
     double global_x_at_max_abs_Ex = 0.0;
@@ -635,6 +645,8 @@ void Diagnostics::write_step_diagnostics(int step, double time,
     double global_N_bkg_e = 0.0;
     double global_N_beam_macro = 0.0;
     double global_N_beam_weighted = 0.0;
+    double global_bkg_current_energy_max_abs_diff = 0.0;
+    double global_bkg_current_energy_E_dot_diff = 0.0;
     double global_x_at_max_loss_u_high = 0.0;
     double global_f_u_max_x = 0.0;
     double global_integral_f_u_gt_8_x = 0.0;
@@ -669,7 +681,13 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                4, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(local_nsub, global_nsub, 4, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(local_losses, global_losses, 9, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(local_energy, global_energy, 22, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local_energy, global_energy, 23, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&bkg_current_energy_max_abs_diff,
+               &global_bkg_current_energy_max_abs_diff, 1,
+               MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&bkg_current_energy_E_dot_diff,
+               &global_bkg_current_energy_E_dot_diff, 1,
+               MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
     if (mpi_rank == 0) {
         const double current_ke_per_particle_eV =
@@ -717,6 +735,11 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << global_energy[6] << "  "
                   << global_energy[7] << "  "
                   << global_energy[8] << "  "
+                  << global_energy[19] << "  "
+                  << global_bkg_current_energy_max_abs_diff << "  "
+                  << global_bkg_current_energy_E_dot_diff << "  "
+                  << x_limiter_active_fraction << "  "
+                  << x_limiter_min_alpha << "  "
                   << global_energy[9] << "  "
                   << global_energy[10] << "  "
                   << global_energy[11] << "  "
@@ -727,9 +750,9 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << global_energy[16] << "  "
                   << global_energy[17] << "  "
                   << global_energy[18] << "  "
-                  << global_energy[19] << "  "
                   << global_energy[20] << "  "
                   << global_energy[21] << "  "
+                  << global_energy[22] << "  "
                   << initial_ke_per_particle_eV << "  "
                   << effective_T_eV << "  "
                   << global_x_at_max_loss_u_high << "  "
@@ -887,11 +910,14 @@ void Diagnostics::write_current_density(double time,
                                         const Species& electrons,
                                         const BeamPIC& beam,
                                         const SpatialGrid& sg,
-                                        int mpi_rank, int mpi_size)
+                                        int mpi_rank, int mpi_size,
+                                        const std::vector<double>* bkg_energy_current_face)
 {
     int nxl = sg.nx_local;
     const int local_face_count = nxl + ((mpi_rank == 0) ? 1 : 0);
     std::vector<double> local_J_bkg(static_cast<size_t>(local_face_count), 0.0);
+    std::vector<double> local_J_bkg_energy(
+        static_cast<size_t>(local_face_count), 0.0);
     std::vector<double> local_J_beam(static_cast<size_t>(local_face_count), 0.0);
     std::vector<double> local_J_total(static_cast<size_t>(local_face_count), 0.0);
     for (int i = 0; i < local_face_count; ++i) {
@@ -899,9 +925,13 @@ void Diagnostics::write_current_density(double time,
         const size_t slot = static_cast<size_t>(local_face);
         const double J_bkg = (slot < electrons.current_face_x.size())
                            ? electrons.current_face_x[slot] : 0.0;
+        const double J_bkg_energy =
+            (bkg_energy_current_face && slot < bkg_energy_current_face->size())
+            ? (*bkg_energy_current_face)[slot] : 0.0;
         const double J_beam = (slot < beam.current_face_x.size())
                             ? beam.current_face_x[slot] : 0.0;
         local_J_bkg[static_cast<size_t>(i)] = J_bkg;
+        local_J_bkg_energy[static_cast<size_t>(i)] = J_bkg_energy;
         local_J_beam[static_cast<size_t>(i)] = J_beam;
         local_J_total[static_cast<size_t>(i)] = J_bkg + J_beam;
     }
@@ -916,11 +946,15 @@ void Diagnostics::write_current_density(double time,
     }
 
     std::vector<double> global_J_bkg(sg.nx_global + 1);
+    std::vector<double> global_J_bkg_energy(sg.nx_global + 1);
     std::vector<double> global_J_beam(sg.nx_global + 1);
     std::vector<double> global_J_total(sg.nx_global + 1);
     MPI_Gatherv(local_J_bkg.data(), local_face_count, MPI_DOUBLE,
                 global_J_bkg.data(), counts.data(), displs.data(), MPI_DOUBLE,
                 0, MPI_COMM_WORLD);
+    MPI_Gatherv(local_J_bkg_energy.data(), local_face_count, MPI_DOUBLE,
+                global_J_bkg_energy.data(), counts.data(), displs.data(),
+                MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Gatherv(local_J_beam.data(), local_face_count, MPI_DOUBLE,
                 global_J_beam.data(), counts.data(), displs.data(), MPI_DOUBLE,
                 0, MPI_COMM_WORLD);
@@ -934,11 +968,15 @@ void Diagnostics::write_current_density(double time,
               << snapshot_count << ".dat";
         std::ofstream out(fname.str().c_str());
         out << "# time[fs] = " << time / Const::femto << "\n";
-        out << "# x_face[um]  J_bkg_face[A/m2]  J_beam_face[A/m2]  J_total_face[A/m2]\n";
+        out << "# x_face[um]  J_bkg_face[A/m2]  "
+            << "J_bkg_energy_face[A/m2]  J_bkg_charge_minus_energy[A/m2]  "
+            << "J_beam_face[A/m2]  J_total_face[A/m2]\n";
         out << std::scientific << std::setprecision(8);
         for (int i = 0; i <= sg.nx_global; ++i) {
             out << i * sg.dx / Const::micro
                 << "  " << global_J_bkg[i]
+                << "  " << global_J_bkg_energy[i]
+                << "  " << global_J_bkg[i] - global_J_bkg_energy[i]
                 << "  " << global_J_beam[i]
                 << "  " << global_J_total[i] << "\n";
         }

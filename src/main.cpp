@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <mpi.h>
 #include <omp.h>
 #include <vector>
@@ -116,20 +117,48 @@ double integrate_ampere_face_work(const std::vector<double>& current_face,
     return work;
 }
 
-double integrate_static_face_work(const std::vector<double>& current_face,
-                                  const EMFields& fields,
-                                  const SpatialGrid& sg,
-                                  double dt)
+double global_sum(double local_value)
 {
-    double work = 0.0;
-    const size_t unique_faces = static_cast<size_t>(sg.nx_local);
-    const size_t n =
-        std::min(unique_faces, std::min(current_face.size(),
-                                        fields.Ex_face.size()));
+    double global_value = 0.0;
+    MPI_Allreduce(&local_value, &global_value, 1, MPI_DOUBLE,
+                  MPI_SUM, MPI_COMM_WORLD);
+    return global_value;
+}
+
+void accumulate_scaled_face_current(std::vector<double>& target,
+                                    const std::vector<double>& source,
+                                    double scale)
+{
+    const size_t n = std::min(target.size(), source.size());
     for (size_t iface = 0; iface < n; ++iface) {
-        work += current_face[iface] * fields.Ex_face[iface] * sg.dx * dt;
+        target[iface] += scale * source[iface];
     }
-    return work;
+}
+
+void compare_background_current_faces(
+    const std::vector<double>& charge_current_face,
+    const std::vector<double>& energy_current_face,
+    const std::vector<double>& ex_face_before,
+    const EMFields& fields,
+    const SpatialGrid& sg,
+    double& max_abs_difference,
+    double& e_dot_difference)
+{
+    max_abs_difference = 0.0;
+    e_dot_difference = 0.0;
+    const size_t n = std::min(static_cast<size_t>(sg.nx_local),
+                              std::min(charge_current_face.size(),
+                                       std::min(energy_current_face.size(),
+                                                std::min(ex_face_before.size(),
+                                                         fields.Ex_face.size()))));
+    for (size_t iface = 0; iface < n; ++iface) {
+        const double diff =
+            charge_current_face[iface] - energy_current_face[iface];
+        const double ex_mid =
+            0.5 * (ex_face_before[iface] + fields.Ex_face[iface]);
+        max_abs_difference = std::max(max_abs_difference, std::fabs(diff));
+        e_dot_difference += ex_mid * diff * sg.dx;
+    }
 }
 
 void set_midpoint_face_field(EMFields& fields,
@@ -162,11 +191,13 @@ void write_snapshot(Diagnostics& diag,
                     const SpatialGrid& sgrid,
                     int mpi_rank,
                     int mpi_size,
-                    bool write_full_fe)
+                    bool write_full_fe,
+                    const std::vector<double>* bkg_energy_current_face = 0)
 {
     fields.compute_potential(mpi_rank, mpi_size);
     diag.write_fields(time, fields, sgrid, mpi_rank, mpi_size);
-    diag.write_current_density(time, bkg_e, beam, sgrid, mpi_rank, mpi_size);
+    diag.write_current_density(time, bkg_e, beam, sgrid, mpi_rank, mpi_size,
+                               bkg_energy_current_face);
     diag.write_density_profile(time, bkg_e, beam.density, ion_density_profile,
                                sgrid, mpi_rank, mpi_size);
     diag.write_px_distribution(time, bkg_e, mpi_rank, mpi_size);
@@ -213,7 +244,7 @@ int main(int argc, char** argv)
         printf("Electron momentum domain: 0 <= u <= %.3f, vx = c u mu / sqrt(1+u^2)\n",
                Param::momentum_umax);
         printf("Spatial boundary: periodic in x for background electrons and electrostatic field; beam is open\n");
-        printf("Electrostatic update: dE/dt = -(J_total - <J_total>)/eps0 with <E> = 0\n");
+        printf("Electrostatic update: face-centered dE/dt = -J_total/eps0; zero mode evolves explicitly\n");
         printf("Field solver: %s\n", field_solver_name());
         printf("Fixed ions: uniform Z*n_i = %.3e /m^3\n", Param::dens);
         printf("Background electrons: periodic Vlasov transport, T_e = %.1f eV\n",
@@ -293,12 +324,27 @@ int main(int argc, char** argv)
     diag.write_scalars(0.0, 0, bkg_e, beam, fields,
                        cumulative_collision_energy_delta,
                        mpi_rank, mpi_size);
+    std::vector<double> latest_bkg_energy_current_face(
+        static_cast<size_t>(sgrid.nx_local + 1), 0.0);
     write_snapshot(diag, 0.0, bkg_e, beam, fields, ion_density_profile,
-                   sgrid, mpi_rank, mpi_size, config.enable_full_fe_output);
+                   sgrid, mpi_rank, mpi_size, config.enable_full_fe_output,
+                   &latest_bkg_energy_current_face);
 
     double next_snapshot = Param::dt_snapshot;
     int stdout_freq = 1000;
     int last_snapshot_step = 0;
+    double cumulative_bkg_energy_residual = 0.0;
+    std::ofstream bkg_energy_monitor;
+    if (mpi_rank == 0) {
+        bkg_energy_monitor.open("output/bkg_energy_monitor.dat");
+        bkg_energy_monitor
+            << "# step  time[fs]  x_limiter_active_fraction  "
+            << "x_limiter_min_alpha  dKE_bkg_plus_W_bkg_E[J/m2]  "
+            << "relative_residual_step  cumulative_relative_residual  "
+            << "max_abs_J_bkg_charge_minus_energy[A/m2]  "
+            << "E_dot_J_bkg_charge_minus_energy[W/m2]\n";
+        bkg_energy_monitor << std::scientific;
+    }
     for (int step = 1; step <= nsteps; ++step) {
         double time = step * dt;
         const double time_start = time - dt;
@@ -339,9 +385,18 @@ int main(int argc, char** argv)
         double integral_f_u_gt_8_x_step = 0.0;
         double beam_push_ke_before = 0.0;
         double bkg_ke_step_start = 0.0;
+        double global_bkg_ke_step_start = 0.0;
         double beam_ke_step_start = 0.0;
         double field_energy_step_start = 0.0;
-        std::vector<double> ex_face_before_ampere;
+        double x_limiter_active_fraction_step = 0.0;
+        double x_limiter_min_alpha_step = 1.0;
+        double local_bkg_energy_residual_step = 0.0;
+        double bkg_energy_residual_step = 0.0;
+        double bkg_energy_relative_residual_step = 0.0;
+        double local_bkg_current_energy_max_abs_diff = 0.0;
+        double local_bkg_current_energy_E_dot_diff = 0.0;
+        double bkg_current_energy_max_abs_diff = 0.0;
+        double bkg_current_energy_E_dot_diff = 0.0;
         vlasov.set_step_diagnostics_enabled(collect_step_diagnostics);
 
         const Species bkg_step_start = bkg_e;
@@ -359,8 +414,9 @@ int main(int argc, char** argv)
                           &bkg_stage_reference_N, 1,
                           MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
         }
+        bkg_ke_step_start = bkg_e.total_kinetic_energy();
+        global_bkg_ke_step_start = global_sum(bkg_ke_step_start);
         if (collect_step_diagnostics) {
-            bkg_ke_step_start = bkg_e.total_kinetic_energy();
             beam_ke_step_start = beam.total_kinetic_energy();
             field_energy_step_start = fields.total_energy();
         }
@@ -389,6 +445,10 @@ int main(int argc, char** argv)
             static_cast<size_t>(sgrid.nx_local), 0.0);
         std::vector<double> current_beam_trial_next(
             static_cast<size_t>(sgrid.nx_local), 0.0);
+        std::vector<double> bkg_energy_current_trial(
+            static_cast<size_t>(sgrid.nx_local + 1), 0.0);
+        std::vector<double> accepted_bkg_energy_current_face =
+            latest_bkg_energy_current_face;
         bool have_previous_current_trial = false;
         bool coupled_converged = false;
         double final_coupled_error = 0.0;
@@ -422,6 +482,8 @@ int main(int argc, char** argv)
             x_at_max_loss_u_high_step = 0.0;
             f_u_max_x_step = 0.0;
             integral_f_u_gt_8_x_step = 0.0;
+            std::fill(bkg_energy_current_trial.begin(),
+                      bkg_energy_current_trial.end(), 0.0);
 
             beam.begin_step(sgrid, dt);
 
@@ -456,10 +518,11 @@ int main(int argc, char** argv)
             v_mass_error_step += vlasov.last_mass_error_v();
             v_momentum_delta_step += vlasov.last_momentum_delta_v();
             if (collect_step_diagnostics) {
-                v_energy_delta_step +=
-                    integrate_static_face_work(vlasov.last_energy_current_face_x(),
-                                               fields, sgrid, 0.5 * dt);
+                v_energy_delta_step += vlasov.last_energy_delta_v();
             }
+            accumulate_scaled_face_current(
+                bkg_energy_current_trial,
+                vlasov.last_energy_current_face_x(), 0.5);
             abort_if_vmax_loss(vlasov, step, time, "midpoint_v_half_1",
                                mpi_rank);
 
@@ -527,10 +590,11 @@ int main(int argc, char** argv)
             v_mass_error_step += vlasov.last_mass_error_v();
             v_momentum_delta_step += vlasov.last_momentum_delta_v();
             if (collect_step_diagnostics) {
-                v_energy_delta_step +=
-                    integrate_static_face_work(vlasov.last_energy_current_face_x(),
-                                               fields, sgrid, 0.5 * dt);
+                v_energy_delta_step += vlasov.last_energy_delta_v();
             }
+            accumulate_scaled_face_current(
+                bkg_energy_current_trial,
+                vlasov.last_energy_current_face_x(), 0.5);
             abort_if_vmax_loss(vlasov, step, time, "midpoint_v_half_2",
                                mpi_rank);
 
@@ -551,18 +615,13 @@ int main(int argc, char** argv)
 
             bkg_e.compute_moments();
             fields = fields_step_start;
-            if (collect_step_diagnostics) {
-                ex_face_before_ampere = copy_local_ex_face(fields, sgrid);
-            }
             fields.advance_ampere_face(bkg_e.current_face_x,
                                        beam.current_face_x,
                                        dt, mpi_rank, mpi_size);
-            if (collect_step_diagnostics) {
-                W_bkg_E =
-                    integrate_ampere_face_work(bkg_e.current_face_x,
-                                               ex_face_before_ampere,
-                                               fields, sgrid, dt);
-            }
+            W_bkg_E =
+                integrate_ampere_face_work(bkg_e.current_face_x,
+                                           ex_face_step_start,
+                                           fields, sgrid, dt);
 
             for (int iface = 0; iface < sgrid.nx_local; ++iface) {
                 const size_t slot = static_cast<size_t>(iface);
@@ -577,14 +636,14 @@ int main(int argc, char** argv)
                 current_trial_next[slot] = jbkg + jbeam;
             }
 
-            const std::vector<double> ex_face_new =
-                copy_local_ex_face(fields, sgrid);
-            ex_mid_next = ex_face_new;
             const size_t nface =
-                std::min(ex_mid_next.size(), ex_face_step_start.size());
+                std::min(std::min(ex_mid_next.size(),
+                                  ex_face_step_start.size()),
+                         fields.Ex_face.size());
             for (size_t iface = 0; iface < nface; ++iface) {
                 ex_mid_next[iface] =
-                    0.5 * (ex_face_step_start[iface] + ex_face_new[iface]);
+                    0.5 * (ex_face_step_start[iface]
+                         + fields.Ex_face[iface]);
             }
 
             double local_max_delta_ex = 0.0;
@@ -605,9 +664,6 @@ int main(int argc, char** argv)
             double local_max_delta_j_total = 0.0;
             double local_max_delta_j_bkg = 0.0;
             double local_max_delta_j_beam = 0.0;
-            int local_max_delta_j_total_face = 0;
-            int local_max_delta_j_bkg_face = 0;
-            int local_max_delta_j_beam_face = 0;
             if (have_previous_current_trial) {
                 for (size_t iface = 0; iface < current_trial_next.size();
                      ++iface) {
@@ -622,18 +678,12 @@ int main(int argc, char** argv)
                                 - current_beam_trial_prev[iface]);
                     if (delta_total > local_max_delta_j_total) {
                         local_max_delta_j_total = delta_total;
-                        local_max_delta_j_total_face =
-                            static_cast<int>(iface);
                     }
                     if (delta_bkg > local_max_delta_j_bkg) {
                         local_max_delta_j_bkg = delta_bkg;
-                        local_max_delta_j_bkg_face =
-                            static_cast<int>(iface);
                     }
                     if (delta_beam > local_max_delta_j_beam) {
                         local_max_delta_j_beam = delta_beam;
-                        local_max_delta_j_beam_face =
-                            static_cast<int>(iface);
                     }
                 }
             }
@@ -687,10 +737,6 @@ int main(int argc, char** argv)
             const double global_max_delta_j_total = global_iter_errors[5];
             const double global_j_total_error =
                 global_max_delta_j_total / std::max(1.0, global_current_scale);
-            const double global_j_bkg_error =
-                global_iter_errors[6] / std::max(1.0, global_current_scale);
-            const double global_j_beam_error =
-                global_iter_errors[7] / std::max(1.0, global_current_scale);
             const double global_field_convergence_ratio =
                 std::min(global_field_error / field_tol,
                          global_max_delta_ex /
@@ -701,129 +747,11 @@ int main(int argc, char** argv)
                            global_max_delta_j_total /
                            std::max(1.0, global_j_abs_tol))
                 : std::max(1.0, global_field_convergence_ratio);
-
-            const int total_global_face =
-                sgrid.ix_start + local_max_delta_j_total_face;
-            const int bkg_global_face =
-                sgrid.ix_start + local_max_delta_j_bkg_face;
-            const int beam_global_face =
-                sgrid.ix_start + local_max_delta_j_beam_face;
-            const double local_location_values[12] = {
-                local_max_delta_j_total,
-                static_cast<double>(local_max_delta_j_total_face),
-                static_cast<double>(total_global_face),
-                total_global_face * sgrid.dx,
-                local_max_delta_j_bkg,
-                static_cast<double>(local_max_delta_j_bkg_face),
-                static_cast<double>(bkg_global_face),
-                bkg_global_face * sgrid.dx,
-                local_max_delta_j_beam,
-                static_cast<double>(local_max_delta_j_beam_face),
-                static_cast<double>(beam_global_face),
-                beam_global_face * sgrid.dx
-            };
-            std::vector<double> gathered_location_values;
-            if (mpi_rank == 0) {
-                gathered_location_values.assign(static_cast<size_t>(mpi_size) * 12,
-                                                0.0);
-            }
-            MPI_Gather(local_location_values, 12, MPI_DOUBLE,
-                       mpi_rank == 0 ? gathered_location_values.data() : NULL,
-                       12, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
-            if (mpi_rank == 0) {
-                double global_delta_j_total = -1.0;
-                int global_delta_j_total_rank = 0;
-                int global_delta_j_total_face = 0;
-                int global_delta_j_total_global_face = 0;
-                double global_delta_j_total_x = 0.0;
-                double global_delta_j_bkg = -1.0;
-                int global_delta_j_bkg_rank = 0;
-                int global_delta_j_bkg_face = 0;
-                int global_delta_j_bkg_global_face = 0;
-                double global_delta_j_bkg_x = 0.0;
-                double global_delta_j_beam = -1.0;
-                int global_delta_j_beam_rank = 0;
-                int global_delta_j_beam_face = 0;
-                int global_delta_j_beam_global_face = 0;
-                double global_delta_j_beam_x = 0.0;
-                for (int rank = 0; rank < mpi_size; ++rank) {
-                    const size_t base = static_cast<size_t>(rank) * 12;
-                    if (gathered_location_values[base] >
-                        global_delta_j_total) {
-                        global_delta_j_total =
-                            gathered_location_values[base];
-                        global_delta_j_total_rank = rank;
-                        global_delta_j_total_face =
-                            static_cast<int>(gathered_location_values[base + 1]);
-                        global_delta_j_total_global_face =
-                            static_cast<int>(gathered_location_values[base + 2]);
-                        global_delta_j_total_x =
-                            gathered_location_values[base + 3];
-                    }
-                    if (gathered_location_values[base + 4] >
-                        global_delta_j_bkg) {
-                        global_delta_j_bkg =
-                            gathered_location_values[base + 4];
-                        global_delta_j_bkg_rank = rank;
-                        global_delta_j_bkg_face =
-                            static_cast<int>(gathered_location_values[base + 5]);
-                        global_delta_j_bkg_global_face =
-                            static_cast<int>(gathered_location_values[base + 6]);
-                        global_delta_j_bkg_x =
-                            gathered_location_values[base + 7];
-                    }
-                    if (gathered_location_values[base + 8] >
-                        global_delta_j_beam) {
-                        global_delta_j_beam =
-                            gathered_location_values[base + 8];
-                        global_delta_j_beam_rank = rank;
-                        global_delta_j_beam_face =
-                            static_cast<int>(gathered_location_values[base + 9]);
-                        global_delta_j_beam_global_face =
-                            static_cast<int>(gathered_location_values[base + 10]);
-                        global_delta_j_beam_x =
-                            gathered_location_values[base + 11];
-                    }
-                }
-                std::printf("coupled_iter step=%d iter=%d "
-                            "field_error=%.6e J_total_error=%.6e "
-                            "J_bkg_error=%.6e J_beam_error=%.6e "
-                            "E_abs_tol=%.6e max_delta_Ex=%.6e "
-                            "J_abs_tol=%.6e current_scale=%.6e "
-                            "max_abs_Ex_mid=%.6e max_abs_J_bkg=%.6e "
-                            "max_abs_J_beam=%.6e "
-                            "max_delta_J_total_face=%.6e "
-                            "total_rank=%d total_face=%d "
-                            "total_global_face=%d total_x=%.6e "
-                            "max_delta_J_bkg_face=%.6e "
-                            "bkg_rank=%d bkg_face=%d bkg_global_face=%d "
-                            "bkg_x=%.6e "
-                            "max_delta_J_beam_face=%.6e "
-                            "beam_rank=%d beam_face=%d beam_global_face=%d "
-                            "beam_x=%.6e omega=%.3f\n",
-                            step, coupled_iter + 1,
-                            global_field_error, global_j_total_error,
-                            global_j_bkg_error, global_j_beam_error,
-                            global_e_abs_tol, global_max_delta_ex,
-                            global_j_abs_tol, global_current_scale,
-                            global_iter_errors[1], global_iter_errors[3],
-                            global_iter_errors[4],
-                            global_delta_j_total,
-                            global_delta_j_total_rank,
-                            global_delta_j_total_face,
-                            global_delta_j_total_global_face,
-                            global_delta_j_total_x,
-                            global_delta_j_bkg, global_delta_j_bkg_rank,
-                            global_delta_j_bkg_face,
-                            global_delta_j_bkg_global_face,
-                            global_delta_j_bkg_x,
-                            global_delta_j_beam, global_delta_j_beam_rank,
-                            global_delta_j_beam_face,
-                            global_delta_j_beam_global_face,
-                            global_delta_j_beam_x, midpoint_omega);
-                std::fflush(stdout);
-            }
+            const bool field_current_converged =
+                have_previous_current_trial &&
+                (global_field_error < field_tol ||
+                 global_max_delta_ex < global_e_abs_tol) &&
+                global_max_delta_j_total < global_j_abs_tol;
 
             final_coupled_error = global_normalized_error;
             final_field_error = global_field_error;
@@ -831,14 +759,16 @@ int main(int argc, char** argv)
             final_max_delta_ex = global_max_delta_ex;
             final_e_abs_tol = global_e_abs_tol;
             final_j_abs_tol = global_j_abs_tol;
-            if (have_previous_current_trial &&
-                (global_field_error < field_tol ||
-                 global_max_delta_ex < global_e_abs_tol) &&
-                global_max_delta_j_total < global_j_abs_tol) {
+            if (field_current_converged) {
                 coupled_converged = true;
                 accepted_bkg = bkg_e;
                 accepted_beam = beam;
                 accepted_fields = fields;
+                accepted_bkg_energy_current_face = bkg_energy_current_trial;
+                x_limiter_active_fraction_step =
+                    vlasov.last_x_limiter_active_fraction();
+                x_limiter_min_alpha_step =
+                    vlasov.last_x_limiter_min_alpha();
                 break;
             }
             if (previous_normalized_error > 0.0) {
@@ -884,8 +814,7 @@ int main(int argc, char** argv)
                              step, time, final_coupled_error,
                              final_field_error, final_max_delta_ex,
                              final_e_abs_tol, final_current_error,
-                             final_j_abs_tol,
-                             max_coupled_iters);
+                             final_j_abs_tol, max_coupled_iters);
             }
             MPI_Abort(MPI_COMM_WORLD, 8);
         }
@@ -893,8 +822,60 @@ int main(int argc, char** argv)
         bkg_e = accepted_bkg;
         beam = accepted_beam;
         fields = accepted_fields;
+        latest_bkg_energy_current_face = accepted_bkg_energy_current_face;
         moments_current = true;
 
+        compare_background_current_faces(
+            bkg_e.current_face_x, latest_bkg_energy_current_face,
+            ex_face_step_start, fields, sgrid,
+            local_bkg_current_energy_max_abs_diff,
+            local_bkg_current_energy_E_dot_diff);
+        MPI_Allreduce(&local_bkg_current_energy_max_abs_diff,
+                      &bkg_current_energy_max_abs_diff, 1,
+                      MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+
+        const double bkg_ke_step_end_for_residual =
+            bkg_e.total_kinetic_energy();
+        local_bkg_energy_residual_step =
+            (bkg_ke_step_end_for_residual - bkg_ke_step_start) + W_bkg_E;
+        const double local_bkg_energy_values[4] = {
+            bkg_ke_step_end_for_residual,
+            W_bkg_E,
+            local_bkg_energy_residual_step,
+            local_bkg_current_energy_E_dot_diff
+        };
+        double global_bkg_energy_values[4] = {0.0, 0.0, 0.0, 0.0};
+        MPI_Allreduce(local_bkg_energy_values, global_bkg_energy_values, 4,
+                      MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        const double global_dke_bkg_step =
+            global_bkg_energy_values[0] - global_bkg_ke_step_start;
+        const double global_W_bkg_E = global_bkg_energy_values[1];
+        bkg_energy_residual_step = global_bkg_energy_values[2];
+        bkg_current_energy_E_dot_diff = global_bkg_energy_values[3];
+        const double bkg_energy_residual_den =
+            std::max(std::max(std::fabs(global_dke_bkg_step),
+                              std::fabs(global_W_bkg_E)),
+                     std::max(1.0,
+                              1.0e-12 *
+                              std::fabs(global_bkg_ke_step_start)));
+        bkg_energy_relative_residual_step =
+            std::fabs(bkg_energy_residual_step) /
+            bkg_energy_residual_den;
+        cumulative_bkg_energy_residual +=
+            bkg_energy_relative_residual_step;
+
+        if (mpi_rank == 0) {
+            bkg_energy_monitor << step << "  "
+                               << time / Const::femto << "  "
+                               << x_limiter_active_fraction_step << "  "
+                               << x_limiter_min_alpha_step << "  "
+                               << bkg_energy_residual_step << "  "
+                               << bkg_energy_relative_residual_step << "  "
+                               << cumulative_bkg_energy_residual << "  "
+                               << bkg_current_energy_max_abs_diff << "  "
+                               << bkg_current_energy_E_dot_diff << "\n";
+            bkg_energy_monitor.flush();
+        }
         if (bkg_e.collisions_enabled) {
             trace_progress(config, mpi_rank, step, "before collisions");
             collision_energy_step +=
@@ -958,6 +939,11 @@ int main(int argc, char** argv)
                                         E_src_in_step,
                                         E_src_out_step,
                                         E_balance_step,
+                                        x_limiter_active_fraction_step,
+                                        x_limiter_min_alpha_step,
+                                        local_bkg_energy_residual_step,
+                                        local_bkg_current_energy_max_abs_diff,
+                                        local_bkg_current_energy_E_dot_diff,
                                         max_loss_u_high_step,
                                         x_at_max_loss_u_high_step,
                                         f_u_max_x_step,
@@ -975,7 +961,9 @@ int main(int argc, char** argv)
 
         if (time >= next_snapshot) {
             write_snapshot(diag, time, bkg_e, beam, fields, ion_density_profile,
-                           sgrid, mpi_rank, mpi_size, config.enable_full_fe_output);
+                           sgrid, mpi_rank, mpi_size,
+                           config.enable_full_fe_output,
+                           &latest_bkg_energy_current_face);
             last_snapshot_step = step;
             next_snapshot += Param::dt_snapshot;
         }
@@ -995,7 +983,8 @@ int main(int argc, char** argv)
                        mpi_rank, mpi_size);
     if (last_snapshot_step != nsteps) {
         write_snapshot(diag, Param::t_end, bkg_e, beam, fields, ion_density_profile,
-                       sgrid, mpi_rank, mpi_size, config.enable_full_fe_output);
+                       sgrid, mpi_rank, mpi_size, config.enable_full_fe_output,
+                       &latest_bkg_energy_current_face);
     }
 
     if (mpi_rank == 0) {
