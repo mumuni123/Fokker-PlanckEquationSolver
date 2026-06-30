@@ -356,6 +356,31 @@ void EMFields::advance_ampere_face(const std::vector<double>& background_current
     update_cell_ex_from_faces(*this, mpi_rank, mpi_size);
 }
 
+void EMFields::advance_ampere_face_from_midpoint_current(
+    const std::vector<double>& total_current_face_mid,
+    double dt,
+    int mpi_rank,
+    int mpi_size)
+{
+    const int nxl = nx_total - 2 * Param::Nghost;
+    if (dt <= 0.0 || nxl <= 0) return;
+    if (Ex_face.size() != static_cast<size_t>(nxl + 1)) {
+        Ex_face.assign(static_cast<size_t>(nxl + 1), 0.0);
+    }
+
+    const double ampere_scale = -dt / Const::eps0;
+    for (int iface = 0; iface < nxl; ++iface) {
+        const size_t slot = static_cast<size_t>(iface);
+        const double j_mid =
+            (slot < total_current_face_mid.size())
+            ? total_current_face_mid[slot] : 0.0;
+        Ex_face[slot] += ampere_scale * j_mid;
+    }
+
+    close_periodic_right_face(Ex_face, nxl, mpi_rank, mpi_size, 306);
+    update_cell_ex_from_faces(*this, mpi_rank, mpi_size);
+}
+
 void EMFields::sync_cell_ex_from_faces(int mpi_rank, int mpi_size)
 {
     const int nxl = nx_total - 2 * Param::Nghost;

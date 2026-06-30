@@ -271,8 +271,18 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                       << "E_total[J/m2]  dKE_bkg[J/m2]  dKE_beam[J/m2]  "
                       << "dE_field[J/m2]  W_bkg_E[J/m2]  W_beam_E[J/m2]  "
                       << "bkg_energy_residual_step[J/m2]  "
-                      << "max_abs_J_bkg_charge_minus_energy[A/m2]  "
-                      << "E_dot_J_bkg_charge_minus_energy[W/m2]  "
+                      << "max_abs_J_bkg_charge[A/m2]  "
+                      << "max_abs_J_bkg_energy_diagnostic[A/m2]  "
+                      << "max_abs_J_bkg_ampere[A/m2]  "
+                      << "max_abs_J_bkg_charge_minus_ampere[A/m2]  "
+                      << "max_abs_J_bkg_energy_minus_ampere[A/m2]  "
+                      << "E_dot_J_bkg_charge[W/m2]  "
+                      << "E_dot_J_bkg_energy_diagnostic[W/m2]  "
+                      << "E_dot_J_bkg_ampere[W/m2]  "
+                      << "residual_if_charge_current[J/m2]  "
+                      << "residual_if_ampere_current[J/m2]  "
+                      << "coupled_iter  coupled_residual_E  "
+                      << "coupled_residual_J_bkg  coupled_residual_J_beam  "
                       << "x_limiter_active_fraction  x_limiter_min_alpha  "
                       << "u_mass_error  mu_mass_error  "
                       << "u_px_delta[kg/m/s/m2]  mu_px_delta[kg/m/s/m2]  "
@@ -551,8 +561,20 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                                          double x_limiter_active_fraction,
                                          double x_limiter_min_alpha,
                                          double bkg_energy_residual_step,
-                                         double bkg_current_energy_max_abs_diff,
-                                         double bkg_current_energy_E_dot_diff,
+                                         double bkg_current_max_abs_charge,
+                                         double bkg_current_max_abs_energy,
+                                         double bkg_current_max_abs_ampere,
+                                         double bkg_current_max_abs_charge_minus_ampere,
+                                         double bkg_current_max_abs_energy_minus_ampere,
+                                         double bkg_current_e_dot_charge,
+                                         double bkg_current_e_dot_energy,
+                                         double bkg_current_e_dot_ampere,
+                                         double bkg_residual_if_charge_current,
+                                         double bkg_residual_if_ampere_current,
+                                         int coupled_iter,
+                                         double coupled_residual_E,
+                                         double coupled_residual_J_bkg,
+                                         double coupled_residual_J_beam,
                                          double local_max_loss_u_high,
                                          double local_x_at_max_loss_u_high,
                                          double local_f_u_max_x,
@@ -608,7 +630,7 @@ void Diagnostics::write_step_diagnostics(int step, double time,
     const double local_field_energy = fields.total_energy();
     const double local_total_energy =
         local_bkg_ke + local_beam_ke + local_field_energy;
-    double local_energy[23] = {
+    double local_energy[28] = {
         local_bkg_ke,
         local_beam_ke,
         local_field_energy,
@@ -629,14 +651,20 @@ void Diagnostics::write_step_diagnostics(int step, double time,
         collision_energy_step,
         E_balance_step,
         bkg_energy_residual_step,
+        bkg_current_e_dot_charge,
+        bkg_current_e_dot_energy,
+        bkg_current_e_dot_ampere,
+        bkg_residual_if_charge_current,
+        bkg_residual_if_ampere_current,
         beam.cumulative_injected_energy(),
         beam.cumulative_outflow_energy(),
         cumulative_collision_energy_delta
     };
-    double global_energy[23] = {
+    double global_energy[28] = {
         0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
         0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0
     };
     double global_max_abs_Ex = 0.0;
     double global_x_at_max_abs_Ex = 0.0;
@@ -645,8 +673,16 @@ void Diagnostics::write_step_diagnostics(int step, double time,
     double global_N_bkg_e = 0.0;
     double global_N_beam_macro = 0.0;
     double global_N_beam_weighted = 0.0;
-    double global_bkg_current_energy_max_abs_diff = 0.0;
-    double global_bkg_current_energy_E_dot_diff = 0.0;
+    double global_bkg_current_max_values[5] = {
+        0.0, 0.0, 0.0, 0.0, 0.0
+    };
+    double local_coupled_values[4] = {
+        static_cast<double>(coupled_iter),
+        coupled_residual_E,
+        coupled_residual_J_bkg,
+        coupled_residual_J_beam
+    };
+    double global_coupled_values[4] = {0.0, 0.0, 0.0, 0.0};
     double global_x_at_max_loss_u_high = 0.0;
     double global_f_u_max_x = 0.0;
     double global_integral_f_u_gt_8_x = 0.0;
@@ -681,13 +717,18 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                4, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(local_nsub, global_nsub, 4, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(local_losses, global_losses, 9, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(local_energy, global_energy, 23, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&bkg_current_energy_max_abs_diff,
-               &global_bkg_current_energy_max_abs_diff, 1,
-               MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&bkg_current_energy_E_dot_diff,
-               &global_bkg_current_energy_E_dot_diff, 1,
-               MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local_energy, global_energy, 28, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    double local_bkg_current_max_values[5] = {
+        bkg_current_max_abs_charge,
+        bkg_current_max_abs_energy,
+        bkg_current_max_abs_ampere,
+        bkg_current_max_abs_charge_minus_ampere,
+        bkg_current_max_abs_energy_minus_ampere
+    };
+    MPI_Reduce(local_bkg_current_max_values, global_bkg_current_max_values,
+               5, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local_coupled_values, global_coupled_values,
+               4, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (mpi_rank == 0) {
         const double current_ke_per_particle_eV =
@@ -736,8 +777,20 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << global_energy[7] << "  "
                   << global_energy[8] << "  "
                   << global_energy[19] << "  "
-                  << global_bkg_current_energy_max_abs_diff << "  "
-                  << global_bkg_current_energy_E_dot_diff << "  "
+                  << global_bkg_current_max_values[0] << "  "
+                  << global_bkg_current_max_values[1] << "  "
+                  << global_bkg_current_max_values[2] << "  "
+                  << global_bkg_current_max_values[3] << "  "
+                  << global_bkg_current_max_values[4] << "  "
+                  << global_energy[20] << "  "
+                  << global_energy[21] << "  "
+                  << global_energy[22] << "  "
+                  << global_energy[23] << "  "
+                  << global_energy[24] << "  "
+                  << static_cast<int>(global_coupled_values[0]) << "  "
+                  << global_coupled_values[1] << "  "
+                  << global_coupled_values[2] << "  "
+                  << global_coupled_values[3] << "  "
                   << x_limiter_active_fraction << "  "
                   << x_limiter_min_alpha << "  "
                   << global_energy[9] << "  "
@@ -750,9 +803,9 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << global_energy[16] << "  "
                   << global_energy[17] << "  "
                   << global_energy[18] << "  "
-                  << global_energy[20] << "  "
-                  << global_energy[21] << "  "
-                  << global_energy[22] << "  "
+                  << global_energy[25] << "  "
+                  << global_energy[26] << "  "
+                  << global_energy[27] << "  "
                   << initial_ke_per_particle_eV << "  "
                   << effective_T_eV << "  "
                   << global_x_at_max_loss_u_high << "  "
@@ -911,29 +964,34 @@ void Diagnostics::write_current_density(double time,
                                         const BeamPIC& beam,
                                         const SpatialGrid& sg,
                                         int mpi_rank, int mpi_size,
-                                        const std::vector<double>* bkg_energy_current_face)
+                                        const std::vector<double>* bkg_energy_current_face,
+                                        const std::vector<double>* bkg_ampere_current_face)
 {
     int nxl = sg.nx_local;
     const int local_face_count = nxl + ((mpi_rank == 0) ? 1 : 0);
-    std::vector<double> local_J_bkg(static_cast<size_t>(local_face_count), 0.0);
-    std::vector<double> local_J_bkg_energy(
-        static_cast<size_t>(local_face_count), 0.0);
-    std::vector<double> local_J_beam(static_cast<size_t>(local_face_count), 0.0);
-    std::vector<double> local_J_total(static_cast<size_t>(local_face_count), 0.0);
+    const int ncomp = 6;
+    std::vector<double> local_J(
+        static_cast<size_t>(local_face_count) * ncomp, 0.0);
     for (int i = 0; i < local_face_count; ++i) {
         const int local_face = i + ((mpi_rank == 0) ? 0 : 1);
         const size_t slot = static_cast<size_t>(local_face);
+        const size_t base = static_cast<size_t>(i) * ncomp;
         const double J_bkg = (slot < electrons.current_face_x.size())
                            ? electrons.current_face_x[slot] : 0.0;
         const double J_bkg_energy =
             (bkg_energy_current_face && slot < bkg_energy_current_face->size())
             ? (*bkg_energy_current_face)[slot] : 0.0;
+        const double J_bkg_ampere =
+            (bkg_ampere_current_face && slot < bkg_ampere_current_face->size())
+            ? (*bkg_ampere_current_face)[slot] : J_bkg;
         const double J_beam = (slot < beam.current_face_x.size())
                             ? beam.current_face_x[slot] : 0.0;
-        local_J_bkg[static_cast<size_t>(i)] = J_bkg;
-        local_J_bkg_energy[static_cast<size_t>(i)] = J_bkg_energy;
-        local_J_beam[static_cast<size_t>(i)] = J_beam;
-        local_J_total[static_cast<size_t>(i)] = J_bkg + J_beam;
+        local_J[base] = J_bkg;
+        local_J[base + 1] = J_bkg_energy;
+        local_J[base + 2] = J_bkg - J_bkg_ampere;
+        local_J[base + 3] = J_bkg_ampere;
+        local_J[base + 4] = J_beam;
+        local_J[base + 5] = J_bkg_ampere + J_beam;
     }
 
     std::vector<int> counts(mpi_size);
@@ -943,23 +1001,16 @@ void Diagnostics::write_current_density(double time,
     if (mpi_rank == 0) {
         displs[0] = 0;
         for (int r = 1; r < mpi_size; ++r) displs[r] = displs[r - 1] + counts[r - 1];
+        for (int r = 0; r < mpi_size; ++r) {
+            counts[r] *= ncomp;
+            displs[r] *= ncomp;
+        }
     }
 
-    std::vector<double> global_J_bkg(sg.nx_global + 1);
-    std::vector<double> global_J_bkg_energy(sg.nx_global + 1);
-    std::vector<double> global_J_beam(sg.nx_global + 1);
-    std::vector<double> global_J_total(sg.nx_global + 1);
-    MPI_Gatherv(local_J_bkg.data(), local_face_count, MPI_DOUBLE,
-                global_J_bkg.data(), counts.data(), displs.data(), MPI_DOUBLE,
-                0, MPI_COMM_WORLD);
-    MPI_Gatherv(local_J_bkg_energy.data(), local_face_count, MPI_DOUBLE,
-                global_J_bkg_energy.data(), counts.data(), displs.data(),
-                MPI_DOUBLE, 0, MPI_COMM_WORLD);
-    MPI_Gatherv(local_J_beam.data(), local_face_count, MPI_DOUBLE,
-                global_J_beam.data(), counts.data(), displs.data(), MPI_DOUBLE,
-                0, MPI_COMM_WORLD);
-    MPI_Gatherv(local_J_total.data(), local_face_count, MPI_DOUBLE,
-                global_J_total.data(), counts.data(), displs.data(), MPI_DOUBLE,
+    std::vector<double> global_J(
+        static_cast<size_t>(sg.nx_global + 1) * ncomp, 0.0);
+    MPI_Gatherv(local_J.data(), local_face_count * ncomp, MPI_DOUBLE,
+                global_J.data(), counts.data(), displs.data(), MPI_DOUBLE,
                 0, MPI_COMM_WORLD);
 
     if (mpi_rank == 0) {
@@ -968,17 +1019,22 @@ void Diagnostics::write_current_density(double time,
               << snapshot_count << ".dat";
         std::ofstream out(fname.str().c_str());
         out << "# time[fs] = " << time / Const::femto << "\n";
-        out << "# x_face[um]  J_bkg_face[A/m2]  "
-            << "J_bkg_energy_face[A/m2]  J_bkg_charge_minus_energy[A/m2]  "
-            << "J_beam_face[A/m2]  J_total_face[A/m2]\n";
+        out << "# x_face[um]  J_bkg_charge_face[A/m2]  "
+            << "J_bkg_energy_diagnostic_face[A/m2]  "
+            << "J_bkg_charge_minus_ampere[A/m2]  "
+            << "J_bkg_ampere_face[A/m2]  J_beam_face[A/m2]  "
+            << "J_total_charge_face[A/m2]  J_total_ampere_face[A/m2]\n";
         out << std::scientific << std::setprecision(8);
         for (int i = 0; i <= sg.nx_global; ++i) {
+            const size_t base = static_cast<size_t>(i) * ncomp;
             out << i * sg.dx / Const::micro
-                << "  " << global_J_bkg[i]
-                << "  " << global_J_bkg_energy[i]
-                << "  " << global_J_bkg[i] - global_J_bkg_energy[i]
-                << "  " << global_J_beam[i]
-                << "  " << global_J_total[i] << "\n";
+                << "  " << global_J[base]
+                << "  " << global_J[base + 1]
+                << "  " << global_J[base + 2]
+                << "  " << global_J[base + 3]
+                << "  " << global_J[base + 4]
+                << "  " << global_J[base] + global_J[base + 4]
+                << "  " << global_J[base + 5] << "\n";
         }
     }
 }

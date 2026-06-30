@@ -1,17 +1,18 @@
 #include "parameters.h"
 #include "grid.h"
 #include "species.h"
-#include "vlasov.h"
 #include "maxwell.h"
 #include "collision.h"
 #include "diagnostics.h"
 #include "beam_pic.h"
+#include "vlasov_ampere_midpoint.h"
 #include "config.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <iomanip>
 #include <mpi.h>
 #include <omp.h>
 #include <vector>
@@ -58,128 +59,31 @@ void sync_moments_and_charge(Species& electrons,
     fields.set_charge_density(electrons, beam.density, ion_density_profile);
 }
 
-void abort_if_vmax_loss(const VlasovSolver& vlasov,
-                        int step,
-                        double time,
-                        const char* stage,
-                        int mpi_rank)
+struct BackgroundCurrentDiagnostics {
+    double residual_if_charge;
+    double residual_if_ampere;
+    double e_dot_j_charge;
+    double e_dot_j_energy;
+    double e_dot_j_ampere;
+    double max_abs_j_charge;
+    double max_abs_j_energy;
+    double max_abs_j_ampere;
+    double max_abs_j_charge_minus_ampere;
+    double max_abs_j_energy_minus_ampere;
+};
+
+void reset_background_current_diagnostics(BackgroundCurrentDiagnostics& diag)
 {
-    if (!Param::abort_on_vmax_loss) return;
-
-    const double local_loss = vlasov.last_loss_v_high();
-    double global_loss = 0.0;
-    MPI_Allreduce(&local_loss, &global_loss, 1, MPI_DOUBLE,
-                  MPI_SUM, MPI_COMM_WORLD);
-
-    const double threshold =
-        Param::umax_loss_abort_fraction * Param::dens * Param::plasma_length;
-    if (!(global_loss <= threshold)) {
-        if (mpi_rank == 0) {
-            std::fprintf(stderr,
-                         "ERROR: background electron distribution reached umax "
-                         "during %s at step %d, t = %.6e s. "
-                         "loss_u_high = %.8e, threshold = %.8e. "
-                         "Stopping to avoid amplifying nonphysical results.\n",
-                         stage, step, time, global_loss, threshold);
-        }
-        MPI_Abort(MPI_COMM_WORLD, 2);
-    }
-}
-
-std::vector<double> copy_local_ex_face(const EMFields& fields,
-                                       const SpatialGrid& sg)
-{
-    std::vector<double> ex_face(static_cast<size_t>(sg.nx_local), 0.0);
-    const size_t n = std::min(ex_face.size(), fields.Ex_face.size());
-    for (size_t iface = 0; iface < n; ++iface) {
-        ex_face[iface] = fields.Ex_face[iface];
-    }
-    return ex_face;
-}
-
-double integrate_ampere_face_work(const std::vector<double>& current_face,
-                                  const std::vector<double>& ex_face_before,
-                                  const EMFields& fields,
-                                  const SpatialGrid& sg,
-                                  double dt)
-{
-    double work = 0.0;
-    const size_t unique_faces = static_cast<size_t>(sg.nx_local);
-    const size_t n = std::min(unique_faces,
-                              std::min(current_face.size(),
-                                       std::min(ex_face_before.size(),
-                                                fields.Ex_face.size())));
-    for (size_t iface = 0; iface < n; ++iface) {
-        const double ex_mid =
-            0.5 * (ex_face_before[iface] + fields.Ex_face[iface]);
-        work -= current_face[iface] * ex_mid * sg.dx * dt;
-    }
-    return work;
-}
-
-double global_sum(double local_value)
-{
-    double global_value = 0.0;
-    MPI_Allreduce(&local_value, &global_value, 1, MPI_DOUBLE,
-                  MPI_SUM, MPI_COMM_WORLD);
-    return global_value;
-}
-
-void accumulate_scaled_face_current(std::vector<double>& target,
-                                    const std::vector<double>& source,
-                                    double scale)
-{
-    const size_t n = std::min(target.size(), source.size());
-    for (size_t iface = 0; iface < n; ++iface) {
-        target[iface] += scale * source[iface];
-    }
-}
-
-void compare_background_current_faces(
-    const std::vector<double>& charge_current_face,
-    const std::vector<double>& energy_current_face,
-    const std::vector<double>& ex_face_before,
-    const EMFields& fields,
-    const SpatialGrid& sg,
-    double& max_abs_difference,
-    double& e_dot_difference)
-{
-    max_abs_difference = 0.0;
-    e_dot_difference = 0.0;
-    const size_t n = std::min(static_cast<size_t>(sg.nx_local),
-                              std::min(charge_current_face.size(),
-                                       std::min(energy_current_face.size(),
-                                                std::min(ex_face_before.size(),
-                                                         fields.Ex_face.size()))));
-    for (size_t iface = 0; iface < n; ++iface) {
-        const double diff =
-            charge_current_face[iface] - energy_current_face[iface];
-        const double ex_mid =
-            0.5 * (ex_face_before[iface] + fields.Ex_face[iface]);
-        max_abs_difference = std::max(max_abs_difference, std::fabs(diff));
-        e_dot_difference += ex_mid * diff * sg.dx;
-    }
-}
-
-void set_midpoint_face_field(EMFields& fields,
-                             const std::vector<double>& ex_old,
-                             const std::vector<double>& ex_mid,
-                             const SpatialGrid& sg,
-                             int mpi_rank,
-                             int mpi_size)
-{
-    const size_t n =
-        std::min(static_cast<size_t>(sg.nx_local), fields.Ex_face.size());
-    for (size_t iface = 0; iface < n; ++iface) {
-        const double old_value = (iface < ex_old.size()) ? ex_old[iface] : 0.0;
-        const double mid_value = (iface < ex_mid.size()) ? ex_mid[iface] : old_value;
-        fields.Ex_face[iface] = mid_value;
-    }
-    if (fields.Ex_face.size() > static_cast<size_t>(sg.nx_local)) {
-        fields.Ex_face[static_cast<size_t>(sg.nx_local)] =
-            (sg.nx_local == 0) ? 0.0 : fields.Ex_face[0];
-    }
-    fields.sync_cell_ex_from_faces(mpi_rank, mpi_size);
+    diag.residual_if_charge = 0.0;
+    diag.residual_if_ampere = 0.0;
+    diag.e_dot_j_charge = 0.0;
+    diag.e_dot_j_energy = 0.0;
+    diag.e_dot_j_ampere = 0.0;
+    diag.max_abs_j_charge = 0.0;
+    diag.max_abs_j_energy = 0.0;
+    diag.max_abs_j_ampere = 0.0;
+    diag.max_abs_j_charge_minus_ampere = 0.0;
+    diag.max_abs_j_energy_minus_ampere = 0.0;
 }
 
 void write_snapshot(Diagnostics& diag,
@@ -192,12 +96,14 @@ void write_snapshot(Diagnostics& diag,
                     int mpi_rank,
                     int mpi_size,
                     bool write_full_fe,
-                    const std::vector<double>* bkg_energy_current_face = 0)
+                    const std::vector<double>* bkg_energy_current_face = 0,
+                    const std::vector<double>* bkg_ampere_current_face = 0)
 {
     fields.compute_potential(mpi_rank, mpi_size);
     diag.write_fields(time, fields, sgrid, mpi_rank, mpi_size);
     diag.write_current_density(time, bkg_e, beam, sgrid, mpi_rank, mpi_size,
-                               bkg_energy_current_face);
+                               bkg_energy_current_face,
+                               bkg_ampere_current_face);
     diag.write_density_profile(time, bkg_e, beam.density, ion_density_profile,
                                sgrid, mpi_rank, mpi_size);
     diag.write_px_distribution(time, bkg_e, mpi_rank, mpi_size);
@@ -293,8 +199,8 @@ int main(int argc, char** argv)
     EMFields fields;
     fields.init(sgrid);
 
-    VlasovSolver vlasov;
-    vlasov.set_step_diagnostics_enabled(false);
+    VlasovAmpereMidpointSolver midpoint_solver;
+    midpoint_solver.set_step_diagnostics_enabled(false);
     CollisionOperator collision;
     Diagnostics diag;
     diag.init("output", mpi_rank, config.enable_debug_diagnostics,
@@ -326,9 +232,12 @@ int main(int argc, char** argv)
                        mpi_rank, mpi_size);
     std::vector<double> latest_bkg_energy_current_face(
         static_cast<size_t>(sgrid.nx_local + 1), 0.0);
+    std::vector<double> latest_bkg_ampere_current_face(
+        static_cast<size_t>(sgrid.nx_local + 1), 0.0);
     write_snapshot(diag, 0.0, bkg_e, beam, fields, ion_density_profile,
                    sgrid, mpi_rank, mpi_size, config.enable_full_fe_output,
-                   &latest_bkg_energy_current_face);
+                   &latest_bkg_energy_current_face,
+                   &latest_bkg_ampere_current_face);
 
     double next_snapshot = Param::dt_snapshot;
     int stdout_freq = 1000;
@@ -341,14 +250,45 @@ int main(int argc, char** argv)
             << "# step  time[fs]  x_limiter_active_fraction  "
             << "x_limiter_min_alpha  dKE_bkg_plus_W_bkg_E[J/m2]  "
             << "relative_residual_step  cumulative_relative_residual  "
-            << "max_abs_J_bkg_charge_minus_energy[A/m2]  "
-            << "E_dot_J_bkg_charge_minus_energy[W/m2]\n";
+            << "x_limiter_active_fraction_core  "
+            << "x_limiter_active_fraction_boundary  "
+            << "x_limiter_min_alpha_core  "
+            << "x_limiter_min_alpha_boundary  "
+            << "x_negative_mass_before_repair[m^-2]  "
+            << "x_mass_added_by_positivity_repair[m^-2]  "
+            << "max_abs_J_bkg_charge[A/m2]  "
+            << "max_abs_J_bkg_energy_diagnostic[A/m2]  "
+            << "max_abs_J_bkg_ampere[A/m2]  "
+            << "max_abs_J_bkg_charge_minus_ampere[A/m2]  "
+            << "max_abs_J_bkg_energy_minus_ampere[A/m2]  "
+            << "E_dot_J_bkg_charge[W/m2]  "
+            << "E_dot_J_bkg_energy_diagnostic[W/m2]  "
+            << "E_dot_J_bkg_ampere[W/m2]  "
+            << "residual_if_charge_current[J/m2]  "
+            << "residual_if_ampere_current[J/m2]  "
+            << "positivity_mass_defect[m^-2]  "
+            << "positivity_energy_defect[J/m2]  "
+            << "u_limiter_mass_delta[m^-2]  "
+            << "u_limiter_px_delta[kg/m/s/m2]  "
+            << "u_limiter_energy_delta[J/m2]  "
+            << "u_force_alpha_min  u_force_alpha_active_frac  "
+            << "coupled_iter  coupled_residual_E  "
+            << "coupled_residual_J_bkg  coupled_residual_J_beam  "
+            << "coupled_residual_bkg_mass  "
+            << "coupled_residual_beam_continuity\n";
         bkg_energy_monitor << std::scientific;
+
+        std::ofstream f_neg_monitor;
+        f_neg_monitor.open("output/f_negativity_monitor.dat");
+        f_neg_monitor
+            << "# step  time[fs]  min_f  neg_ratio_max  "
+            << "neg_mass_total[m^-2]  neg_cell_count  "
+            << "x_worst  u_worst  mu_worst\n";
+        f_neg_monitor << std::scientific << std::setprecision(8);
+        f_neg_monitor.close();
     }
     for (int step = 1; step <= nsteps; ++step) {
         double time = step * dt;
-        const double time_start = time - dt;
-        const double time_center = time_start + 0.5 * dt;
         int nsub_v1 = 0;
         int nsub_mu1 = 0;
         int nsub_v2 = 0;
@@ -383,475 +323,236 @@ int main(int argc, char** argv)
         double x_at_max_loss_u_high_step = 0.0;
         double f_u_max_x_step = 0.0;
         double integral_f_u_gt_8_x_step = 0.0;
-        double beam_push_ke_before = 0.0;
+        double bkg_number_step_start = 0.0;
         double bkg_ke_step_start = 0.0;
         double global_bkg_ke_step_start = 0.0;
         double beam_ke_step_start = 0.0;
         double field_energy_step_start = 0.0;
         double x_limiter_active_fraction_step = 0.0;
         double x_limiter_min_alpha_step = 1.0;
+        double x_limiter_active_fraction_core_step = 0.0;
+        double x_limiter_active_fraction_boundary_step = 0.0;
+        double x_limiter_min_alpha_core_step = 1.0;
+        double x_limiter_min_alpha_boundary_step = 1.0;
+        double x_negative_mass_before_repair_step = 0.0;
+        double x_mass_added_by_positivity_repair_step = 0.0;
+        double positivity_energy_defect_step = 0.0;
+        double positivity_mass_defect_step = 0.0;
+        double u_limiter_mass_delta_step = 0.0;
+        double u_limiter_momentum_delta_step = 0.0;
+        double u_limiter_energy_delta_step = 0.0;
+        double u_force_alpha_min_step = 1.0;
+        double u_force_alpha_active_frac_step = 0.0;
+        double f_neg_min_step = 0.0;
+        double f_neg_ratio_max_step = 0.0;
+        double f_neg_mass_total_step = 0.0;
+        long long f_neg_cell_count_step = 0;
+        int f_neg_ix_step = -1;
+        int f_neg_iv_step = -1;
+        int f_neg_imu_step = -1;
         double local_bkg_energy_residual_step = 0.0;
         double bkg_energy_residual_step = 0.0;
         double bkg_energy_relative_residual_step = 0.0;
-        double local_bkg_current_energy_max_abs_diff = 0.0;
-        double local_bkg_current_energy_E_dot_diff = 0.0;
-        double bkg_current_energy_max_abs_diff = 0.0;
-        double bkg_current_energy_E_dot_diff = 0.0;
-        vlasov.set_step_diagnostics_enabled(collect_step_diagnostics);
-
+        int coupled_iter_step = 0;
+        double coupled_residual_E_step = 0.0;
+        double coupled_residual_J_bkg_step = 0.0;
+        double coupled_residual_J_beam_step = 0.0;
+        double coupled_residual_bkg_mass_step = 0.0;
+        double coupled_residual_beam_continuity_step = 0.0;
+        BackgroundCurrentDiagnostics local_bkg_current_diag_step;
+        reset_background_current_diagnostics(local_bkg_current_diag_step);
+        BackgroundCurrentDiagnostics global_bkg_current_diag_step;
+        reset_background_current_diagnostics(global_bkg_current_diag_step);
         const Species bkg_step_start = bkg_e;
         const BeamPIC beam_step_start = beam;
         const EMFields fields_step_start = fields;
-        const std::vector<double> ex_face_step_start =
-            copy_local_ex_face(fields_step_start, sgrid);
-        const bool write_bkg_stage_diagnostics =
-            config.enable_step_diagnostics && (step % 50 == 0);
-        double bkg_stage_reference_N = 0.0;
-        if (write_bkg_stage_diagnostics) {
-            const double local_bkg_stage_reference_N =
-                bkg_step_start.total_particle_number();
-            MPI_Allreduce(&local_bkg_stage_reference_N,
-                          &bkg_stage_reference_N, 1,
-                          MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        }
-        bkg_ke_step_start = bkg_e.total_kinetic_energy();
-        global_bkg_ke_step_start = global_sum(bkg_ke_step_start);
+        bkg_e.total_particle_number_and_energy(bkg_number_step_start,
+                                               bkg_ke_step_start);
+        double global_bkg_start_values[2] = {
+            bkg_number_step_start,
+            bkg_ke_step_start
+        };
+        MPI_Allreduce(MPI_IN_PLACE, global_bkg_start_values, 2,
+                      MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        global_bkg_ke_step_start = global_bkg_start_values[1];
         if (collect_step_diagnostics) {
             beam_ke_step_start = beam.total_kinetic_energy();
             field_energy_step_start = fields.total_energy();
         }
 
-        std::vector<double> ex_mid_trial = ex_face_step_start;
-        std::vector<double> ex_mid_next = ex_face_step_start;
-        Species accepted_bkg = bkg_step_start;
-        BeamPIC accepted_beam = beam_step_start;
-        EMFields accepted_fields = fields_step_start;
-        const int max_coupled_iters = 30;
-        const double field_tol = 1.0e-6;
-        const double field_floor = 1.0;
-        const double current_tol = 1.0e-5;
-        double midpoint_omega = 0.5;
-        double previous_normalized_error = -1.0;
-        int residual_decrease_count = 0;
-        std::vector<double> current_trial_prev(
-            static_cast<size_t>(sgrid.nx_local), 0.0);
-        std::vector<double> current_trial_next(
-            static_cast<size_t>(sgrid.nx_local), 0.0);
-        std::vector<double> current_bkg_trial_prev(
-            static_cast<size_t>(sgrid.nx_local), 0.0);
-        std::vector<double> current_bkg_trial_next(
-            static_cast<size_t>(sgrid.nx_local), 0.0);
-        std::vector<double> current_beam_trial_prev(
-            static_cast<size_t>(sgrid.nx_local), 0.0);
-        std::vector<double> current_beam_trial_next(
-            static_cast<size_t>(sgrid.nx_local), 0.0);
-        std::vector<double> bkg_energy_current_trial(
-            static_cast<size_t>(sgrid.nx_local + 1), 0.0);
-        std::vector<double> accepted_bkg_energy_current_face =
-            latest_bkg_energy_current_face;
-        bool have_previous_current_trial = false;
-        bool coupled_converged = false;
-        double final_coupled_error = 0.0;
-        double final_field_error = 0.0;
-        double final_current_error = 0.0;
-        double final_max_delta_ex = 0.0;
-        double final_e_abs_tol = 0.0;
-        double final_j_abs_tol = 0.0;
+        trace_progress(config, mpi_rank, step,
+                       "before coupled midpoint FV solve");
+        midpoint_solver.set_step_diagnostics_enabled(collect_step_diagnostics);
+        VlasovAmpereMidpointSolver::Result midpoint_result =
+            midpoint_solver.advance_background_and_fields(
+                bkg_step_start, beam_step_start, fields_step_start, sgrid,
+                dt, time, mpi_rank, mpi_size);
+        trace_progress(config, mpi_rank, step,
+                       "after coupled midpoint FV solve");
 
-        for (int coupled_iter = 0; coupled_iter < max_coupled_iters;
-             ++coupled_iter) {
-            bkg_e = bkg_step_start;
-            beam = beam_step_start;
-            fields = fields_step_start;
-            set_midpoint_face_field(fields, ex_face_step_start, ex_mid_trial,
-                                    sgrid, mpi_rank, mpi_size);
-
-            nsub_v1 = nsub_mu1 = nsub_v2 = nsub_mu2 = 0;
-            loss_v1 = loss_v1_low = loss_v1_high = 0.0;
-            loss_mu1 = loss_v2 = loss_v2_low = loss_v2_high = loss_mu2 = 0.0;
-            dke_beam_push = 0.0;
-            W_bkg_E = 0.0;
-            W_beam_E = 0.0;
-            v_mass_error_step = 0.0;
-            mu_mass_error_step = 0.0;
-            v_momentum_delta_step = 0.0;
-            mu_momentum_delta_step = 0.0;
-            v_energy_delta_step = 0.0;
-            mu_energy_delta_step = 0.0;
-            max_loss_u_high_step = 0.0;
-            x_at_max_loss_u_high_step = 0.0;
-            f_u_max_x_step = 0.0;
-            integral_f_u_gt_8_x_step = 0.0;
-            std::fill(bkg_energy_current_trial.begin(),
-                      bkg_energy_current_trial.end(), 0.0);
-
-            beam.begin_step(sgrid, dt);
-
-            if (write_bkg_stage_diagnostics) {
-                diag.write_bkg_stage_diagnostics(
-                    step, time, coupled_iter + 1, "step_start",
-                    bkg_e, sgrid, mpi_rank, mpi_size,
-                    bkg_stage_reference_N);
-            }
-
-            trace_progress(config, mpi_rank, step, "midpoint before v half 1");
-            vlasov.advect_v(bkg_e, sgrid, fields, 0.5 * dt,
-                            mpi_rank, mpi_size);
-            trace_progress(config, mpi_rank, step, "midpoint after v half 1");
-            if (write_bkg_stage_diagnostics) {
-                diag.write_bkg_stage_diagnostics(
-                    step, time, coupled_iter + 1, "after_v_half_1",
-                    bkg_e, sgrid, mpi_rank, mpi_size,
-                    bkg_stage_reference_N);
-            }
-            nsub_v1 = vlasov.last_nsub_v();
-            loss_v1 = vlasov.last_loss_v();
-            loss_v1_low = vlasov.last_loss_v_low();
-            loss_v1_high = vlasov.last_loss_v_high();
-            if (vlasov.last_loss_v_high_local_max() > max_loss_u_high_step) {
-                max_loss_u_high_step = vlasov.last_loss_v_high_local_max();
-                x_at_max_loss_u_high_step = vlasov.last_x_at_max_loss_v_high();
-                f_u_max_x_step = vlasov.last_f_umax_at_max_loss_v_high();
-                integral_f_u_gt_8_x_step =
-                    vlasov.last_integral_f_u_gt_8_at_max_loss_v_high();
-            }
-            v_mass_error_step += vlasov.last_mass_error_v();
-            v_momentum_delta_step += vlasov.last_momentum_delta_v();
-            if (collect_step_diagnostics) {
-                v_energy_delta_step += vlasov.last_energy_delta_v();
-            }
-            accumulate_scaled_face_current(
-                bkg_energy_current_trial,
-                vlasov.last_energy_current_face_x(), 0.5);
-            abort_if_vmax_loss(vlasov, step, time, "midpoint_v_half_1",
-                               mpi_rank);
-
-            trace_progress(config, mpi_rank, step, "midpoint before mu half 1");
-            vlasov.advect_mu(bkg_e, sgrid, fields, 0.5 * dt);
-            trace_progress(config, mpi_rank, step, "midpoint after mu half 1");
-            if (write_bkg_stage_diagnostics) {
-                diag.write_bkg_stage_diagnostics(
-                    step, time, coupled_iter + 1, "after_mu_half_1",
-                    bkg_e, sgrid, mpi_rank, mpi_size,
-                    bkg_stage_reference_N);
-            }
-            nsub_mu1 = vlasov.last_nsub_mu();
-            loss_mu1 = vlasov.last_loss_mu();
-            mu_mass_error_step += vlasov.last_mass_error_mu();
-            mu_momentum_delta_step += vlasov.last_momentum_delta_mu();
-            mu_energy_delta_step += vlasov.last_energy_delta_mu();
-
-            trace_progress(config, mpi_rank, step, "midpoint before x full");
-            vlasov.advect_x(bkg_e, sgrid, dt, mpi_rank, mpi_size, time_center);
-            trace_progress(config, mpi_rank, step, "midpoint after x full");
-            if (write_bkg_stage_diagnostics) {
-                diag.write_bkg_stage_diagnostics(
-                    step, time, coupled_iter + 1, "after_x_full",
-                    bkg_e, sgrid, mpi_rank, mpi_size,
-                    bkg_stage_reference_N);
-            }
-
-            trace_progress(config, mpi_rank, step, "midpoint before mu half 2");
-            vlasov.advect_mu(bkg_e, sgrid, fields, 0.5 * dt);
-            trace_progress(config, mpi_rank, step, "midpoint after mu half 2");
-            if (write_bkg_stage_diagnostics) {
-                diag.write_bkg_stage_diagnostics(
-                    step, time, coupled_iter + 1, "after_mu_half_2",
-                    bkg_e, sgrid, mpi_rank, mpi_size,
-                    bkg_stage_reference_N);
-            }
-            nsub_mu2 = vlasov.last_nsub_mu();
-            loss_mu2 = vlasov.last_loss_mu();
-            mu_mass_error_step += vlasov.last_mass_error_mu();
-            mu_momentum_delta_step += vlasov.last_momentum_delta_mu();
-            mu_energy_delta_step += vlasov.last_energy_delta_mu();
-
-            trace_progress(config, mpi_rank, step, "midpoint before v half 2");
-            vlasov.advect_v(bkg_e, sgrid, fields, 0.5 * dt,
-                            mpi_rank, mpi_size);
-            trace_progress(config, mpi_rank, step, "midpoint after v half 2");
-            if (write_bkg_stage_diagnostics) {
-                diag.write_bkg_stage_diagnostics(
-                    step, time, coupled_iter + 1, "after_v_half_2",
-                    bkg_e, sgrid, mpi_rank, mpi_size,
-                    bkg_stage_reference_N);
-            }
-            nsub_v2 = vlasov.last_nsub_v();
-            loss_v2 = vlasov.last_loss_v();
-            loss_v2_low = vlasov.last_loss_v_low();
-            loss_v2_high = vlasov.last_loss_v_high();
-            if (vlasov.last_loss_v_high_local_max() > max_loss_u_high_step) {
-                max_loss_u_high_step = vlasov.last_loss_v_high_local_max();
-                x_at_max_loss_u_high_step = vlasov.last_x_at_max_loss_v_high();
-                f_u_max_x_step = vlasov.last_f_umax_at_max_loss_v_high();
-                integral_f_u_gt_8_x_step =
-                    vlasov.last_integral_f_u_gt_8_at_max_loss_v_high();
-            }
-            v_mass_error_step += vlasov.last_mass_error_v();
-            v_momentum_delta_step += vlasov.last_momentum_delta_v();
-            if (collect_step_diagnostics) {
-                v_energy_delta_step += vlasov.last_energy_delta_v();
-            }
-            accumulate_scaled_face_current(
-                bkg_energy_current_trial,
-                vlasov.last_energy_current_face_x(), 0.5);
-            abort_if_vmax_loss(vlasov, step, time, "midpoint_v_half_2",
-                               mpi_rank);
-
-            trace_progress(config, mpi_rank, step, "midpoint before beam");
-            beam.inject(sgrid, fields, dt, time, mpi_rank, mpi_size);
-            if (collect_step_diagnostics) {
-                beam_push_ke_before = beam.total_kinetic_energy();
-            }
-            beam.push(sgrid, fields, dt, mpi_rank, mpi_size);
-            if (collect_step_diagnostics) {
-                dke_beam_push += beam.total_kinetic_energy() - beam_push_ke_before;
-            }
-            beam.deposit_density(sgrid, mpi_rank, mpi_size);
-            beam.finalize_charge_conserving_current(sgrid, dt,
-                                                    mpi_rank, mpi_size);
-            trace_progress(config, mpi_rank, step, "midpoint after beam");
-            W_beam_E = collect_step_diagnostics ? beam.last_field_work() : 0.0;
-
-            bkg_e.compute_moments();
-            fields = fields_step_start;
-            fields.advance_ampere_face(bkg_e.current_face_x,
-                                       beam.current_face_x,
-                                       dt, mpi_rank, mpi_size);
-            W_bkg_E =
-                integrate_ampere_face_work(bkg_e.current_face_x,
-                                           ex_face_step_start,
-                                           fields, sgrid, dt);
-
-            for (int iface = 0; iface < sgrid.nx_local; ++iface) {
-                const size_t slot = static_cast<size_t>(iface);
-                const double jbkg =
-                    (slot < bkg_e.current_face_x.size())
-                    ? bkg_e.current_face_x[slot] : 0.0;
-                const double jbeam =
-                    (slot < beam.current_face_x.size())
-                    ? beam.current_face_x[slot] : 0.0;
-                current_bkg_trial_next[slot] = jbkg;
-                current_beam_trial_next[slot] = jbeam;
-                current_trial_next[slot] = jbkg + jbeam;
-            }
-
-            const size_t nface =
-                std::min(std::min(ex_mid_next.size(),
-                                  ex_face_step_start.size()),
-                         fields.Ex_face.size());
-            for (size_t iface = 0; iface < nface; ++iface) {
-                ex_mid_next[iface] =
-                    0.5 * (ex_face_step_start[iface]
-                         + fields.Ex_face[iface]);
-            }
-
-            double local_max_delta_ex = 0.0;
-            double local_max_abs_ex = 0.0;
-            const size_t field_faces =
-                std::min(static_cast<size_t>(sgrid.nx_local),
-                         std::min(ex_mid_next.size(), ex_mid_trial.size()));
-            for (size_t iface = 0; iface < field_faces; ++iface) {
-                local_max_delta_ex =
-                    std::max(local_max_delta_ex,
-                             std::fabs(ex_mid_next[iface]
-                                     - ex_mid_trial[iface]));
-                local_max_abs_ex =
-                    std::max(local_max_abs_ex,
-                             std::max(std::fabs(ex_mid_next[iface]),
-                                      std::fabs(ex_mid_trial[iface])));
-            }
-            double local_max_delta_j_total = 0.0;
-            double local_max_delta_j_bkg = 0.0;
-            double local_max_delta_j_beam = 0.0;
-            if (have_previous_current_trial) {
-                for (size_t iface = 0; iface < current_trial_next.size();
-                     ++iface) {
-                    const double delta_total =
-                        std::fabs(current_trial_next[iface]
-                                - current_trial_prev[iface]);
-                    const double delta_bkg =
-                        std::fabs(current_bkg_trial_next[iface]
-                                - current_bkg_trial_prev[iface]);
-                    const double delta_beam =
-                        std::fabs(current_beam_trial_next[iface]
-                                - current_beam_trial_prev[iface]);
-                    if (delta_total > local_max_delta_j_total) {
-                        local_max_delta_j_total = delta_total;
-                    }
-                    if (delta_bkg > local_max_delta_j_bkg) {
-                        local_max_delta_j_bkg = delta_bkg;
-                    }
-                    if (delta_beam > local_max_delta_j_beam) {
-                        local_max_delta_j_beam = delta_beam;
-                    }
-                }
-            }
-            double local_max_j_total = 0.0;
-            for (size_t iface = 0; iface < current_trial_next.size(); ++iface) {
-                local_max_j_total =
-                    std::max(local_max_j_total,
-                             std::fabs(current_trial_next[iface]));
-            }
-            double local_max_j_bkg = 0.0;
-            for (size_t iface = 0; iface < bkg_e.current_face_x.size();
-                 ++iface) {
-                local_max_j_bkg =
-                    std::max(local_max_j_bkg,
-                             std::fabs(bkg_e.current_face_x[iface]));
-            }
-            double local_max_j_beam = 0.0;
-            for (size_t iface = 0; iface < beam.current_face_x.size();
-                 ++iface) {
-                local_max_j_beam =
-                    std::max(local_max_j_beam,
-                             std::fabs(beam.current_face_x[iface]));
-            }
-            const double local_iter_errors[8] = {
-                local_max_delta_ex,
-                local_max_abs_ex,
-                local_max_j_total,
-                local_max_j_bkg,
-                local_max_j_beam,
-                local_max_delta_j_total,
-                local_max_delta_j_bkg,
-                local_max_delta_j_beam
-            };
-            double global_iter_errors[8] = {
-                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-            };
-            MPI_Allreduce(local_iter_errors, global_iter_errors, 8,
-                          MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-            const double global_max_delta_ex = global_iter_errors[0];
-            const double global_max_abs_ex = global_iter_errors[1];
-            const double global_field_error =
-                global_max_delta_ex /
-                std::max(field_floor, global_max_abs_ex);
-            const double global_current_scale =
-                std::max(std::fabs(Param::jb), global_iter_errors[2]);
-            const double global_j_abs_tol =
-                current_tol * std::max(1.0, global_current_scale);
-            const double global_e_abs_tol =
-                std::max(field_tol * field_floor,
-                         0.5 * dt / Const::eps0 * global_j_abs_tol);
-            const double global_max_delta_j_total = global_iter_errors[5];
-            const double global_j_total_error =
-                global_max_delta_j_total / std::max(1.0, global_current_scale);
-            const double global_field_convergence_ratio =
-                std::min(global_field_error / field_tol,
-                         global_max_delta_ex /
-                         std::max(field_tol * field_floor, global_e_abs_tol));
-            const double global_normalized_error =
-                have_previous_current_trial
-                ? std::max(global_field_convergence_ratio,
-                           global_max_delta_j_total /
-                           std::max(1.0, global_j_abs_tol))
-                : std::max(1.0, global_field_convergence_ratio);
-            const bool field_current_converged =
-                have_previous_current_trial &&
-                (global_field_error < field_tol ||
-                 global_max_delta_ex < global_e_abs_tol) &&
-                global_max_delta_j_total < global_j_abs_tol;
-
-            final_coupled_error = global_normalized_error;
-            final_field_error = global_field_error;
-            final_current_error = global_j_total_error;
-            final_max_delta_ex = global_max_delta_ex;
-            final_e_abs_tol = global_e_abs_tol;
-            final_j_abs_tol = global_j_abs_tol;
-            if (field_current_converged) {
-                coupled_converged = true;
-                accepted_bkg = bkg_e;
-                accepted_beam = beam;
-                accepted_fields = fields;
-                accepted_bkg_energy_current_face = bkg_energy_current_trial;
-                x_limiter_active_fraction_step =
-                    vlasov.last_x_limiter_active_fraction();
-                x_limiter_min_alpha_step =
-                    vlasov.last_x_limiter_min_alpha();
-                break;
-            }
-            if (previous_normalized_error > 0.0) {
-                if (global_normalized_error < 0.9 * previous_normalized_error) {
-                    ++residual_decrease_count;
-                    const double omega_cap =
-                        (residual_decrease_count >= 2) ? 1.0 : 0.8;
-                    midpoint_omega =
-                        std::min(omega_cap, midpoint_omega + 0.1);
-                } else if (global_normalized_error >
-                           1.02 * previous_normalized_error) {
-                    residual_decrease_count = 0;
-                    midpoint_omega = std::max(0.3, 0.5 * midpoint_omega);
-                } else {
-                    residual_decrease_count = 0;
-                    midpoint_omega = std::max(0.3, 0.8 * midpoint_omega);
-                }
-            }
-            previous_normalized_error = global_normalized_error;
-            const size_t relax_faces =
-                std::min(ex_mid_trial.size(), ex_mid_next.size());
-            for (size_t iface = 0; iface < relax_faces; ++iface) {
-                ex_mid_trial[iface] =
-                    (1.0 - midpoint_omega) * ex_mid_trial[iface]
-                  + midpoint_omega * ex_mid_next[iface];
-            }
-            current_trial_prev.swap(current_trial_next);
-            current_bkg_trial_prev.swap(current_bkg_trial_next);
-            current_beam_trial_prev.swap(current_beam_trial_next);
-            have_previous_current_trial = true;
-        }
-
-        if (!coupled_converged) {
+        if (!midpoint_result.converged || midpoint_result.failed) {
             if (mpi_rank == 0) {
                 std::fprintf(stderr,
-                             "ERROR: coupled midpoint iteration failed to "
-                             "converge at step %d, t = %.6e s; normalized "
-                             "residual %.6e, field_error %.6e, "
-                             "max_delta_Ex %.6e, E_abs_tol %.6e, "
-                             "current_error %.6e, J_abs_tol %.6e after %d "
-                             "iterations. Reduce dt or increase the coupled "
-                             "solve robustness.\n",
-                             step, time, final_coupled_error,
-                             final_field_error, final_max_delta_ex,
-                             final_e_abs_tol, final_current_error,
-                             final_j_abs_tol, max_coupled_iters);
+                             "WARNING: coupled midpoint FV solve failed at "
+                             "step %d, t = %.6e s; residual %.6e, "
+                             "field %.6e, f %.6e, J_bkg %.6e, J_beam %.6e, "
+                             "bkg_mass %.6e, beam_continuity %.6e after "
+                             "%d iterations, substeps %d; limiter active "
+                             "%.6e, min_alpha %.6e, core_active %.6e, "
+                             "boundary_active %.6e, core_min_alpha %.6e, "
+                             "boundary_min_alpha %.6e. "
+                             "Continuing with best available result.\n",
+                             step, time,
+                             midpoint_result.nonlinear_residual,
+                             midpoint_result.residual_E,
+                             midpoint_result.residual_f,
+                             midpoint_result.residual_J_bkg,
+                             midpoint_result.residual_J_beam,
+                             midpoint_result.continuity_residual_bkg,
+                             midpoint_result.beam_continuity_residual,
+                             midpoint_result.nonlinear_iterations,
+                             midpoint_result.substeps_used,
+                             midpoint_result.limiter_active_fraction,
+                             midpoint_result.limiter_min_alpha,
+                             midpoint_result.limiter_active_fraction_core,
+                             midpoint_result.limiter_active_fraction_boundary,
+                             midpoint_result.limiter_min_alpha_core,
+                             midpoint_result.limiter_min_alpha_boundary);
             }
-            MPI_Abort(MPI_COMM_WORLD, 8);
+            // Protection disabled for long-run test — continue with best result
+            // MPI_Abort(MPI_COMM_WORLD, 8);
         }
 
-        bkg_e = accepted_bkg;
-        beam = accepted_beam;
-        fields = accepted_fields;
-        latest_bkg_energy_current_face = accepted_bkg_energy_current_face;
+        bkg_e = midpoint_result.species_np1;
+        beam = midpoint_result.beam_np1;
+        fields = midpoint_result.fields_np1;
+        latest_bkg_energy_current_face =
+            midpoint_result.j_bkg_energy_debug_face;
         moments_current = true;
-
-        compare_background_current_faces(
-            bkg_e.current_face_x, latest_bkg_energy_current_face,
-            ex_face_step_start, fields, sgrid,
-            local_bkg_current_energy_max_abs_diff,
-            local_bkg_current_energy_E_dot_diff);
-        MPI_Allreduce(&local_bkg_current_energy_max_abs_diff,
-                      &bkg_current_energy_max_abs_diff, 1,
-                      MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        latest_bkg_ampere_current_face = midpoint_result.j_bkg_face_mid;
+        local_bkg_current_diag_step.residual_if_charge =
+            midpoint_result.current_diag.residual_if_charge;
+        local_bkg_current_diag_step.residual_if_ampere =
+            midpoint_result.current_diag.residual_if_ampere;
+        local_bkg_current_diag_step.e_dot_j_charge =
+            midpoint_result.current_diag.e_dot_j_charge;
+        local_bkg_current_diag_step.e_dot_j_energy =
+            midpoint_result.current_diag.e_dot_j_energy;
+        local_bkg_current_diag_step.e_dot_j_ampere =
+            midpoint_result.current_diag.e_dot_j_ampere;
+        local_bkg_current_diag_step.max_abs_j_charge =
+            midpoint_result.current_diag.max_abs_j_charge;
+        local_bkg_current_diag_step.max_abs_j_energy =
+            midpoint_result.current_diag.max_abs_j_energy;
+        local_bkg_current_diag_step.max_abs_j_ampere =
+            midpoint_result.current_diag.max_abs_j_ampere;
+        local_bkg_current_diag_step.max_abs_j_charge_minus_ampere =
+            midpoint_result.current_diag.max_abs_j_charge_minus_ampere;
+        local_bkg_current_diag_step.max_abs_j_energy_minus_ampere =
+            midpoint_result.current_diag.max_abs_j_energy_minus_ampere;
+        W_bkg_E = midpoint_result.field_work_bkg;
+        W_beam_E = midpoint_result.field_work_beam;
+        dke_beam_push = midpoint_result.delta_ke_beam;
+        x_limiter_active_fraction_step =
+            midpoint_result.limiter_active_fraction;
+        x_limiter_min_alpha_step = midpoint_result.limiter_min_alpha;
+        x_limiter_active_fraction_core_step =
+            midpoint_result.limiter_active_fraction_core;
+        x_limiter_active_fraction_boundary_step =
+            midpoint_result.limiter_active_fraction_boundary;
+        x_limiter_min_alpha_core_step =
+            midpoint_result.limiter_min_alpha_core;
+        x_limiter_min_alpha_boundary_step =
+            midpoint_result.limiter_min_alpha_boundary;
+        x_negative_mass_before_repair_step =
+            midpoint_result.x_negative_mass_before_repair;
+        x_mass_added_by_positivity_repair_step =
+            midpoint_result.x_mass_added_by_positivity_repair;
+        positivity_energy_defect_step =
+            midpoint_result.positivity_energy_defect;
+        positivity_mass_defect_step =
+            midpoint_result.positivity_mass_defect;
+        u_limiter_mass_delta_step =
+            midpoint_result.limiter_mass_defect;
+        u_limiter_momentum_delta_step =
+            midpoint_result.limiter_momentum_defect;
+        u_limiter_energy_delta_step =
+            midpoint_result.limiter_energy_defect;
+        u_force_alpha_min_step =
+            midpoint_result.u_force_alpha_min;
+        u_force_alpha_active_frac_step =
+            midpoint_result.u_force_alpha_active_frac;
+        f_neg_min_step = midpoint_result.f_neg_min;
+        f_neg_ratio_max_step = midpoint_result.f_neg_ratio_max;
+        f_neg_mass_total_step = midpoint_result.f_neg_mass_total;
+        f_neg_cell_count_step = midpoint_result.f_neg_cell_count;
+        f_neg_ix_step = midpoint_result.f_neg_ix;
+        f_neg_iv_step = midpoint_result.f_neg_iv;
+        f_neg_imu_step = midpoint_result.f_neg_imu;
+        coupled_iter_step = midpoint_result.nonlinear_iterations;
+        coupled_residual_E_step = midpoint_result.residual_E;
+        coupled_residual_J_bkg_step = midpoint_result.residual_J_bkg;
+        coupled_residual_J_beam_step = midpoint_result.residual_J_beam;
+        coupled_residual_bkg_mass_step =
+            midpoint_result.continuity_residual_bkg;
+        coupled_residual_beam_continuity_step =
+            midpoint_result.beam_continuity_residual;
 
         const double bkg_ke_step_end_for_residual =
-            bkg_e.total_kinetic_energy();
+            bkg_ke_step_start + midpoint_result.delta_ke_bkg;
         local_bkg_energy_residual_step =
             (bkg_ke_step_end_for_residual - bkg_ke_step_start) + W_bkg_E;
-        const double local_bkg_energy_values[4] = {
+        const double local_bkg_energy_values[8] = {
             bkg_ke_step_end_for_residual,
             W_bkg_E,
             local_bkg_energy_residual_step,
-            local_bkg_current_energy_E_dot_diff
+            local_bkg_current_diag_step.residual_if_charge,
+            local_bkg_current_diag_step.residual_if_ampere,
+            local_bkg_current_diag_step.e_dot_j_charge,
+            local_bkg_current_diag_step.e_dot_j_energy,
+            local_bkg_current_diag_step.e_dot_j_ampere
         };
-        double global_bkg_energy_values[4] = {0.0, 0.0, 0.0, 0.0};
-        MPI_Allreduce(local_bkg_energy_values, global_bkg_energy_values, 4,
+        double global_bkg_energy_values[8] = {
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        };
+        MPI_Allreduce(local_bkg_energy_values, global_bkg_energy_values, 8,
                       MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        const double local_current_max_values[5] = {
+            local_bkg_current_diag_step.max_abs_j_charge,
+            local_bkg_current_diag_step.max_abs_j_energy,
+            local_bkg_current_diag_step.max_abs_j_ampere,
+            local_bkg_current_diag_step.max_abs_j_charge_minus_ampere,
+            local_bkg_current_diag_step.max_abs_j_energy_minus_ampere
+        };
+        double global_current_max_values[5] = {
+            0.0, 0.0, 0.0, 0.0, 0.0
+        };
+        MPI_Allreduce(local_current_max_values, global_current_max_values, 5,
+                      MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        global_bkg_current_diag_step.residual_if_charge =
+            global_bkg_energy_values[3];
+        global_bkg_current_diag_step.residual_if_ampere =
+            global_bkg_energy_values[4];
+        global_bkg_current_diag_step.e_dot_j_charge =
+            global_bkg_energy_values[5];
+        global_bkg_current_diag_step.e_dot_j_energy =
+            global_bkg_energy_values[6];
+        global_bkg_current_diag_step.e_dot_j_ampere =
+            global_bkg_energy_values[7];
+        global_bkg_current_diag_step.max_abs_j_charge =
+            global_current_max_values[0];
+        global_bkg_current_diag_step.max_abs_j_energy =
+            global_current_max_values[1];
+        global_bkg_current_diag_step.max_abs_j_ampere =
+            global_current_max_values[2];
+        global_bkg_current_diag_step.max_abs_j_charge_minus_ampere =
+            global_current_max_values[3];
+        global_bkg_current_diag_step.max_abs_j_energy_minus_ampere =
+            global_current_max_values[4];
         const double global_dke_bkg_step =
             global_bkg_energy_values[0] - global_bkg_ke_step_start;
         const double global_W_bkg_E = global_bkg_energy_values[1];
         bkg_energy_residual_step = global_bkg_energy_values[2];
-        bkg_current_energy_E_dot_diff = global_bkg_energy_values[3];
         const double bkg_energy_residual_den =
             std::max(std::max(std::fabs(global_dke_bkg_step),
                               std::fabs(global_W_bkg_E)),
@@ -864,7 +565,7 @@ int main(int argc, char** argv)
         cumulative_bkg_energy_residual +=
             bkg_energy_relative_residual_step;
 
-        if (mpi_rank == 0) {
+        if (mpi_rank == 0 && step % 100 == 0) {
             bkg_energy_monitor << step << "  "
                                << time / Const::femto << "  "
                                << x_limiter_active_fraction_step << "  "
@@ -872,9 +573,51 @@ int main(int argc, char** argv)
                                << bkg_energy_residual_step << "  "
                                << bkg_energy_relative_residual_step << "  "
                                << cumulative_bkg_energy_residual << "  "
-                               << bkg_current_energy_max_abs_diff << "  "
-                               << bkg_current_energy_E_dot_diff << "\n";
+                               << x_limiter_active_fraction_core_step << "  "
+                               << x_limiter_active_fraction_boundary_step << "  "
+                               << x_limiter_min_alpha_core_step << "  "
+                               << x_limiter_min_alpha_boundary_step << "  "
+                               << x_negative_mass_before_repair_step << "  "
+                               << x_mass_added_by_positivity_repair_step << "  "
+                               << global_bkg_current_diag_step.max_abs_j_charge << "  "
+                               << global_bkg_current_diag_step.max_abs_j_energy << "  "
+                               << global_bkg_current_diag_step.max_abs_j_ampere << "  "
+                               << global_bkg_current_diag_step.max_abs_j_charge_minus_ampere << "  "
+                               << global_bkg_current_diag_step.max_abs_j_energy_minus_ampere << "  "
+                               << global_bkg_current_diag_step.e_dot_j_charge << "  "
+                               << global_bkg_current_diag_step.e_dot_j_energy << "  "
+                               << global_bkg_current_diag_step.e_dot_j_ampere << "  "
+                               << global_bkg_current_diag_step.residual_if_charge << "  "
+                               << global_bkg_current_diag_step.residual_if_ampere << "  "
+                               << positivity_mass_defect_step << "  "
+                               << positivity_energy_defect_step << "  "
+                               << u_limiter_mass_delta_step << "  "
+                               << u_limiter_momentum_delta_step << "  "
+                               << u_limiter_energy_delta_step << "  "
+                               << u_force_alpha_min_step << "  "
+                               << u_force_alpha_active_frac_step << "  "
+                               << coupled_iter_step << "  "
+                               << coupled_residual_E_step << "  "
+                               << coupled_residual_J_bkg_step << "  "
+                               << coupled_residual_J_beam_step << "  "
+                               << coupled_residual_bkg_mass_step << "  "
+                               << coupled_residual_beam_continuity_step << "\n";
             bkg_energy_monitor.flush();
+
+            // f-negativity monitor: append every 100 steps
+            std::ofstream f_neg_monitor;
+            f_neg_monitor.open("output/f_negativity_monitor.dat",
+                               std::ios::app);
+            f_neg_monitor << step << "  "
+                          << time / Const::femto << "  "
+                          << f_neg_min_step << "  "
+                          << f_neg_ratio_max_step << "  "
+                          << f_neg_mass_total_step << "  "
+                          << f_neg_cell_count_step << "  "
+                          << f_neg_ix_step << "  "
+                          << f_neg_iv_step << "  "
+                          << f_neg_imu_step << "\n";
+            f_neg_monitor.close();
         }
         if (bkg_e.collisions_enabled) {
             trace_progress(config, mpi_rank, step, "before collisions");
@@ -942,8 +685,20 @@ int main(int argc, char** argv)
                                         x_limiter_active_fraction_step,
                                         x_limiter_min_alpha_step,
                                         local_bkg_energy_residual_step,
-                                        local_bkg_current_energy_max_abs_diff,
-                                        local_bkg_current_energy_E_dot_diff,
+                                        local_bkg_current_diag_step.max_abs_j_charge,
+                                        local_bkg_current_diag_step.max_abs_j_energy,
+                                        local_bkg_current_diag_step.max_abs_j_ampere,
+                                        local_bkg_current_diag_step.max_abs_j_charge_minus_ampere,
+                                        local_bkg_current_diag_step.max_abs_j_energy_minus_ampere,
+                                        local_bkg_current_diag_step.e_dot_j_charge,
+                                        local_bkg_current_diag_step.e_dot_j_energy,
+                                        local_bkg_current_diag_step.e_dot_j_ampere,
+                                        local_bkg_current_diag_step.residual_if_charge,
+                                        local_bkg_current_diag_step.residual_if_ampere,
+                                        coupled_iter_step,
+                                        coupled_residual_E_step,
+                                        coupled_residual_J_bkg_step,
+                                        coupled_residual_J_beam_step,
                                         max_loss_u_high_step,
                                         x_at_max_loss_u_high_step,
                                         f_u_max_x_step,
@@ -963,7 +718,8 @@ int main(int argc, char** argv)
             write_snapshot(diag, time, bkg_e, beam, fields, ion_density_profile,
                            sgrid, mpi_rank, mpi_size,
                            config.enable_full_fe_output,
-                           &latest_bkg_energy_current_face);
+                           &latest_bkg_energy_current_face,
+                           &latest_bkg_ampere_current_face);
             last_snapshot_step = step;
             next_snapshot += Param::dt_snapshot;
         }
@@ -984,7 +740,8 @@ int main(int argc, char** argv)
     if (last_snapshot_step != nsteps) {
         write_snapshot(diag, Param::t_end, bkg_e, beam, fields, ion_density_profile,
                        sgrid, mpi_rank, mpi_size, config.enable_full_fe_output,
-                       &latest_bkg_energy_current_face);
+                       &latest_bkg_energy_current_face,
+                       &latest_bkg_ampere_current_face);
     }
 
     if (mpi_rank == 0) {

@@ -65,6 +65,30 @@ public:
     double last_x_limiter_min_alpha() const {
         return last_x_limiter_min_alpha_;
     }
+    double last_x_limiter_active_fraction_core() const {
+        return last_x_limiter_active_fraction_core_;
+    }
+    double last_x_limiter_active_fraction_boundary() const {
+        return last_x_limiter_active_fraction_boundary_;
+    }
+    double last_x_limiter_min_alpha_core() const {
+        return last_x_limiter_min_alpha_core_;
+    }
+    double last_x_limiter_min_alpha_boundary() const {
+        return last_x_limiter_min_alpha_boundary_;
+    }
+    double last_x_negative_mass_before_repair() const {
+        return last_x_negative_mass_before_repair_;
+    }
+    double last_x_mass_added_by_positivity_repair() const {
+        return last_x_mass_added_by_positivity_repair_;
+    }
+    double last_u_force_mass_defect() const {
+        return last_u_force_mass_defect_;
+    }
+    double last_u_force_energy_defect() const {
+        return last_u_force_energy_defect_;
+    }
 
 private:
     void exchange_ghosts_x(Species& sp, const SpatialGrid& sg,
@@ -99,6 +123,14 @@ private:
     double last_energy_delta_mu_;
     double last_x_limiter_active_fraction_;
     double last_x_limiter_min_alpha_;
+    double last_x_limiter_active_fraction_core_;
+    double last_x_limiter_active_fraction_boundary_;
+    double last_x_limiter_min_alpha_core_;
+    double last_x_limiter_min_alpha_boundary_;
+    double last_x_negative_mass_before_repair_;
+    double last_x_mass_added_by_positivity_repair_;
+    double last_u_force_mass_defect_;
+    double last_u_force_energy_defect_;
     int last_nsub_v_;
     int last_nsub_mu_;
     bool step_diagnostics_enabled_;

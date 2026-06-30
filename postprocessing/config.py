@@ -45,13 +45,11 @@ FV_COLUMNS = ["F(u)"]
 FV_X_AXIS_RANGE = (0.0, 3.0e8)
 
 # Settings for plot_current_density_profile.py.
-FACE_CURRENT_FILES = DATA_DIR / "current_00010.dat"
+FACE_CURRENT_FILES = DATA_DIR / "current_00005.dat"
 # Use None to plot every current column in FACE_CURRENT_FILES.
 # Column names may omit units, e.g. "J_total_smoothed" matches "J_total_smoothed[A/m2]".
 FACE_CURRENT_COLUMNS = [
-    "J_total_face",
-    #"J_bkg_e",
-    #"J_beam",
+    "J_total_ampere_face",
 ]
 FACE_CURRENT_X_AXIS_RANGE = None
 

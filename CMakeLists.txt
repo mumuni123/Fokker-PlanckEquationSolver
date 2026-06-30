@@ -23,6 +23,7 @@ set(SOURCES
     src/config.cpp
     src/species.cpp
     src/vlasov.cpp
+    src/vlasov_ampere_midpoint.cpp
     src/maxwell.cpp
     src/collision.cpp
     src/diagnostics.cpp

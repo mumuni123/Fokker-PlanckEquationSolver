@@ -305,6 +305,14 @@ VlasovSolver::VlasovSolver()
       last_energy_delta_mu_(0.0),
       last_x_limiter_active_fraction_(0.0),
       last_x_limiter_min_alpha_(1.0),
+      last_x_limiter_active_fraction_core_(0.0),
+      last_x_limiter_active_fraction_boundary_(0.0),
+      last_x_limiter_min_alpha_core_(1.0),
+      last_x_limiter_min_alpha_boundary_(1.0),
+      last_x_negative_mass_before_repair_(0.0),
+      last_x_mass_added_by_positivity_repair_(0.0),
+      last_u_force_mass_defect_(0.0),
+      last_u_force_energy_defect_(0.0),
       last_nsub_v_(1),
       last_nsub_mu_(1),
       step_diagnostics_enabled_(false)
@@ -350,11 +358,28 @@ void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
     std::vector<double> limiter_right_edge(Param::Nvmu, 1.0);
     const int max_midpoint_iters = 24;
     const double midpoint_tol = 1.0e-11;
+    const double limiter_negative_tol = 1.0e-12;
+    const int boundary_width =
+        std::max(1, std::min(sg.nx_global / 20, 64));
     long long local_limiter_active = 0;
     long long local_limiter_total = 0;
+    long long local_limiter_active_core = 0;
+    long long local_limiter_total_core = 0;
+    long long local_limiter_active_boundary = 0;
+    long long local_limiter_total_boundary = 0;
     double local_limiter_min_alpha = 1.0;
+    double local_limiter_min_alpha_core = 1.0;
+    double local_limiter_min_alpha_boundary = 1.0;
+    double local_negative_mass_before_repair = 0.0;
+    double local_mass_added_by_positivity_repair = 0.0;
     last_x_limiter_active_fraction_ = 0.0;
     last_x_limiter_min_alpha_ = 1.0;
+    last_x_limiter_active_fraction_core_ = 0.0;
+    last_x_limiter_active_fraction_boundary_ = 0.0;
+    last_x_limiter_min_alpha_core_ = 1.0;
+    last_x_limiter_min_alpha_boundary_ = 1.0;
+    last_x_negative_mass_before_repair_ = 0.0;
+    last_x_mass_added_by_positivity_repair_ = 0.0;
 
     for (int isub = 0; isub < nsub_x; ++isub) {
         exchange_ghosts_x(sp, sg, mpi_rank, mpi_size);
@@ -397,7 +422,8 @@ void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
             close_periodic_face_values(high_flux_faces, nxl,
                                        mpi_rank, mpi_size, 744);
 
-            #pragma omp parallel for collapse(2) schedule(static)
+            #pragma omp parallel for collapse(2) schedule(static) \
+                reduction(+:local_negative_mass_before_repair)
             for (int ix = 0; ix < nxl; ++ix) {
                 for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu);
                      ++k_int) {
@@ -406,6 +432,12 @@ void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
                         static_cast<size_t>(ix) * Param::Nvmu + k;
                     const size_t offset =
                         static_cast<size_t>(ng + ix) * Param::Nvmu + k;
+                    if (iter == 0 && f_old[offset] < 0.0) {
+                        const int iv = k_int / Param::Nmu;
+                        local_negative_mass_before_repair +=
+                            -f_old[offset] * sp.vgrid.moment_weight[iv]
+                            * sg.dx;
+                    }
                     f_low[cell_slot] =
                         f_old[offset]
                       - dt_dx *
@@ -416,9 +448,7 @@ void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
                 }
             }
 
-            #pragma omp parallel for schedule(static) \
-                reduction(+:local_limiter_active,local_limiter_total) \
-                reduction(min:local_limiter_min_alpha)
+            #pragma omp parallel for schedule(static)
             for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu);
                  ++k_int) {
                 const size_t k = static_cast<size_t>(k_int);
@@ -441,10 +471,18 @@ void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
                         dt_dx * (std::max(0.0, right_anti)
                                + std::max(0.0, -left_anti));
                     if (outgoing > 0.0) {
+                        const size_t offset =
+                            static_cast<size_t>(ng + ix) * Param::Nvmu + k;
+                        const double local_scale =
+                            std::max(std::fabs(f_old[offset]),
+                                     std::fabs(f_low[cell_slot]));
+                        const double allowed_negative =
+                            limiter_negative_tol * std::max(1.0, local_scale);
+                        const double available =
+                            std::max(0.0, f_low[cell_slot]
+                                          + allowed_negative);
                         limiter_cell[cell_slot] =
-                            std::min(1.0,
-                                     std::max(0.0, f_low[cell_slot]) /
-                                     outgoing);
+                            std::min(1.0, available / outgoing);
                     } else {
                         limiter_cell[cell_slot] = 1.0;
                     }
@@ -456,7 +494,14 @@ void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
                                         limiter_left_edge,
                                         limiter_right_edge);
 
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(static) \
+                reduction(+:local_limiter_active,local_limiter_total, \
+                            local_limiter_active_core,local_limiter_total_core, \
+                            local_limiter_active_boundary, \
+                            local_limiter_total_boundary) \
+                reduction(min:local_limiter_min_alpha, \
+                              local_limiter_min_alpha_core, \
+                              local_limiter_min_alpha_boundary)
             for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu);
                  ++k_int) {
                 const size_t k = static_cast<size_t>(k_int);
@@ -491,6 +536,25 @@ void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
                     ++local_limiter_total;
                     local_limiter_min_alpha =
                         std::min(local_limiter_min_alpha, alpha);
+                    const int global_face = sg.ix_start + iface;
+                    const bool boundary_face =
+                        (global_face < boundary_width) ||
+                        (global_face > sg.nx_global - boundary_width);
+                    if (boundary_face) {
+                        if (alpha < 0.999999) {
+                            ++local_limiter_active_boundary;
+                        }
+                        ++local_limiter_total_boundary;
+                        local_limiter_min_alpha_boundary =
+                            std::min(local_limiter_min_alpha_boundary, alpha);
+                    } else {
+                        if (alpha < 0.999999) {
+                            ++local_limiter_active_core;
+                        }
+                        ++local_limiter_total_core;
+                        local_limiter_min_alpha_core =
+                            std::min(local_limiter_min_alpha_core, alpha);
+                    }
                     flux_faces[face_slot] =
                         low_flux_faces[face_slot] + alpha * anti;
                 }
@@ -562,21 +626,49 @@ void VlasovSolver::advect_x(Species& sp, const SpatialGrid& sg, double dt,
         }
     }
 
-    long long global_limiter_counts[2] = {
+    long long global_limiter_counts[6] = {
         local_limiter_active,
-        local_limiter_total
+        local_limiter_total,
+        local_limiter_active_core,
+        local_limiter_total_core,
+        local_limiter_active_boundary,
+        local_limiter_total_boundary
     };
-    MPI_Allreduce(MPI_IN_PLACE, global_limiter_counts, 2,
+    MPI_Allreduce(MPI_IN_PLACE, global_limiter_counts, 6,
                   MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
-    double global_limiter_min_alpha = local_limiter_min_alpha;
-    MPI_Allreduce(MPI_IN_PLACE, &global_limiter_min_alpha, 1,
+    double global_limiter_min_alpha[3] = {
+        local_limiter_min_alpha,
+        local_limiter_min_alpha_core,
+        local_limiter_min_alpha_boundary
+    };
+    MPI_Allreduce(MPI_IN_PLACE, global_limiter_min_alpha, 3,
                   MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+    double global_x_mass_diagnostics[2] = {
+        local_negative_mass_before_repair,
+        local_mass_added_by_positivity_repair
+    };
+    MPI_Allreduce(MPI_IN_PLACE, global_x_mass_diagnostics, 2,
+                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     if (global_limiter_counts[1] > 0) {
         last_x_limiter_active_fraction_ =
             static_cast<double>(global_limiter_counts[0]) /
             static_cast<double>(global_limiter_counts[1]);
     }
-    last_x_limiter_min_alpha_ = global_limiter_min_alpha;
+    last_x_limiter_min_alpha_ = global_limiter_min_alpha[0];
+    if (global_limiter_counts[3] > 0) {
+        last_x_limiter_active_fraction_core_ =
+            static_cast<double>(global_limiter_counts[2]) /
+            static_cast<double>(global_limiter_counts[3]);
+    }
+    if (global_limiter_counts[5] > 0) {
+        last_x_limiter_active_fraction_boundary_ =
+            static_cast<double>(global_limiter_counts[4]) /
+            static_cast<double>(global_limiter_counts[5]);
+    }
+    last_x_limiter_min_alpha_core_ = global_limiter_min_alpha[1];
+    last_x_limiter_min_alpha_boundary_ = global_limiter_min_alpha[2];
+    last_x_negative_mass_before_repair_ = global_x_mass_diagnostics[0];
+    last_x_mass_added_by_positivity_repair_ = global_x_mass_diagnostics[1];
 
     if (mpi_size <= 1 && sp.current_face_x.size() >= static_cast<size_t>(nxl + 1)) {
         sp.current_face_x[static_cast<size_t>(nxl)] = sp.current_face_x[0];
@@ -612,23 +704,28 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
     last_mass_error_v_ = 0.0;
     last_momentum_delta_v_ = 0.0;
     last_energy_delta_v_ = 0.0;
+    last_u_force_mass_defect_ = 0.0;
+    last_u_force_energy_defect_ = 0.0;
 
     const int ng = sg.nghost;
     const int nxl = sg.nx_local;
     resize_or_zero(last_energy_current_cell_x_, static_cast<size_t>(nxl));
     resize_or_zero(last_energy_current_face_x_, static_cast<size_t>(nxl + 1));
     double max_cfl = 0.0;
+    double max_abs_ex = 0.0;
     const bool track_high_loss_location = step_diagnostics_enabled_;
     std::vector<double> loss_high_by_x;
     if (track_high_loss_location) {
         loss_high_by_x.assign(static_cast<size_t>(nxl), 0.0);
     }
 
-    #pragma omp parallel for collapse(2) schedule(static) reduction(max:max_cfl)
+    #pragma omp parallel for collapse(2) schedule(static) \
+        reduction(max:max_cfl,max_abs_ex)
     for (int ix = 0; ix < nxl; ++ix) {
         for (int iv = 0; iv < Param::Nv; ++iv) {
             const int ix_g = ix + ng;
             const double ex_cell = staggered_cell_ex(fields, ix, ix_g);
+            max_abs_ex = std::max(max_abs_ex, std::fabs(ex_cell));
             const double udot_abs =
                 std::fabs(sp.charge * ex_cell / (sp.mass * Const::c));
             const double cfl =
@@ -642,6 +739,8 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
     last_cfl_v_ = max_cfl / last_nsub_v_;
     const double dt_sub = dt / last_nsub_v_;
     const double face_weight_base = 2.0 * Const::pi * sp.vgrid.dmu;
+    const double energy_current_ex_floor =
+        1.0e-12 * std::max(1.0, max_abs_ex);
     std::array<double, Param::Nv> diag_px_base;
     std::array<double, Param::Nv> diag_ke;
     if (track_step_diagnostics) {
@@ -662,9 +761,12 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
         double px_before_sub = 0.0;
         double px_after_sub = 0.0;
         double ke_flux_delta_sub = 0.0;
+        double local_u_mass_defect = 0.0;
+        double local_u_energy_defect = 0.0;
 
         #pragma omp parallel reduction(+:n_before_sub,n_after_sub,loss_low_sub,loss_high_sub, \
-                                         px_before_sub,px_after_sub,ke_flux_delta_sub)
+                                         px_before_sub,px_after_sub,ke_flux_delta_sub, \
+                                         local_u_mass_defect,local_u_energy_defect)
         {
             std::array<double, Param::Nv> mass;
             std::array<double, Param::Nv> new_mass;
@@ -744,7 +846,21 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
                     if (ff == 0.0) continue;
                     const int donor = (ff >= 0.0) ? face - 1 : face;
                     if (donor >= 0 && donor < Param::Nv) {
-                        ff *= scale[static_cast<size_t>(donor)];
+                        const double alpha = scale[static_cast<size_t>(donor)];
+                        if (alpha < 1.0) {
+                            const double ff_orig = ff;
+                            ff *= alpha;
+                            const double suppressed =
+                                dt_sub * (1.0 - alpha) * std::fabs(ff_orig);
+                            local_u_mass_defect += suppressed;
+                            if (track_step_diagnostics) {
+                                const double ke_per_mass =
+                                    (sp.vgrid.gamma_cells[donor] - 1.0)
+                                  * sp.mass * Const::c * Const::c;
+                                local_u_energy_defect +=
+                                    suppressed * ke_per_mass;
+                            }
+                        }
                     }
                 }
 
@@ -762,7 +878,8 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
                             ke_flux_delta_sub +=
                                 dt_sub * ff * ke_jump * sg.dx;
                         }
-                        if (ex_cell != 0.0) {
+                        if (std::isfinite(ex_cell) &&
+                            std::fabs(ex_cell) > energy_current_ex_floor) {
                             energy_current_dt_sum +=
                                 dt_sub * ff * ke_jump / ex_cell;
                         }
@@ -774,13 +891,6 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
                 if (flux[static_cast<size_t>(Param::Nv)] > 0.0) {
                     const double ff = flux[static_cast<size_t>(Param::Nv)];
                     new_mass[static_cast<size_t>(Param::Nv - 1)] -= dt_sub * ff;
-                    if (ex_cell != 0.0) {
-                        const double ke_high =
-                            (sp.vgrid.gamma_cells[Param::Nv - 1] - 1.0)
-                            * sp.mass * Const::c * Const::c;
-                        energy_current_dt_sum -=
-                            dt_sub * ff * ke_high / ex_cell;
-                    }
                     if (track_step_diagnostics || track_vmax_loss) {
                         const double loss_high = dt_sub * ff * sg.dx;
                         loss_high_sub += loss_high;
@@ -788,6 +898,14 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
                             const double ke_high =
                                 diag_ke[static_cast<size_t>(Param::Nv - 1)];
                             ke_flux_delta_sub -= loss_high * ke_high;
+                        }
+                        if (std::isfinite(ex_cell) &&
+                            std::fabs(ex_cell) > energy_current_ex_floor) {
+                            const double ke_high =
+                                (sp.vgrid.gamma_cells[Param::Nv - 1] - 1.0)
+                                * sp.mass * Const::c * Const::c;
+                            energy_current_dt_sum -=
+                                dt_sub * ff * ke_high / ex_cell;
                         }
                         if (track_high_loss_location) {
                             #pragma omp atomic
@@ -810,15 +928,17 @@ void VlasovSolver::advect_v(Species& sp, const SpatialGrid& sg,
                     }
                     sp.f_tmp[offset] = cell_mass * sp.vgrid.inv_moment_weight[iv];
                 }
-            }
+                }
                 if (dt > 0.0) {
                     last_energy_current_cell_x_[static_cast<size_t>(ix)] +=
                         energy_current_dt_sum / dt;
                 }
-        }
+            }
         }
 
         sp.f.swap(sp.f_tmp);
+        last_u_force_mass_defect_ += local_u_mass_defect;
+        last_u_force_energy_defect_ += local_u_energy_defect;
         if (track_step_diagnostics) {
             last_loss_v_ += n_before_sub - n_after_sub;
             last_loss_v_low_ += loss_low_sub;

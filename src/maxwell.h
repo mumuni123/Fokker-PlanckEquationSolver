@@ -50,6 +50,11 @@ struct EMFields {
                              double dt,
                              int mpi_rank,
                              int mpi_size);
+    void advance_ampere_face_from_midpoint_current(
+        const std::vector<double>& total_current_face_mid,
+        double dt,
+        int mpi_rank,
+        int mpi_size);
     void sync_cell_ex_from_faces(int mpi_rank, int mpi_size);
     void update_gauss_residual_diagnostics(int mpi_rank, int mpi_size);
     // Snapshot-only potential reconstruction.
