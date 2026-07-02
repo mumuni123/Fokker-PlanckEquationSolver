@@ -53,6 +53,12 @@ public:
         double limiter_energy_defect;
         double limiter_mass_defect;
         double limiter_momentum_defect;
+        double region_u_limiter_energy_boundary[2];
+        double region_u_limiter_energy_core[2];
+        double region_abs_u_limiter_energy_boundary[2];
+        double region_abs_u_limiter_energy_core[2];
+        double region_limiter_active_fraction_boundary[2];
+        double region_limiter_active_fraction_core[2];
         double x_negative_mass_before_repair;
         double x_mass_added_by_positivity_repair;
         double positivity_energy_defect;
@@ -104,6 +110,12 @@ private:
         double limiter_energy_defect;
         double limiter_mass_defect;
         double limiter_momentum_defect;
+        double region_u_limiter_energy_boundary[2];
+        double region_u_limiter_energy_core[2];
+        double region_abs_u_limiter_energy_boundary[2];
+        double region_abs_u_limiter_energy_core[2];
+        double region_limiter_active_fraction_boundary[2];
+        double region_limiter_active_fraction_core[2];
         double negative_mass_before_repair;
         double mass_added_by_positivity_repair;
         double positivity_energy_defect;

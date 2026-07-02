@@ -312,6 +312,24 @@ VlasovAmpereMidpointSolver::advance_with_fixed_substeps(
             combined.limiter_mass_defect += sub.limiter_mass_defect;
             combined.limiter_momentum_defect +=
                 sub.limiter_momentum_defect;
+            for (int ir = 0; ir < 2; ++ir) {
+                combined.region_u_limiter_energy_boundary[ir] +=
+                    sub.region_u_limiter_energy_boundary[ir];
+                combined.region_u_limiter_energy_core[ir] +=
+                    sub.region_u_limiter_energy_core[ir];
+                combined.region_abs_u_limiter_energy_boundary[ir] +=
+                    sub.region_abs_u_limiter_energy_boundary[ir];
+                combined.region_abs_u_limiter_energy_core[ir] +=
+                    sub.region_abs_u_limiter_energy_core[ir];
+                combined.region_limiter_active_fraction_boundary[ir] =
+                    std::max(
+                        combined.region_limiter_active_fraction_boundary[ir],
+                        sub.region_limiter_active_fraction_boundary[ir]);
+                combined.region_limiter_active_fraction_core[ir] =
+                    std::max(
+                        combined.region_limiter_active_fraction_core[ir],
+                        sub.region_limiter_active_fraction_core[ir]);
+            }
             combined.x_negative_mass_before_repair +=
                 sub.x_negative_mass_before_repair;
             combined.x_mass_added_by_positivity_repair +=
@@ -471,6 +489,14 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
     result.limiter_energy_defect = 0.0;
     result.limiter_mass_defect = 0.0;
     result.limiter_momentum_defect = 0.0;
+    for (int ir = 0; ir < 2; ++ir) {
+        result.region_u_limiter_energy_boundary[ir] = 0.0;
+        result.region_u_limiter_energy_core[ir] = 0.0;
+        result.region_abs_u_limiter_energy_boundary[ir] = 0.0;
+        result.region_abs_u_limiter_energy_core[ir] = 0.0;
+        result.region_limiter_active_fraction_boundary[ir] = 0.0;
+        result.region_limiter_active_fraction_core[ir] = 0.0;
+    }
     result.x_negative_mass_before_repair = 0.0;
     result.x_mass_added_by_positivity_repair = 0.0;
     result.positivity_energy_defect = 0.0;
@@ -569,6 +595,14 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     fluxes.limiter_energy_defect = 0.0;
     fluxes.limiter_mass_defect = 0.0;
     fluxes.limiter_momentum_defect = 0.0;
+    for (int ir = 0; ir < 2; ++ir) {
+        fluxes.region_u_limiter_energy_boundary[ir] = 0.0;
+        fluxes.region_u_limiter_energy_core[ir] = 0.0;
+        fluxes.region_abs_u_limiter_energy_boundary[ir] = 0.0;
+        fluxes.region_abs_u_limiter_energy_core[ir] = 0.0;
+        fluxes.region_limiter_active_fraction_boundary[ir] = 0.0;
+        fluxes.region_limiter_active_fraction_core[ir] = 0.0;
+    }
     fluxes.negative_mass_before_repair = 0.0;
     fluxes.mass_added_by_positivity_repair = 0.0;
     fluxes.positivity_energy_defect = 0.0;
@@ -916,6 +950,22 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     double local_limiter_mass_delta = 0.0;
     double local_limiter_momentum_delta = 0.0;
     double local_limiter_energy_delta = 0.0;
+    double local_limiter_energy_boundary_01 = 0.0;
+    double local_limiter_energy_core_01 = 0.0;
+    double local_abs_limiter_energy_boundary_01 = 0.0;
+    double local_abs_limiter_energy_core_01 = 0.0;
+    double local_limiter_energy_boundary_02 = 0.0;
+    double local_limiter_energy_core_02 = 0.0;
+    double local_abs_limiter_energy_boundary_02 = 0.0;
+    double local_abs_limiter_energy_core_02 = 0.0;
+    long long local_limiter_active_boundary_01 = 0;
+    long long local_limiter_total_boundary_01 = 0;
+    long long local_limiter_active_core_01 = 0;
+    long long local_limiter_total_core_01 = 0;
+    long long local_limiter_active_boundary_02 = 0;
+    long long local_limiter_total_boundary_02 = 0;
+    long long local_limiter_active_core_02 = 0;
+    long long local_limiter_total_core_02 = 0;
     double local_f_neg_min = 0.0;
     double local_f_neg_ratio_max = 0.0;
     double local_f_neg_mass = 0.0;
@@ -936,8 +986,24 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     #pragma omp parallel for collapse(2) schedule(static) \
         reduction(+:local_neg_mass_defect,local_neg_energy_defect, \
                     local_limiter_mass_delta,local_limiter_momentum_delta, \
-                    local_limiter_energy_delta,local_f_neg_mass, \
-                    local_f_neg_count) \
+                    local_limiter_energy_delta, \
+                    local_limiter_energy_boundary_01, \
+                    local_limiter_energy_core_01, \
+                    local_abs_limiter_energy_boundary_01, \
+                    local_abs_limiter_energy_core_01, \
+                    local_limiter_energy_boundary_02, \
+                    local_limiter_energy_core_02, \
+                    local_abs_limiter_energy_boundary_02, \
+                    local_abs_limiter_energy_core_02, \
+                    local_limiter_active_boundary_01, \
+                    local_limiter_total_boundary_01, \
+                    local_limiter_active_core_01, \
+                    local_limiter_total_core_01, \
+                    local_limiter_active_boundary_02, \
+                    local_limiter_total_boundary_02, \
+                    local_limiter_active_core_02, \
+                    local_limiter_total_core_02, \
+                    local_f_neg_mass,local_f_neg_count) \
         reduction(min:local_f_neg_min) \
         reduction(max:local_f_neg_ratio_max)
     for (int ix = 0; ix < nxl; ++ix) {
@@ -981,16 +1047,61 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             const double local_scale = std::max(1.0, std::fabs(f0));
             const double cell_weight = bkg_n.vgrid.moment_weight[iv];
             const double ke_per_mass = ke_per_mass_arr[iv];
+            const double x_cell =
+                (static_cast<double>(sg.ix_start + ix) + 0.5) * sg.dx;
+            const bool in_boundary_01 =
+                (x_cell < 0.1 * Const::micro) ||
+                (x_cell > Param::Lx - 0.1 * Const::micro);
+            const bool in_boundary_02 =
+                (x_cell < 0.2 * Const::micro) ||
+                (x_cell > Param::Lx - 0.2 * Const::micro);
+            const bool limiter_cell_active =
+                fluxes.cell_alpha[static_cast<size_t>(ix) * Param::Nvmu + k]
+                < 0.999999;
+            if (in_boundary_01) {
+                ++local_limiter_total_boundary_01;
+                if (limiter_cell_active) ++local_limiter_active_boundary_01;
+            } else {
+                ++local_limiter_total_core_01;
+                if (limiter_cell_active) ++local_limiter_active_core_01;
+            }
+            if (in_boundary_02) {
+                ++local_limiter_total_boundary_02;
+                if (limiter_cell_active) ++local_limiter_active_boundary_02;
+            } else {
+                ++local_limiter_total_core_02;
+                if (limiter_cell_active) ++local_limiter_active_core_02;
+            }
             const double limiter_delta_f = du_div_ec - du_div;
             if (limiter_delta_f != 0.0) {
                 const double limiter_delta_n =
                     limiter_delta_f * cell_weight * sg.dx;
+                const double limiter_delta_e =
+                    limiter_delta_n * ke_per_mass;
                 const double px =
                     bkg_n.mass * Const::c * bkg_n.vgrid.v_cells[iv] *
                     bkg_n.vgrid.mu_cells[imu];
                 local_limiter_mass_delta += limiter_delta_n;
                 local_limiter_momentum_delta += limiter_delta_n * px;
-                local_limiter_energy_delta += limiter_delta_n * ke_per_mass;
+                local_limiter_energy_delta += limiter_delta_e;
+                if (in_boundary_01) {
+                    local_limiter_energy_boundary_01 += limiter_delta_e;
+                    local_abs_limiter_energy_boundary_01 +=
+                        std::fabs(limiter_delta_e);
+                } else {
+                    local_limiter_energy_core_01 += limiter_delta_e;
+                    local_abs_limiter_energy_core_01 +=
+                        std::fabs(limiter_delta_e);
+                }
+                if (in_boundary_02) {
+                    local_limiter_energy_boundary_02 += limiter_delta_e;
+                    local_abs_limiter_energy_boundary_02 +=
+                        std::fabs(limiter_delta_e);
+                } else {
+                    local_limiter_energy_core_02 += limiter_delta_e;
+                    local_abs_limiter_energy_core_02 +=
+                        std::fabs(limiter_delta_e);
+                }
             }
 
             bool record_failure = false;
@@ -1167,6 +1278,71 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         fluxes.limiter_mass_defect = global_limiter[0];
         fluxes.limiter_momentum_defect = global_limiter[1];
         fluxes.limiter_energy_defect = global_limiter[2];
+    }
+    {
+        double local_region_limiter[8] = {
+            local_limiter_energy_boundary_01,
+            local_limiter_energy_core_01,
+            local_abs_limiter_energy_boundary_01,
+            local_abs_limiter_energy_core_01,
+            local_limiter_energy_boundary_02,
+            local_limiter_energy_core_02,
+            local_abs_limiter_energy_boundary_02,
+            local_abs_limiter_energy_core_02
+        };
+        double global_region_limiter[8] = {
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        };
+        MPI_Allreduce(local_region_limiter, global_region_limiter, 8,
+                      MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        fluxes.region_u_limiter_energy_boundary[0] =
+            global_region_limiter[0];
+        fluxes.region_u_limiter_energy_core[0] = global_region_limiter[1];
+        fluxes.region_abs_u_limiter_energy_boundary[0] =
+            global_region_limiter[2];
+        fluxes.region_abs_u_limiter_energy_core[0] =
+            global_region_limiter[3];
+        fluxes.region_u_limiter_energy_boundary[1] =
+            global_region_limiter[4];
+        fluxes.region_u_limiter_energy_core[1] = global_region_limiter[5];
+        fluxes.region_abs_u_limiter_energy_boundary[1] =
+            global_region_limiter[6];
+        fluxes.region_abs_u_limiter_energy_core[1] =
+            global_region_limiter[7];
+
+        long long local_region_counts[8] = {
+            local_limiter_active_boundary_01,
+            local_limiter_total_boundary_01,
+            local_limiter_active_core_01,
+            local_limiter_total_core_01,
+            local_limiter_active_boundary_02,
+            local_limiter_total_boundary_02,
+            local_limiter_active_core_02,
+            local_limiter_total_core_02
+        };
+        long long global_region_counts[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        MPI_Allreduce(local_region_counts, global_region_counts, 8,
+                      MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
+        fluxes.region_limiter_active_fraction_boundary[0] =
+            (global_region_counts[1] > 0)
+            ? static_cast<double>(global_region_counts[0]) /
+              static_cast<double>(global_region_counts[1])
+            : 0.0;
+        fluxes.region_limiter_active_fraction_core[0] =
+            (global_region_counts[3] > 0)
+            ? static_cast<double>(global_region_counts[2]) /
+              static_cast<double>(global_region_counts[3])
+            : 0.0;
+        fluxes.region_limiter_active_fraction_boundary[1] =
+            (global_region_counts[5] > 0)
+            ? static_cast<double>(global_region_counts[4]) /
+              static_cast<double>(global_region_counts[5])
+            : 0.0;
+        fluxes.region_limiter_active_fraction_core[1] =
+            (global_region_counts[7] > 0)
+            ? static_cast<double>(global_region_counts[6]) /
+              static_cast<double>(global_region_counts[7])
+            : 0.0;
     }
     {
         long long global_u[2] = { local_u_face_active, local_u_face_total };
@@ -1593,6 +1769,20 @@ VlasovAmpereMidpointSolver::advance_single_step(
         result.limiter_mass_defect = fluxes.limiter_mass_defect;
         result.limiter_momentum_defect =
             fluxes.limiter_momentum_defect;
+        for (int ir = 0; ir < 2; ++ir) {
+            result.region_u_limiter_energy_boundary[ir] =
+                fluxes.region_u_limiter_energy_boundary[ir];
+            result.region_u_limiter_energy_core[ir] =
+                fluxes.region_u_limiter_energy_core[ir];
+            result.region_abs_u_limiter_energy_boundary[ir] =
+                fluxes.region_abs_u_limiter_energy_boundary[ir];
+            result.region_abs_u_limiter_energy_core[ir] =
+                fluxes.region_abs_u_limiter_energy_core[ir];
+            result.region_limiter_active_fraction_boundary[ir] =
+                fluxes.region_limiter_active_fraction_boundary[ir];
+            result.region_limiter_active_fraction_core[ir] =
+                fluxes.region_limiter_active_fraction_core[ir];
+        }
         result.x_negative_mass_before_repair =
             fluxes.negative_mass_before_repair;
         result.x_mass_added_by_positivity_repair =
@@ -1700,6 +1890,20 @@ VlasovAmpereMidpointSolver::advance_single_step(
             result.limiter_mass_defect = fluxes.limiter_mass_defect;
             result.limiter_momentum_defect =
                 fluxes.limiter_momentum_defect;
+            for (int ir = 0; ir < 2; ++ir) {
+                result.region_u_limiter_energy_boundary[ir] =
+                    fluxes.region_u_limiter_energy_boundary[ir];
+                result.region_u_limiter_energy_core[ir] =
+                    fluxes.region_u_limiter_energy_core[ir];
+                result.region_abs_u_limiter_energy_boundary[ir] =
+                    fluxes.region_abs_u_limiter_energy_boundary[ir];
+                result.region_abs_u_limiter_energy_core[ir] =
+                    fluxes.region_abs_u_limiter_energy_core[ir];
+                result.region_limiter_active_fraction_boundary[ir] =
+                    fluxes.region_limiter_active_fraction_boundary[ir];
+                result.region_limiter_active_fraction_core[ir] =
+                    fluxes.region_limiter_active_fraction_core[ir];
+            }
             result.x_negative_mass_before_repair =
                 fluxes.negative_mass_before_repair;
             result.x_mass_added_by_positivity_repair =

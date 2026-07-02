@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <mpi.h>
 #include <omp.h>
 #include <vector>
@@ -72,6 +73,36 @@ struct BackgroundCurrentDiagnostics {
     double max_abs_j_energy_minus_ampere;
 };
 
+struct BoundaryCoreDiagnostics {
+    double boundary_width;
+    double neg_mass_boundary;
+    double neg_mass_core;
+    long long neg_cell_count_boundary;
+    long long neg_cell_count_core;
+    double min_f_boundary;
+    double min_f_core;
+    double max_abs_J_bkg_boundary;
+    double max_abs_J_bkg_core;
+    double rms_J_bkg_boundary;
+    double rms_J_bkg_core;
+    double mean_abs_J_bkg_boundary;
+    double mean_abs_J_bkg_core;
+    double max_abs_Ex_boundary;
+    double max_abs_Ex_core;
+    double W_bkg_E_boundary;
+    double W_bkg_E_core;
+};
+
+struct FNegativitySnapshotDiagnostics {
+    double min_f;
+    double neg_ratio_max;
+    double neg_mass_total;
+    long long neg_cell_count;
+    int x_worst;
+    int u_worst;
+    int mu_worst;
+};
+
 void reset_background_current_diagnostics(BackgroundCurrentDiagnostics& diag)
 {
     diag.residual_if_charge = 0.0;
@@ -84,6 +115,296 @@ void reset_background_current_diagnostics(BackgroundCurrentDiagnostics& diag)
     diag.max_abs_j_ampere = 0.0;
     diag.max_abs_j_charge_minus_ampere = 0.0;
     diag.max_abs_j_energy_minus_ampere = 0.0;
+}
+
+void reset_boundary_core_diagnostics(BoundaryCoreDiagnostics& diag,
+                                     double boundary_width)
+{
+    diag.boundary_width = boundary_width;
+    diag.neg_mass_boundary = 0.0;
+    diag.neg_mass_core = 0.0;
+    diag.neg_cell_count_boundary = 0;
+    diag.neg_cell_count_core = 0;
+    diag.min_f_boundary = 0.0;
+    diag.min_f_core = 0.0;
+    diag.max_abs_J_bkg_boundary = 0.0;
+    diag.max_abs_J_bkg_core = 0.0;
+    diag.rms_J_bkg_boundary = 0.0;
+    diag.rms_J_bkg_core = 0.0;
+    diag.mean_abs_J_bkg_boundary = 0.0;
+    diag.mean_abs_J_bkg_core = 0.0;
+    diag.max_abs_Ex_boundary = 0.0;
+    diag.max_abs_Ex_core = 0.0;
+    diag.W_bkg_E_boundary = 0.0;
+    diag.W_bkg_E_core = 0.0;
+}
+
+void reset_f_negativity_snapshot_diagnostics(
+    FNegativitySnapshotDiagnostics& diag)
+{
+    diag.min_f = 0.0;
+    diag.neg_ratio_max = 0.0;
+    diag.neg_mass_total = 0.0;
+    diag.neg_cell_count = 0;
+    diag.x_worst = -1;
+    diag.u_worst = -1;
+    diag.mu_worst = -1;
+}
+
+void compute_f_negativity_snapshot_diagnostics(
+    const Species& electrons,
+    const SpatialGrid& sg,
+    FNegativitySnapshotDiagnostics& diag)
+{
+    reset_f_negativity_snapshot_diagnostics(diag);
+
+    const int ng = sg.nghost;
+    const int nxl = sg.nx_local;
+    double local_min_f = std::numeric_limits<double>::infinity();
+    double local_max_positive_f = 0.0;
+    double local_neg_mass = 0.0;
+    long long local_neg_count = 0;
+    int local_min_indices[3] = { -1, -1, -1 };
+
+    for (int ix = 0; ix < nxl; ++ix) {
+        const size_t xbase =
+            static_cast<size_t>(ng + ix) * Param::Nvmu;
+        for (int iv = 0; iv < Param::Nv; ++iv) {
+            const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
+            for (int imu = 0; imu < Param::Nmu; ++imu) {
+                const double f = electrons.f[row + static_cast<size_t>(imu)];
+                if (f < local_min_f) {
+                    local_min_f = f;
+                    local_min_indices[0] = sg.ix_start + ix;
+                    local_min_indices[1] = iv;
+                    local_min_indices[2] = imu;
+                }
+                if (f > 0.0) {
+                    local_max_positive_f = std::max(local_max_positive_f, f);
+                }
+                if (f < 0.0) {
+                    local_neg_mass +=
+                        (-f) * electrons.vgrid.moment_weight[iv] * sg.dx;
+                    ++local_neg_count;
+                }
+            }
+        }
+    }
+
+    int mpi_rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+    struct { double val; int rank; } local_min_loc, global_min_loc;
+    local_min_loc.val = local_min_f;
+    local_min_loc.rank = mpi_rank;
+    global_min_loc.val = std::numeric_limits<double>::infinity();
+    global_min_loc.rank = -1;
+    MPI_Allreduce(&local_min_loc, &global_min_loc, 1, MPI_DOUBLE_INT,
+                  MPI_MINLOC, MPI_COMM_WORLD);
+    double global_max_positive_f = local_max_positive_f;
+    MPI_Allreduce(MPI_IN_PLACE, &global_max_positive_f, 1, MPI_DOUBLE,
+                  MPI_MAX, MPI_COMM_WORLD);
+    double global_neg_mass = 0.0;
+    MPI_Allreduce(&local_neg_mass, &global_neg_mass, 1, MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+    long long global_neg_count = 0;
+    MPI_Allreduce(&local_neg_count, &global_neg_count, 1,
+                  MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
+
+    const double scale =
+        std::max(global_max_positive_f,
+                 std::numeric_limits<double>::min());
+    if (global_min_loc.rank >= 0) {
+        MPI_Bcast(local_min_indices, 3, MPI_INT, global_min_loc.rank,
+                  MPI_COMM_WORLD);
+    }
+
+    diag.min_f = std::isfinite(global_min_loc.val) ? global_min_loc.val : 0.0;
+    diag.neg_ratio_max = (diag.min_f < 0.0) ? -diag.min_f / scale : 0.0;
+    diag.neg_mass_total = global_neg_mass;
+    diag.neg_cell_count = global_neg_count;
+    diag.x_worst = (diag.min_f < 0.0) ? local_min_indices[0] : -1;
+    diag.u_worst = (diag.min_f < 0.0) ? local_min_indices[1] : -1;
+    diag.mu_worst = (diag.min_f < 0.0) ? local_min_indices[2] : -1;
+}
+
+void compute_boundary_core_diagnostics(
+    const Species& electrons,
+    const EMFields& fields,
+    const SpatialGrid& sg,
+    double dt,
+    double boundary_width,
+    int mpi_rank,
+    int mpi_size,
+    BoundaryCoreDiagnostics& diag)
+{
+    reset_boundary_core_diagnostics(diag, boundary_width);
+    const int ng = sg.nghost;
+    const int nxl = sg.nx_local;
+    double local_neg_mass_boundary = 0.0;
+    double local_neg_mass_core = 0.0;
+    long long local_neg_count_boundary = 0;
+    long long local_neg_count_core = 0;
+    double local_min_f_boundary = std::numeric_limits<double>::infinity();
+    double local_min_f_core = std::numeric_limits<double>::infinity();
+
+    for (int ix = 0; ix < nxl; ++ix) {
+        const double x_cell =
+            (static_cast<double>(sg.ix_start + ix) + 0.5) * sg.dx;
+        const bool boundary =
+            (x_cell < boundary_width) || (x_cell > Param::Lx - boundary_width);
+        const size_t xbase =
+            static_cast<size_t>(ng + ix) * Param::Nvmu;
+        for (int iv = 0; iv < Param::Nv; ++iv) {
+            const double shell = electrons.vgrid.moment_weight[iv];
+            const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
+            for (int imu = 0; imu < Param::Nmu; ++imu) {
+                const double f = electrons.f[row + static_cast<size_t>(imu)];
+                if (boundary) {
+                    local_min_f_boundary =
+                        std::min(local_min_f_boundary, f);
+                } else {
+                    local_min_f_core = std::min(local_min_f_core, f);
+                }
+                if (f < 0.0) {
+                    const double neg_mass = -f * shell * sg.dx;
+                    if (boundary) {
+                        local_neg_mass_boundary += neg_mass;
+                        ++local_neg_count_boundary;
+                    } else {
+                        local_neg_mass_core += neg_mass;
+                        ++local_neg_count_core;
+                    }
+                }
+            }
+        }
+    }
+
+    double local_max_j_boundary = 0.0;
+    double local_max_j_core = 0.0;
+    double local_sum_abs_j_boundary = 0.0;
+    double local_sum_abs_j_core = 0.0;
+    double local_sum_j2_boundary = 0.0;
+    double local_sum_j2_core = 0.0;
+    double local_max_ex_boundary = 0.0;
+    double local_max_ex_core = 0.0;
+    double local_work_boundary = 0.0;
+    double local_work_core = 0.0;
+    long long local_face_count_boundary = 0;
+    long long local_face_count_core = 0;
+
+    const int face_count =
+        std::min(nxl, static_cast<int>(std::min(electrons.current_face_x.size(),
+                                                fields.Ex_face.size())));
+    for (int iface = 0; iface < face_count; ++iface) {
+        const double x_face =
+            static_cast<double>(sg.ix_start + iface) * sg.dx;
+        const bool boundary =
+            (x_face < boundary_width) || (x_face > Param::Lx - boundary_width);
+        const double j = electrons.current_face_x[static_cast<size_t>(iface)];
+        const double ex = fields.Ex_face[static_cast<size_t>(iface)];
+        const double abs_j = std::fabs(j);
+        const double abs_ex = std::fabs(ex);
+        const double work = -j * ex * sg.dx * dt;
+        if (boundary) {
+            local_max_j_boundary = std::max(local_max_j_boundary, abs_j);
+            local_sum_abs_j_boundary += abs_j;
+            local_sum_j2_boundary += j * j;
+            local_max_ex_boundary = std::max(local_max_ex_boundary, abs_ex);
+            local_work_boundary += work;
+            ++local_face_count_boundary;
+        } else {
+            local_max_j_core = std::max(local_max_j_core, abs_j);
+            local_sum_abs_j_core += abs_j;
+            local_sum_j2_core += j * j;
+            local_max_ex_core = std::max(local_max_ex_core, abs_ex);
+            local_work_core += work;
+            ++local_face_count_core;
+        }
+    }
+
+    double sums[10] = {
+        local_neg_mass_boundary,
+        local_neg_mass_core,
+        local_sum_abs_j_boundary,
+        local_sum_abs_j_core,
+        local_sum_j2_boundary,
+        local_sum_j2_core,
+        local_work_boundary,
+        local_work_core,
+        0.0,
+        0.0
+    };
+    MPI_Allreduce(MPI_IN_PLACE, sums, 10, MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+
+    double mins[2] = { local_min_f_boundary, local_min_f_core };
+    MPI_Allreduce(MPI_IN_PLACE, mins, 2, MPI_DOUBLE, MPI_MIN,
+                  MPI_COMM_WORLD);
+
+    double maxes[4] = {
+        local_max_j_boundary,
+        local_max_j_core,
+        local_max_ex_boundary,
+        local_max_ex_core
+    };
+    MPI_Allreduce(MPI_IN_PLACE, maxes, 4, MPI_DOUBLE, MPI_MAX,
+                  MPI_COMM_WORLD);
+
+    long long counts[4] = {
+        local_neg_count_boundary,
+        local_neg_count_core,
+        local_face_count_boundary,
+        local_face_count_core
+    };
+    MPI_Allreduce(MPI_IN_PLACE, counts, 4, MPI_LONG_LONG_INT, MPI_SUM,
+                  MPI_COMM_WORLD);
+
+    (void)mpi_rank;
+    (void)mpi_size;
+    diag.neg_mass_boundary = sums[0];
+    diag.neg_mass_core = sums[1];
+    diag.neg_cell_count_boundary = counts[0];
+    diag.neg_cell_count_core = counts[1];
+    diag.min_f_boundary =
+        std::isfinite(mins[0]) ? mins[0] : 0.0;
+    diag.min_f_core =
+        std::isfinite(mins[1]) ? mins[1] : 0.0;
+    diag.max_abs_J_bkg_boundary = maxes[0];
+    diag.max_abs_J_bkg_core = maxes[1];
+    diag.mean_abs_J_bkg_boundary =
+        (counts[2] > 0) ? sums[2] / static_cast<double>(counts[2]) : 0.0;
+    diag.mean_abs_J_bkg_core =
+        (counts[3] > 0) ? sums[3] / static_cast<double>(counts[3]) : 0.0;
+    diag.rms_J_bkg_boundary =
+        (counts[2] > 0) ? std::sqrt(sums[4] / static_cast<double>(counts[2]))
+                        : 0.0;
+    diag.rms_J_bkg_core =
+        (counts[3] > 0) ? std::sqrt(sums[5] / static_cast<double>(counts[3]))
+                        : 0.0;
+    diag.max_abs_Ex_boundary = maxes[2];
+    diag.max_abs_Ex_core = maxes[3];
+    diag.W_bkg_E_boundary = sums[6];
+    diag.W_bkg_E_core = sums[7];
+}
+
+const char* classify_boundary_core_state(double neg_mass_core_fraction,
+                                         double neg_cell_core_fraction,
+                                         double limiter_core_fraction,
+                                         double j_core_to_boundary_ratio)
+{
+    if (neg_mass_core_fraction > 0.2 ||
+        neg_cell_core_fraction > 0.2 ||
+        limiter_core_fraction > 0.2 ||
+        j_core_to_boundary_ratio > 0.5) {
+        return "core_contaminated";
+    }
+    if (neg_mass_core_fraction < 0.05 &&
+        neg_cell_core_fraction < 0.05 &&
+        limiter_core_fraction < 0.05 &&
+        j_core_to_boundary_ratio < 0.2) {
+        return "boundary_only";
+    }
+    return "transition";
 }
 
 void write_snapshot(Diagnostics& diag,
@@ -244,6 +565,7 @@ int main(int argc, char** argv)
     int last_snapshot_step = 0;
     double cumulative_bkg_energy_residual = 0.0;
     std::ofstream bkg_energy_monitor;
+    std::ofstream boundary_core_monitor;
     if (mpi_rank == 0) {
         bkg_energy_monitor.open("output/bkg_energy_monitor.dat");
         bkg_energy_monitor
@@ -281,11 +603,40 @@ int main(int argc, char** argv)
         std::ofstream f_neg_monitor;
         f_neg_monitor.open("output/f_negativity_monitor.dat");
         f_neg_monitor
+            << "# accepted_snapshot: statistics scan final accepted bkg_e.f; "
+            << "neg_ratio_max uses max positive f as scale\n"
             << "# step  time[fs]  min_f  neg_ratio_max  "
             << "neg_mass_total[m^-2]  neg_cell_count  "
             << "x_worst  u_worst  mu_worst\n";
         f_neg_monitor << std::scientific << std::setprecision(8);
         f_neg_monitor.close();
+
+        boundary_core_monitor.open("output/boundary_core_diagnostics.dat");
+        boundary_core_monitor
+            << "# step  time[fs]  boundary_width[um]  "
+            << "neg_mass_boundary[m^-2]  neg_mass_core[m^-2]  "
+            << "neg_mass_core_fraction  "
+            << "neg_cell_count_boundary  neg_cell_count_core  "
+            << "neg_cell_count_core_fraction  "
+            << "min_f_boundary  min_f_core  "
+            << "u_limiter_energy_delta_boundary[J/m2]  "
+            << "u_limiter_energy_delta_core[J/m2]  "
+            << "abs_u_limiter_energy_delta_boundary[J/m2]  "
+            << "abs_u_limiter_energy_delta_core[J/m2]  "
+            << "u_limiter_energy_delta_core_fraction  "
+            << "core_limiter_energy_relative_to_core_work  "
+            << "x_limiter_active_fraction_boundary  "
+            << "x_limiter_active_fraction_core  "
+            << "max_abs_J_bkg_boundary[A/m2]  "
+            << "max_abs_J_bkg_core[A/m2]  "
+            << "J_bkg_core_to_boundary_ratio  "
+            << "rms_J_bkg_boundary[A/m2]  rms_J_bkg_core[A/m2]  "
+            << "mean_abs_J_bkg_boundary[A/m2]  "
+            << "mean_abs_J_bkg_core[A/m2]  "
+            << "max_abs_Ex_boundary[V/m]  max_abs_Ex_core[V/m]  "
+            << "W_bkg_E_boundary[J/m2]  W_bkg_E_core[J/m2]  "
+            << "conclusion\n";
+        boundary_core_monitor << std::scientific << std::setprecision(8);
     }
     for (int step = 1; step <= nsteps; ++step) {
         double time = step * dt;
@@ -343,13 +694,6 @@ int main(int argc, char** argv)
         double u_limiter_energy_delta_step = 0.0;
         double u_force_alpha_min_step = 1.0;
         double u_force_alpha_active_frac_step = 0.0;
-        double f_neg_min_step = 0.0;
-        double f_neg_ratio_max_step = 0.0;
-        double f_neg_mass_total_step = 0.0;
-        long long f_neg_cell_count_step = 0;
-        int f_neg_ix_step = -1;
-        int f_neg_iv_step = -1;
-        int f_neg_imu_step = -1;
         double local_bkg_energy_residual_step = 0.0;
         double bkg_energy_residual_step = 0.0;
         double bkg_energy_relative_residual_step = 0.0;
@@ -482,13 +826,6 @@ int main(int argc, char** argv)
             midpoint_result.u_force_alpha_min;
         u_force_alpha_active_frac_step =
             midpoint_result.u_force_alpha_active_frac;
-        f_neg_min_step = midpoint_result.f_neg_min;
-        f_neg_ratio_max_step = midpoint_result.f_neg_ratio_max;
-        f_neg_mass_total_step = midpoint_result.f_neg_mass_total;
-        f_neg_cell_count_step = midpoint_result.f_neg_cell_count;
-        f_neg_ix_step = midpoint_result.f_neg_ix;
-        f_neg_iv_step = midpoint_result.f_neg_iv;
-        f_neg_imu_step = midpoint_result.f_neg_imu;
         coupled_iter_step = midpoint_result.nonlinear_iterations;
         coupled_residual_E_step = midpoint_result.residual_E;
         coupled_residual_J_bkg_step = midpoint_result.residual_J_bkg;
@@ -603,21 +940,123 @@ int main(int argc, char** argv)
                                << coupled_residual_bkg_mass_step << "  "
                                << coupled_residual_beam_continuity_step << "\n";
             bkg_energy_monitor.flush();
+        }
+        if (step % 100 == 0) {
+            FNegativitySnapshotDiagnostics f_neg_snapshot;
+            compute_f_negativity_snapshot_diagnostics(
+                bkg_e, sgrid, f_neg_snapshot);
 
-            // f-negativity monitor: append every 100 steps
-            std::ofstream f_neg_monitor;
-            f_neg_monitor.open("output/f_negativity_monitor.dat",
-                               std::ios::app);
-            f_neg_monitor << step << "  "
-                          << time / Const::femto << "  "
-                          << f_neg_min_step << "  "
-                          << f_neg_ratio_max_step << "  "
-                          << f_neg_mass_total_step << "  "
-                          << f_neg_cell_count_step << "  "
-                          << f_neg_ix_step << "  "
-                          << f_neg_iv_step << "  "
-                          << f_neg_imu_step << "\n";
-            f_neg_monitor.close();
+            if (mpi_rank == 0) {
+                // f-negativity monitor: final accepted snapshot every 100 steps.
+                std::ofstream f_neg_monitor;
+                f_neg_monitor.open("output/f_negativity_monitor.dat",
+                                   std::ios::app);
+                f_neg_monitor << step << "  "
+                              << time / Const::femto << "  "
+                              << f_neg_snapshot.min_f << "  "
+                              << f_neg_snapshot.neg_ratio_max << "  "
+                              << f_neg_snapshot.neg_mass_total << "  "
+                              << f_neg_snapshot.neg_cell_count << "  "
+                              << f_neg_snapshot.x_worst << "  "
+                              << f_neg_snapshot.u_worst << "  "
+                              << f_neg_snapshot.mu_worst << "\n";
+                f_neg_monitor.close();
+            }
+        }
+        if (step % 100 == 0) {
+            const double region_widths[2] = {
+                0.1 * Const::micro,
+                0.2 * Const::micro
+            };
+            for (int ir = 0; ir < 2; ++ir) {
+                BoundaryCoreDiagnostics region_diag;
+                compute_boundary_core_diagnostics(
+                    bkg_e, fields, sgrid, dt, region_widths[ir],
+                    mpi_rank, mpi_size, region_diag);
+                const double neg_mass_total_region =
+                    region_diag.neg_mass_boundary + region_diag.neg_mass_core;
+                const double neg_mass_core_fraction =
+                    (neg_mass_total_region > 0.0)
+                    ? region_diag.neg_mass_core / neg_mass_total_region
+                    : 0.0;
+                const long long neg_cell_total_region =
+                    region_diag.neg_cell_count_boundary
+                  + region_diag.neg_cell_count_core;
+                const double neg_cell_core_fraction =
+                    (neg_cell_total_region > 0)
+                    ? static_cast<double>(region_diag.neg_cell_count_core) /
+                      static_cast<double>(neg_cell_total_region)
+                    : 0.0;
+                const double abs_limiter_boundary =
+                    midpoint_result
+                        .region_abs_u_limiter_energy_boundary[ir];
+                const double abs_limiter_core =
+                    midpoint_result
+                        .region_abs_u_limiter_energy_core[ir];
+                const double abs_limiter_total =
+                    abs_limiter_boundary + abs_limiter_core;
+                const double limiter_core_fraction =
+                    (abs_limiter_total > 0.0)
+                    ? abs_limiter_core / abs_limiter_total
+                    : 0.0;
+                const double j_core_to_boundary_ratio =
+                    (region_diag.max_abs_J_bkg_boundary > 0.0)
+                    ? region_diag.max_abs_J_bkg_core /
+                      region_diag.max_abs_J_bkg_boundary
+                    : 0.0;
+                const double core_limiter_relative_to_work =
+                    abs_limiter_core /
+                    std::max(std::fabs(region_diag.W_bkg_E_core), 1.0);
+                const char* conclusion =
+                    classify_boundary_core_state(
+                        neg_mass_core_fraction,
+                        neg_cell_core_fraction,
+                        limiter_core_fraction,
+                        j_core_to_boundary_ratio);
+                if (mpi_rank == 0) {
+                    boundary_core_monitor
+                        << step << "  "
+                        << time / Const::femto << "  "
+                        << region_widths[ir] / Const::micro << "  "
+                        << region_diag.neg_mass_boundary << "  "
+                        << region_diag.neg_mass_core << "  "
+                        << neg_mass_core_fraction << "  "
+                        << region_diag.neg_cell_count_boundary << "  "
+                        << region_diag.neg_cell_count_core << "  "
+                        << neg_cell_core_fraction << "  "
+                        << region_diag.min_f_boundary << "  "
+                        << region_diag.min_f_core << "  "
+                        << midpoint_result
+                               .region_u_limiter_energy_boundary[ir] << "  "
+                        << midpoint_result
+                               .region_u_limiter_energy_core[ir] << "  "
+                        << abs_limiter_boundary << "  "
+                        << abs_limiter_core << "  "
+                        << limiter_core_fraction << "  "
+                        << core_limiter_relative_to_work << "  "
+                        << midpoint_result
+                               .region_limiter_active_fraction_boundary[ir]
+                        << "  "
+                        << midpoint_result
+                               .region_limiter_active_fraction_core[ir]
+                        << "  "
+                        << region_diag.max_abs_J_bkg_boundary << "  "
+                        << region_diag.max_abs_J_bkg_core << "  "
+                        << j_core_to_boundary_ratio << "  "
+                        << region_diag.rms_J_bkg_boundary << "  "
+                        << region_diag.rms_J_bkg_core << "  "
+                        << region_diag.mean_abs_J_bkg_boundary << "  "
+                        << region_diag.mean_abs_J_bkg_core << "  "
+                        << region_diag.max_abs_Ex_boundary << "  "
+                        << region_diag.max_abs_Ex_core << "  "
+                        << region_diag.W_bkg_E_boundary << "  "
+                        << region_diag.W_bkg_E_core << "  "
+                        << conclusion << "\n";
+                }
+            }
+            if (mpi_rank == 0) {
+                boundary_core_monitor.flush();
+            }
         }
         if (bkg_e.collisions_enabled) {
             trace_progress(config, mpi_rank, step, "before collisions");
