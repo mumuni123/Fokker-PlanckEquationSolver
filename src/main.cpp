@@ -610,6 +610,11 @@ int main(int argc, char** argv)
             << "mu_low_u_half_dt_inv_shell0  "
             << "mu_low_u_dimless_scale0  "
             << "mu_low_u_endpoint_flux_max  "
+            << "remap_active_fraction  "
+            << "remap_cell_count  "
+            << "low_u_subcycle_active_fraction  "
+            << "low_u_average_subcycles  "
+            << "low_u_max_subcycles  "
             << "u_force_alpha_min  u_force_alpha_active_frac  "
             << "coupled_iter  coupled_residual_E  "
             << "coupled_residual_J_bkg  coupled_residual_J_beam  "
@@ -726,6 +731,11 @@ int main(int argc, char** argv)
         double mu_low_u_half_dt_inv_shell0_step = 0.0;
         double mu_low_u_dimless_scale0_step = 0.0;
         double mu_low_u_endpoint_flux_max_step = 0.0;
+        double remap_active_fraction_step = 0.0;
+        long long remap_cell_count_step = 0;
+        double low_u_subcycle_active_fraction_step = 0.0;
+        double low_u_average_subcycles_step = 1.0;
+        int low_u_max_subcycles_step = 1;
         double u_force_alpha_min_step = 1.0;
         double u_force_alpha_active_frac_step = 0.0;
         double local_bkg_energy_residual_step = 0.0;
@@ -889,6 +899,14 @@ int main(int argc, char** argv)
             midpoint_result.mu_low_u_dimless_scale0;
         mu_low_u_endpoint_flux_max_step =
             midpoint_result.mu_low_u_endpoint_flux_max;
+        remap_active_fraction_step =
+            midpoint_result.remap_active_fraction;
+        remap_cell_count_step = midpoint_result.remap_cell_count;
+        low_u_subcycle_active_fraction_step =
+            midpoint_result.low_u_subcycle_active_fraction;
+        low_u_average_subcycles_step =
+            midpoint_result.low_u_average_subcycles;
+        low_u_max_subcycles_step = midpoint_result.low_u_max_subcycles;
         u_force_alpha_min_step =
             midpoint_result.u_force_alpha_min;
         u_force_alpha_active_frac_step =
@@ -1015,6 +1033,11 @@ int main(int argc, char** argv)
                                << mu_low_u_half_dt_inv_shell0_step << "  "
                                << mu_low_u_dimless_scale0_step << "  "
                                << mu_low_u_endpoint_flux_max_step << "  "
+                               << remap_active_fraction_step << "  "
+                               << remap_cell_count_step << "  "
+                               << low_u_subcycle_active_fraction_step << "  "
+                               << low_u_average_subcycles_step << "  "
+                               << low_u_max_subcycles_step << "  "
                                << u_force_alpha_min_step << "  "
                                << u_force_alpha_active_frac_step << "  "
                                << coupled_iter_step << "  "

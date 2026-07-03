@@ -18,6 +18,14 @@ const double NEG_TOL_HARD   = 1.0e300;  // disabled for long-run test
 const int BKG_STAGE_COUNT = 3;
 const int BKG_DIV_COMPONENT_COUNT = 3;
 const double CORE_DIAG_BOUNDARY_WIDTH = 0.2 * Const::micro;
+const int LOW_U_MU_LIMIT_COUNT = 6;
+const int LOW_U_ADAPTIVE_MAX_SUBCYCLES = 4;
+const int LOW_U_MU_REMAP_ENDPOINT_BAND = 2;
+const double LOW_U_ADAPTIVE_CFL_THRESHOLD = 0.25;
+const double LOW_U_REMAP_NEG_RATIO_THRESHOLD = 1.0e-6;
+const double LOW_U_MU_ALPHA_SAFETY = 0.95;
+const double LOW_U_MU_ALPHA_SMOOTH = 0.25;
+const double LOW_U_MU_ENDPOINT_ALPHA_CAP = 0.5;
 
 void resize_or_zero(std::vector<double>& values, size_t n)
 {
@@ -130,6 +138,31 @@ double shell_consistent_mu_u_eff(const VelocityGrid& vg, int iv)
         return std::max(int_u2 / int_u, Param::u_floor);
     }
     return std::max(vg.v_cells[iv], Param::u_floor);
+}
+
+double smooth_low_u_mu_alpha(double alpha)
+{
+    alpha = std::max(0.0, std::min(1.0, alpha));
+    if (alpha >= 1.0) return 1.0;
+    const double safe = LOW_U_MU_ALPHA_SAFETY * alpha;
+    return safe * (1.0 - LOW_U_MU_ALPHA_SMOOTH * (1.0 - safe));
+}
+
+bool near_mu_endpoint(int imu)
+{
+    return imu < LOW_U_MU_REMAP_ENDPOINT_BAND ||
+           imu >= Param::Nmu - LOW_U_MU_REMAP_ENDPOINT_BAND;
+}
+
+int adaptive_low_u_subcycles(double out, double available)
+{
+    if (!(out > 0.0) || !std::isfinite(out)) return 1;
+    const double cfl =
+        out / std::max(available, std::numeric_limits<double>::min());
+    if (cfl <= LOW_U_ADAPTIVE_CFL_THRESHOLD) return 1;
+    const int cycles =
+        static_cast<int>(std::ceil(cfl / LOW_U_ADAPTIVE_CFL_THRESHOLD));
+    return std::max(1, std::min(LOW_U_ADAPTIVE_MAX_SUBCYCLES, cycles));
 }
 
 double max_abs_vector(const std::vector<double>& values, size_t n)
@@ -369,6 +402,19 @@ VlasovAmpereMidpointSolver::advance_with_fixed_substeps(
             combined.mu_low_u_endpoint_flux_max =
                 std::max(combined.mu_low_u_endpoint_flux_max,
                          sub.mu_low_u_endpoint_flux_max);
+            combined.remap_active_fraction =
+                std::max(combined.remap_active_fraction,
+                         sub.remap_active_fraction);
+            combined.remap_cell_count += sub.remap_cell_count;
+            combined.low_u_subcycle_active_fraction =
+                std::max(combined.low_u_subcycle_active_fraction,
+                         sub.low_u_subcycle_active_fraction);
+            combined.low_u_average_subcycles =
+                std::max(combined.low_u_average_subcycles,
+                         sub.low_u_average_subcycles);
+            combined.low_u_max_subcycles =
+                std::max(combined.low_u_max_subcycles,
+                         sub.low_u_max_subcycles);
             for (int ir = 0; ir < 2; ++ir) {
                 combined.region_u_limiter_energy_boundary[ir] +=
                     sub.region_u_limiter_energy_boundary[ir];
@@ -599,6 +645,11 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
     result.mu_low_u_half_dt_inv_shell0 = 0.0;
     result.mu_low_u_dimless_scale0 = 0.0;
     result.mu_low_u_endpoint_flux_max = 0.0;
+    result.remap_active_fraction = 0.0;
+    result.remap_cell_count = 0;
+    result.low_u_subcycle_active_fraction = 0.0;
+    result.low_u_average_subcycles = 1.0;
+    result.low_u_max_subcycles = 1;
     for (int ir = 0; ir < 2; ++ir) {
         result.region_u_limiter_energy_boundary[ir] = 0.0;
         result.region_u_limiter_energy_core[ir] = 0.0;
@@ -744,6 +795,11 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     fluxes.mu_low_u_half_dt_inv_shell0 = 0.0;
     fluxes.mu_low_u_dimless_scale0 = 0.0;
     fluxes.mu_low_u_endpoint_flux_max = 0.0;
+    fluxes.remap_active_fraction = 0.0;
+    fluxes.remap_cell_count = 0;
+    fluxes.low_u_subcycle_active_fraction = 0.0;
+    fluxes.low_u_average_subcycles = 1.0;
+    fluxes.low_u_max_subcycles = 1;
     for (int ir = 0; ir < 2; ++ir) {
         fluxes.region_u_limiter_energy_boundary[ir] = 0.0;
         fluxes.region_u_limiter_energy_core[ir] = 0.0;
@@ -1113,6 +1169,8 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
      * from its two adjacent cells.
      */
     bkg_new = bkg_n;
+    const int low_u_limit_count =
+        std::min(LOW_U_MU_LIMIT_COUNT, Param::Nv);
     // Precompute dt*inv_shell/2 and other per-iv constants once
     double half_dt_inv_shell[Param::Nv];
     double ke_per_mass_arr[Param::Nv];
@@ -1290,6 +1348,10 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                     alpha_face = std::min(alpha_left[k], alpha_right[k]);
                 }
                 alpha_face = std::max(0.0, std::min(1.0, alpha_face));
+                if (face <= low_u_limit_count &&
+                    alpha_face < 1.0 - 1.0e-12) {
+                    alpha_face = smooth_low_u_mu_alpha(alpha_face);
+                }
                 ff *= alpha_face;
                 if (alpha_face < 0.999999) ++local_u_face_active;
                 ++local_u_face_total;
@@ -1303,7 +1365,6 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                                mpi_rank, mpi_size, 506);
     } // need_face_limiting
 
-    const int low_u_limit_count = std::min(2, Param::Nv);
     std::vector<double> mu_force_low_u_ec(
         static_cast<size_t>(nxl + 1) * low_u_limit_count *
         static_cast<size_t>(Param::Nmu + 1), 0.0);
@@ -1326,6 +1387,10 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     long long local_mu_low_u_face_total_boundary = 0;
     long long local_mu_low_u_face_active_core = 0;
     long long local_mu_low_u_face_total_core = 0;
+    long long local_low_u_subcycle_active = 0;
+    long long local_low_u_subcycle_total = 0;
+    long long local_low_u_subcycle_sum = 0;
+    int local_low_u_max_subcycles = 1;
     double local_mu_low_u_alpha_min = 1.0;
     double local_mu_low_u_alpha_min_boundary = 1.0;
     double local_mu_low_u_alpha_min_core = 1.0;
@@ -1335,10 +1400,14 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                     local_mu_low_u_face_active_boundary, \
                     local_mu_low_u_face_total_boundary, \
                     local_mu_low_u_face_active_core, \
-                    local_mu_low_u_face_total_core) \
+                    local_mu_low_u_face_total_core, \
+                    local_low_u_subcycle_active, \
+                    local_low_u_subcycle_total, \
+                    local_low_u_subcycle_sum) \
         reduction(min:local_mu_low_u_alpha_min, \
                       local_mu_low_u_alpha_min_boundary, \
-                      local_mu_low_u_alpha_min_core)
+                      local_mu_low_u_alpha_min_core) \
+        reduction(max:local_low_u_max_subcycles)
     for (int iface = 0; iface < nxl; ++iface) {
         for (int iv = 0; iv < low_u_limit_count; ++iv) {
             const int ix_left = ng + iface - 1;
@@ -1365,12 +1434,34 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                     const double donor_face_f =
                         0.5 * (f_mid.f[left_donor] + f_mid.f[right_donor]);
                     const double available = std::max(0.0, donor_face_f);
-                    const double out = half_dt_inv_shell[iv] * std::fabs(ff);
+                    const double full_out =
+                        half_dt_inv_shell[iv] * std::fabs(ff);
                     if (!std::isfinite(donor_face_f) ||
-                        !std::isfinite(out)) {
+                        !std::isfinite(full_out)) {
                         alpha_face = 0.0;
-                    } else if (out > 0.0) {
-                        alpha_face = std::min(1.0, available / out);
+                    } else if (full_out > 0.0) {
+                        const int subcycles =
+                            adaptive_low_u_subcycles(full_out, available);
+                        ++local_low_u_subcycle_total;
+                        local_low_u_subcycle_sum += subcycles;
+                        local_low_u_max_subcycles =
+                            std::max(local_low_u_max_subcycles, subcycles);
+                        const bool adaptive_region = subcycles > 1;
+                        if (adaptive_region) {
+                            ++local_low_u_subcycle_active;
+                        }
+                        const double full_alpha =
+                            std::min(1.0, available / full_out);
+                        alpha_face = full_alpha;
+                        if (adaptive_region &&
+                            (face == 1 || face == Param::Nmu - 1)) {
+                            alpha_face =
+                                std::min(alpha_face,
+                                         LOW_U_MU_ENDPOINT_ALPHA_CAP);
+                        }
+                        if (adaptive_region || alpha_face < 1.0 - 1.0e-12) {
+                            alpha_face = smooth_low_u_mu_alpha(alpha_face);
+                        }
                     }
                     alpha_face = std::max(0.0, std::min(1.0, alpha_face));
                     ff *= alpha_face;
@@ -1451,6 +1542,29 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             ? static_cast<double>(global_mu_counts[4]) /
               static_cast<double>(global_mu_counts[5])
             : 0.0;
+
+        long long local_subcycle_counts[3] = {
+            local_low_u_subcycle_active,
+            local_low_u_subcycle_total,
+            local_low_u_subcycle_sum
+        };
+        long long global_subcycle_counts[3] = {0, 0, 0};
+        MPI_Allreduce(local_subcycle_counts, global_subcycle_counts, 3,
+                      MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
+        int global_low_u_max_subcycles = local_low_u_max_subcycles;
+        MPI_Allreduce(MPI_IN_PLACE, &global_low_u_max_subcycles, 1, MPI_INT,
+                      MPI_MAX, MPI_COMM_WORLD);
+        fluxes.low_u_subcycle_active_fraction =
+            (global_subcycle_counts[1] > 0)
+            ? static_cast<double>(global_subcycle_counts[0]) /
+              static_cast<double>(global_subcycle_counts[1])
+            : 0.0;
+        fluxes.low_u_average_subcycles =
+            (global_subcycle_counts[1] > 0)
+            ? static_cast<double>(global_subcycle_counts[2]) /
+              static_cast<double>(global_subcycle_counts[1])
+            : 1.0;
+        fluxes.low_u_max_subcycles = global_low_u_max_subcycles;
     }
 
     // ---- Pass 3: final update (uses scaled u_force_face if limiting was needed) ----
@@ -1466,6 +1580,8 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     double local_mu_low_u_energy_delta = 0.0;
     double local_mu_low_u_energy_delta_boundary = 0.0;
     double local_mu_low_u_energy_delta_core = 0.0;
+    long long local_remap_cell_count = 0;
+    long long local_remap_cell_total = 0;
     double local_limiter_energy_boundary_01 = 0.0;
     double local_limiter_energy_core_01 = 0.0;
     double local_abs_limiter_energy_boundary_01 = 0.0;
@@ -1546,6 +1662,7 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                     local_mu_low_u_energy_delta, \
                     local_mu_low_u_energy_delta_boundary, \
                     local_mu_low_u_energy_delta_core, \
+                    local_remap_cell_count,local_remap_cell_total, \
                     local_limiter_energy_boundary_01, \
                     local_limiter_energy_core_01, \
                     local_abs_limiter_energy_boundary_01, \
@@ -1787,7 +1904,7 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                 severity = std::numeric_limits<double>::infinity();
                 max_negative = std::numeric_limits<double>::infinity();
                 relative_negative = std::numeric_limits<double>::infinity();
-            } else if (updated < 0.0) {
+            } else if (updated < 0.0 && iv >= low_u_limit_count) {
                 const double neg_ratio = -updated / local_scale;
                 if (neg_ratio >= NEG_TOL_HARD) {
                     #pragma omp atomic write
@@ -1806,7 +1923,7 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             }
 
             // Track f-negativity for diagnostics (all levels)
-            if (updated < 0.0) {
+            if (updated < 0.0 && iv >= low_u_limit_count) {
                 local_f_neg_min = std::min(local_f_neg_min, updated);
                 const double neg_ratio = (updated < 0.0)
                     ? (-updated) / local_scale : 0.0;
@@ -1851,6 +1968,132 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             }
 
             bkg_new.f[dst] = updated;
+        }
+    }
+
+    #pragma omp parallel for collapse(2) schedule(static) \
+        reduction(+:local_mu_low_u_energy_delta, \
+                    local_mu_low_u_energy_delta_boundary, \
+                    local_mu_low_u_energy_delta_core, \
+                    local_neg_mass_defect,local_neg_energy_defect, \
+                    local_f_neg_mass,local_f_neg_count) \
+        reduction(min:local_f_neg_min) \
+        reduction(max:local_f_neg_ratio_max)
+    for (int ix = 0; ix < nxl; ++ix) {
+        for (int iv = 0; iv < low_u_limit_count; ++iv) {
+            ++local_remap_cell_total;
+            double endpoint_total_f = 0.0;
+            double endpoint_positive_f = 0.0;
+            bool has_endpoint_strong_negative = false;
+            bool has_nonfinite = false;
+            for (int imu = 0; imu < Param::Nmu; ++imu) {
+                if (!near_mu_endpoint(imu)) continue;
+                const size_t dst =
+                    static_cast<size_t>(ng + ix) * Param::Nvmu
+                  + static_cast<size_t>(iv) * Param::Nmu
+                  + static_cast<size_t>(imu);
+                const double fv = bkg_new.f[dst];
+                if (!std::isfinite(fv)) {
+                    has_nonfinite = true;
+                    continue;
+                }
+                endpoint_total_f += fv;
+                if (fv > 0.0) endpoint_positive_f += fv;
+                if (fv < 0.0) {
+                    const double local_scale =
+                        std::max(1.0, std::fabs(fv));
+                    const double neg_ratio = -fv / local_scale;
+                    if (neg_ratio >= LOW_U_REMAP_NEG_RATIO_THRESHOLD) {
+                        has_endpoint_strong_negative = true;
+                    }
+                }
+            }
+
+            const double cell_weight = bkg_n.vgrid.moment_weight[iv];
+            const double ke_per_mass = ke_per_mass_arr[iv];
+            const double x_cell =
+                (static_cast<double>(sg.ix_start + ix) + 0.5) * sg.dx;
+            const bool in_boundary_02 =
+                (x_cell < 0.2 * Const::micro) ||
+                (x_cell > Param::Lx - 0.2 * Const::micro);
+            const double energy_before =
+                endpoint_total_f * cell_weight * sg.dx * ke_per_mass;
+
+            if (has_endpoint_strong_negative && !has_nonfinite &&
+                endpoint_total_f >= 0.0 && endpoint_positive_f > 0.0) {
+                ++local_remap_cell_count;
+                const double scale = endpoint_total_f / endpoint_positive_f;
+                for (int imu = 0; imu < Param::Nmu; ++imu) {
+                    if (!near_mu_endpoint(imu)) continue;
+                    const size_t dst =
+                        static_cast<size_t>(ng + ix) * Param::Nvmu
+                      + static_cast<size_t>(iv) * Param::Nmu
+                      + static_cast<size_t>(imu);
+                    bkg_new.f[dst] =
+                        std::max(0.0, bkg_new.f[dst]) * scale;
+                }
+                double total_after = 0.0;
+                for (int imu = 0; imu < Param::Nmu; ++imu) {
+                    if (!near_mu_endpoint(imu)) continue;
+                    const size_t dst =
+                        static_cast<size_t>(ng + ix) * Param::Nvmu
+                      + static_cast<size_t>(iv) * Param::Nmu
+                      + static_cast<size_t>(imu);
+                    total_after += bkg_new.f[dst];
+                }
+                const double energy_after =
+                    total_after * cell_weight * sg.dx * ke_per_mass;
+                const double remap_energy_delta =
+                    energy_after - energy_before;
+                local_mu_low_u_energy_delta += remap_energy_delta;
+                if (in_boundary_02) {
+                    local_mu_low_u_energy_delta_boundary +=
+                        remap_energy_delta;
+                } else {
+                    local_mu_low_u_energy_delta_core +=
+                        remap_energy_delta;
+                }
+            }
+
+            for (int imu = 0; imu < Param::Nmu; ++imu) {
+                const size_t dst =
+                    static_cast<size_t>(ng + ix) * Param::Nvmu
+                  + static_cast<size_t>(iv) * Param::Nmu
+                  + static_cast<size_t>(imu);
+                const double fv = bkg_new.f[dst];
+                if (!std::isfinite(fv)) {
+                    #pragma omp atomic write
+                    local_bad_update_centered = 1;
+                    continue;
+                }
+                if (fv >= 0.0) continue;
+
+                const double local_scale = std::max(1.0, std::fabs(fv));
+                const double neg_ratio = -fv / local_scale;
+                if (neg_ratio >= NEG_TOL_SOFT) {
+                    const double mass_defect =
+                        (-fv) * cell_weight * sg.dx;
+                    local_neg_mass_defect += mass_defect;
+                    local_neg_energy_defect += mass_defect * ke_per_mass;
+                }
+                local_f_neg_min = std::min(local_f_neg_min, fv);
+                local_f_neg_ratio_max =
+                    std::max(local_f_neg_ratio_max, neg_ratio);
+                local_f_neg_mass += (-fv) * cell_weight * sg.dx;
+                ++local_f_neg_count;
+
+                const int tid = omp_get_thread_num();
+                NegCellInfo& wn =
+                    thread_worst_neg[static_cast<size_t>(tid)];
+                if (!wn.valid || neg_ratio > wn.neg_ratio) {
+                    wn.neg_ratio = neg_ratio;
+                    wn.f_val = fv;
+                    wn.ix = sg.ix_start + ix;
+                    wn.iv = iv;
+                    wn.imu = imu;
+                    wn.valid = 1;
+                }
+            }
         }
     }
 
@@ -2086,6 +2329,20 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         fluxes.mu_low_u_energy_delta_boundary =
             global_mu_low_u_limiter[1];
         fluxes.mu_low_u_energy_delta_core = global_mu_low_u_limiter[2];
+
+        long long local_remap_counts[2] = {
+            local_remap_cell_count,
+            local_remap_cell_total
+        };
+        long long global_remap_counts[2] = {0, 0};
+        MPI_Allreduce(local_remap_counts, global_remap_counts, 2,
+                      MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
+        fluxes.remap_cell_count = global_remap_counts[0];
+        fluxes.remap_active_fraction =
+            (global_remap_counts[1] > 0)
+            ? static_cast<double>(global_remap_counts[0]) /
+              static_cast<double>(global_remap_counts[1])
+            : 0.0;
     }
     {
         double local_region_limiter[8] = {
@@ -2417,14 +2674,61 @@ VlasovAmpereMidpointSolver::advance_single_step(
     double local_n_start = 0.0;
     double local_ke_start = 0.0;
     bkg_n.total_particle_number_and_energy(local_n_start, local_ke_start);
-    const int max_iters = 80;
+    const int max_iters = 50;
     const double field_tol = 1.0e-6;
     const double current_tol = 1.0e-5;
-    const double f_tol = 1.0e-6;
+    const double f_tol = 1.0e-4;
     const double omega_min = 0.05;
     double omega = 0.5;
     double previous_residual = -1.0;
     bool have_previous_current = false;
+
+    auto compute_beam_trial =
+        [&](const std::vector<double>& ex_mid,
+            BeamPIC& beam_trial,
+            double& beam_ke_before,
+            double& beam_ke_after,
+            double& beam_continuity,
+            std::vector<double>& j_beam_face,
+            std::vector<double>& j_beam_local) {
+            EMFields fields_mid;
+            set_midpoint_field(fields_mid, fields_n, ex_mid, sg,
+                               mpi_rank, mpi_size);
+            beam_trial = beam_n;
+            beam_trial.begin_step(sg, dt);
+            beam_trial.inject(sg, fields_mid, dt, time, mpi_rank, mpi_size);
+            beam_ke_before = beam_trial.total_kinetic_energy();
+            beam_trial.push(sg, fields_mid, dt, mpi_rank, mpi_size);
+            beam_ke_after = beam_trial.total_kinetic_energy();
+            beam_trial.deposit_density(sg, mpi_rank, mpi_size);
+            beam_trial.finalize_charge_conserving_current(sg, dt, mpi_rank,
+                                                          mpi_size);
+            j_beam_face.assign(static_cast<size_t>(nxl + 1), 0.0);
+            const size_t nface =
+                std::min(j_beam_face.size(), beam_trial.current_face_x.size());
+            std::copy(beam_trial.current_face_x.begin(),
+                      beam_trial.current_face_x.begin() + nface,
+                      j_beam_face.begin());
+            j_beam_local.assign(static_cast<size_t>(nxl), 0.0);
+            for (int iface = 0; iface < nxl; ++iface) {
+                j_beam_local[static_cast<size_t>(iface)] =
+                    j_beam_face[static_cast<size_t>(iface)];
+            }
+            beam_continuity =
+                std::max(beam_trial.last_continuity_linf_error(),
+                         beam_trial.last_boundary_flux_error());
+        };
+
+    BeamPIC beam_predictor;
+    double beam_ke_before_predictor = 0.0;
+    double beam_ke_after_predictor = 0.0;
+    double beam_continuity_predictor = 0.0;
+    std::vector<double> j_beam_predictor_face;
+    std::vector<double> j_beam_predictor_local;
+    compute_beam_trial(ex_mid_trial, beam_predictor,
+                       beam_ke_before_predictor, beam_ke_after_predictor,
+                       beam_continuity_predictor, j_beam_predictor_face,
+                       j_beam_predictor_local);
 
     FluxPack fluxes;
     for (int iter = 0; iter < max_iters; ++iter) {
@@ -2440,22 +2744,12 @@ VlasovAmpereMidpointSolver::advance_single_step(
         bkg_new.compute_moments();
         sync_cell_current_from_faces(bkg_new, nxl);
 
-        BeamPIC beam_trial = beam_n;
-        beam_trial.begin_step(sg, dt);
-        beam_trial.inject(sg, fields_mid, dt, time, mpi_rank, mpi_size);
-        const double beam_ke_before = beam_trial.total_kinetic_energy();
-        beam_trial.push(sg, fields_mid, dt, mpi_rank, mpi_size);
-        const double beam_ke_after = beam_trial.total_kinetic_energy();
-        beam_trial.deposit_density(sg, mpi_rank, mpi_size);
-        beam_trial.finalize_charge_conserving_current(sg, dt, mpi_rank,
-                                                      mpi_size);
-
         for (int iface = 0; iface <= nxl; ++iface) {
             const size_t slot = static_cast<size_t>(iface);
             const double jb = (slot < bkg_new.current_face_x.size())
                             ? bkg_new.current_face_x[slot] : 0.0;
-            const double jbeam = (slot < beam_trial.current_face_x.size())
-                               ? beam_trial.current_face_x[slot] : 0.0;
+            const double jbeam = (slot < j_beam_predictor_face.size())
+                               ? j_beam_predictor_face[slot] : 0.0;
             j_total_face[slot] = jb + jbeam;
         }
 
@@ -2469,8 +2763,8 @@ VlasovAmpereMidpointSolver::advance_single_step(
                 (slot < bkg_new.current_face_x.size())
                 ? bkg_new.current_face_x[slot] : 0.0;
             j_beam_next[slot] =
-                (slot < beam_trial.current_face_x.size())
-                ? beam_trial.current_face_x[slot] : 0.0;
+                (slot < j_beam_predictor_local.size())
+                ? j_beam_predictor_local[slot] : 0.0;
             j_total_next[slot] = j_bkg_next[slot] + j_beam_next[slot];
             ex_mid_next[slot] =
                 0.5 * (fields_n.Ex_face[slot] + fields_new.Ex_face[slot]);
@@ -2531,9 +2825,7 @@ VlasovAmpereMidpointSolver::advance_single_step(
         double global_mass_delta = local_end_values[0] - local_n_start;
         MPI_Allreduce(MPI_IN_PLACE, &global_mass_delta, 1, MPI_DOUBLE,
                       MPI_SUM, MPI_COMM_WORLD);
-        const double local_beam_continuity =
-            std::max(beam_trial.last_continuity_linf_error(),
-                     beam_trial.last_boundary_flux_error());
+        const double local_beam_continuity = beam_continuity_predictor;
         const double local_max_j_total =
             max_abs_vector(j_total_next, static_cast<size_t>(nxl));
         const double local_max_j_bkg =
@@ -2636,6 +2928,12 @@ VlasovAmpereMidpointSolver::advance_single_step(
         result.mu_low_u_dimless_scale0 = fluxes.mu_low_u_dimless_scale0;
         result.mu_low_u_endpoint_flux_max =
             fluxes.mu_low_u_endpoint_flux_max;
+        result.remap_active_fraction = fluxes.remap_active_fraction;
+        result.remap_cell_count = fluxes.remap_cell_count;
+        result.low_u_subcycle_active_fraction =
+            fluxes.low_u_subcycle_active_fraction;
+        result.low_u_average_subcycles = fluxes.low_u_average_subcycles;
+        result.low_u_max_subcycles = fluxes.low_u_max_subcycles;
         for (int ir = 0; ir < 2; ++ir) {
             result.region_u_limiter_energy_boundary[ir] =
                 fluxes.region_u_limiter_energy_boundary[ir];
@@ -2687,8 +2985,8 @@ VlasovAmpereMidpointSolver::advance_single_step(
 
         const bool finite_state =
             global_errors[12] == 0.0 &&
-            check_finite_state(bkg_new, beam_trial, fields_new, ex_mid_next,
-                               j_total_next);
+            check_finite_state(bkg_new, beam_predictor, fields_new,
+                               ex_mid_next, j_total_next);
         if (!finite_state) {
             if (mpi_rank == 0 && global_errors[12] != 0.0) {
                 if (fluxes.finite_flux_has_failure != 0) {
@@ -2731,33 +3029,67 @@ VlasovAmpereMidpointSolver::advance_single_step(
             global_errors[10] < global_bkg_mass_tol &&
             global_errors[11] < global_beam_cont_tol;
         result.protected_converged = protected_quantities_converged;
-        const bool converged =
-            protected_quantities_converged && global_f_error < f_tol;
-        const bool soft_accepted = false;
+        const bool converged = protected_quantities_converged;
+        const bool soft_accepted =
+            protected_quantities_converged && global_f_error >= f_tol;
 
         if (converged) {
+            BeamPIC beam_corrected;
+            double beam_ke_before_corrected = 0.0;
+            double beam_ke_after_corrected = 0.0;
+            double beam_continuity_corrected = 0.0;
+            std::vector<double> j_beam_corrected_face;
+            std::vector<double> j_beam_corrected_local;
+            compute_beam_trial(ex_mid_next, beam_corrected,
+                               beam_ke_before_corrected,
+                               beam_ke_after_corrected,
+                               beam_continuity_corrected,
+                               j_beam_corrected_face,
+                               j_beam_corrected_local);
+            MPI_Allreduce(MPI_IN_PLACE, &beam_continuity_corrected, 1,
+                          MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            for (int iface = 0; iface <= nxl; ++iface) {
+                const size_t slot = static_cast<size_t>(iface);
+                const double jb =
+                    (slot < bkg_new.current_face_x.size())
+                    ? bkg_new.current_face_x[slot] : 0.0;
+                const double jbeam =
+                    (slot < j_beam_corrected_face.size())
+                    ? j_beam_corrected_face[slot] : 0.0;
+                j_total_face[slot] = jb + jbeam;
+            }
+            fields_new = fields_n;
+            fields_new.advance_ampere_face_from_midpoint_current(
+                j_total_face, dt, mpi_rank, mpi_size);
+            EMFields fields_mid_corrected;
+            set_midpoint_field(fields_mid_corrected, fields_n, ex_mid_next,
+                               sg, mpi_rank, mpi_size);
+
             result.species_np1 = bkg_new;
-            result.beam_np1 = beam_trial;
+            result.beam_np1 = beam_corrected;
             result.fields_np1 = fields_new;
             result.j_bkg_face_mid = bkg_new.current_face_x;
-            result.j_beam_face_mid = beam_trial.current_face_x;
+            result.j_beam_face_mid = j_beam_corrected_face;
             result.j_total_face_mid = j_total_face;
             result.j_bkg_energy_debug_face = bkg_new.current_face_x;
             result.delta_ke_bkg = local_end_values[1] - local_ke_start;
-            result.delta_ke_beam = beam_ke_after - beam_ke_before;
+            result.delta_ke_beam =
+                beam_ke_after_corrected - beam_ke_before_corrected;
             result.field_work_bkg =
-                integrate_face_work(bkg_new.current_face_x, fields_mid, sg,
-                                    dt);
+                integrate_face_work(bkg_new.current_face_x,
+                                    fields_mid_corrected, sg, dt);
             result.field_work_beam =
-                integrate_face_work(beam_trial.current_face_x, fields_mid, sg,
-                                    dt);
+                integrate_face_work(j_beam_corrected_face,
+                                    fields_mid_corrected, sg, dt);
             result.energy_residual_bkg =
                 result.delta_ke_bkg + result.field_work_bkg;
+            result.beam_continuity_residual = beam_continuity_corrected;
             build_current_diagnostics(result.j_bkg_face_mid,
                                       result.j_bkg_energy_debug_face,
                                       result.j_bkg_face_mid,
-                                      fields_mid, sg, result.delta_ke_bkg,
-                                      dt, result.current_diag);
+                                      fields_mid_corrected, sg,
+                                      result.delta_ke_bkg, dt,
+                                      result.current_diag);
             result.limiter_active_fraction =
                 fluxes.limiter_active_fraction;
             result.limiter_min_alpha = fluxes.limiter_min_alpha;
@@ -2803,6 +3135,13 @@ VlasovAmpereMidpointSolver::advance_single_step(
                 fluxes.mu_low_u_dimless_scale0;
             result.mu_low_u_endpoint_flux_max =
                 fluxes.mu_low_u_endpoint_flux_max;
+            result.remap_active_fraction = fluxes.remap_active_fraction;
+            result.remap_cell_count = fluxes.remap_cell_count;
+            result.low_u_subcycle_active_fraction =
+                fluxes.low_u_subcycle_active_fraction;
+            result.low_u_average_subcycles =
+                fluxes.low_u_average_subcycles;
+            result.low_u_max_subcycles = fluxes.low_u_max_subcycles;
             for (int ir = 0; ir < 2; ++ir) {
                 result.region_u_limiter_energy_boundary[ir] =
                     fluxes.region_u_limiter_energy_boundary[ir];

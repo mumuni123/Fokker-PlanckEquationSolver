@@ -70,6 +70,11 @@ public:
         double mu_low_u_half_dt_inv_shell0;
         double mu_low_u_dimless_scale0;
         double mu_low_u_endpoint_flux_max;
+        double remap_active_fraction;
+        long long remap_cell_count;
+        double low_u_subcycle_active_fraction;
+        double low_u_average_subcycles;
+        int low_u_max_subcycles;
         double region_u_limiter_energy_boundary[2];
         double region_u_limiter_energy_core[2];
         double region_abs_u_limiter_energy_boundary[2];
@@ -157,6 +162,11 @@ private:
         double mu_low_u_half_dt_inv_shell0;
         double mu_low_u_dimless_scale0;
         double mu_low_u_endpoint_flux_max;
+        double remap_active_fraction;
+        long long remap_cell_count;
+        double low_u_subcycle_active_fraction;
+        double low_u_average_subcycles;
+        int low_u_max_subcycles;
         double region_u_limiter_energy_boundary[2];
         double region_u_limiter_energy_core[2];
         double region_abs_u_limiter_energy_boundary[2];
