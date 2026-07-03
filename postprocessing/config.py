@@ -19,13 +19,13 @@ TIME_COLUMNS = ["Ex[V/m]"]
 TIME_X_AXIS_RANGE = None
 
 # Settings for plot_space_profile.py.
-SPACE_FILE = DATA_DIR / "fields_00015.dat"
+SPACE_FILE = DATA_DIR / "fields_00025.dat"
 SPACE_COLUMNS = ["Ex[V/m]"]
 # Use None to plot the full available range, or set (min, max) to restrict it.
 # Bounds can also be None individually, e.g. (1.0, None).
 SPACE_X_AXIS_RANGE = None
 
-ALL_DENSITY_FILES = "density_00015.dat"
+ALL_DENSITY_FILES = "density_00020.dat"
 
 # Settings for plot_background_density_evolution.py.
 BACKGROUND_DENSITY_FILES = [
@@ -45,7 +45,7 @@ FV_COLUMNS = ["F(u)"]
 FV_X_AXIS_RANGE = (0.0, 3.0e8)
 
 # Settings for plot_current_density_profile.py.
-FACE_CURRENT_FILES = DATA_DIR / "current_00015.dat"
+FACE_CURRENT_FILES = DATA_DIR / "current_00025.dat"
 # Use None to plot every current column in FACE_CURRENT_FILES.
 # Column names may omit units, e.g. "J_total_smoothed" matches "J_total_smoothed[A/m2]".
 FACE_CURRENT_COLUMNS = [

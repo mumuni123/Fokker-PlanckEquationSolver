@@ -105,6 +105,30 @@ public:
                                      int mpi_rank, int mpi_size,
                                      double reference_total_mass_raw);
 
+    void write_bkg_stage_negativity(
+        int step, double time, int coupled_iter,
+        const std::vector<double>& min_f,
+        const std::vector<double>& neg_mass,
+        const std::vector<long long>& neg_cell_count,
+        const std::vector<double>& low_u_neg_mass,
+        const std::vector<double>& core_low_u_min_f,
+        int mpi_rank);
+
+    void write_bkg_stage_by_u_diagnostics(
+        int step, double time, int coupled_iter,
+        const std::vector<double>& min_f_core_by_u,
+        const std::vector<double>& neg_mass_core_by_u,
+        const std::vector<long long>& neg_cell_count_core_by_u,
+        const std::vector<double>& min_f_boundary_by_u,
+        const std::vector<double>& neg_mass_boundary_by_u,
+        const std::vector<long long>& neg_cell_count_boundary_by_u,
+        int mpi_rank);
+
+    void write_bkg_low_u_divergence_diagnostics(
+        int step, double time, int coupled_iter,
+        const std::vector<double>& low_u_neg_added_by_div,
+        int mpi_rank);
+
     void write_fields(double time,
                       const EMFields& fields,
                       const SpatialGrid& sg,
@@ -143,6 +167,8 @@ private:
 #endif
     std::ofstream step_file;
     std::ofstream bkg_stage_file;
+    std::ofstream bkg_stage_by_u_file;
+    std::ofstream bkg_low_u_divergence_file;
     bool debug_enabled;
     bool step_enabled;
     bool has_energy_reference;

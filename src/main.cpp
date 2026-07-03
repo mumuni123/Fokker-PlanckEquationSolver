@@ -593,6 +593,23 @@ int main(int argc, char** argv)
             << "u_limiter_mass_delta[m^-2]  "
             << "u_limiter_px_delta[kg/m/s/m2]  "
             << "u_limiter_energy_delta[J/m2]  "
+            << "x_limiter_mass_delta[m^-2]  "
+            << "x_limiter_energy_delta[J/m2]  "
+            << "mu_low_u_alpha_min  "
+            << "mu_low_u_limiter_active_fraction  "
+            << "mu_low_u_energy_delta[J/m2]  "
+            << "mu_low_u_alpha_min_boundary  "
+            << "mu_low_u_alpha_min_core  "
+            << "mu_low_u_limiter_active_fraction_boundary  "
+            << "mu_low_u_limiter_active_fraction_core  "
+            << "mu_low_u_energy_delta_boundary[J/m2]  "
+            << "mu_low_u_energy_delta_core[J/m2]  "
+            << "mu_low_u_u_eff0  "
+            << "mu_low_u_moment_weight0  "
+            << "mu_low_u_mu_flux_scale0  "
+            << "mu_low_u_half_dt_inv_shell0  "
+            << "mu_low_u_dimless_scale0  "
+            << "mu_low_u_endpoint_flux_max  "
             << "u_force_alpha_min  u_force_alpha_active_frac  "
             << "coupled_iter  coupled_residual_E  "
             << "coupled_residual_J_bkg  coupled_residual_J_beam  "
@@ -692,6 +709,23 @@ int main(int argc, char** argv)
         double u_limiter_mass_delta_step = 0.0;
         double u_limiter_momentum_delta_step = 0.0;
         double u_limiter_energy_delta_step = 0.0;
+        double x_limiter_mass_delta_step = 0.0;
+        double x_limiter_energy_delta_step = 0.0;
+        double mu_low_u_alpha_min_step = 1.0;
+        double mu_low_u_limiter_active_fraction_step = 0.0;
+        double mu_low_u_energy_delta_step = 0.0;
+        double mu_low_u_alpha_min_boundary_step = 1.0;
+        double mu_low_u_alpha_min_core_step = 1.0;
+        double mu_low_u_limiter_active_fraction_boundary_step = 0.0;
+        double mu_low_u_limiter_active_fraction_core_step = 0.0;
+        double mu_low_u_energy_delta_boundary_step = 0.0;
+        double mu_low_u_energy_delta_core_step = 0.0;
+        double mu_low_u_u_eff0_step = 0.0;
+        double mu_low_u_moment_weight0_step = 0.0;
+        double mu_low_u_mu_flux_scale0_step = 0.0;
+        double mu_low_u_half_dt_inv_shell0_step = 0.0;
+        double mu_low_u_dimless_scale0_step = 0.0;
+        double mu_low_u_endpoint_flux_max_step = 0.0;
         double u_force_alpha_min_step = 1.0;
         double u_force_alpha_active_frac_step = 0.0;
         double local_bkg_energy_residual_step = 0.0;
@@ -822,6 +856,39 @@ int main(int argc, char** argv)
             midpoint_result.limiter_momentum_defect;
         u_limiter_energy_delta_step =
             midpoint_result.limiter_energy_defect;
+        x_limiter_mass_delta_step =
+            midpoint_result.x_limiter_mass_defect;
+        x_limiter_energy_delta_step =
+            midpoint_result.x_limiter_energy_defect;
+        mu_low_u_alpha_min_step =
+            midpoint_result.mu_low_u_alpha_min;
+        mu_low_u_limiter_active_fraction_step =
+            midpoint_result.mu_low_u_limiter_active_fraction;
+        mu_low_u_energy_delta_step =
+            midpoint_result.mu_low_u_energy_delta;
+        mu_low_u_alpha_min_boundary_step =
+            midpoint_result.mu_low_u_alpha_min_boundary;
+        mu_low_u_alpha_min_core_step =
+            midpoint_result.mu_low_u_alpha_min_core;
+        mu_low_u_limiter_active_fraction_boundary_step =
+            midpoint_result.mu_low_u_limiter_active_fraction_boundary;
+        mu_low_u_limiter_active_fraction_core_step =
+            midpoint_result.mu_low_u_limiter_active_fraction_core;
+        mu_low_u_energy_delta_boundary_step =
+            midpoint_result.mu_low_u_energy_delta_boundary;
+        mu_low_u_energy_delta_core_step =
+            midpoint_result.mu_low_u_energy_delta_core;
+        mu_low_u_u_eff0_step = midpoint_result.mu_low_u_u_eff0;
+        mu_low_u_moment_weight0_step =
+            midpoint_result.mu_low_u_moment_weight0;
+        mu_low_u_mu_flux_scale0_step =
+            midpoint_result.mu_low_u_mu_flux_scale0;
+        mu_low_u_half_dt_inv_shell0_step =
+            midpoint_result.mu_low_u_half_dt_inv_shell0;
+        mu_low_u_dimless_scale0_step =
+            midpoint_result.mu_low_u_dimless_scale0;
+        mu_low_u_endpoint_flux_max_step =
+            midpoint_result.mu_low_u_endpoint_flux_max;
         u_force_alpha_min_step =
             midpoint_result.u_force_alpha_min;
         u_force_alpha_active_frac_step =
@@ -931,6 +998,23 @@ int main(int argc, char** argv)
                                << u_limiter_mass_delta_step << "  "
                                << u_limiter_momentum_delta_step << "  "
                                << u_limiter_energy_delta_step << "  "
+                               << x_limiter_mass_delta_step << "  "
+                               << x_limiter_energy_delta_step << "  "
+                               << mu_low_u_alpha_min_step << "  "
+                               << mu_low_u_limiter_active_fraction_step << "  "
+                               << mu_low_u_energy_delta_step << "  "
+                               << mu_low_u_alpha_min_boundary_step << "  "
+                               << mu_low_u_alpha_min_core_step << "  "
+                               << mu_low_u_limiter_active_fraction_boundary_step << "  "
+                               << mu_low_u_limiter_active_fraction_core_step << "  "
+                               << mu_low_u_energy_delta_boundary_step << "  "
+                               << mu_low_u_energy_delta_core_step << "  "
+                               << mu_low_u_u_eff0_step << "  "
+                               << mu_low_u_moment_weight0_step << "  "
+                               << mu_low_u_mu_flux_scale0_step << "  "
+                               << mu_low_u_half_dt_inv_shell0_step << "  "
+                               << mu_low_u_dimless_scale0_step << "  "
+                               << mu_low_u_endpoint_flux_max_step << "  "
                                << u_force_alpha_min_step << "  "
                                << u_force_alpha_active_frac_step << "  "
                                << coupled_iter_step << "  "
@@ -941,7 +1025,29 @@ int main(int argc, char** argv)
                                << coupled_residual_beam_continuity_step << "\n";
             bkg_energy_monitor.flush();
         }
-        if (step % 100 == 0) {
+        if (collect_step_diagnostics) {
+            diag.write_bkg_stage_negativity(
+                step, time, coupled_iter_step,
+                midpoint_result.stage_min_f,
+                midpoint_result.stage_neg_mass,
+                midpoint_result.stage_neg_cell_count,
+                midpoint_result.stage_low_u_neg_mass,
+                midpoint_result.stage_core_low_u_min_f,
+                mpi_rank);
+            diag.write_bkg_stage_by_u_diagnostics(
+                step, time, coupled_iter_step,
+                midpoint_result.stage_min_f_core_by_u,
+                midpoint_result.stage_neg_mass_core_by_u,
+                midpoint_result.stage_neg_cell_count_core_by_u,
+                midpoint_result.stage_min_f_boundary_by_u,
+                midpoint_result.stage_neg_mass_boundary_by_u,
+                midpoint_result.stage_neg_cell_count_boundary_by_u,
+                mpi_rank);
+            diag.write_bkg_low_u_divergence_diagnostics(
+                step, time, coupled_iter_step,
+                midpoint_result.low_u_neg_added_by_div,
+                mpi_rank);
+
             FNegativitySnapshotDiagnostics f_neg_snapshot;
             compute_f_negativity_snapshot_diagnostics(
                 bkg_e, sgrid, f_neg_snapshot);

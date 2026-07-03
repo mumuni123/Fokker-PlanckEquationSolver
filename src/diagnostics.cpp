@@ -304,8 +304,30 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                 << "# step  time[fs]  coupled_iter  stage  "
                 << "min_f  negative_mass[m^-2]  positive_mass[m^-2]  "
                 << "total_mass_raw[m^-2]  total_mass_clipped[m^-2]  "
-                << "N_bkg_change[m^-2]\n";
+                << "N_bkg_change[m^-2]  "
+                << "neg_cell_count  low_u_neg_mass[m^-2]  "
+                << "core_low_u_min_f\n";
             bkg_stage_file << std::scientific << std::setprecision(8);
+
+            bkg_stage_by_u_file.open(
+                (output_dir + "/bkg_stage_by_u_diagnostics.dat").c_str());
+            bkg_stage_by_u_file
+                << "# step  time[fs]  coupled_iter  stage  u_index  "
+                << "min_f_core_by_u  neg_mass_core_by_u[m^-2]  "
+                << "neg_cell_count_core_by_u  "
+                << "min_f_boundary_by_u  neg_mass_boundary_by_u[m^-2]  "
+                << "neg_cell_count_boundary_by_u\n";
+            bkg_stage_by_u_file << std::scientific << std::setprecision(8);
+
+            bkg_low_u_divergence_file.open(
+                (output_dir + "/bkg_low_u_divergence_diagnostics.dat").c_str());
+            bkg_low_u_divergence_file
+                << "# step  time[fs]  coupled_iter  "
+                << "low_u_dx_div_neg_added[m^-2]  "
+                << "low_u_du_div_neg_added[m^-2]  "
+                << "low_u_dmu_div_neg_added[m^-2]\n";
+            bkg_low_u_divergence_file
+                << std::scientific << std::setprecision(8);
         }
     }
     MPI_Barrier(MPI_COMM_WORLD);
@@ -874,9 +896,128 @@ void Diagnostics::write_bkg_stage_diagnostics(
                        << global_sums[1] << "  "
                        << global_sums[2] << "  "
                        << total_mass_clipped << "  "
-                       << N_bkg_change << "\n";
+                       << N_bkg_change << "  "
+                       << 0 << "  "
+                       << 0.0 << "  "
+                       << 0.0 << "\n";
         bkg_stage_file.flush();
     }
+}
+
+void Diagnostics::write_bkg_stage_negativity(
+    int step, double time, int coupled_iter,
+    const std::vector<double>& min_f,
+    const std::vector<double>& neg_mass,
+    const std::vector<long long>& neg_cell_count,
+    const std::vector<double>& low_u_neg_mass,
+    const std::vector<double>& core_low_u_min_f,
+    int mpi_rank)
+{
+    if (!step_enabled || mpi_rank != 0) return;
+    static const char* stages[3] = {"after_x", "after_u", "after_mu"};
+    const size_t nstage = 3;
+    for (size_t istage = 0; istage < nstage; ++istage) {
+        const double min_value =
+            (istage < min_f.size()) ? min_f[istage] : 0.0;
+        const double neg_mass_value =
+            (istage < neg_mass.size()) ? neg_mass[istage] : 0.0;
+        const long long neg_count_value =
+            (istage < neg_cell_count.size()) ? neg_cell_count[istage] : 0;
+        const double low_u_value =
+            (istage < low_u_neg_mass.size()) ? low_u_neg_mass[istage] : 0.0;
+        const double core_low_u_min =
+            (istage < core_low_u_min_f.size())
+            ? core_low_u_min_f[istage] : 0.0;
+        bkg_stage_file << step << "  "
+                       << time / Const::femto << "  "
+                       << coupled_iter << "  "
+                       << stages[istage] << "  "
+                       << min_value << "  "
+                       << neg_mass_value << "  "
+                       << 0.0 << "  "
+                       << 0.0 << "  "
+                       << 0.0 << "  "
+                       << 0.0 << "  "
+                       << neg_count_value << "  "
+                       << low_u_value << "  "
+                       << core_low_u_min << "\n";
+    }
+    bkg_stage_file.flush();
+}
+
+void Diagnostics::write_bkg_stage_by_u_diagnostics(
+    int step, double time, int coupled_iter,
+    const std::vector<double>& min_f_core_by_u,
+    const std::vector<double>& neg_mass_core_by_u,
+    const std::vector<long long>& neg_cell_count_core_by_u,
+    const std::vector<double>& min_f_boundary_by_u,
+    const std::vector<double>& neg_mass_boundary_by_u,
+    const std::vector<long long>& neg_cell_count_boundary_by_u,
+    int mpi_rank)
+{
+    if (!step_enabled || mpi_rank != 0) return;
+    static const char* stages[3] = {"after_x", "after_u", "after_mu"};
+    const size_t stride = Param::Nv;
+    for (size_t istage = 0; istage < 3; ++istage) {
+        const size_t base = istage * stride;
+        for (int iv = 0; iv < Param::Nv; ++iv) {
+            const size_t slot = base + static_cast<size_t>(iv);
+            const double min_core =
+                (slot < min_f_core_by_u.size())
+                ? min_f_core_by_u[slot] : 0.0;
+            const double neg_core =
+                (slot < neg_mass_core_by_u.size())
+                ? neg_mass_core_by_u[slot] : 0.0;
+            const long long count_core =
+                (slot < neg_cell_count_core_by_u.size())
+                ? neg_cell_count_core_by_u[slot] : 0;
+            const double min_boundary =
+                (slot < min_f_boundary_by_u.size())
+                ? min_f_boundary_by_u[slot] : 0.0;
+            const double neg_boundary =
+                (slot < neg_mass_boundary_by_u.size())
+                ? neg_mass_boundary_by_u[slot] : 0.0;
+            const long long count_boundary =
+                (slot < neg_cell_count_boundary_by_u.size())
+                ? neg_cell_count_boundary_by_u[slot] : 0;
+            bkg_stage_by_u_file << step << "  "
+                                << time / Const::femto << "  "
+                                << coupled_iter << "  "
+                                << stages[istage] << "  "
+                                << iv << "  "
+                                << min_core << "  "
+                                << neg_core << "  "
+                                << count_core << "  "
+                                << min_boundary << "  "
+                                << neg_boundary << "  "
+                                << count_boundary << "\n";
+        }
+    }
+    bkg_stage_by_u_file.flush();
+}
+
+void Diagnostics::write_bkg_low_u_divergence_diagnostics(
+    int step, double time, int coupled_iter,
+    const std::vector<double>& low_u_neg_added_by_div,
+    int mpi_rank)
+{
+    if (!step_enabled || mpi_rank != 0) return;
+    const double dx_added =
+        (low_u_neg_added_by_div.size() > 0)
+        ? low_u_neg_added_by_div[0] : 0.0;
+    const double du_added =
+        (low_u_neg_added_by_div.size() > 1)
+        ? low_u_neg_added_by_div[1] : 0.0;
+    const double dmu_added =
+        (low_u_neg_added_by_div.size() > 2)
+        ? low_u_neg_added_by_div[2] : 0.0;
+    bkg_low_u_divergence_file << step << "  "
+                              << time / Const::femto << "  "
+                              << coupled_iter << "  "
+                              << dx_added << "  "
+                              << du_added << "  "
+                              << dmu_added << "\n";
+    bkg_low_u_divergence_file.flush();
 }
 
 void Diagnostics::write_fields(double time,
