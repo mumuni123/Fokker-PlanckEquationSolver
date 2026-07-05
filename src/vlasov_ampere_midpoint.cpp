@@ -20,9 +20,7 @@ const int BKG_DIV_COMPONENT_COUNT = 3;
 const double CORE_DIAG_BOUNDARY_WIDTH = 0.2 * Const::micro;
 const int LOW_U_MU_LIMIT_COUNT = 6;
 const int LOW_U_ADAPTIVE_MAX_SUBCYCLES = 4;
-const int LOW_U_MU_REMAP_ENDPOINT_BAND = 2;
 const double LOW_U_ADAPTIVE_CFL_THRESHOLD = 0.25;
-const double LOW_U_REMAP_NEG_RATIO_THRESHOLD = 1.0e-6;
 const double LOW_U_MU_ALPHA_SAFETY = 0.95;
 const double LOW_U_MU_ALPHA_SMOOTH = 0.25;
 const double LOW_U_MU_ENDPOINT_ALPHA_CAP = 0.5;
@@ -112,6 +110,13 @@ inline size_t u_xface_index(int iface, int face, int imu)
          + static_cast<size_t>(imu);
 }
 
+inline size_t u_cell_index(int ix, int face, int imu)
+{
+    return (static_cast<size_t>(ix) * (Param::Nv + 1)
+          + static_cast<size_t>(face)) * Param::Nmu
+         + static_cast<size_t>(imu);
+}
+
 inline size_t mu_xface_index(int iface, int iv, int face)
 {
     return (static_cast<size_t>(iface) * Param::Nv
@@ -165,12 +170,6 @@ double smooth_low_u_mu_alpha(double alpha)
     return safe * (1.0 - LOW_U_MU_ALPHA_SMOOTH * (1.0 - safe));
 }
 
-bool near_mu_endpoint(int imu)
-{
-    return imu < LOW_U_MU_REMAP_ENDPOINT_BAND ||
-           imu >= Param::Nmu - LOW_U_MU_REMAP_ENDPOINT_BAND;
-}
-
 int adaptive_low_u_subcycles(double out, double available)
 {
     if (!(out > 0.0) || !std::isfinite(out)) return 1;
@@ -219,6 +218,20 @@ struct FiniteFluxCandidate {
     int iv;
     int imu;
     int has_failure;
+};
+
+struct UFluxAuditCandidate {
+    double severity;
+    double f0;
+    double f_low;
+    double f_high;
+    double alpha;
+    double du_div_low;
+    double du_div_high;
+    int ix;
+    int iv;
+    int imu;
+    int valid;
 };
 
 FiniteFluxCandidate empty_finite_flux_candidate()
@@ -526,6 +539,52 @@ VlasovAmpereMidpointSolver::advance_with_fixed_substeps(
             combined.u_force_alpha_active_frac =
                 (combined.u_force_alpha_active_frac * isub
                + sub.u_force_alpha_active_frac) * inv_count;
+            if (sub.u_flux_audit_valid &&
+                (!combined.u_flux_audit_valid ||
+                 sub.u_flux_audit_severity >
+                     combined.u_flux_audit_severity)) {
+                combined.u_flux_audit_valid = sub.u_flux_audit_valid;
+                combined.u_flux_audit_rank = sub.u_flux_audit_rank;
+                combined.u_flux_audit_ix = sub.u_flux_audit_ix;
+                combined.u_flux_audit_iv = sub.u_flux_audit_iv;
+                combined.u_flux_audit_imu = sub.u_flux_audit_imu;
+                combined.u_flux_audit_severity =
+                    sub.u_flux_audit_severity;
+                combined.u_flux_audit_f0 = sub.u_flux_audit_f0;
+                combined.u_flux_audit_f_low = sub.u_flux_audit_f_low;
+                combined.u_flux_audit_f_high = sub.u_flux_audit_f_high;
+                combined.u_flux_audit_alpha = sub.u_flux_audit_alpha;
+                combined.u_flux_audit_du_div_low =
+                    sub.u_flux_audit_du_div_low;
+                combined.u_flux_audit_du_div_high =
+                    sub.u_flux_audit_du_div_high;
+                combined.u_flux_audit_du_div_final =
+                    sub.u_flux_audit_du_div_final;
+                combined.u_flux_audit_updated =
+                    sub.u_flux_audit_updated;
+                combined.u_flux_audit_final_xl_lo =
+                    sub.u_flux_audit_final_xl_lo;
+                combined.u_flux_audit_final_xl_hi =
+                    sub.u_flux_audit_final_xl_hi;
+                combined.u_flux_audit_final_xr_lo =
+                    sub.u_flux_audit_final_xr_lo;
+                combined.u_flux_audit_final_xr_hi =
+                    sub.u_flux_audit_final_xr_hi;
+            }
+            if (sub.u_low_failure_audit.valid &&
+                (!combined.u_low_failure_audit.valid ||
+                 sub.u_low_failure_audit.severity >
+                     combined.u_low_failure_audit.severity)) {
+                combined.u_low_failure_audit =
+                    sub.u_low_failure_audit;
+            }
+            if (sub.mu_low_failure_audit.valid &&
+                (!combined.mu_low_failure_audit.valid ||
+                 sub.mu_low_failure_audit.severity >
+                     combined.mu_low_failure_audit.severity)) {
+                combined.mu_low_failure_audit =
+                    sub.mu_low_failure_audit;
+            }
             combined.f_neg_min =
                 std::min(combined.f_neg_min, sub.f_neg_min);
             if (sub.f_neg_ratio_max > combined.f_neg_ratio_max) {
@@ -630,6 +689,64 @@ VlasovAmpereMidpointSolver::advance_background_and_fields(
     reset_result(failed);
     failed.failed = true;
     return failed;
+}
+
+UFluxAuditCandidate empty_u_flux_audit_candidate()
+{
+    UFluxAuditCandidate info;
+    info.severity = 0.0;
+    info.f0 = 0.0;
+    info.f_low = 0.0;
+    info.f_high = 0.0;
+    info.alpha = 1.0;
+    info.du_div_low = 0.0;
+    info.du_div_high = 0.0;
+    info.ix = -1;
+    info.iv = -1;
+    info.imu = -1;
+    info.valid = 0;
+    return info;
+}
+
+VlasovAmpereMidpointSolver::LowOrderFailureAudit
+empty_low_order_failure_audit()
+{
+    VlasovAmpereMidpointSolver::LowOrderFailureAudit info;
+    info.valid = 0;
+    info.rank = -1;
+    info.ix = -1;
+    info.iv = -1;
+    info.imu = -1;
+    info.region = 0;
+    info.severity = 0.0;
+    info.f_input = 0.0;
+    info.f_after_x = 0.0;
+    info.dx_div = 0.0;
+    info.dmu_div_used = 0.0;
+    info.du_div_low = 0.0;
+    info.f_low = 0.0;
+    info.left_lower_flux = 0.0;
+    info.left_upper_flux = 0.0;
+    info.right_lower_flux = 0.0;
+    info.right_upper_flux = 0.0;
+    info.left_lower_scale = 0.0;
+    info.left_upper_scale = 0.0;
+    info.right_lower_scale = 0.0;
+    info.right_upper_scale = 0.0;
+    info.left_lower_donor_f = 0.0;
+    info.left_upper_donor_f = 0.0;
+    info.right_lower_donor_f = 0.0;
+    info.right_upper_donor_f = 0.0;
+    info.lower_characteristic = 0.0;
+    info.upper_characteristic = 0.0;
+    info.moment_weight = 0.0;
+    info.cell_budget = 0.0;
+    info.low_order_failed_count = 0.0;
+    info.left_lower_donor_index = -1;
+    info.left_upper_donor_index = -1;
+    info.right_lower_donor_index = -1;
+    info.right_upper_donor_index = -1;
+    return info;
 }
 
 VlasovAmpereMidpointSolver::VlasovAmpereMidpointSolver()
@@ -762,6 +879,26 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
     result.positivity_mass_defect = 0.0;
     result.u_force_alpha_min = 1.0;
     result.u_force_alpha_active_frac = 0.0;
+    result.u_flux_audit_valid = 0;
+    result.u_flux_audit_rank = -1;
+    result.u_flux_audit_ix = -1;
+    result.u_flux_audit_iv = -1;
+    result.u_flux_audit_imu = -1;
+    result.u_flux_audit_severity = 0.0;
+    result.u_flux_audit_f0 = 0.0;
+    result.u_flux_audit_f_low = 0.0;
+    result.u_flux_audit_f_high = 0.0;
+    result.u_flux_audit_alpha = 1.0;
+    result.u_flux_audit_du_div_low = 0.0;
+    result.u_flux_audit_du_div_high = 0.0;
+    result.u_flux_audit_du_div_final = 0.0;
+    result.u_flux_audit_updated = 0.0;
+    result.u_flux_audit_final_xl_lo = 0.0;
+    result.u_flux_audit_final_xl_hi = 0.0;
+    result.u_flux_audit_final_xr_lo = 0.0;
+    result.u_flux_audit_final_xr_hi = 0.0;
+    result.u_low_failure_audit = empty_low_order_failure_audit();
+    result.mu_low_failure_audit = empty_low_order_failure_audit();
     result.f_neg_min = 0.0;
     result.f_neg_ratio_max = 0.0;
     result.f_neg_mass_total = 0.0;
@@ -853,6 +990,12 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                    static_cast<size_t>(nxl + 1) * (Param::Nv + 1) * Param::Nmu);
     resize_or_zero(fluxes.u_final,
                    static_cast<size_t>(nxl + 1) * (Param::Nv + 1) * Param::Nmu);
+    resize_or_zero(fluxes.u_high_cell,
+                   static_cast<size_t>(nxl) * (Param::Nv + 1) * Param::Nmu);
+    resize_or_zero(fluxes.u_low_cell,
+                   static_cast<size_t>(nxl) * (Param::Nv + 1) * Param::Nmu);
+    resize_or_zero(fluxes.u_final_cell,
+                   static_cast<size_t>(nxl) * (Param::Nv + 1) * Param::Nmu);
     resize_or_zero(fluxes.mu_high,
                    static_cast<size_t>(nxl + 1) * Param::Nv * (Param::Nmu + 1));
     resize_or_zero(fluxes.mu_low,
@@ -956,6 +1099,26 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     fluxes.positivity_mass_defect = 0.0;
     fluxes.u_force_alpha_min = 1.0;
     fluxes.u_force_alpha_active_frac = 0.0;
+    fluxes.u_flux_audit_valid = 0;
+    fluxes.u_flux_audit_rank = -1;
+    fluxes.u_flux_audit_ix = -1;
+    fluxes.u_flux_audit_iv = -1;
+    fluxes.u_flux_audit_imu = -1;
+    fluxes.u_flux_audit_severity = 0.0;
+    fluxes.u_flux_audit_f0 = 0.0;
+    fluxes.u_flux_audit_f_low = 0.0;
+    fluxes.u_flux_audit_f_high = 0.0;
+    fluxes.u_flux_audit_alpha = 1.0;
+    fluxes.u_flux_audit_du_div_low = 0.0;
+    fluxes.u_flux_audit_du_div_high = 0.0;
+    fluxes.u_flux_audit_du_div_final = 0.0;
+    fluxes.u_flux_audit_updated = 0.0;
+    fluxes.u_flux_audit_final_xl_lo = 0.0;
+    fluxes.u_flux_audit_final_xl_hi = 0.0;
+    fluxes.u_flux_audit_final_xr_lo = 0.0;
+    fluxes.u_flux_audit_final_xr_hi = 0.0;
+    fluxes.u_low_failure_audit = empty_low_order_failure_audit();
+    fluxes.mu_low_failure_audit = empty_low_order_failure_audit();
     fluxes.f_neg_min = 0.0;
     fluxes.f_neg_ratio_max = 0.0;
     fluxes.f_neg_mass_total = 0.0;
@@ -1334,37 +1497,6 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         const int ix_left = ng + iface - 1;
         const int ix_right = ng + iface;
 
-        for (int imu = 0; imu < Param::Nmu; ++imu) {
-            const double u_dot_base = accel_u * bkg_n.vgrid.mu_cells[imu];
-            for (int face = 1; face < Param::Nv; ++face) {
-                const size_t left_lo =
-                    static_cast<size_t>(ix_left) * Param::Nvmu
-                  + static_cast<size_t>(face - 1) * Param::Nmu
-                  + static_cast<size_t>(imu);
-                const size_t left_hi =
-                    static_cast<size_t>(ix_left) * Param::Nvmu
-                  + static_cast<size_t>(face) * Param::Nmu
-                  + static_cast<size_t>(imu);
-                const size_t right_lo =
-                    static_cast<size_t>(ix_right) * Param::Nvmu
-                  + static_cast<size_t>(face - 1) * Param::Nmu
-                  + static_cast<size_t>(imu);
-                const size_t right_hi =
-                    static_cast<size_t>(ix_right) * Param::Nvmu
-                  + static_cast<size_t>(face) * Param::Nmu
-                  + static_cast<size_t>(imu);
-                const double f_lo =
-                    0.5 * (f_mid.f[left_lo] + f_mid.f[right_lo]);
-                const double f_hi =
-                    0.5 * (f_mid.f[left_hi] + f_mid.f[right_hi]);
-                const double scale =
-                    2.0 * Const::pi * bkg_n.vgrid.dmu
-                  * bkg_n.vgrid.v2_faces[face] * u_dot_base;
-                u_force_face[u_xface_index(iface, face, imu)] =
-                    scale * 0.5 * (f_lo + f_hi);
-            }
-        }
-
         for (int iv = 0; iv < Param::Nv; ++iv) {
             const double u_eff = mu_u_eff[iv];
             for (int face = 1; face < Param::Nmu; ++face) {
@@ -1396,9 +1528,6 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             }
         }
     }
-    close_periodic_face_blocks(u_force_face, nxl,
-                               (Param::Nv + 1) * Param::Nmu,
-                               mpi_rank, mpi_size, 506);
     close_periodic_face_blocks(mu_force_face, nxl,
                                Param::Nv * (Param::Nmu + 1),
                                mpi_rank, mpi_size, 507);
@@ -1410,26 +1539,165 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         }
     }
 
-    // 7.1.1: save pre-limiter (high-order) u and mu fluxes
+    // 7.1.1: save pre-limiter (high-order) mu fluxes.  u high-order
+    // fluxes are now built cell-locally below.
     {
-        const size_t u_size = static_cast<size_t>(nxl + 1) *
-                              (Param::Nv + 1) * Param::Nmu;
         const size_t mu_size = static_cast<size_t>(nxl + 1) *
                                Param::Nv * (Param::Nmu + 1);
-        std::copy(u_force_face.begin(), u_force_face.begin() + u_size,
-                  fluxes.u_high.begin());
         std::copy(mu_force_face.begin(), mu_force_face.begin() + mu_size,
                   fluxes.mu_high.begin());
     }
+    /*
+     * 7.1.3 finite-volume u-boundary closure.
+     * The u-force update is closed at u=0 and u=u_max in this model.  These
+     * faces are physical velocity-space boundaries, not ghost cells, so both
+     * the high-order candidate and the working flux are explicitly zeroed
+     * before any positivity limiting or final update can see them.
+     */
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int iface = 0; iface <= nxl; ++iface) {
+        for (int imu = 0; imu < Param::Nmu; ++imu) {
+            fluxes.u_high[u_xface_index(iface, 0, imu)] = 0.0;
+            fluxes.u_high[u_xface_index(iface, Param::Nv, imu)] = 0.0;
+            u_force_face[u_xface_index(iface, 0, imu)] = 0.0;
+            u_force_face[u_xface_index(iface, Param::Nv, imu)] = 0.0;
+        }
+    }
 
     /*
-     * Positivity-constrained u-force flux limiter.
+     * 7.1.3 / reconstruction-plan step 5:
+     * construct a truly cell-local donor-cell u_low operator.  The positivity
+     * base is f_after_x in each fixed (ix, imu) velocity column; no x-face
+     * left/right average is allowed to decide the donor mass.  The x-face
+     * arrays are filled only as compatibility diagnostics after the cell-local
+     * fluxes have been built.
+     */
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int ix = 0; ix < nxl; ++ix) {
+        for (int imu = 0; imu < Param::Nmu; ++imu) {
+            double f_base[Param::Nv];
+            double f_floor[Param::Nv];
+            double raw_low[Param::Nv + 1];
+            double raw_high[Param::Nv + 1];
+            double scale_face[Param::Nv + 1];
+            double low_out[Param::Nv];
+            double theta[Param::Nv];
+            for (int iv = 0; iv < Param::Nv; ++iv) {
+                const size_t k =
+                    static_cast<size_t>(iv) * Param::Nmu
+                  + static_cast<size_t>(imu);
+                const size_t src =
+                    static_cast<size_t>(ng + ix) * Param::Nvmu + k;
+                const double dx_div =
+                    dt_dx *
+                    (fluxes.x_final[
+                         static_cast<size_t>(ix + 1) * Param::Nvmu + k]
+                   - fluxes.x_final[
+                         static_cast<size_t>(ix) * Param::Nvmu + k]);
+                f_base[iv] = bkg_n.f[src] - dx_div;
+                const double local_scale =
+                    std::max(1.0, std::fabs(f_base[iv]));
+                f_floor[iv] = -eps_tol_base * local_scale;
+                low_out[iv] = 0.0;
+                theta[iv] = 1.0;
+            }
+            for (int face = 0; face <= Param::Nv; ++face) {
+                raw_low[face] = 0.0;
+                raw_high[face] = 0.0;
+                scale_face[face] = 0.0;
+            }
+            const double ex_left =
+                (static_cast<size_t>(ix) < fields_mid.Ex_face.size())
+                ? fields_mid.Ex_face[static_cast<size_t>(ix)] : 0.0;
+            const double ex_right =
+                (static_cast<size_t>(ix + 1) < fields_mid.Ex_face.size())
+                ? fields_mid.Ex_face[static_cast<size_t>(ix + 1)] : ex_left;
+            const double accel_u =
+                bkg_n.charge * 0.5 * (ex_left + ex_right) /
+                (bkg_n.mass * Const::c);
+            const double u_dot_base =
+                accel_u * bkg_n.vgrid.mu_cells[imu];
+            for (int face = 1; face < Param::Nv; ++face) {
+                const double scale =
+                    2.0 * Const::pi * bkg_n.vgrid.dmu
+                  * bkg_n.vgrid.v2_faces[face] * u_dot_base;
+                const int donor_iv = (scale >= 0.0) ? face - 1 : face;
+                scale_face[face] = scale;
+                raw_low[face] = scale * f_base[donor_iv];
+                raw_high[face] =
+                    scale * 0.5 * (f_base[face - 1] + f_base[face]);
+                const double dt_inv =
+                    dt * bkg_n.vgrid.inv_moment_weight[donor_iv];
+                const double donor_decrement =
+                    (scale >= 0.0)
+                    ? dt_inv * std::max(0.0, raw_low[face])
+                    : dt_inv * std::max(0.0, -raw_low[face]);
+                low_out[donor_iv] += donor_decrement;
+            }
+            for (int iv = 0; iv < Param::Nv; ++iv) {
+                if (low_out[iv] > 0.0) {
+                    const double budget =
+                        std::max(0.0, f_base[iv] - f_floor[iv]);
+                    theta[iv] =
+                        std::max(0.0, std::min(1.0, budget / low_out[iv]));
+                }
+            }
+            for (int face = 1; face < Param::Nv; ++face) {
+                const int donor_iv =
+                    (scale_face[face] >= 0.0) ? face - 1 : face;
+                raw_low[face] *= theta[donor_iv];
+            }
+            for (int face = 0; face <= Param::Nv; ++face) {
+                const size_t idx = u_cell_index(ix, face, imu);
+                fluxes.u_low_cell[idx] = raw_low[face];
+                fluxes.u_high_cell[idx] = raw_high[face];
+                fluxes.u_final_cell[idx] = raw_high[face];
+            }
+        }
+    }
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int iface = 0; iface <= nxl; ++iface) {
+        for (int face = 0; face <= Param::Nv; ++face) {
+            for (int imu = 0; imu < Param::Nmu; ++imu) {
+                double low_val = 0.0;
+                double high_val = 0.0;
+                if (nxl > 0) {
+                    if (iface == 0) {
+                        low_val = fluxes.u_low_cell[u_cell_index(0, face, imu)];
+                        high_val = fluxes.u_high_cell[u_cell_index(0, face, imu)];
+                    } else if (iface == nxl) {
+                        low_val =
+                            fluxes.u_low_cell[u_cell_index(nxl - 1, face, imu)];
+                        high_val =
+                            fluxes.u_high_cell[u_cell_index(nxl - 1, face, imu)];
+                    } else {
+                        low_val = 0.5 *
+                            (fluxes.u_low_cell[
+                                 u_cell_index(iface - 1, face, imu)]
+                           + fluxes.u_low_cell[
+                                 u_cell_index(iface, face, imu)]);
+                        high_val = 0.5 *
+                            (fluxes.u_high_cell[
+                                 u_cell_index(iface - 1, face, imu)]
+                           + fluxes.u_high_cell[
+                                 u_cell_index(iface, face, imu)]);
+                    }
+                }
+                fluxes.u_low[u_xface_index(iface, face, imu)] = low_val;
+                fluxes.u_high[u_xface_index(iface, face, imu)] = high_val;
+                u_force_face[u_xface_index(iface, face, imu)] = high_val;
+            }
+        }
+    }
+
+    /*
+     * Positivity-constrained u-force FCT limiter.
      *
-     * The centered midpoint u-flux can produce negative f when du_div is large.
-     * Instead of clipping f to zero after the fact, we limit the u_force_face
-     * fluxes proportionally so that the discrete update respects positivity.
-     * The limiter is face-consistent: each u_face takes min(alpha_L, alpha_R)
-     * from its two adjacent cells.
+     * F_u_final = F_u_low + alpha_u_face * (F_u_high - F_u_low).
+     * This is true flux-corrected transport: first form the low-order state,
+     * then limit only antidiffusive fluxes that would drain a cell beyond its
+     * remaining positive budget.  The accepted update and energy-defect
+     * accounting use only F_u_final.
      */
     bkg_new = bkg_n;
     const int low_u_limit_count =
@@ -1489,8 +1757,54 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     std::fill(alpha_cell.begin(), alpha_cell.end(), 1.0);
     int local_any_limited = 0;
     long long local_ec_negative_cells = 0;
+    long long local_u_low_order_failed = 0;
+    double local_u_min_f_low = std::numeric_limits<double>::infinity();
+    const int u_audit_threads = std::max(1, omp_get_max_threads());
+    std::vector<UFluxAuditCandidate> thread_u_audit(
+        static_cast<size_t>(u_audit_threads),
+        empty_u_flux_audit_candidate());
+    std::vector<LowOrderFailureAudit> thread_u_low_failure(
+        static_cast<size_t>(u_audit_threads),
+        empty_low_order_failure_audit());
+    auto u_low_scale_at = [&](int ix, int face, int imu) -> double {
+        if (face <= 0 || face >= Param::Nv) return 0.0;
+        const double ex_left =
+            (static_cast<size_t>(ix) < fields_mid.Ex_face.size())
+            ? fields_mid.Ex_face[static_cast<size_t>(ix)] : 0.0;
+        const double ex_right =
+            (static_cast<size_t>(ix + 1) < fields_mid.Ex_face.size())
+            ? fields_mid.Ex_face[static_cast<size_t>(ix + 1)] : ex_left;
+        const double accel_u =
+            bkg_n.charge * 0.5 * (ex_left + ex_right) /
+            (bkg_n.mass * Const::c);
+        const double u_dot_base = accel_u * bkg_n.vgrid.mu_cells[imu];
+        return 2.0 * Const::pi * bkg_n.vgrid.dmu
+             * bkg_n.vgrid.v2_faces[face] * u_dot_base;
+    };
+    auto u_low_donor_iv_at = [&](double scale, int face) -> int {
+        if (face <= 0 || face >= Param::Nv) return -1;
+        return (scale >= 0.0) ? face - 1 : face;
+    };
+    auto u_low_donor_f_at =
+        [&](int ix, int donor_iv, int imu) -> double {
+            if (donor_iv < 0 || donor_iv >= Param::Nv) return 0.0;
+            const size_t k =
+                static_cast<size_t>(donor_iv) * Param::Nmu
+              + static_cast<size_t>(imu);
+            const size_t src =
+                static_cast<size_t>(ng + ix) * Param::Nvmu + k;
+            const double dx_div =
+                dt_dx *
+                (fluxes.x_final[
+                     static_cast<size_t>(ix + 1) * Param::Nvmu + k]
+               - fluxes.x_final[
+                     static_cast<size_t>(ix) * Param::Nvmu + k]);
+            return bkg_n.f[src] - dx_div;
+        };
     #pragma omp parallel for collapse(2) schedule(static) \
-        reduction(max:local_any_limited) reduction(+:local_ec_negative_cells)
+        reduction(max:local_any_limited) \
+        reduction(+:local_ec_negative_cells,local_u_low_order_failed) \
+        reduction(min:local_u_min_f_low)
     for (int ix = 0; ix < nxl; ++ix) {
         for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu); ++k_int) {
             const int iv = k_int / Param::Nmu;
@@ -1506,117 +1820,461 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                 dt_dx *
                 (fluxes.x_final[static_cast<size_t>(ix + 1) * Param::Nvmu + k]
                - fluxes.x_final[static_cast<size_t>(ix) * Param::Nvmu + k]);
-            const double mu_div_left =
-                mu_force_face[mu_xface_index(ix, iv, imu + 1)]
-              - mu_force_face[mu_xface_index(ix, iv, imu)];
-            const double mu_div_right =
-                mu_force_face[mu_xface_index(ix + 1, iv, imu + 1)]
-              - mu_force_face[mu_xface_index(ix + 1, iv, imu)];
-            const double dmu_div = hdt_is * (mu_div_left + mu_div_right);
-            const double contrib[4] = {
-                +hdt_is * u_force_face[u_xface_index(ix, iv + 1, imu)],
-                -hdt_is * u_force_face[u_xface_index(ix, iv, imu)],
-                +hdt_is * u_force_face[u_xface_index(ix + 1, iv + 1, imu)],
-                -hdt_is * u_force_face[u_xface_index(ix + 1, iv, imu)]
-            };
-            double du_div_out = 0.0;
-            double du_div_ec = 0.0;
-            for (int c = 0; c < 4; ++c) {
-                if (contrib[c] > 0.0) du_div_out += contrib[c];
-                du_div_ec += contrib[c];
+            const double f_after_x = f0 - dx_div;
+            const double dt_inv_shell = 2.0 * hdt_is;
+            const double u_div_low =
+                fluxes.u_low_cell[u_cell_index(ix, iv + 1, imu)]
+              - fluxes.u_low_cell[u_cell_index(ix, iv, imu)];
+            const double du_div_low = dt_inv_shell * u_div_low;
+            const double u_div_high =
+                fluxes.u_high_cell[u_cell_index(ix, iv + 1, imu)]
+              - fluxes.u_high_cell[u_cell_index(ix, iv, imu)];
+            const double du_div_high = dt_inv_shell * u_div_high;
+            const double local_scale = std::max(1.0, std::fabs(f_after_x));
+            const double f_floor = -eps_tol_base * local_scale;
+            const double f_low = f_after_x - du_div_low;
+            const double f_high = f_after_x - du_div_high;
+            local_u_min_f_low = std::min(local_u_min_f_low, f_low);
+            double audit_alpha = 1.0;
+            double audit_severity = 0.0;
+            if (!std::isfinite(f_low) || !std::isfinite(f_high)) {
+                alpha_cell[ix_k] = 0.0;
+                ++local_u_low_order_failed;
+                local_any_limited = 1;
+                audit_alpha = 0.0;
+                audit_severity = std::numeric_limits<double>::infinity();
+                const int tid = omp_get_thread_num();
+                UFluxAuditCandidate& audit =
+                    thread_u_audit[static_cast<size_t>(tid)];
+                if (!audit.valid || audit_severity > audit.severity) {
+                    audit.valid = 1;
+                    audit.severity = audit_severity;
+                    audit.f0 = f0;
+                    audit.f_low = f_low;
+                    audit.f_high = f_high;
+                    audit.alpha = audit_alpha;
+                    audit.du_div_low = du_div_low;
+                    audit.du_div_high = du_div_high;
+                    audit.ix = sg.ix_start + ix;
+                    audit.iv = iv;
+                    audit.imu = imu;
+                }
+                const int low_tid = omp_get_thread_num();
+                LowOrderFailureAudit& low_audit =
+                    thread_u_low_failure[static_cast<size_t>(low_tid)];
+                if (!low_audit.valid ||
+                    audit_severity > low_audit.severity) {
+                    const int lower_face = iv;
+                    const int upper_face = iv + 1;
+                    const double left_lower_scale =
+                        u_low_scale_at(ix, lower_face, imu);
+                    const double left_upper_scale =
+                        u_low_scale_at(ix, upper_face, imu);
+                    const double right_lower_scale =
+                        left_lower_scale;
+                    const double right_upper_scale =
+                        left_upper_scale;
+                    const int left_lower_donor =
+                        u_low_donor_iv_at(left_lower_scale, lower_face);
+                    const int left_upper_donor =
+                        u_low_donor_iv_at(left_upper_scale, upper_face);
+                    const int right_lower_donor =
+                        u_low_donor_iv_at(right_lower_scale, lower_face);
+                    const int right_upper_donor =
+                        u_low_donor_iv_at(right_upper_scale, upper_face);
+                    const double x_cell =
+                        (static_cast<double>(sg.ix_start + ix) + 0.5)
+                      * sg.dx;
+                    low_audit.valid = 1;
+                    low_audit.rank = mpi_rank;
+                    low_audit.ix = sg.ix_start + ix;
+                    low_audit.iv = iv;
+                    low_audit.imu = imu;
+                    low_audit.region =
+                        (x_cell < CORE_DIAG_BOUNDARY_WIDTH ||
+                         x_cell > Param::Lx - CORE_DIAG_BOUNDARY_WIDTH)
+                        ? 1 : 0;
+                    low_audit.severity = audit_severity;
+                    low_audit.f_input = f0;
+                    low_audit.f_after_x = f0 - dx_div;
+                    low_audit.dx_div = dx_div;
+                    low_audit.dmu_div_used = 0.0;
+                    low_audit.du_div_low = du_div_low;
+                    low_audit.f_low = f_low;
+                    low_audit.left_lower_flux =
+                        fluxes.u_low_cell[u_cell_index(ix, lower_face, imu)];
+                    low_audit.left_upper_flux =
+                        fluxes.u_low_cell[u_cell_index(ix, upper_face, imu)];
+                    low_audit.right_lower_flux =
+                        low_audit.left_lower_flux;
+                    low_audit.right_upper_flux =
+                        low_audit.left_upper_flux;
+                    low_audit.left_lower_scale = left_lower_scale;
+                    low_audit.left_upper_scale = left_upper_scale;
+                    low_audit.right_lower_scale = right_lower_scale;
+                    low_audit.right_upper_scale = right_upper_scale;
+                    low_audit.left_lower_donor_f =
+                        u_low_donor_f_at(ix, left_lower_donor, imu);
+                    low_audit.left_upper_donor_f =
+                        u_low_donor_f_at(ix, left_upper_donor, imu);
+                    low_audit.right_lower_donor_f =
+                        low_audit.left_lower_donor_f;
+                    low_audit.right_upper_donor_f =
+                        low_audit.left_upper_donor_f;
+                    low_audit.lower_characteristic = 0.5 *
+                        (left_lower_scale + right_lower_scale);
+                    low_audit.upper_characteristic = 0.5 *
+                        (left_upper_scale + right_upper_scale);
+                    low_audit.moment_weight = bkg_n.vgrid.moment_weight[iv];
+                    low_audit.cell_budget =
+                        std::isfinite(f_low) ? f_low - f_floor : 0.0;
+                    low_audit.left_lower_donor_index = left_lower_donor;
+                    low_audit.left_upper_donor_index = left_upper_donor;
+                    low_audit.right_lower_donor_index = right_lower_donor;
+                    low_audit.right_upper_donor_index = right_upper_donor;
+                }
+                continue;
             }
-            const double f_ec = f0 - dx_div - dmu_div - du_div_ec;
-            // Fast path: energy-conserving update is non-negative (common case)
-            if (__builtin_expect(!std::isfinite(f_ec) || f_ec >= 0.0, 1)) continue;
-            ++local_ec_negative_cells;
-            if (du_div_out <= 0.0) continue;
-
-            const double local_scale = std::max(1.0, std::fabs(f0));
-            const double eps_tol = eps_tol_base * local_scale;
-            const double needed_reduction = -f_ec + eps_tol;
-            const double alpha =
-                std::max(0.0, std::min(1.0,
-                         1.0 - needed_reduction / du_div_out));
-            alpha_cell[ix_k] = alpha;
-            local_any_limited = 1;
+            if (f_low < f_floor) {
+                alpha_cell[ix_k] = 0.0;
+                ++local_u_low_order_failed;
+                local_any_limited = 1;
+                audit_alpha = 0.0;
+                audit_severity = std::max(0.0, -f_low);
+                const int tid = omp_get_thread_num();
+                UFluxAuditCandidate& audit =
+                    thread_u_audit[static_cast<size_t>(tid)];
+                if (!audit.valid || audit_severity > audit.severity) {
+                    audit.valid = 1;
+                    audit.severity = audit_severity;
+                    audit.f0 = f0;
+                    audit.f_low = f_low;
+                    audit.f_high = f_high;
+                    audit.alpha = audit_alpha;
+                    audit.du_div_low = du_div_low;
+                    audit.du_div_high = du_div_high;
+                    audit.ix = sg.ix_start + ix;
+                    audit.iv = iv;
+                    audit.imu = imu;
+                }
+                const int low_tid = omp_get_thread_num();
+                LowOrderFailureAudit& low_audit =
+                    thread_u_low_failure[static_cast<size_t>(low_tid)];
+                if (!low_audit.valid ||
+                    audit_severity > low_audit.severity) {
+                    const int lower_face = iv;
+                    const int upper_face = iv + 1;
+                    const double left_lower_scale =
+                        u_low_scale_at(ix, lower_face, imu);
+                    const double left_upper_scale =
+                        u_low_scale_at(ix, upper_face, imu);
+                    const double right_lower_scale =
+                        left_lower_scale;
+                    const double right_upper_scale =
+                        left_upper_scale;
+                    const int left_lower_donor =
+                        u_low_donor_iv_at(left_lower_scale, lower_face);
+                    const int left_upper_donor =
+                        u_low_donor_iv_at(left_upper_scale, upper_face);
+                    const int right_lower_donor =
+                        u_low_donor_iv_at(right_lower_scale, lower_face);
+                    const int right_upper_donor =
+                        u_low_donor_iv_at(right_upper_scale, upper_face);
+                    const double x_cell =
+                        (static_cast<double>(sg.ix_start + ix) + 0.5)
+                      * sg.dx;
+                    low_audit.valid = 1;
+                    low_audit.rank = mpi_rank;
+                    low_audit.ix = sg.ix_start + ix;
+                    low_audit.iv = iv;
+                    low_audit.imu = imu;
+                    low_audit.region =
+                        (x_cell < CORE_DIAG_BOUNDARY_WIDTH ||
+                         x_cell > Param::Lx - CORE_DIAG_BOUNDARY_WIDTH)
+                        ? 1 : 0;
+                    low_audit.severity = audit_severity;
+                    low_audit.f_input = f0;
+                    low_audit.f_after_x = f0 - dx_div;
+                    low_audit.dx_div = dx_div;
+                    low_audit.dmu_div_used = 0.0;
+                    low_audit.du_div_low = du_div_low;
+                    low_audit.f_low = f_low;
+                    low_audit.left_lower_flux =
+                        fluxes.u_low_cell[u_cell_index(ix, lower_face, imu)];
+                    low_audit.left_upper_flux =
+                        fluxes.u_low_cell[u_cell_index(ix, upper_face, imu)];
+                    low_audit.right_lower_flux =
+                        low_audit.left_lower_flux;
+                    low_audit.right_upper_flux =
+                        low_audit.left_upper_flux;
+                    low_audit.left_lower_scale = left_lower_scale;
+                    low_audit.left_upper_scale = left_upper_scale;
+                    low_audit.right_lower_scale = right_lower_scale;
+                    low_audit.right_upper_scale = right_upper_scale;
+                    low_audit.left_lower_donor_f =
+                        u_low_donor_f_at(ix, left_lower_donor, imu);
+                    low_audit.left_upper_donor_f =
+                        u_low_donor_f_at(ix, left_upper_donor, imu);
+                    low_audit.right_lower_donor_f =
+                        low_audit.left_lower_donor_f;
+                    low_audit.right_upper_donor_f =
+                        low_audit.left_upper_donor_f;
+                    low_audit.lower_characteristic = 0.5 *
+                        (left_lower_scale + right_lower_scale);
+                    low_audit.upper_characteristic = 0.5 *
+                        (left_upper_scale + right_upper_scale);
+                    low_audit.moment_weight = bkg_n.vgrid.moment_weight[iv];
+                    low_audit.cell_budget = f_low - f_floor;
+                    low_audit.left_lower_donor_index = left_lower_donor;
+                    low_audit.left_upper_donor_index = left_upper_donor;
+                    low_audit.right_lower_donor_index = right_lower_donor;
+                    low_audit.right_upper_donor_index = right_upper_donor;
+                }
+                continue;
+            }
+            const double a_lo =
+                fluxes.u_high_cell[u_cell_index(ix, iv, imu)]
+              - fluxes.u_low_cell[u_cell_index(ix, iv, imu)];
+            const double a_hi =
+                fluxes.u_high_cell[u_cell_index(ix, iv + 1, imu)]
+              - fluxes.u_low_cell[u_cell_index(ix, iv + 1, imu)];
+            const double antidiff_out =
+                dt_inv_shell * (std::max(0.0,  a_hi)
+                              + std::max(0.0, -a_lo));
+            if (f_high < f_floor) ++local_ec_negative_cells;
+            if (antidiff_out > 0.0) {
+                const double budget = std::max(0.0, f_low - f_floor);
+                const double alpha =
+                    std::max(0.0, std::min(1.0, budget / antidiff_out));
+                alpha_cell[ix_k] = alpha;
+                audit_alpha = alpha;
+                if (alpha < 1.0 - 1.0e-14) local_any_limited = 1;
+            }
+            audit_severity =
+                std::max(0.0, -std::min(f_low, f_high));
+            if (audit_severity > 0.0) {
+                const int tid = omp_get_thread_num();
+                UFluxAuditCandidate& audit =
+                    thread_u_audit[static_cast<size_t>(tid)];
+                if (!audit.valid || audit_severity > audit.severity) {
+                    audit.valid = 1;
+                    audit.severity = audit_severity;
+                    audit.f0 = f0;
+                    audit.f_low = f_low;
+                    audit.f_high = f_high;
+                    audit.alpha = audit_alpha;
+                    audit.du_div_low = du_div_low;
+                    audit.du_div_high = du_div_high;
+                    audit.ix = sg.ix_start + ix;
+                    audit.iv = iv;
+                    audit.imu = imu;
+                }
+            }
         }
     }
     int global_any_limited = local_any_limited;
     MPI_Allreduce(MPI_IN_PLACE, &global_any_limited, 1, MPI_INT, MPI_MAX,
                   MPI_COMM_WORLD);
+    long long global_u_low_order_failed_for_audit =
+        local_u_low_order_failed;
+    MPI_Allreduce(MPI_IN_PLACE, &global_u_low_order_failed_for_audit, 1,
+                  MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
     (void)local_ec_negative_cells;
-
-    const bool need_face_limiting = (global_any_limited != 0);
-    std::vector<double> u_force_ec;
-    if (need_face_limiting) {
-        u_force_ec = u_force_face;
-    }
-    std::vector<double> alpha_left_ghost;
-    if (need_face_limiting && nxl > 0) {
-        alpha_left_ghost.assign(Param::Nvmu, 1.0);
-        if (mpi_size <= 1) {
-            const size_t last_base =
-                static_cast<size_t>(nxl - 1) * Param::Nvmu;
-            std::copy(alpha_cell.begin() + last_base,
-                      alpha_cell.begin() + last_base + Param::Nvmu,
-                      alpha_left_ghost.begin());
-        } else {
-            std::vector<double> alpha_send_right(Param::Nvmu, 1.0);
-            const size_t last_base =
-                static_cast<size_t>(nxl - 1) * Param::Nvmu;
-            std::copy(alpha_cell.begin() + last_base,
-                      alpha_cell.begin() + last_base + Param::Nvmu,
-                      alpha_send_right.begin());
-            const int left_rank = (mpi_rank + mpi_size - 1) % mpi_size;
-            const int right_rank = (mpi_rank + 1) % mpi_size;
-            MPI_Sendrecv(alpha_send_right.data(),
-                         static_cast<int>(Param::Nvmu), MPI_DOUBLE,
-                         right_rank, 508,
-                         alpha_left_ghost.data(),
-                         static_cast<int>(Param::Nvmu), MPI_DOUBLE,
-                         left_rank, 508, MPI_COMM_WORLD,
-                         MPI_STATUS_IGNORE);
+    UFluxAuditCandidate local_u_audit = empty_u_flux_audit_candidate();
+    for (const UFluxAuditCandidate& audit : thread_u_audit) {
+        if (audit.valid &&
+            (!local_u_audit.valid ||
+             audit.severity > local_u_audit.severity)) {
+            local_u_audit = audit;
         }
     }
+    struct {
+        double value;
+        int rank;
+    } local_u_audit_loc, global_u_audit_loc;
+    local_u_audit_loc.value =
+        local_u_audit.valid ? local_u_audit.severity : 0.0;
+    local_u_audit_loc.rank = mpi_rank;
+    global_u_audit_loc.value = 0.0;
+    global_u_audit_loc.rank = -1;
+    MPI_Allreduce(&local_u_audit_loc, &global_u_audit_loc, 1,
+                  MPI_DOUBLE_INT, MPI_MAXLOC, MPI_COMM_WORLD);
+    double u_audit_values[7] = {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
+    int u_audit_indices[4] = {-1, -1, -1, -1};
+    if (local_u_audit.valid && mpi_rank == global_u_audit_loc.rank) {
+        u_audit_values[0] = local_u_audit.severity;
+        u_audit_values[1] = local_u_audit.f0;
+        u_audit_values[2] = local_u_audit.f_low;
+        u_audit_values[3] = local_u_audit.f_high;
+        u_audit_values[4] = local_u_audit.alpha;
+        u_audit_values[5] = local_u_audit.du_div_low;
+        u_audit_values[6] = local_u_audit.du_div_high;
+        u_audit_indices[0] = mpi_rank;
+        u_audit_indices[1] = local_u_audit.ix;
+        u_audit_indices[2] = local_u_audit.iv;
+        u_audit_indices[3] = local_u_audit.imu;
+    }
+    if (global_u_audit_loc.value > 0.0 &&
+        global_u_audit_loc.rank >= 0) {
+        MPI_Bcast(u_audit_values, 7, MPI_DOUBLE,
+                  global_u_audit_loc.rank, MPI_COMM_WORLD);
+        MPI_Bcast(u_audit_indices, 4, MPI_INT,
+                  global_u_audit_loc.rank, MPI_COMM_WORLD);
+        fluxes.u_flux_audit_valid = 1;
+        fluxes.u_flux_audit_rank = u_audit_indices[0];
+        fluxes.u_flux_audit_ix = u_audit_indices[1];
+        fluxes.u_flux_audit_iv = u_audit_indices[2];
+        fluxes.u_flux_audit_imu = u_audit_indices[3];
+        fluxes.u_flux_audit_severity = u_audit_values[0];
+        fluxes.u_flux_audit_f0 = u_audit_values[1];
+        fluxes.u_flux_audit_f_low = u_audit_values[2];
+        fluxes.u_flux_audit_f_high = u_audit_values[3];
+        fluxes.u_flux_audit_alpha = u_audit_values[4];
+        fluxes.u_flux_audit_du_div_low = u_audit_values[5];
+        fluxes.u_flux_audit_du_div_high = u_audit_values[6];
+    }
+    LowOrderFailureAudit local_u_low_audit =
+        empty_low_order_failure_audit();
+    for (const LowOrderFailureAudit& audit : thread_u_low_failure) {
+        if (audit.valid &&
+            (!local_u_low_audit.valid ||
+             audit.severity > local_u_low_audit.severity)) {
+            local_u_low_audit = audit;
+        }
+    }
+    struct {
+        double value;
+        int rank;
+    } local_u_low_loc, global_u_low_loc;
+    local_u_low_loc.value =
+        local_u_low_audit.valid ? local_u_low_audit.severity : 0.0;
+    local_u_low_loc.rank = mpi_rank;
+    global_u_low_loc.value = 0.0;
+    global_u_low_loc.rank = -1;
+    MPI_Allreduce(&local_u_low_loc, &global_u_low_loc, 1,
+                  MPI_DOUBLE_INT, MPI_MAXLOC, MPI_COMM_WORLD);
+    double u_low_values[27] = {0.0};
+    int u_low_indices[10] = {-1, -1, -1, -1, 0, -1, -1, -1, -1, 0};
+    if (local_u_low_audit.valid &&
+        mpi_rank == global_u_low_loc.rank) {
+        u_low_values[0] = local_u_low_audit.severity;
+        u_low_values[1] = local_u_low_audit.f_input;
+        u_low_values[2] = local_u_low_audit.f_after_x;
+        u_low_values[3] = local_u_low_audit.dx_div;
+        u_low_values[4] = local_u_low_audit.dmu_div_used;
+        u_low_values[5] = local_u_low_audit.du_div_low;
+        u_low_values[6] = local_u_low_audit.f_low;
+        u_low_values[7] = local_u_low_audit.left_lower_flux;
+        u_low_values[8] = local_u_low_audit.left_upper_flux;
+        u_low_values[9] = local_u_low_audit.right_lower_flux;
+        u_low_values[10] = local_u_low_audit.right_upper_flux;
+        u_low_values[11] = local_u_low_audit.left_lower_scale;
+        u_low_values[12] = local_u_low_audit.left_upper_scale;
+        u_low_values[13] = local_u_low_audit.right_lower_scale;
+        u_low_values[14] = local_u_low_audit.right_upper_scale;
+        u_low_values[15] = local_u_low_audit.left_lower_donor_f;
+        u_low_values[16] = local_u_low_audit.left_upper_donor_f;
+        u_low_values[17] = local_u_low_audit.right_lower_donor_f;
+        u_low_values[18] = local_u_low_audit.right_upper_donor_f;
+        u_low_values[19] = local_u_low_audit.lower_characteristic;
+        u_low_values[20] = local_u_low_audit.upper_characteristic;
+        u_low_values[21] = local_u_low_audit.moment_weight;
+        u_low_values[22] = local_u_low_audit.cell_budget;
+        u_low_values[23] =
+            static_cast<double>(global_u_low_order_failed_for_audit);
+        u_low_indices[0] = local_u_low_audit.rank;
+        u_low_indices[1] = local_u_low_audit.ix;
+        u_low_indices[2] = local_u_low_audit.iv;
+        u_low_indices[3] = local_u_low_audit.imu;
+        u_low_indices[4] = local_u_low_audit.region;
+        u_low_indices[5] = local_u_low_audit.left_lower_donor_index;
+        u_low_indices[6] = local_u_low_audit.left_upper_donor_index;
+        u_low_indices[7] = local_u_low_audit.right_lower_donor_index;
+        u_low_indices[8] = local_u_low_audit.right_upper_donor_index;
+    }
+    if (global_u_low_loc.value > 0.0 && global_u_low_loc.rank >= 0) {
+        MPI_Bcast(u_low_values, 27, MPI_DOUBLE,
+                  global_u_low_loc.rank, MPI_COMM_WORLD);
+        MPI_Bcast(u_low_indices, 10, MPI_INT,
+                  global_u_low_loc.rank, MPI_COMM_WORLD);
+        LowOrderFailureAudit& audit = fluxes.u_low_failure_audit;
+        audit.valid = 1;
+        audit.rank = u_low_indices[0];
+        audit.ix = u_low_indices[1];
+        audit.iv = u_low_indices[2];
+        audit.imu = u_low_indices[3];
+        audit.region = u_low_indices[4];
+        audit.severity = u_low_values[0];
+        audit.f_input = u_low_values[1];
+        audit.f_after_x = u_low_values[2];
+        audit.dx_div = u_low_values[3];
+        audit.dmu_div_used = u_low_values[4];
+        audit.du_div_low = u_low_values[5];
+        audit.f_low = u_low_values[6];
+        audit.left_lower_flux = u_low_values[7];
+        audit.left_upper_flux = u_low_values[8];
+        audit.right_lower_flux = u_low_values[9];
+        audit.right_upper_flux = u_low_values[10];
+        audit.left_lower_scale = u_low_values[11];
+        audit.left_upper_scale = u_low_values[12];
+        audit.right_lower_scale = u_low_values[13];
+        audit.right_upper_scale = u_low_values[14];
+        audit.left_lower_donor_f = u_low_values[15];
+        audit.left_upper_donor_f = u_low_values[16];
+        audit.right_lower_donor_f = u_low_values[17];
+        audit.right_upper_donor_f = u_low_values[18];
+        audit.lower_characteristic = u_low_values[19];
+        audit.upper_characteristic = u_low_values[20];
+        audit.moment_weight = u_low_values[21];
+        audit.cell_budget = u_low_values[22];
+        audit.low_order_failed_count = u_low_values[23];
+        audit.left_lower_donor_index = u_low_indices[5];
+        audit.left_upper_donor_index = u_low_indices[6];
+        audit.right_lower_donor_index = u_low_indices[7];
+        audit.right_upper_donor_index = u_low_indices[8];
+    }
 
+    const bool need_face_limiting = (global_any_limited != 0);
     long long local_u_face_active = 0;
     long long local_u_face_total = 0;
     double local_u_alpha_min = 1.0;
 
     if (need_face_limiting) {
-    // ---- Pass 2: face-level alpha and scale u_force_face ----
+    // ---- Pass 2: cell-local face alpha and construct F_u_final_cell ----
     #pragma omp parallel for schedule(static) \
         reduction(+:local_u_face_active,local_u_face_total) \
         reduction(min:local_u_alpha_min)
-    for (int iface = 0; iface < nxl; ++iface) {
-        const double* alpha_left =
-            (iface == 0)
-            ? alpha_left_ghost.data()
-            : &alpha_cell[static_cast<size_t>(iface - 1) * Param::Nvmu];
-        const double* alpha_right =
-            &alpha_cell[static_cast<size_t>(iface) * Param::Nvmu];
+    for (int ix = 0; ix < nxl; ++ix) {
         for (int face = 0; face <= Param::Nv; ++face) {
             for (int imu = 0; imu < Param::Nmu; ++imu) {
-                const size_t face_idx = u_xface_index(iface, face, imu);
-                double& ff = u_force_face[face_idx];
+                const size_t face_idx = u_cell_index(ix, face, imu);
+                const double antidiff =
+                    fluxes.u_high_cell[face_idx] -
+                    fluxes.u_low_cell[face_idx];
                 double alpha_face = 1.0;
-                if (ff > 0.0 && face > 0) {
-                    const size_t k =
+                if (face > 0 && face < Param::Nv && antidiff > 0.0) {
+                    const size_t k_lo =
+                        static_cast<size_t>(ix) * Param::Nvmu +
                         static_cast<size_t>(face - 1) * Param::Nmu
                       + static_cast<size_t>(imu);
-                    alpha_face = std::min(alpha_left[k], alpha_right[k]);
-                } else if (ff < 0.0 && face < Param::Nv) {
-                    const size_t k =
+                    alpha_face = alpha_cell[k_lo];
+                } else if (face > 0 && face < Param::Nv && antidiff < 0.0) {
+                    const size_t k_hi =
+                        static_cast<size_t>(ix) * Param::Nvmu +
                         static_cast<size_t>(face) * Param::Nmu
                       + static_cast<size_t>(imu);
-                    alpha_face = std::min(alpha_left[k], alpha_right[k]);
+                    alpha_face = alpha_cell[k_hi];
                 }
                 alpha_face = std::max(0.0, std::min(1.0, alpha_face));
                 if (face <= low_u_limit_count &&
                     alpha_face < 1.0 - 1.0e-12) {
                     alpha_face = smooth_low_u_mu_alpha(alpha_face);
                 }
-                ff *= alpha_face;
+                fluxes.u_final_cell[face_idx] =
+                    fluxes.u_low_cell[face_idx] +
+                    alpha_face *
+                    (fluxes.u_high_cell[face_idx] -
+                     fluxes.u_low_cell[face_idx]);
                 if (alpha_face < 0.999999) ++local_u_face_active;
                 ++local_u_face_total;
                 local_u_alpha_min =
@@ -1624,19 +2282,34 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             }
         }
     }
-    close_periodic_face_blocks(u_force_face, nxl,
-                               (Param::Nv + 1) * Param::Nmu,
-                               mpi_rank, mpi_size, 506);
     } // need_face_limiting
 
-    // 7.1.1: save post-limiter (final) u-flux; u_low not yet implemented
-    {
-        const size_t u_size = static_cast<size_t>(nxl + 1) *
-                              (Param::Nv + 1) * Param::Nmu;
-        std::copy(u_force_face.begin(), u_force_face.begin() + u_size,
-                  fluxes.u_final.begin());
-        std::copy(fluxes.u_final.begin(), fluxes.u_final.begin() + u_size,
-                  fluxes.u_low.begin());
+    // Map cell-local final u flux back to x-face storage for diagnostics only.
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int iface = 0; iface <= nxl; ++iface) {
+        for (int face = 0; face <= Param::Nv; ++face) {
+            for (int imu = 0; imu < Param::Nmu; ++imu) {
+                double final_val = 0.0;
+                if (nxl > 0) {
+                    if (iface == 0) {
+                        final_val =
+                            fluxes.u_final_cell[u_cell_index(0, face, imu)];
+                    } else if (iface == nxl) {
+                        final_val =
+                            fluxes.u_final_cell[
+                                u_cell_index(nxl - 1, face, imu)];
+                    } else {
+                        final_val = 0.5 *
+                            (fluxes.u_final_cell[
+                                 u_cell_index(iface - 1, face, imu)]
+                           + fluxes.u_final_cell[
+                                 u_cell_index(iface, face, imu)]);
+                    }
+                }
+                fluxes.u_final[u_xface_index(iface, face, imu)] = final_val;
+                u_force_face[u_xface_index(iface, face, imu)] = final_val;
+            }
+        }
     }
 
     std::vector<double> mu_force_low_u_ec(
@@ -1788,6 +2461,299 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                   fluxes.mu_low.begin());
     }
     {
+        const int mu_audit_threads = std::max(1, omp_get_max_threads());
+        std::vector<LowOrderFailureAudit> thread_mu_low_failure(
+            static_cast<size_t>(mu_audit_threads),
+            empty_low_order_failure_audit());
+        long long local_mu_low_order_failed = 0;
+        auto mu_dot_at = [&](int iface, int iv, int face) -> double {
+            if (face <= 0 || face >= Param::Nmu) return 0.0;
+            const double ex_face =
+                (static_cast<size_t>(iface) < fields_mid.Ex_face.size())
+                ? fields_mid.Ex_face[static_cast<size_t>(iface)] : 0.0;
+            const double accel_u =
+                bkg_n.charge * ex_face / (bkg_n.mass * Const::c);
+            return accel_u * bkg_n.vgrid.mu_face_factor[face]
+                 / mu_u_eff[iv];
+        };
+        auto mu_donor_imu_at = [&](double characteristic, int face) -> int {
+            if (face <= 0 || face >= Param::Nmu) return -1;
+            return (characteristic >= 0.0) ? face - 1 : face;
+        };
+        #pragma omp parallel for collapse(2) schedule(static) \
+            reduction(+:local_mu_low_order_failed)
+        for (int ix = 0; ix < nxl; ++ix) {
+            for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu);
+                 ++k_int) {
+                const int iv = k_int / Param::Nmu;
+                const int imu = k_int - iv * Param::Nmu;
+                const size_t k = static_cast<size_t>(k_int);
+                const size_t src =
+                    static_cast<size_t>(ng + ix) * Param::Nvmu + k;
+                const double hdt_is = half_dt_inv_shell[iv];
+                const double dx_div =
+                    dt_dx *
+                    (fluxes.x_final[
+                         static_cast<size_t>(ix + 1) * Param::Nvmu + k]
+                   - fluxes.x_final[
+                         static_cast<size_t>(ix) * Param::Nvmu + k]);
+                const double u_div =
+                    fluxes.u_final_cell[u_cell_index(ix, iv + 1, imu)]
+                  - fluxes.u_final_cell[u_cell_index(ix, iv, imu)];
+                const double du_div = (2.0 * hdt_is) * u_div;
+                const double mu_left_lower =
+                    fluxes.mu_low[mu_xface_index(ix, iv, imu)];
+                const double mu_left_upper =
+                    fluxes.mu_low[mu_xface_index(ix, iv, imu + 1)];
+                const double mu_right_lower =
+                    fluxes.mu_low[mu_xface_index(ix + 1, iv, imu)];
+                const double mu_right_upper =
+                    fluxes.mu_low[mu_xface_index(ix + 1, iv, imu + 1)];
+                const double dmu_div_low =
+                    hdt_is * ((mu_left_upper - mu_left_lower)
+                            + (mu_right_upper - mu_right_lower));
+                const double f_before_mu = bkg_n.f[src] - dx_div - du_div;
+                const double f_mu_low = f_before_mu - dmu_div_low;
+                const double local_scale =
+                    std::max(1.0, std::fabs(f_before_mu));
+                const double f_floor = -eps_tol_base * local_scale;
+                bool failed = false;
+                double severity = 0.0;
+                if (!std::isfinite(f_mu_low)) {
+                    failed = true;
+                    severity = std::numeric_limits<double>::infinity();
+                } else if (f_mu_low < f_floor) {
+                    failed = true;
+                    severity = -f_mu_low;
+                }
+                if (!failed) continue;
+                ++local_mu_low_order_failed;
+                const int tid = omp_get_thread_num();
+                LowOrderFailureAudit& audit =
+                    thread_mu_low_failure[static_cast<size_t>(tid)];
+                if (!audit.valid || severity > audit.severity) {
+                    const int lower_face = imu;
+                    const int upper_face = imu + 1;
+                    const double left_lower_mu_dot =
+                        mu_dot_at(ix, iv, lower_face);
+                    const double left_upper_mu_dot =
+                        mu_dot_at(ix, iv, upper_face);
+                    const double right_lower_mu_dot =
+                        mu_dot_at(ix + 1, iv, lower_face);
+                    const double right_upper_mu_dot =
+                        mu_dot_at(ix + 1, iv, upper_face);
+                    const double lower_char =
+                        0.5 * (left_lower_mu_dot + right_lower_mu_dot);
+                    const double upper_char =
+                        0.5 * (left_upper_mu_dot + right_upper_mu_dot);
+                    const double x_cell =
+                        (static_cast<double>(sg.ix_start + ix) + 0.5)
+                      * sg.dx;
+                    audit.valid = 1;
+                    audit.rank = mpi_rank;
+                    audit.ix = sg.ix_start + ix;
+                    audit.iv = iv;
+                    audit.imu = imu;
+                    audit.region =
+                        (x_cell < CORE_DIAG_BOUNDARY_WIDTH ||
+                         x_cell > Param::Lx - CORE_DIAG_BOUNDARY_WIDTH)
+                        ? 1 : 0;
+                    audit.severity = severity;
+                    audit.f_input = f_before_mu;
+                    audit.f_after_x = bkg_n.f[src] - dx_div;
+                    audit.dx_div = dx_div;
+                    audit.dmu_div_used = dmu_div_low;
+                    audit.du_div_low = du_div;
+                    audit.f_low = f_mu_low;
+                    audit.left_lower_flux = mu_left_lower;
+                    audit.left_upper_flux = mu_left_upper;
+                    audit.right_lower_flux = mu_right_lower;
+                    audit.right_upper_flux = mu_right_upper;
+                    audit.left_lower_scale = left_lower_mu_dot;
+                    audit.left_upper_scale = left_upper_mu_dot;
+                    audit.right_lower_scale = right_lower_mu_dot;
+                    audit.right_upper_scale = right_upper_mu_dot;
+                    audit.left_lower_donor_f = 0.0;
+                    audit.left_upper_donor_f = 0.0;
+                    audit.right_lower_donor_f = 0.0;
+                    audit.right_upper_donor_f = 0.0;
+                    audit.lower_characteristic = lower_char;
+                    audit.upper_characteristic = upper_char;
+                    audit.moment_weight = bkg_n.vgrid.moment_weight[iv];
+                    audit.cell_budget =
+                        std::isfinite(f_mu_low) ? f_mu_low - f_floor : 0.0;
+                    audit.left_lower_donor_index =
+                        mu_donor_imu_at(left_lower_mu_dot, lower_face);
+                    audit.left_upper_donor_index =
+                        mu_donor_imu_at(left_upper_mu_dot, upper_face);
+                    audit.right_lower_donor_index =
+                        mu_donor_imu_at(right_lower_mu_dot, lower_face);
+                    audit.right_upper_donor_index =
+                        mu_donor_imu_at(right_upper_mu_dot, upper_face);
+                }
+            }
+        }
+        long long global_mu_low_order_failed =
+            local_mu_low_order_failed;
+        MPI_Allreduce(MPI_IN_PLACE, &global_mu_low_order_failed, 1,
+                      MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
+        LowOrderFailureAudit local_mu_low_audit =
+            empty_low_order_failure_audit();
+        for (const LowOrderFailureAudit& audit : thread_mu_low_failure) {
+            if (audit.valid &&
+                (!local_mu_low_audit.valid ||
+                 audit.severity > local_mu_low_audit.severity)) {
+                local_mu_low_audit = audit;
+            }
+        }
+        struct {
+            double value;
+            int rank;
+        } local_mu_low_loc, global_mu_low_loc;
+        local_mu_low_loc.value =
+            local_mu_low_audit.valid ? local_mu_low_audit.severity : 0.0;
+        local_mu_low_loc.rank = mpi_rank;
+        global_mu_low_loc.value = 0.0;
+        global_mu_low_loc.rank = -1;
+        MPI_Allreduce(&local_mu_low_loc, &global_mu_low_loc, 1,
+                      MPI_DOUBLE_INT, MPI_MAXLOC, MPI_COMM_WORLD);
+        double mu_low_values[27] = {0.0};
+        int mu_low_indices[10] = {-1, -1, -1, -1, 0, -1, -1, -1, -1, 0};
+        if (local_mu_low_audit.valid &&
+            mpi_rank == global_mu_low_loc.rank) {
+            mu_low_values[0] = local_mu_low_audit.severity;
+            mu_low_values[1] = local_mu_low_audit.f_input;
+            mu_low_values[2] = local_mu_low_audit.f_after_x;
+            mu_low_values[3] = local_mu_low_audit.dx_div;
+            mu_low_values[4] = local_mu_low_audit.dmu_div_used;
+            mu_low_values[5] = local_mu_low_audit.du_div_low;
+            mu_low_values[6] = local_mu_low_audit.f_low;
+            mu_low_values[7] = local_mu_low_audit.left_lower_flux;
+            mu_low_values[8] = local_mu_low_audit.left_upper_flux;
+            mu_low_values[9] = local_mu_low_audit.right_lower_flux;
+            mu_low_values[10] = local_mu_low_audit.right_upper_flux;
+            mu_low_values[11] = local_mu_low_audit.left_lower_scale;
+            mu_low_values[12] = local_mu_low_audit.left_upper_scale;
+            mu_low_values[13] = local_mu_low_audit.right_lower_scale;
+            mu_low_values[14] = local_mu_low_audit.right_upper_scale;
+            mu_low_values[19] = local_mu_low_audit.lower_characteristic;
+            mu_low_values[20] = local_mu_low_audit.upper_characteristic;
+            mu_low_values[21] = local_mu_low_audit.moment_weight;
+            mu_low_values[22] = local_mu_low_audit.cell_budget;
+            mu_low_values[23] =
+                static_cast<double>(global_mu_low_order_failed);
+            mu_low_indices[0] = local_mu_low_audit.rank;
+            mu_low_indices[1] = local_mu_low_audit.ix;
+            mu_low_indices[2] = local_mu_low_audit.iv;
+            mu_low_indices[3] = local_mu_low_audit.imu;
+            mu_low_indices[4] = local_mu_low_audit.region;
+            mu_low_indices[5] =
+                local_mu_low_audit.left_lower_donor_index;
+            mu_low_indices[6] =
+                local_mu_low_audit.left_upper_donor_index;
+            mu_low_indices[7] =
+                local_mu_low_audit.right_lower_donor_index;
+            mu_low_indices[8] =
+                local_mu_low_audit.right_upper_donor_index;
+        }
+        if (global_mu_low_loc.value > 0.0 &&
+            global_mu_low_loc.rank >= 0) {
+            MPI_Bcast(mu_low_values, 27, MPI_DOUBLE,
+                      global_mu_low_loc.rank, MPI_COMM_WORLD);
+            MPI_Bcast(mu_low_indices, 10, MPI_INT,
+                      global_mu_low_loc.rank, MPI_COMM_WORLD);
+            LowOrderFailureAudit& audit = fluxes.mu_low_failure_audit;
+            audit.valid = 1;
+            audit.rank = mu_low_indices[0];
+            audit.ix = mu_low_indices[1];
+            audit.iv = mu_low_indices[2];
+            audit.imu = mu_low_indices[3];
+            audit.region = mu_low_indices[4];
+            audit.severity = mu_low_values[0];
+            audit.f_input = mu_low_values[1];
+            audit.f_after_x = mu_low_values[2];
+            audit.dx_div = mu_low_values[3];
+            audit.dmu_div_used = mu_low_values[4];
+            audit.du_div_low = mu_low_values[5];
+            audit.f_low = mu_low_values[6];
+            audit.left_lower_flux = mu_low_values[7];
+            audit.left_upper_flux = mu_low_values[8];
+            audit.right_lower_flux = mu_low_values[9];
+            audit.right_upper_flux = mu_low_values[10];
+            audit.left_lower_scale = mu_low_values[11];
+            audit.left_upper_scale = mu_low_values[12];
+            audit.right_lower_scale = mu_low_values[13];
+            audit.right_upper_scale = mu_low_values[14];
+            audit.lower_characteristic = mu_low_values[19];
+            audit.upper_characteristic = mu_low_values[20];
+            audit.moment_weight = mu_low_values[21];
+            audit.cell_budget = mu_low_values[22];
+            audit.low_order_failed_count = mu_low_values[23];
+            audit.left_lower_donor_index = mu_low_indices[5];
+            audit.left_upper_donor_index = mu_low_indices[6];
+            audit.right_lower_donor_index = mu_low_indices[7];
+            audit.right_upper_donor_index = mu_low_indices[8];
+        }
+    }
+    if (fluxes.u_flux_audit_valid) {
+        double final_values[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        const int audit_local_ix = fluxes.u_flux_audit_ix - sg.ix_start;
+        const bool owns_audit =
+            mpi_rank == fluxes.u_flux_audit_rank &&
+            audit_local_ix >= 0 && audit_local_ix < nxl &&
+            fluxes.u_flux_audit_iv >= 0 &&
+            fluxes.u_flux_audit_iv < Param::Nv &&
+            fluxes.u_flux_audit_imu >= 0 &&
+            fluxes.u_flux_audit_imu < Param::Nmu;
+        if (owns_audit) {
+            const int ix = audit_local_ix;
+            const int iv = fluxes.u_flux_audit_iv;
+            const int imu = fluxes.u_flux_audit_imu;
+            const size_t k =
+                static_cast<size_t>(iv) * Param::Nmu
+              + static_cast<size_t>(imu);
+            const size_t dst =
+                static_cast<size_t>(ng + ix) * Param::Nvmu + k;
+            const double hdt_is = half_dt_inv_shell[iv];
+            const double dx_div =
+                dt_dx *
+                (fluxes.x_final[static_cast<size_t>(ix + 1) * Param::Nvmu + k]
+               - fluxes.x_final[static_cast<size_t>(ix) * Param::Nvmu + k]);
+            const double u_xl_lo =
+                fluxes.u_final_cell[u_cell_index(ix, iv, imu)];
+            const double u_xl_hi =
+                fluxes.u_final_cell[u_cell_index(ix, iv + 1, imu)];
+            const double u_xr_lo = u_xl_lo;
+            const double u_xr_hi = u_xl_hi;
+            const double u_div_cell = u_xl_hi - u_xl_lo;
+            const double du_div_final =
+                (2.0 * hdt_is) * u_div_cell;
+            const double mu_div_left =
+                mu_force_face[mu_xface_index(ix, iv, imu + 1)]
+              - mu_force_face[mu_xface_index(ix, iv, imu)];
+            const double mu_div_right =
+                mu_force_face[mu_xface_index(ix + 1, iv, imu + 1)]
+              - mu_force_face[mu_xface_index(ix + 1, iv, imu)];
+            const double dmu_div =
+                hdt_is * (mu_div_left + mu_div_right);
+            final_values[0] = du_div_final;
+            final_values[1] =
+                bkg_n.f[dst] - dx_div - du_div_final - dmu_div;
+            final_values[2] = u_xl_lo;
+            final_values[3] = u_xl_hi;
+            final_values[4] = u_xr_lo;
+            final_values[5] = u_xr_hi;
+        }
+        MPI_Bcast(final_values, 6, MPI_DOUBLE,
+                  fluxes.u_flux_audit_rank, MPI_COMM_WORLD);
+        fluxes.u_flux_audit_du_div_final = final_values[0];
+        fluxes.u_flux_audit_updated = final_values[1];
+        fluxes.u_flux_audit_final_xl_lo = final_values[2];
+        fluxes.u_flux_audit_final_xl_hi = final_values[3];
+        fluxes.u_flux_audit_final_xr_lo = final_values[4];
+        fluxes.u_flux_audit_final_xr_hi = final_values[5];
+    }
+    {
         long long local_mu_counts[6] = {
             local_mu_low_u_face_active,
             local_mu_low_u_face_total,
@@ -1850,7 +2816,7 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         fluxes.low_u_max_subcycles = global_low_u_max_subcycles;
     }
 
-    // ---- Pass 3: final update (uses scaled u_force_face if limiting was needed) ----
+    // ---- Pass 3: final update (uses cell-local u_final_cell) ----
     int local_bad_update_centered = 0;
     int local_bad_negative_hard = 0;
     double local_neg_mass_defect = 0.0;
@@ -1981,23 +2947,14 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                 dt_dx *
                 (fluxes.x_high[static_cast<size_t>(ix + 1) * Param::Nvmu + k]
                - fluxes.x_high[static_cast<size_t>(ix) * Param::Nvmu + k]);
-            const double u_div_left =
-                u_force_face[u_xface_index(ix, iv + 1, imu)]
-              - u_force_face[u_xface_index(ix, iv, imu)];
-            const double u_div_right =
-                u_force_face[u_xface_index(ix + 1, iv + 1, imu)]
-              - u_force_face[u_xface_index(ix + 1, iv, imu)];
-            const double du_div = hdt_is * (u_div_left + u_div_right);
-            double du_div_ec = du_div;
-            if (need_face_limiting) {
-                const double u_div_left_ec =
-                    u_force_ec[u_xface_index(ix, iv + 1, imu)]
-                  - u_force_ec[u_xface_index(ix, iv, imu)];
-                const double u_div_right_ec =
-                    u_force_ec[u_xface_index(ix + 1, iv + 1, imu)]
-                  - u_force_ec[u_xface_index(ix + 1, iv, imu)];
-                du_div_ec = hdt_is * (u_div_left_ec + u_div_right_ec);
-            }
+            const double u_div =
+                fluxes.u_final_cell[u_cell_index(ix, iv + 1, imu)]
+              - fluxes.u_final_cell[u_cell_index(ix, iv, imu)];
+            const double du_div = (2.0 * hdt_is) * u_div;
+            const double u_div_ec =
+                fluxes.u_high_cell[u_cell_index(ix, iv + 1, imu)]
+              - fluxes.u_high_cell[u_cell_index(ix, iv, imu)];
+            const double du_div_ec = (2.0 * hdt_is) * u_div_ec;
             const double mu_div_left =
                 mu_force_face[mu_xface_index(ix, iv, imu + 1)]
               - mu_force_face[mu_xface_index(ix, iv, imu)];
@@ -2265,79 +3222,15 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     for (int ix = 0; ix < nxl; ++ix) {
         for (int iv = 0; iv < low_u_limit_count; ++iv) {
             ++local_remap_cell_total;
-            double endpoint_total_f = 0.0;
-            double endpoint_positive_f = 0.0;
-            bool has_endpoint_strong_negative = false;
-            bool has_nonfinite = false;
-            for (int imu = 0; imu < Param::Nmu; ++imu) {
-                if (!near_mu_endpoint(imu)) continue;
-                const size_t dst =
-                    static_cast<size_t>(ng + ix) * Param::Nvmu
-                  + static_cast<size_t>(iv) * Param::Nmu
-                  + static_cast<size_t>(imu);
-                const double fv = bkg_new.f[dst];
-                if (!std::isfinite(fv)) {
-                    has_nonfinite = true;
-                    continue;
-                }
-                endpoint_total_f += fv;
-                if (fv > 0.0) endpoint_positive_f += fv;
-                if (fv < 0.0) {
-                    const double local_scale =
-                        std::max(1.0, std::fabs(fv));
-                    const double neg_ratio = -fv / local_scale;
-                    if (neg_ratio >= LOW_U_REMAP_NEG_RATIO_THRESHOLD) {
-                        has_endpoint_strong_negative = true;
-                    }
-                }
-            }
-
             const double cell_weight = bkg_n.vgrid.moment_weight[iv];
             const double ke_per_mass = ke_per_mass_arr[iv];
-            const double x_cell =
-                (static_cast<double>(sg.ix_start + ix) + 0.5) * sg.dx;
-            const bool in_boundary_02 =
-                (x_cell < 0.2 * Const::micro) ||
-                (x_cell > Param::Lx - 0.2 * Const::micro);
-            const double energy_before =
-                endpoint_total_f * cell_weight * sg.dx * ke_per_mass;
-
-            if (has_endpoint_strong_negative && !has_nonfinite &&
-                endpoint_total_f >= 0.0 && endpoint_positive_f > 0.0) {
-                ++local_remap_cell_count;
-                const double scale = endpoint_total_f / endpoint_positive_f;
-                for (int imu = 0; imu < Param::Nmu; ++imu) {
-                    if (!near_mu_endpoint(imu)) continue;
-                    const size_t dst =
-                        static_cast<size_t>(ng + ix) * Param::Nvmu
-                      + static_cast<size_t>(iv) * Param::Nmu
-                      + static_cast<size_t>(imu);
-                    bkg_new.f[dst] =
-                        std::max(0.0, bkg_new.f[dst]) * scale;
-                }
-                double total_after = 0.0;
-                for (int imu = 0; imu < Param::Nmu; ++imu) {
-                    if (!near_mu_endpoint(imu)) continue;
-                    const size_t dst =
-                        static_cast<size_t>(ng + ix) * Param::Nvmu
-                      + static_cast<size_t>(iv) * Param::Nmu
-                      + static_cast<size_t>(imu);
-                    total_after += bkg_new.f[dst];
-                }
-                const double energy_after =
-                    total_after * cell_weight * sg.dx * ke_per_mass;
-                const double remap_energy_delta =
-                    energy_after - energy_before;
-                local_mu_low_u_energy_delta += remap_energy_delta;
-                if (in_boundary_02) {
-                    local_mu_low_u_energy_delta_boundary +=
-                        remap_energy_delta;
-                } else {
-                    local_mu_low_u_energy_delta_core +=
-                        remap_energy_delta;
-                }
-            }
-
+            /*
+             * Do not repair endpoint negatives with max(0,f) scaling.  7.1.3
+             * requires positivity control to enter through conservative
+             * fluxes.  Strong endpoint negatives remain in the existing
+             * negative-mass diagnostics so the preceding u/mu flux limiter can
+             * be fixed instead of hiding the defect with a post-update clip.
+             */
             for (int imu = 0; imu < Param::Nmu; ++imu) {
                 const size_t dst =
                     static_cast<size_t>(ng + ix) * Param::Nvmu
@@ -2499,12 +3392,20 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     // 7.1.6: populate u-direction and mu-direction flux diagnostics
     // after stage_min_f is finalized via MPI reductions above.
     {
+        double global_u_min_f_low = local_u_min_f_low;
+        MPI_Allreduce(MPI_IN_PLACE, &global_u_min_f_low, 1,
+                      MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+        long long global_u_low_order_failed = local_u_low_order_failed;
+        MPI_Allreduce(MPI_IN_PLACE, &global_u_low_order_failed, 1,
+                      MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
         // --- u-direction (index 1) ---
         FluxPositivityDiag& fu = fluxes.flux_pos[1];
         fu.min_f_before = fluxes.stage_min_f[0];  // after x, before u
-        fu.min_f_low    = fluxes.stage_min_f[0];  // no u_low yet → use final
+        fu.min_f_low    =
+            std::isfinite(global_u_min_f_low) ? global_u_min_f_low : 0.0;
         fu.min_f_final  = fluxes.stage_min_f[1];  // after x + u
-        fu.low_order_failed_count  = 0.0;  // not yet tracked for u
+        fu.low_order_failed_count =
+            static_cast<double>(global_u_low_order_failed);
         fu.alpha_active_fraction   = fluxes.u_force_alpha_active_frac;
         fu.alpha_min               = fluxes.u_force_alpha_min;
         fu.alpha_core_fraction     = 0.0;
@@ -3446,6 +4347,31 @@ VlasovAmpereMidpointSolver::advance_single_step(
         result.u_force_alpha_min = fluxes.u_force_alpha_min;
         result.u_force_alpha_active_frac =
             fluxes.u_force_alpha_active_frac;
+        result.u_flux_audit_valid = fluxes.u_flux_audit_valid;
+        result.u_flux_audit_rank = fluxes.u_flux_audit_rank;
+        result.u_flux_audit_ix = fluxes.u_flux_audit_ix;
+        result.u_flux_audit_iv = fluxes.u_flux_audit_iv;
+        result.u_flux_audit_imu = fluxes.u_flux_audit_imu;
+        result.u_flux_audit_severity = fluxes.u_flux_audit_severity;
+        result.u_flux_audit_f0 = fluxes.u_flux_audit_f0;
+        result.u_flux_audit_f_low = fluxes.u_flux_audit_f_low;
+        result.u_flux_audit_f_high = fluxes.u_flux_audit_f_high;
+        result.u_flux_audit_alpha = fluxes.u_flux_audit_alpha;
+        result.u_flux_audit_du_div_low = fluxes.u_flux_audit_du_div_low;
+        result.u_flux_audit_du_div_high = fluxes.u_flux_audit_du_div_high;
+        result.u_flux_audit_du_div_final =
+            fluxes.u_flux_audit_du_div_final;
+        result.u_flux_audit_updated = fluxes.u_flux_audit_updated;
+        result.u_flux_audit_final_xl_lo =
+            fluxes.u_flux_audit_final_xl_lo;
+        result.u_flux_audit_final_xl_hi =
+            fluxes.u_flux_audit_final_xl_hi;
+        result.u_flux_audit_final_xr_lo =
+            fluxes.u_flux_audit_final_xr_lo;
+        result.u_flux_audit_final_xr_hi =
+            fluxes.u_flux_audit_final_xr_hi;
+        result.u_low_failure_audit = fluxes.u_low_failure_audit;
+        result.mu_low_failure_audit = fluxes.mu_low_failure_audit;
         result.f_neg_min = fluxes.f_neg_min;
         result.f_neg_ratio_max = fluxes.f_neg_ratio_max;
         result.f_neg_mass_total = fluxes.f_neg_mass_total;
@@ -3711,6 +4637,33 @@ VlasovAmpereMidpointSolver::advance_single_step(
             result.u_force_alpha_min = fluxes.u_force_alpha_min;
             result.u_force_alpha_active_frac =
                 fluxes.u_force_alpha_active_frac;
+            result.u_flux_audit_valid = fluxes.u_flux_audit_valid;
+            result.u_flux_audit_rank = fluxes.u_flux_audit_rank;
+            result.u_flux_audit_ix = fluxes.u_flux_audit_ix;
+            result.u_flux_audit_iv = fluxes.u_flux_audit_iv;
+            result.u_flux_audit_imu = fluxes.u_flux_audit_imu;
+            result.u_flux_audit_severity = fluxes.u_flux_audit_severity;
+            result.u_flux_audit_f0 = fluxes.u_flux_audit_f0;
+            result.u_flux_audit_f_low = fluxes.u_flux_audit_f_low;
+            result.u_flux_audit_f_high = fluxes.u_flux_audit_f_high;
+            result.u_flux_audit_alpha = fluxes.u_flux_audit_alpha;
+            result.u_flux_audit_du_div_low =
+                fluxes.u_flux_audit_du_div_low;
+            result.u_flux_audit_du_div_high =
+                fluxes.u_flux_audit_du_div_high;
+            result.u_flux_audit_du_div_final =
+                fluxes.u_flux_audit_du_div_final;
+            result.u_flux_audit_updated = fluxes.u_flux_audit_updated;
+            result.u_flux_audit_final_xl_lo =
+                fluxes.u_flux_audit_final_xl_lo;
+            result.u_flux_audit_final_xl_hi =
+                fluxes.u_flux_audit_final_xl_hi;
+            result.u_flux_audit_final_xr_lo =
+                fluxes.u_flux_audit_final_xr_lo;
+            result.u_flux_audit_final_xr_hi =
+                fluxes.u_flux_audit_final_xr_hi;
+            result.u_low_failure_audit = fluxes.u_low_failure_audit;
+            result.mu_low_failure_audit = fluxes.mu_low_failure_audit;
             result.f_neg_min = fluxes.f_neg_min;
             result.f_neg_ratio_max = fluxes.f_neg_ratio_max;
             result.f_neg_mass_total = fluxes.f_neg_mass_total;

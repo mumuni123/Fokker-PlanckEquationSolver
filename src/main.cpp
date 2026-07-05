@@ -567,6 +567,9 @@ int main(int argc, char** argv)
     std::ofstream bkg_energy_monitor;
     std::ofstream boundary_core_monitor;
     std::ofstream x_low_monitor;
+    std::ofstream u_flux_audit;
+    std::ofstream u_low_failure_audit;
+    std::ofstream mu_low_failure_audit;
     if (mpi_rank == 0) {
         bkg_energy_monitor.open("output/bkg_energy_monitor.dat");
         bkg_energy_monitor
@@ -622,6 +625,51 @@ int main(int argc, char** argv)
             << "coupled_residual_bkg_mass  "
             << "coupled_residual_beam_continuity\n";
         bkg_energy_monitor << std::scientific;
+
+        u_flux_audit.open("output/u_flux_audit.dat");
+        u_flux_audit
+            << "# step  time[fs]  valid  rank  ix_global  iv  imu  "
+            << "severity  f0  f_low  f_high  alpha  "
+            << "du_div_low  du_div_high  du_div_final  updated  "
+            << "u_final_xleft_lower  u_final_xleft_upper  "
+            << "u_final_xright_lower  u_final_xright_upper\n";
+        u_flux_audit << std::scientific << std::setprecision(8);
+
+        u_low_failure_audit.open("output/u_low_failure_audit.dat");
+        u_low_failure_audit
+            << "# step  time[fs]  rank  ix_global  iv  imu  region  "
+            << "severity  f_input  f_after_x  dx_div  dmu_div_used  "
+            << "du_div_low  f_low  "
+            << "left_lower_u_low  left_upper_u_low  "
+            << "right_lower_u_low  right_upper_u_low  "
+            << "left_lower_scale  left_upper_scale  "
+            << "right_lower_scale  right_upper_scale  "
+            << "left_lower_donor_iv  left_upper_donor_iv  "
+            << "right_lower_donor_iv  right_upper_donor_iv  "
+            << "left_lower_donor_f  left_upper_donor_f  "
+            << "right_lower_donor_f  right_upper_donor_f  "
+            << "lower_characteristic  upper_characteristic  "
+            << "moment_weight  cell_budget  "
+            << "low_order_failed_count\n";
+        u_low_failure_audit << std::scientific << std::setprecision(8);
+
+        mu_low_failure_audit.open("output/mu_low_failure_audit.dat");
+        mu_low_failure_audit
+            << "# step  time[fs]  rank  ix_global  iv  imu  region  "
+            << "severity  f_before_mu  f_after_x  dx_div  dmu_div_low  "
+            << "du_div_used  f_mu_low  "
+            << "left_lower_mu_low  left_upper_mu_low  "
+            << "right_lower_mu_low  right_upper_mu_low  "
+            << "left_lower_mu_dot  left_upper_mu_dot  "
+            << "right_lower_mu_dot  right_upper_mu_dot  "
+            << "left_lower_donor_imu  left_upper_donor_imu  "
+            << "right_lower_donor_imu  right_upper_donor_imu  "
+            << "left_lower_donor_f  left_upper_donor_f  "
+            << "right_lower_donor_f  right_upper_donor_f  "
+            << "lower_mu_dot_avg  upper_mu_dot_avg  "
+            << "moment_weight  cell_budget  "
+            << "low_order_failed_count\n";
+        mu_low_failure_audit << std::scientific << std::setprecision(8);
 
         std::ofstream f_neg_monitor;
         f_neg_monitor.open("output/f_negativity_monitor.dat");
@@ -1028,6 +1076,82 @@ int main(int argc, char** argv)
             midpoint_result.continuity_residual_bkg;
         coupled_residual_beam_continuity_step =
             midpoint_result.beam_continuity_residual;
+
+        if (mpi_rank == 0) {
+            u_flux_audit << step << "  "
+                         << time / Const::femto << "  "
+                         << midpoint_result.u_flux_audit_valid << "  "
+                         << midpoint_result.u_flux_audit_rank << "  "
+                         << midpoint_result.u_flux_audit_ix << "  "
+                         << midpoint_result.u_flux_audit_iv << "  "
+                         << midpoint_result.u_flux_audit_imu << "  "
+                         << midpoint_result.u_flux_audit_severity << "  "
+                         << midpoint_result.u_flux_audit_f0 << "  "
+                         << midpoint_result.u_flux_audit_f_low << "  "
+                         << midpoint_result.u_flux_audit_f_high << "  "
+                         << midpoint_result.u_flux_audit_alpha << "  "
+                         << midpoint_result.u_flux_audit_du_div_low << "  "
+                         << midpoint_result.u_flux_audit_du_div_high << "  "
+                         << midpoint_result.u_flux_audit_du_div_final << "  "
+                         << midpoint_result.u_flux_audit_updated << "  "
+                         << midpoint_result.u_flux_audit_final_xl_lo << "  "
+                         << midpoint_result.u_flux_audit_final_xl_hi << "  "
+                         << midpoint_result.u_flux_audit_final_xr_lo << "  "
+                         << midpoint_result.u_flux_audit_final_xr_hi << "\n";
+            u_flux_audit.flush();
+        }
+        if (mpi_rank == 0) {
+            auto write_low_order_failure_audit =
+                [&](std::ofstream& out,
+                    const VlasovAmpereMidpointSolver::LowOrderFailureAudit&
+                        audit) {
+                    if (!audit.valid) return;
+                    const char* region =
+                        (audit.region != 0) ? "boundary" : "core";
+                    out << step << "  "
+                        << time / Const::femto << "  "
+                        << audit.rank << "  "
+                        << audit.ix << "  "
+                        << audit.iv << "  "
+                        << audit.imu << "  "
+                        << region << "  "
+                        << audit.severity << "  "
+                        << audit.f_input << "  "
+                        << audit.f_after_x << "  "
+                        << audit.dx_div << "  "
+                        << audit.dmu_div_used << "  "
+                        << audit.du_div_low << "  "
+                        << audit.f_low << "  "
+                        << audit.left_lower_flux << "  "
+                        << audit.left_upper_flux << "  "
+                        << audit.right_lower_flux << "  "
+                        << audit.right_upper_flux << "  "
+                        << audit.left_lower_scale << "  "
+                        << audit.left_upper_scale << "  "
+                        << audit.right_lower_scale << "  "
+                        << audit.right_upper_scale << "  "
+                        << audit.left_lower_donor_index << "  "
+                        << audit.left_upper_donor_index << "  "
+                        << audit.right_lower_donor_index << "  "
+                        << audit.right_upper_donor_index << "  "
+                        << audit.left_lower_donor_f << "  "
+                        << audit.left_upper_donor_f << "  "
+                        << audit.right_lower_donor_f << "  "
+                        << audit.right_upper_donor_f << "  "
+                        << audit.lower_characteristic << "  "
+                        << audit.upper_characteristic << "  "
+                        << audit.moment_weight << "  "
+                        << audit.cell_budget << "  "
+                        << audit.low_order_failed_count << "\n";
+                    out.flush();
+                };
+            write_low_order_failure_audit(
+                u_low_failure_audit,
+                midpoint_result.u_low_failure_audit);
+            write_low_order_failure_audit(
+                mu_low_failure_audit,
+                midpoint_result.mu_low_failure_audit);
+        }
 
         const double bkg_ke_step_end_for_residual =
             bkg_ke_step_start + midpoint_result.delta_ke_bkg;
