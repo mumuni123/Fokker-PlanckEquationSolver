@@ -19,7 +19,7 @@ TIME_COLUMNS = ["Ex[V/m]"]
 TIME_X_AXIS_RANGE = None
 
 # Settings for plot_space_profile.py.
-SPACE_FILE = DATA_DIR / "fields_00028.dat"
+SPACE_FILE = DATA_DIR / "fields_00005.dat"
 SPACE_COLUMNS = ["Ex[V/m]"]
 # Use None to plot the full available range, or set (min, max) to restrict it.
 # Bounds can also be None individually, e.g. (1.0, None).

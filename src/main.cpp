@@ -566,6 +566,7 @@ int main(int argc, char** argv)
     double cumulative_bkg_energy_residual = 0.0;
     std::ofstream bkg_energy_monitor;
     std::ofstream boundary_core_monitor;
+    std::ofstream x_low_monitor;
     if (mpi_rank == 0) {
         bkg_energy_monitor.open("output/bkg_energy_monitor.dat");
         bkg_energy_monitor
@@ -659,7 +660,27 @@ int main(int argc, char** argv)
             << "W_bkg_E_boundary[J/m2]  W_bkg_E_core[J/m2]  "
             << "conclusion\n";
         boundary_core_monitor << std::scientific << std::setprecision(8);
+
+        x_low_monitor.open("output/x_low_diagnostics.dat");
+        x_low_monitor
+            << "# step  time[fs]  x_low_input_min_f  x_low_max_cfl  "
+            << "x_low_output_min_f  x_low_failed_count  "
+            << "x_low_input_neg_mass[m^-2]  x_low_input_rel_neg  "
+            << "x_low_output_rel_neg  x_low_input_core_failed_count  "
+            << "x_low_input_debt_accepted  x_low_failure_kind  "
+            << "prev_stage_valid  "
+            << "prev_after_x_min_f  prev_after_x_neg_mass[m^-2]  "
+            << "prev_after_x_neg_cell_count  "
+            << "prev_after_u_min_f  prev_after_u_neg_mass[m^-2]  "
+            << "prev_after_u_neg_cell_count  "
+            << "prev_after_mu_min_f  prev_after_mu_neg_mass[m^-2]  "
+            << "prev_after_mu_neg_cell_count\n";
+        x_low_monitor << std::scientific << std::setprecision(8);
     }
+    bool last_accepted_stage_valid = false;
+    double last_accepted_stage_min_f[3] = {0.0, 0.0, 0.0};
+    double last_accepted_stage_neg_mass[3] = {0.0, 0.0, 0.0};
+    long long last_accepted_stage_neg_cell_count[3] = {0, 0, 0};
     for (int step = 1; step <= nsteps; ++step) {
         double time = step * dt;
         int nsub_v1 = 0;
@@ -716,6 +737,16 @@ int main(int argc, char** argv)
         double u_limiter_energy_delta_step = 0.0;
         double x_limiter_mass_delta_step = 0.0;
         double x_limiter_energy_delta_step = 0.0;
+        double x_low_input_min_f_step = 0.0;
+        double x_low_max_cfl_step = 0.0;
+        double x_low_output_min_f_step = 0.0;
+        double x_low_failed_count_step = 0.0;
+        double x_low_input_neg_mass_step = 0.0;
+        double x_low_input_rel_neg_step = 0.0;
+        double x_low_output_rel_neg_step = 0.0;
+        double x_low_input_core_failed_count_step = 0.0;
+        double x_low_input_debt_accepted_step = 0.0;
+        int x_low_failure_kind_step = 0;
         double mu_low_u_alpha_min_step = 1.0;
         double mu_low_u_limiter_active_fraction_step = 0.0;
         double mu_low_u_energy_delta_step = 0.0;
@@ -788,8 +819,25 @@ int main(int argc, char** argv)
                              "%d iterations, substeps %d; limiter active "
                              "%.6e, min_alpha %.6e, core_active %.6e, "
                              "boundary_active %.6e, core_min_alpha %.6e, "
-                             "boundary_min_alpha %.6e. "
-                             "Continuing with best available result.\n",
+                             "boundary_min_alpha %.6e, "
+                             "x_low_input_min_f %.6e, "
+                             "x_low_max_cfl %.6e, "
+                             "x_low_output_min_f %.6e, "
+                             "x_low_failed_count %.0f, "
+                             "x_low_input_neg_mass %.6e, "
+                             "x_low_input_rel_neg %.6e, "
+                             "x_low_output_rel_neg %.6e, "
+                             "x_low_input_core_failed_count %.0f, "
+                             "x_low_input_debt_accepted %.0f, "
+                             "x_low_failure_kind %d. "
+                             "previous accepted stage valid %d; "
+                             "prev after_x(min %.6e, neg_mass %.6e, "
+                             "neg_count %lld), "
+                             "after_u(min %.6e, neg_mass %.6e, "
+                             "neg_count %lld), "
+                             "after_mu(min %.6e, neg_mass %.6e, "
+                             "neg_count %lld). "
+                             "Failed midpoint states are not accepted.\n",
                              step, time,
                              midpoint_result.nonlinear_residual,
                              midpoint_result.residual_E,
@@ -805,10 +853,30 @@ int main(int argc, char** argv)
                              midpoint_result.limiter_active_fraction_core,
                              midpoint_result.limiter_active_fraction_boundary,
                              midpoint_result.limiter_min_alpha_core,
-                             midpoint_result.limiter_min_alpha_boundary);
+                             midpoint_result.limiter_min_alpha_boundary,
+                             midpoint_result.x_low_input_min_f,
+                             midpoint_result.x_low_max_cfl,
+                             midpoint_result.x_low_output_min_f,
+                             midpoint_result.x_low_failed_count,
+                             midpoint_result.x_low_input_neg_mass,
+                             midpoint_result.x_low_input_rel_neg,
+                             midpoint_result.x_low_output_rel_neg,
+                             midpoint_result.x_low_input_core_failed_count,
+                             midpoint_result.x_low_input_debt_accepted,
+                             midpoint_result.x_low_failure_kind,
+                             last_accepted_stage_valid ? 1 : 0,
+                             last_accepted_stage_min_f[0],
+                             last_accepted_stage_neg_mass[0],
+                             last_accepted_stage_neg_cell_count[0],
+                             last_accepted_stage_min_f[1],
+                             last_accepted_stage_neg_mass[1],
+                             last_accepted_stage_neg_cell_count[1],
+                             last_accepted_stage_min_f[2],
+                             last_accepted_stage_neg_mass[2],
+                             last_accepted_stage_neg_cell_count[2]);
             }
-            // Protection disabled for long-run test — continue with best result
-            // MPI_Abort(MPI_COMM_WORLD, 8);
+            MPI_Abort(MPI_COMM_WORLD, 8);
+            return 8;
         }
 
         bkg_e = midpoint_result.species_np1;
@@ -870,6 +938,47 @@ int main(int argc, char** argv)
             midpoint_result.x_limiter_mass_defect;
         x_limiter_energy_delta_step =
             midpoint_result.x_limiter_energy_defect;
+        x_low_input_min_f_step = midpoint_result.x_low_input_min_f;
+        x_low_max_cfl_step = midpoint_result.x_low_max_cfl;
+        x_low_output_min_f_step = midpoint_result.x_low_output_min_f;
+        x_low_failed_count_step = midpoint_result.x_low_failed_count;
+        x_low_input_neg_mass_step = midpoint_result.x_low_input_neg_mass;
+        x_low_input_rel_neg_step = midpoint_result.x_low_input_rel_neg;
+        x_low_output_rel_neg_step = midpoint_result.x_low_output_rel_neg;
+        x_low_input_core_failed_count_step =
+            midpoint_result.x_low_input_core_failed_count;
+        x_low_input_debt_accepted_step =
+            midpoint_result.x_low_input_debt_accepted;
+        x_low_failure_kind_step = midpoint_result.x_low_failure_kind;
+        if (mpi_rank == 0 && x_low_input_debt_accepted_step > 0.0) {
+            std::fprintf(
+                stderr,
+                "WARNING: accepted x_low input negative debt at step %d, "
+                "t = %.6e s; failed_cell_count %.0f, input_min_f %.6e, "
+                "input_neg_mass %.6e, input_rel_neg %.6e, "
+                "output_min_f %.6e, output_rel_neg %.6e, "
+                "core_failed_count %.0f. Previous accepted stage valid %d: "
+                "after_x(min %.6e, neg_mass %.6e, neg_count %lld), "
+                "after_u(min %.6e, neg_mass %.6e, neg_count %lld), "
+                "after_mu(min %.6e, neg_mass %.6e, neg_count %lld).\n",
+                step, time, x_low_failed_count_step,
+                x_low_input_min_f_step,
+                x_low_input_neg_mass_step,
+                x_low_input_rel_neg_step,
+                x_low_output_min_f_step,
+                x_low_output_rel_neg_step,
+                x_low_input_core_failed_count_step,
+                last_accepted_stage_valid ? 1 : 0,
+                last_accepted_stage_min_f[0],
+                last_accepted_stage_neg_mass[0],
+                last_accepted_stage_neg_cell_count[0],
+                last_accepted_stage_min_f[1],
+                last_accepted_stage_neg_mass[1],
+                last_accepted_stage_neg_cell_count[1],
+                last_accepted_stage_min_f[2],
+                last_accepted_stage_neg_mass[2],
+                last_accepted_stage_neg_cell_count[2]);
+        }
         mu_low_u_alpha_min_step =
             midpoint_result.mu_low_u_alpha_min;
         mu_low_u_limiter_active_fraction_step =
@@ -987,7 +1096,9 @@ int main(int argc, char** argv)
         cumulative_bkg_energy_residual +=
             bkg_energy_relative_residual_step;
 
-        if (mpi_rank == 0 && step % 100 == 0) {
+        const bool write_periodic_monitors =
+            (step % 100 == 0) || (x_low_input_debt_accepted_step > 0.0);
+        if (mpi_rank == 0 && write_periodic_monitors) {
             bkg_energy_monitor << step << "  "
                                << time / Const::femto << "  "
                                << x_limiter_active_fraction_step << "  "
@@ -1047,6 +1158,29 @@ int main(int argc, char** argv)
                                << coupled_residual_bkg_mass_step << "  "
                                << coupled_residual_beam_continuity_step << "\n";
             bkg_energy_monitor.flush();
+            x_low_monitor << step << "  "
+                          << time / Const::femto << "  "
+                          << x_low_input_min_f_step << "  "
+                          << x_low_max_cfl_step << "  "
+                          << x_low_output_min_f_step << "  "
+                          << x_low_failed_count_step << "  "
+                          << x_low_input_neg_mass_step << "  "
+                          << x_low_input_rel_neg_step << "  "
+                          << x_low_output_rel_neg_step << "  "
+                          << x_low_input_core_failed_count_step << "  "
+                          << x_low_input_debt_accepted_step << "  "
+                          << x_low_failure_kind_step << "  "
+                          << (last_accepted_stage_valid ? 1 : 0) << "  "
+                          << last_accepted_stage_min_f[0] << "  "
+                          << last_accepted_stage_neg_mass[0] << "  "
+                          << last_accepted_stage_neg_cell_count[0] << "  "
+                          << last_accepted_stage_min_f[1] << "  "
+                          << last_accepted_stage_neg_mass[1] << "  "
+                          << last_accepted_stage_neg_cell_count[1] << "  "
+                          << last_accepted_stage_min_f[2] << "  "
+                          << last_accepted_stage_neg_mass[2] << "  "
+                          << last_accepted_stage_neg_cell_count[2] << "\n";
+            x_low_monitor.flush();
         }
         if (collect_step_diagnostics) {
             diag.write_bkg_stage_negativity(
@@ -1070,6 +1204,45 @@ int main(int argc, char** argv)
                 step, time, coupled_iter_step,
                 midpoint_result.low_u_neg_added_by_div,
                 mpi_rank);
+
+            // 7.1.6: per-direction flux diagnostics
+            {
+                double fp_min_before[3], fp_min_low[3], fp_min_final[3];
+                double fp_low_failed[3], fp_alpha_active[3], fp_alpha_min[3];
+                double fp_alpha_core[3], fp_alpha_boundary[3];
+                double fp_neg_mass_prev[3];
+                double fd_mass[3], fd_momentum[3], fd_energy[3];
+                double fd_bound_mass[3], fd_bound_energy[3];
+                for (int d = 0; d < 3; ++d) {
+                    const auto& fp = midpoint_result.flux_pos[d];
+                    fp_min_before[d]   = fp.min_f_before;
+                    fp_min_low[d]      = fp.min_f_low;
+                    fp_min_final[d]    = fp.min_f_final;
+                    fp_low_failed[d]   = fp.low_order_failed_count;
+                    fp_alpha_active[d] = fp.alpha_active_fraction;
+                    fp_alpha_min[d]    = fp.alpha_min;
+                    fp_alpha_core[d]   = fp.alpha_core_fraction;
+                    fp_alpha_boundary[d] = fp.alpha_boundary_fraction;
+                    fp_neg_mass_prev[d]  = fp.negative_mass_prevented;
+                    const auto& fd = midpoint_result.flux_defect[d];
+                    fd_mass[d]      = fd.mass_defect;
+                    fd_momentum[d]  = fd.momentum_defect;
+                    fd_energy[d]    = fd.energy_defect;
+                    fd_bound_mass[d]  = fd.boundary_mass_loss;
+                    fd_bound_energy[d] = fd.boundary_energy_loss;
+                }
+                diag.write_flux_positivity_diagnostics(
+                    step, time,
+                    fp_min_before, fp_min_low, fp_min_final,
+                    fp_low_failed, fp_alpha_active, fp_alpha_min,
+                    fp_alpha_core, fp_alpha_boundary, fp_neg_mass_prev,
+                    mpi_rank);
+                diag.write_stage_flux_defect_diagnostics(
+                    step, time,
+                    fd_mass, fd_momentum, fd_energy,
+                    fd_bound_mass, fd_bound_energy,
+                    mpi_rank);
+            }
 
             FNegativitySnapshotDiagnostics f_neg_snapshot;
             compute_f_negativity_snapshot_diagnostics(
@@ -1186,6 +1359,25 @@ int main(int argc, char** argv)
             if (mpi_rank == 0) {
                 boundary_core_monitor.flush();
             }
+        }
+        const bool midpoint_stage_values_are_valid =
+            midpoint_result.stage_min_f.size() >= 3 &&
+            midpoint_result.stage_neg_mass.size() >= 3 &&
+            midpoint_result.stage_neg_cell_count.size() >= 3 &&
+            std::isfinite(midpoint_result.stage_min_f[0]) &&
+            std::isfinite(midpoint_result.stage_min_f[1]) &&
+            std::isfinite(midpoint_result.stage_min_f[2]);
+        if (midpoint_stage_values_are_valid) {
+            for (int istage = 0; istage < 3; ++istage) {
+                last_accepted_stage_min_f[istage] =
+                    midpoint_result.stage_min_f[static_cast<size_t>(istage)];
+                last_accepted_stage_neg_mass[istage] =
+                    midpoint_result.stage_neg_mass[static_cast<size_t>(istage)];
+                last_accepted_stage_neg_cell_count[istage] =
+                    midpoint_result
+                        .stage_neg_cell_count[static_cast<size_t>(istage)];
+            }
+            last_accepted_stage_valid = true;
         }
         if (bkg_e.collisions_enabled) {
             trace_progress(config, mpi_rank, step, "before collisions");

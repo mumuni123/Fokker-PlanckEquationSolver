@@ -1,5 +1,5 @@
-#ifndef VLASOV_AMPERE_MIDPOINT_H
-#define VLASOV_AMPERE_MIDPOINT_H
+#ifndef VLASOV_AMPERE_CONSISTENT_H
+#define VLASOV_AMPERE_CONSISTENT_H
 
 #include "beam_pic.h"
 #include "grid.h"
@@ -8,7 +8,7 @@
 
 #include <vector>
 
-class VlasovAmpereMidpointSolver {
+class VlasovAmpereConsistentSolver {
 public:
     struct CurrentDiagnostics {
         double residual_if_charge;
@@ -21,28 +21,6 @@ public:
         double max_abs_j_ampere;
         double max_abs_j_charge_minus_ampere;
         double max_abs_j_energy_minus_ampere;
-    };
-
-    // 7.1.6: per-direction flux-positivity diagnostics
-    struct FluxPositivityDiag {
-        double min_f_before;
-        double min_f_low;
-        double min_f_final;
-        double low_order_failed_count;
-        double alpha_active_fraction;
-        double alpha_min;
-        double alpha_core_fraction;
-        double alpha_boundary_fraction;
-        double negative_mass_prevented;
-    };
-
-    // 7.1.6: per-direction flux-defect diagnostics
-    struct FluxDefectDiag {
-        double mass_defect;
-        double momentum_defect;
-        double energy_defect;
-        double boundary_mass_loss;
-        double boundary_energy_loss;
     };
 
     struct Result {
@@ -93,25 +71,21 @@ public:
         double mu_low_u_dimless_scale0;
         double mu_low_u_endpoint_flux_max;
         double remap_active_fraction;
+        double remap_active_fraction_boundary;
+        double remap_active_fraction_core;
+        double remap_regular_active_fraction;
+        double remap_repair_active_fraction;
+        double remap_active_fraction_u[3];
+        double remap_repair_active_fraction_u[3];
+        double remap_mass_delta;
+        double remap_momentum_delta;
+        double remap_energy_delta;
+        double remap_max_abs_delta_j_moment;
         long long remap_cell_count;
+        long long remap_repair_cell_count;
         double low_u_subcycle_active_fraction;
         double low_u_average_subcycles;
         int low_u_max_subcycles;
-        // 7.1.1: unified flux diagnostics for Result
-        double x_low_order_failed_count;
-        double x_low_input_min_f;
-        double x_low_max_cfl;
-        double x_low_output_min_f;
-        double x_low_failed_count;
-        double x_low_input_neg_mass;
-        double x_low_input_rel_neg;
-        double x_low_output_rel_neg;
-        double x_low_input_core_failed_count;
-        double x_low_input_debt_accepted;
-        int x_low_failure_kind;
-        // 7.1.6: per-direction flux diagnostics (0=x, 1=u, 2=mu)
-        FluxPositivityDiag flux_pos[3];
-        FluxDefectDiag      flux_defect[3];
         double region_u_limiter_energy_boundary[2];
         double region_u_limiter_energy_core[2];
         double region_abs_u_limiter_energy_boundary[2];
@@ -151,7 +125,7 @@ public:
         int substeps_used;
     };
 
-    VlasovAmpereMidpointSolver();
+    VlasovAmpereConsistentSolver();
 
     void set_step_diagnostics_enabled(bool enabled) {
         step_diagnostics_enabled_ = enabled;
@@ -169,33 +143,10 @@ public:
 private:
     struct FluxPack {
         std::vector<double> x_high;
-        std::vector<double> x_low;
         std::vector<double> x_final;
-        std::vector<double> cell_alpha_u;   // 7.1.1: u-direction per-cell alpha
-        std::vector<double> cell_alpha_x;   // 7.1.1: x-direction per-cell alpha
+        std::vector<double> cell_alpha;
+        std::vector<double> x_cell_alpha;
         std::vector<double> j_bkg_face;
-        // 7.1.1: unified three-flux storage
-        std::vector<double> u_high;
-        std::vector<double> u_low;
-        std::vector<double> u_final;
-        std::vector<double> mu_high;
-        std::vector<double> mu_low;
-        std::vector<double> mu_final;
-        std::vector<double> cell_alpha_mu;
-        double x_low_order_failed_count;
-        double x_low_input_min_f;
-        double x_low_max_cfl;
-        double x_low_output_min_f;
-        double x_low_failed_count;
-        double x_low_input_neg_mass;
-        double x_low_input_rel_neg;
-        double x_low_output_rel_neg;
-        double x_low_input_core_failed_count;
-        double x_low_input_debt_accepted;
-        int x_low_failure_kind;
-        // 7.1.6: per-direction flux diagnostics (0=x, 1=u, 2=mu)
-        FluxPositivityDiag flux_pos[3];
-        FluxDefectDiag      flux_defect[3];
         double limiter_active_fraction;
         double limiter_min_alpha;
         double limiter_active_fraction_core;
@@ -223,7 +174,18 @@ private:
         double mu_low_u_dimless_scale0;
         double mu_low_u_endpoint_flux_max;
         double remap_active_fraction;
+        double remap_active_fraction_boundary;
+        double remap_active_fraction_core;
+        double remap_regular_active_fraction;
+        double remap_repair_active_fraction;
+        double remap_active_fraction_u[3];
+        double remap_repair_active_fraction_u[3];
+        double remap_mass_delta;
+        double remap_momentum_delta;
+        double remap_energy_delta;
+        double remap_max_abs_delta_j_moment;
         long long remap_cell_count;
+        long long remap_repair_cell_count;
         double low_u_subcycle_active_fraction;
         double low_u_average_subcycles;
         int low_u_max_subcycles;
@@ -283,15 +245,6 @@ private:
                                int mpi_rank,
                                int mpi_size,
                                int substeps_used) const;
-    Result advance_with_fixed_substeps(const Species& bkg_n,
-                                       const BeamPIC& beam_n,
-                                       const EMFields& fields_n,
-                                       const SpatialGrid& sg,
-                                       double dt,
-                                       double time,
-                                       int mpi_rank,
-                                       int mpi_size,
-                                       int substeps) const;
     void set_midpoint_field(EMFields& fields_mid,
                             const EMFields& fields_n,
                             const std::vector<double>& ex_mid,
@@ -324,7 +277,7 @@ private:
                                           bool& finite) const;
     void update_flux_current(const Species& sp,
                              const SpatialGrid& sg,
-                             FluxPack& fluxes,
+                             const FluxPack& fluxes,
                              Species& bkg_new) const;
     double integrate_face_work(const std::vector<double>& current_face,
                                const EMFields& fields_mid,
@@ -355,3 +308,4 @@ private:
 };
 
 #endif
+

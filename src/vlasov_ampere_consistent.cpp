@@ -1,4 +1,4 @@
-#include "vlasov_ampere_midpoint.h"
+#include "vlasov_ampere_consistent.h"
 
 #include "parameters.h"
 
@@ -18,31 +18,7 @@ const double NEG_TOL_HARD   = 1.0e300;  // disabled for long-run test
 const int BKG_STAGE_COUNT = 3;
 const int BKG_DIV_COMPONENT_COUNT = 3;
 const double CORE_DIAG_BOUNDARY_WIDTH = 0.2 * Const::micro;
-const int LOW_U_MU_LIMIT_COUNT = 6;
-const int LOW_U_ADAPTIVE_MAX_SUBCYCLES = 4;
-const int LOW_U_MU_REMAP_ENDPOINT_BAND = 2;
-const double LOW_U_ADAPTIVE_CFL_THRESHOLD = 0.25;
-const double LOW_U_REMAP_NEG_RATIO_THRESHOLD = 1.0e-6;
-const double LOW_U_MU_ALPHA_SAFETY = 0.95;
-const double LOW_U_MU_ALPHA_SMOOTH = 0.25;
-const double LOW_U_MU_ENDPOINT_ALPHA_CAP = 0.5;
-// 7.1.2: safety factor for FCT face-alpha to prevent limiter overshoot
-const double X_FCT_SAFETY = 0.99;
-const double X_LOW_ABS_F_TOL = 1.0e-5;
-const double X_LOW_REL_F_TOL = 1.0e-10;
-const double X_LOW_CFL_TOL = 1.0e-12;
-const double X_LOW_INPUT_DEBT_REL_TOL = 1.0e-8;
-const double X_LOW_INPUT_DEBT_NEG_MASS_FRAC = 1.0e-12;
-const double X_LOW_INPUT_DEBT_CELL_FRAC = 1.0e-6;
-const double X_LOW_INPUT_DEBT_OUTPUT_REL_TOL = 1.0e-8;
-
-enum XLowFailureKind {
-    X_LOW_OK = 0,
-    X_LOW_INPUT_DEBT = 1,
-    X_LOW_INPUT_BAD = 2,
-    X_LOW_DONOR_BUG = 3,
-    X_LOW_TRUE_CFL = 4
-};
+const int REMAP_U_GROUP_COUNT = 3;
 
 void resize_or_zero(std::vector<double>& values, size_t n)
 {
@@ -157,29 +133,215 @@ double shell_consistent_mu_u_eff(const VelocityGrid& vg, int iv)
     return std::max(vg.v_cells[iv], Param::u_floor);
 }
 
+double clamp_mu_open(double mu)
+{
+    const double eps = 32.0 * std::numeric_limits<double>::epsilon();
+    return std::max(-1.0 + eps, std::min(1.0 - eps, mu));
+}
+
+double exact_mu_departure(double mu_arrival, double a_dt)
+{
+    if (!std::isfinite(a_dt)) return mu_arrival;
+    const double mu = clamp_mu_open(mu_arrival);
+    return std::tanh(std::atanh(mu) - a_dt);
+}
+
+double integrate_piecewise_constant_uniform(const double* values,
+                                            int n,
+                                            double x_min,
+                                            double dx,
+                                            double a,
+                                            double b)
+{
+    if (n <= 0 || !(dx > 0.0) || !(b > a)) return 0.0;
+    const double x_max = x_min + static_cast<double>(n) * dx;
+    a = std::max(a, x_min);
+    b = std::min(b, x_max);
+    if (!(b > a)) return 0.0;
+
+    const int first =
+        std::max(0, std::min(n - 1,
+                 static_cast<int>(std::floor((a - x_min) / dx))));
+    const int last =
+        std::max(0, std::min(n - 1,
+                 static_cast<int>(std::floor((b - x_min) / dx))));
+    double integral = 0.0;
+    for (int i = first; i <= last; ++i) {
+        const double left = x_min + static_cast<double>(i) * dx;
+        const double right = left + dx;
+        const double overlap =
+            std::max(0.0, std::min(b, right) - std::max(a, left));
+        integral += values[i] * overlap;
+    }
+    return integral;
+}
+
+double integrate_piecewise_constant_u2(const double* values,
+                                       int n,
+                                       const double* faces,
+                                       double a,
+                                       double b)
+{
+    if (n <= 0 || !(b > a)) return 0.0;
+    a = std::max(a, faces[0]);
+    b = std::min(b, faces[n]);
+    if (!(b > a)) return 0.0;
+
+    double integral = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const double left = std::max(a, faces[i]);
+        const double right = std::min(b, faces[i + 1]);
+        if (!(right > left)) continue;
+        integral += values[i] *
+            (right * right * right - left * left * left) / 3.0;
+    }
+    return integral;
+}
+
+int remap_u_group(int iv)
+{
+    const int low_end = std::max(1, Param::Nv / 3);
+    const int mid_end = std::max(low_end + 1, 2 * Param::Nv / 3);
+    if (iv < low_end) return 0;
+    if (iv < mid_end) return 1;
+    return 2;
+}
+
+bool conservative_u_remap_line(const double* line_in,
+                               double* line_out,
+                               const VelocityGrid& vg,
+                               double u_shift,
+                               double& mass_delta,
+                               double& momentum_delta,
+                               double& energy_delta,
+                               double mu,
+                               double charge_mass_c,
+                               double dx,
+                               const double* ke_per_mass)
+{
+    double source[Param::Nv];
+    double total_mass_before = 0.0;
+    double momentum_before = 0.0;
+    double energy_before = 0.0;
+    for (int iv = 0; iv < Param::Nv; ++iv) {
+        const double fv = line_in[iv];
+        if (!std::isfinite(fv)) return false;
+        if (fv < 0.0) return false;
+        source[iv] = fv;
+        const double shell_dx = vg.moment_weight[iv] * dx;
+        const double mass = fv * shell_dx;
+        total_mass_before += mass;
+        momentum_before += mass * charge_mass_c * vg.v_cells[iv] * mu;
+        energy_before += mass * ke_per_mass[iv];
+    }
+    if (total_mass_before == 0.0) {
+        for (int iv = 0; iv < Param::Nv; ++iv) line_out[iv] = 0.0;
+        return true;
+    }
+    if (total_mass_before < 0.0) return false;
+
+    double total_mass_after = 0.0;
+    double momentum_after = 0.0;
+    double energy_after = 0.0;
+    for (int iv = 0; iv < Param::Nv; ++iv) {
+        const double dep_left = vg.v_faces[iv] - u_shift;
+        const double dep_right = vg.v_faces[iv + 1] - u_shift;
+        const double int_f_u2 =
+            integrate_piecewise_constant_u2(
+                source, Param::Nv, vg.v_faces.data(), dep_left, dep_right);
+        const double shell_int =
+            (vg.v_faces[iv + 1] * vg.v_faces[iv + 1] *
+             vg.v_faces[iv + 1] -
+             vg.v_faces[iv] * vg.v_faces[iv] * vg.v_faces[iv]) / 3.0;
+        line_out[iv] = (shell_int > 0.0) ? int_f_u2 / shell_int : 0.0;
+        if (!std::isfinite(line_out[iv]) || line_out[iv] < 0.0) {
+            return false;
+        }
+        const double mass = line_out[iv] * vg.moment_weight[iv] * dx;
+        total_mass_after += mass;
+        momentum_after += mass * charge_mass_c * vg.v_cells[iv] * mu;
+        energy_after += mass * ke_per_mass[iv];
+    }
+
+    mass_delta += total_mass_after - total_mass_before;
+    momentum_delta += momentum_after - momentum_before;
+    energy_delta += energy_after - energy_before;
+    return true;
+}
+
+bool conservative_mu_remap_line(const double* line_in,
+                                double* line_out,
+                                const VelocityGrid& vg,
+                                double a_dt,
+                                double& mass_delta,
+                                double& momentum_delta,
+                                double& energy_delta,
+                                double px_base,
+                                double cell_weight_dx,
+                                double ke_per_mass)
+{
+    double source[Param::Nmu];
+    double total_f = 0.0;
+    double momentum_before = 0.0;
+    for (int imu = 0; imu < Param::Nmu; ++imu) {
+        const double fv = line_in[imu];
+        if (!std::isfinite(fv)) return false;
+        if (fv < 0.0) return false;
+        source[imu] = fv;
+        total_f += fv;
+        momentum_before += fv * cell_weight_dx * px_base * vg.mu_cells[imu];
+    }
+    if (total_f == 0.0) {
+        for (int imu = 0; imu < Param::Nmu; ++imu) line_out[imu] = 0.0;
+        return true;
+    }
+    if (total_f < 0.0) return false;
+
+    double dep[Param::Nmu + 1];
+    dep[0] = -1.0;
+    dep[Param::Nmu] = 1.0;
+    for (int face = 1; face < Param::Nmu; ++face) {
+        dep[face] = exact_mu_departure(vg.mu_faces[face], a_dt);
+    }
+
+    double total_after_f = 0.0;
+    double momentum_after = 0.0;
+    const double mu_min = vg.mu_faces[0];
+    for (int imu = 0; imu < Param::Nmu; ++imu) {
+        const double mass_int =
+            integrate_piecewise_constant_uniform(
+                source, Param::Nmu, mu_min, vg.dmu,
+                dep[imu], dep[imu + 1]);
+        line_out[imu] = mass_int * vg.inv_dmu;
+        if (!std::isfinite(line_out[imu]) || line_out[imu] < 0.0) {
+            return false;
+        }
+        total_after_f += line_out[imu];
+        momentum_after +=
+            line_out[imu] * cell_weight_dx * px_base * vg.mu_cells[imu];
+    }
+
+    const double mass_before = total_f * cell_weight_dx;
+    const double mass_after = total_after_f * cell_weight_dx;
+    mass_delta += mass_after - mass_before;
+    energy_delta += (mass_after - mass_before) * ke_per_mass;
+    momentum_delta += momentum_after - momentum_before;
+    return true;
+}
+
 double smooth_low_u_mu_alpha(double alpha)
 {
-    alpha = std::max(0.0, std::min(1.0, alpha));
-    if (alpha >= 1.0) return 1.0;
-    const double safe = LOW_U_MU_ALPHA_SAFETY * alpha;
-    return safe * (1.0 - LOW_U_MU_ALPHA_SMOOTH * (1.0 - safe));
+    return std::max(0.0, std::min(1.0, alpha));
 }
 
-bool near_mu_endpoint(int imu)
+bool near_mu_endpoint(int)
 {
-    return imu < LOW_U_MU_REMAP_ENDPOINT_BAND ||
-           imu >= Param::Nmu - LOW_U_MU_REMAP_ENDPOINT_BAND;
+    return true;
 }
 
-int adaptive_low_u_subcycles(double out, double available)
+int adaptive_low_u_subcycles(double, double)
 {
-    if (!(out > 0.0) || !std::isfinite(out)) return 1;
-    const double cfl =
-        out / std::max(available, std::numeric_limits<double>::min());
-    if (cfl <= LOW_U_ADAPTIVE_CFL_THRESHOLD) return 1;
-    const int cycles =
-        static_cast<int>(std::ceil(cfl / LOW_U_ADAPTIVE_CFL_THRESHOLD));
-    return std::max(1, std::min(LOW_U_ADAPTIVE_MAX_SUBCYCLES, cycles));
+    return 1;
 }
 
 double max_abs_vector(const std::vector<double>& values, size_t n)
@@ -241,7 +403,7 @@ FiniteFluxCandidate empty_finite_flux_candidate()
 
 }
 
-void VlasovAmpereMidpointSolver::exchange_ghosts_x_persistent(
+void VlasovAmpereConsistentSolver::exchange_ghosts_x_persistent(
     Species& sp, const SpatialGrid& sg, int mpi_rank, int mpi_size) const
 {
     const int ng = sg.nghost;
@@ -286,302 +448,8 @@ void VlasovAmpereMidpointSolver::exchange_ghosts_x_persistent(
                 ghost_recv_right_.data(), buffer_size * sizeof(double));
 }
 
-VlasovAmpereMidpointSolver::Result
-VlasovAmpereMidpointSolver::advance_with_fixed_substeps(
-    const Species& bkg_n,
-    const BeamPIC& beam_n,
-    const EMFields& fields_n,
-    const SpatialGrid& sg,
-    double dt,
-    double time,
-    int mpi_rank,
-    int mpi_size,
-    int substeps) const
-{
-    Result combined;
-    reset_result(combined);
-    combined.substeps_used = substeps;
-
-    Species bkg_state = bkg_n;
-    BeamPIC beam_state = beam_n;
-    EMFields fields_state = fields_n;
-    const double sub_dt = dt / static_cast<double>(substeps);
-    const double t_start = time - dt;
-
-    for (int isub = 0; isub < substeps; ++isub) {
-        const double sub_time =
-            t_start + static_cast<double>(isub + 1) * sub_dt;
-        Result sub = advance_single_step(bkg_state, beam_state, fields_state,
-                                         sg, sub_dt, sub_time, mpi_rank,
-                                         mpi_size, substeps);
-        if (!sub.converged || sub.failed) {
-            sub.substeps_used = substeps;
-            return sub;
-        }
-
-        if (isub == 0) {
-            combined = sub;
-            combined.substeps_used = substeps;
-        } else {
-            combined.species_np1 = sub.species_np1;
-            combined.beam_np1 = sub.beam_np1;
-            combined.fields_np1 = sub.fields_np1;
-            combined.j_bkg_face_mid = sub.j_bkg_face_mid;
-            combined.j_beam_face_mid = sub.j_beam_face_mid;
-            combined.j_total_face_mid = sub.j_total_face_mid;
-            combined.j_bkg_energy_debug_face =
-                sub.j_bkg_energy_debug_face;
-
-            combined.delta_ke_bkg += sub.delta_ke_bkg;
-            combined.delta_ke_beam += sub.delta_ke_beam;
-            combined.field_work_bkg += sub.field_work_bkg;
-            combined.field_work_beam += sub.field_work_beam;
-            combined.energy_residual_bkg += sub.energy_residual_bkg;
-            combined.continuity_residual_bkg =
-                std::max(combined.continuity_residual_bkg,
-                         sub.continuity_residual_bkg);
-            combined.beam_continuity_residual =
-                std::max(combined.beam_continuity_residual,
-                         sub.beam_continuity_residual);
-            combined.nonlinear_residual =
-                std::max(combined.nonlinear_residual,
-                         sub.nonlinear_residual);
-            combined.residual_E =
-                std::max(combined.residual_E, sub.residual_E);
-            combined.residual_f =
-                std::max(combined.residual_f, sub.residual_f);
-            combined.residual_J_bkg =
-                std::max(combined.residual_J_bkg, sub.residual_J_bkg);
-            combined.residual_J_beam =
-                std::max(combined.residual_J_beam, sub.residual_J_beam);
-
-            const double inv_count =
-                1.0 / static_cast<double>(isub + 1);
-            combined.limiter_active_fraction =
-                (combined.limiter_active_fraction * isub
-               + sub.limiter_active_fraction) * inv_count;
-            combined.limiter_active_fraction_core =
-                (combined.limiter_active_fraction_core * isub
-               + sub.limiter_active_fraction_core) * inv_count;
-            combined.limiter_active_fraction_boundary =
-                (combined.limiter_active_fraction_boundary * isub
-               + sub.limiter_active_fraction_boundary) * inv_count;
-            combined.limiter_min_alpha =
-                std::min(combined.limiter_min_alpha,
-                         sub.limiter_min_alpha);
-            combined.limiter_min_alpha_core =
-                std::min(combined.limiter_min_alpha_core,
-                         sub.limiter_min_alpha_core);
-            combined.limiter_min_alpha_boundary =
-                std::min(combined.limiter_min_alpha_boundary,
-                         sub.limiter_min_alpha_boundary);
-            combined.limiter_energy_defect += sub.limiter_energy_defect;
-            combined.limiter_mass_defect += sub.limiter_mass_defect;
-            combined.limiter_momentum_defect +=
-                sub.limiter_momentum_defect;
-            combined.x_limiter_energy_defect +=
-                sub.x_limiter_energy_defect;
-            combined.x_limiter_mass_defect +=
-                sub.x_limiter_mass_defect;
-            combined.mu_low_u_alpha_min =
-                std::min(combined.mu_low_u_alpha_min,
-                         sub.mu_low_u_alpha_min);
-            combined.mu_low_u_limiter_active_fraction =
-                std::max(combined.mu_low_u_limiter_active_fraction,
-                         sub.mu_low_u_limiter_active_fraction);
-            combined.mu_low_u_energy_delta += sub.mu_low_u_energy_delta;
-            combined.mu_low_u_alpha_min_boundary =
-                std::min(combined.mu_low_u_alpha_min_boundary,
-                         sub.mu_low_u_alpha_min_boundary);
-            combined.mu_low_u_alpha_min_core =
-                std::min(combined.mu_low_u_alpha_min_core,
-                         sub.mu_low_u_alpha_min_core);
-            combined.mu_low_u_limiter_active_fraction_boundary =
-                std::max(
-                    combined.mu_low_u_limiter_active_fraction_boundary,
-                    sub.mu_low_u_limiter_active_fraction_boundary);
-            combined.mu_low_u_limiter_active_fraction_core =
-                std::max(combined.mu_low_u_limiter_active_fraction_core,
-                         sub.mu_low_u_limiter_active_fraction_core);
-            combined.mu_low_u_energy_delta_boundary +=
-                sub.mu_low_u_energy_delta_boundary;
-            combined.mu_low_u_energy_delta_core +=
-                sub.mu_low_u_energy_delta_core;
-            combined.mu_low_u_u_eff0 = sub.mu_low_u_u_eff0;
-            combined.mu_low_u_moment_weight0 = sub.mu_low_u_moment_weight0;
-            combined.mu_low_u_mu_flux_scale0 =
-                sub.mu_low_u_mu_flux_scale0;
-            combined.mu_low_u_half_dt_inv_shell0 =
-                sub.mu_low_u_half_dt_inv_shell0;
-            combined.mu_low_u_dimless_scale0 =
-                std::max(combined.mu_low_u_dimless_scale0,
-                         sub.mu_low_u_dimless_scale0);
-            combined.mu_low_u_endpoint_flux_max =
-                std::max(combined.mu_low_u_endpoint_flux_max,
-                         sub.mu_low_u_endpoint_flux_max);
-            combined.remap_active_fraction =
-                std::max(combined.remap_active_fraction,
-                         sub.remap_active_fraction);
-            combined.remap_cell_count += sub.remap_cell_count;
-            combined.low_u_subcycle_active_fraction =
-                std::max(combined.low_u_subcycle_active_fraction,
-                         sub.low_u_subcycle_active_fraction);
-            combined.low_u_average_subcycles =
-                std::max(combined.low_u_average_subcycles,
-                         sub.low_u_average_subcycles);
-            combined.low_u_max_subcycles =
-                std::max(combined.low_u_max_subcycles,
-                         sub.low_u_max_subcycles);
-            combined.x_low_order_failed_count +=
-                sub.x_low_order_failed_count;
-            combined.x_low_input_min_f =
-                std::min(combined.x_low_input_min_f,
-                         sub.x_low_input_min_f);
-            combined.x_low_max_cfl =
-                std::max(combined.x_low_max_cfl, sub.x_low_max_cfl);
-            combined.x_low_output_min_f =
-                std::min(combined.x_low_output_min_f,
-                         sub.x_low_output_min_f);
-            combined.x_low_failed_count += sub.x_low_failed_count;
-            combined.x_low_input_neg_mass += sub.x_low_input_neg_mass;
-            combined.x_low_input_rel_neg =
-                std::max(combined.x_low_input_rel_neg,
-                         sub.x_low_input_rel_neg);
-            combined.x_low_output_rel_neg =
-                std::max(combined.x_low_output_rel_neg,
-                         sub.x_low_output_rel_neg);
-            combined.x_low_input_core_failed_count +=
-                sub.x_low_input_core_failed_count;
-            combined.x_low_input_debt_accepted =
-                std::max(combined.x_low_input_debt_accepted,
-                         sub.x_low_input_debt_accepted);
-            combined.x_low_failure_kind =
-                std::max(combined.x_low_failure_kind,
-                         sub.x_low_failure_kind);
-            for (int ir = 0; ir < 2; ++ir) {
-                combined.region_u_limiter_energy_boundary[ir] +=
-                    sub.region_u_limiter_energy_boundary[ir];
-                combined.region_u_limiter_energy_core[ir] +=
-                    sub.region_u_limiter_energy_core[ir];
-                combined.region_abs_u_limiter_energy_boundary[ir] +=
-                    sub.region_abs_u_limiter_energy_boundary[ir];
-                combined.region_abs_u_limiter_energy_core[ir] +=
-                    sub.region_abs_u_limiter_energy_core[ir];
-                combined.region_limiter_active_fraction_boundary[ir] =
-                    std::max(
-                        combined.region_limiter_active_fraction_boundary[ir],
-                        sub.region_limiter_active_fraction_boundary[ir]);
-                combined.region_limiter_active_fraction_core[ir] =
-                    std::max(
-                        combined.region_limiter_active_fraction_core[ir],
-                        sub.region_limiter_active_fraction_core[ir]);
-            }
-            for (int istage = 0; istage < BKG_STAGE_COUNT; ++istage) {
-                const size_t s = static_cast<size_t>(istage);
-                combined.stage_min_f[s] =
-                    std::min(combined.stage_min_f[s],
-                             sub.stage_min_f[s]);
-                combined.stage_neg_mass[s] += sub.stage_neg_mass[s];
-                combined.stage_neg_cell_count[s] +=
-                    sub.stage_neg_cell_count[s];
-                combined.stage_low_u_neg_mass[s] +=
-                    sub.stage_low_u_neg_mass[s];
-                combined.stage_core_low_u_min_f[s] =
-                    std::min(combined.stage_core_low_u_min_f[s],
-                             sub.stage_core_low_u_min_f[s]);
-            }
-            for (int ic = 0; ic < BKG_DIV_COMPONENT_COUNT; ++ic) {
-                const size_t c = static_cast<size_t>(ic);
-                combined.low_u_neg_added_by_div[c] +=
-                    sub.low_u_neg_added_by_div[c];
-            }
-            for (size_t i = 0; i < combined.stage_min_f_core_by_u.size();
-                 ++i) {
-                combined.stage_min_f_core_by_u[i] =
-                    std::min(combined.stage_min_f_core_by_u[i],
-                             sub.stage_min_f_core_by_u[i]);
-                combined.stage_neg_mass_core_by_u[i] +=
-                    sub.stage_neg_mass_core_by_u[i];
-                combined.stage_neg_cell_count_core_by_u[i] +=
-                    sub.stage_neg_cell_count_core_by_u[i];
-                combined.stage_min_f_boundary_by_u[i] =
-                    std::min(combined.stage_min_f_boundary_by_u[i],
-                             sub.stage_min_f_boundary_by_u[i]);
-                combined.stage_neg_mass_boundary_by_u[i] +=
-                    sub.stage_neg_mass_boundary_by_u[i];
-                combined.stage_neg_cell_count_boundary_by_u[i] +=
-                    sub.stage_neg_cell_count_boundary_by_u[i];
-            }
-            combined.x_negative_mass_before_repair +=
-                sub.x_negative_mass_before_repair;
-            combined.x_mass_added_by_positivity_repair +=
-                sub.x_mass_added_by_positivity_repair;
-            combined.positivity_energy_defect +=
-                sub.positivity_energy_defect;
-            combined.positivity_mass_defect +=
-                sub.positivity_mass_defect;
-            combined.u_force_alpha_min =
-                std::min(combined.u_force_alpha_min,
-                         sub.u_force_alpha_min);
-            combined.u_force_alpha_active_frac =
-                (combined.u_force_alpha_active_frac * isub
-               + sub.u_force_alpha_active_frac) * inv_count;
-            combined.f_neg_min =
-                std::min(combined.f_neg_min, sub.f_neg_min);
-            if (sub.f_neg_ratio_max > combined.f_neg_ratio_max) {
-                combined.f_neg_ratio_max = sub.f_neg_ratio_max;
-                combined.f_neg_ix = sub.f_neg_ix;
-                combined.f_neg_iv = sub.f_neg_iv;
-                combined.f_neg_imu = sub.f_neg_imu;
-            }
-            combined.f_neg_mass_total += sub.f_neg_mass_total;
-            combined.f_neg_cell_count += sub.f_neg_cell_count;
-            combined.nonlinear_iterations += sub.nonlinear_iterations;
-            combined.soft_accepted =
-                combined.soft_accepted || sub.soft_accepted;
-            combined.protected_converged =
-                combined.protected_converged && sub.protected_converged;
-
-            combined.current_diag.residual_if_charge +=
-                sub.current_diag.residual_if_charge;
-            combined.current_diag.residual_if_ampere +=
-                sub.current_diag.residual_if_ampere;
-            combined.current_diag.e_dot_j_charge +=
-                sub.current_diag.e_dot_j_charge;
-            combined.current_diag.e_dot_j_energy +=
-                sub.current_diag.e_dot_j_energy;
-            combined.current_diag.e_dot_j_ampere +=
-                sub.current_diag.e_dot_j_ampere;
-            combined.current_diag.max_abs_j_charge =
-                std::max(combined.current_diag.max_abs_j_charge,
-                         sub.current_diag.max_abs_j_charge);
-            combined.current_diag.max_abs_j_energy =
-                std::max(combined.current_diag.max_abs_j_energy,
-                         sub.current_diag.max_abs_j_energy);
-            combined.current_diag.max_abs_j_ampere =
-                std::max(combined.current_diag.max_abs_j_ampere,
-                         sub.current_diag.max_abs_j_ampere);
-            combined.current_diag.max_abs_j_charge_minus_ampere =
-                std::max(combined.current_diag.max_abs_j_charge_minus_ampere,
-                         sub.current_diag.max_abs_j_charge_minus_ampere);
-            combined.current_diag.max_abs_j_energy_minus_ampere =
-                std::max(combined.current_diag.max_abs_j_energy_minus_ampere,
-                         sub.current_diag.max_abs_j_energy_minus_ampere);
-        }
-
-        bkg_state = sub.species_np1;
-        beam_state = sub.beam_np1;
-        fields_state = sub.fields_np1;
-    }
-
-    combined.converged = true;
-    combined.failed = false;
-    combined.substeps_used = substeps;
-    return combined;
-}
-
-VlasovAmpereMidpointSolver::Result
-VlasovAmpereMidpointSolver::advance_background_and_fields(
+VlasovAmpereConsistentSolver::Result
+VlasovAmpereConsistentSolver::advance_background_and_fields(
     const Species& bkg_n,
     const BeamPIC& beam_n,
     const EMFields& fields_n,
@@ -591,52 +459,15 @@ VlasovAmpereMidpointSolver::advance_background_and_fields(
     int mpi_rank,
     int mpi_size)
 {
-    const int substep_trials[7] = {1, 2, 4, 8, 16, 32, 64};
-
-    for (int trial = 0; trial < 7; ++trial) {
-        const int substeps = substep_trials[trial];
-        Result result =
-            (substeps == 1)
-            ? advance_single_step(bkg_n, beam_n, fields_n, sg, dt, time,
-                                  mpi_rank, mpi_size, 1)
-            : advance_with_fixed_substeps(bkg_n, beam_n, fields_n, sg, dt,
-                                          time, mpi_rank, mpi_size,
-                                          substeps);
-        if (result.converged && !result.failed) {
-            return result;
-        }
-        if (result.x_low_failure_kind == X_LOW_INPUT_BAD ||
-            result.x_low_failure_kind == X_LOW_DONOR_BUG) {
-            return result;
-        }
-        if (trial == 6) {
-            result.converged = false;
-            result.failed = true;
-            return result;
-        }
-        if (mpi_rank == 0 && trial < 6) {
-            std::fprintf(stderr,
-                         "WARNING: energy-compatible midpoint solve failed "
-                         "with %d substep(s) at t = %.6e s "
-                         "(residual %.6e, f %.6e, field %.6e); retrying "
-                         "with %d substeps.\n",
-                         substeps, time, result.nonlinear_residual,
-                         result.residual_f, result.residual_E,
-                         substep_trials[trial + 1]);
-        }
-    }
-
-    Result failed;
-    reset_result(failed);
-    failed.failed = true;
-    return failed;
+    return advance_single_step(bkg_n, beam_n, fields_n, sg, dt, time,
+                               mpi_rank, mpi_size, 1);
 }
 
-VlasovAmpereMidpointSolver::VlasovAmpereMidpointSolver()
+VlasovAmpereConsistentSolver::VlasovAmpereConsistentSolver()
     : step_diagnostics_enabled_(false)
 {}
 
-void VlasovAmpereMidpointSolver::reset_current_diag(
+void VlasovAmpereConsistentSolver::reset_current_diag(
     CurrentDiagnostics& diag) const
 {
     diag.residual_if_charge = 0.0;
@@ -651,7 +482,7 @@ void VlasovAmpereMidpointSolver::reset_current_diag(
     diag.max_abs_j_energy_minus_ampere = 0.0;
 }
 
-void VlasovAmpereMidpointSolver::reset_result(Result& result) const
+void VlasovAmpereConsistentSolver::reset_result(Result& result) const
 {
     reset_current_diag(result.current_diag);
     result.delta_ke_bkg = 0.0;
@@ -693,40 +524,23 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
     result.mu_low_u_dimless_scale0 = 0.0;
     result.mu_low_u_endpoint_flux_max = 0.0;
     result.remap_active_fraction = 0.0;
+    result.remap_active_fraction_boundary = 0.0;
+    result.remap_active_fraction_core = 0.0;
+    result.remap_regular_active_fraction = 0.0;
+    result.remap_repair_active_fraction = 0.0;
+    result.remap_mass_delta = 0.0;
+    result.remap_momentum_delta = 0.0;
+    result.remap_energy_delta = 0.0;
+    result.remap_max_abs_delta_j_moment = 0.0;
     result.remap_cell_count = 0;
+    result.remap_repair_cell_count = 0;
+    for (int ig = 0; ig < REMAP_U_GROUP_COUNT; ++ig) {
+        result.remap_active_fraction_u[ig] = 0.0;
+        result.remap_repair_active_fraction_u[ig] = 0.0;
+    }
     result.low_u_subcycle_active_fraction = 0.0;
     result.low_u_average_subcycles = 1.0;
     result.low_u_max_subcycles = 1;
-    result.x_low_order_failed_count = 0.0;
-    result.x_low_input_min_f = std::numeric_limits<double>::infinity();
-    result.x_low_max_cfl = 0.0;
-    result.x_low_output_min_f = std::numeric_limits<double>::infinity();
-    result.x_low_failed_count = 0.0;
-    result.x_low_input_neg_mass = 0.0;
-    result.x_low_input_rel_neg = 0.0;
-    result.x_low_output_rel_neg = 0.0;
-    result.x_low_input_core_failed_count = 0.0;
-    result.x_low_input_debt_accepted = 0.0;
-    result.x_low_failure_kind = X_LOW_OK;
-    // 7.1.6: reset per-direction flux diagnostics
-    for (int d = 0; d < 3; ++d) {
-        FluxPositivityDiag& fp = result.flux_pos[d];
-        fp.min_f_before = std::numeric_limits<double>::infinity();
-        fp.min_f_low    = std::numeric_limits<double>::infinity();
-        fp.min_f_final  = std::numeric_limits<double>::infinity();
-        fp.low_order_failed_count  = 0.0;
-        fp.alpha_active_fraction   = 0.0;
-        fp.alpha_min = 1.0;
-        fp.alpha_core_fraction     = 0.0;
-        fp.alpha_boundary_fraction = 0.0;
-        fp.negative_mass_prevented = 0.0;
-        FluxDefectDiag& fd = result.flux_defect[d];
-        fd.mass_defect = 0.0;
-        fd.momentum_defect = 0.0;
-        fd.energy_defect = 0.0;
-        fd.boundary_mass_loss = 0.0;
-        fd.boundary_energy_loss = 0.0;
-    }
     for (int ir = 0; ir < 2; ++ir) {
         result.region_u_limiter_energy_boundary[ir] = 0.0;
         result.region_u_limiter_energy_core[ir] = 0.0;
@@ -777,7 +591,7 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
     result.substeps_used = 1;
 }
 
-void VlasovAmpereMidpointSolver::set_midpoint_field(
+void VlasovAmpereConsistentSolver::set_midpoint_field(
     EMFields& fields_mid,
     const EMFields& fields_n,
     const std::vector<double>& ex_mid,
@@ -799,7 +613,7 @@ void VlasovAmpereMidpointSolver::set_midpoint_field(
     fields_mid.sync_cell_ex_from_faces(mpi_rank, mpi_size);
 }
 
-void VlasovAmpereMidpointSolver::compute_midpoint_fluxes(
+void VlasovAmpereConsistentSolver::compute_midpoint_fluxes(
     const Species& bkg_n,
     const Species& bkg_guess_np1,
     const EMFields& fields_mid,
@@ -819,7 +633,7 @@ void VlasovAmpereMidpointSolver::compute_midpoint_fluxes(
                                      finite);
 }
 
-void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
+void VlasovAmpereConsistentSolver::compute_vlasov_midpoint_residual(
     const Species& bkg_n,
     const Species& bkg_guess_np1,
     const EMFields& fields_mid,
@@ -843,23 +657,9 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
 
     resize_or_zero(fluxes.x_high, x_faces);
     resize_without_fill(fluxes.x_final, x_faces);
-    resize_or_zero(fluxes.cell_alpha_u, cells);
-    resize_or_zero(fluxes.cell_alpha_x, cells);
+    resize_or_zero(fluxes.cell_alpha, cells);
+    resize_or_zero(fluxes.x_cell_alpha, cells);
     resize_or_zero(fluxes.j_bkg_face, static_cast<size_t>(nxl + 1));
-    // 7.1.1: allocate unified u/mu flux storage
-    resize_or_zero(fluxes.u_high,
-                   static_cast<size_t>(nxl + 1) * (Param::Nv + 1) * Param::Nmu);
-    resize_or_zero(fluxes.u_low,
-                   static_cast<size_t>(nxl + 1) * (Param::Nv + 1) * Param::Nmu);
-    resize_or_zero(fluxes.u_final,
-                   static_cast<size_t>(nxl + 1) * (Param::Nv + 1) * Param::Nmu);
-    resize_or_zero(fluxes.mu_high,
-                   static_cast<size_t>(nxl + 1) * Param::Nv * (Param::Nmu + 1));
-    resize_or_zero(fluxes.mu_low,
-                   static_cast<size_t>(nxl + 1) * Param::Nv * (Param::Nmu + 1));
-    resize_or_zero(fluxes.mu_final,
-                   static_cast<size_t>(nxl + 1) * Param::Nv * (Param::Nmu + 1));
-    resize_or_zero(fluxes.cell_alpha_mu, cells);
     fluxes.limiter_active_fraction = 0.0;
     fluxes.limiter_min_alpha = 1.0;
     fluxes.limiter_active_fraction_core = 0.0;
@@ -871,36 +671,6 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     fluxes.limiter_momentum_defect = 0.0;
     fluxes.x_limiter_energy_defect = 0.0;
     fluxes.x_limiter_mass_defect = 0.0;
-    fluxes.x_low_order_failed_count = 0.0;
-    fluxes.x_low_input_min_f = std::numeric_limits<double>::infinity();
-    fluxes.x_low_max_cfl = 0.0;
-    fluxes.x_low_output_min_f = std::numeric_limits<double>::infinity();
-    fluxes.x_low_failed_count = 0.0;
-    fluxes.x_low_input_neg_mass = 0.0;
-    fluxes.x_low_input_rel_neg = 0.0;
-    fluxes.x_low_output_rel_neg = 0.0;
-    fluxes.x_low_input_core_failed_count = 0.0;
-    fluxes.x_low_input_debt_accepted = 0.0;
-    fluxes.x_low_failure_kind = X_LOW_OK;
-    // 7.1.6: zero per-direction flux diagnostics
-    for (int d = 0; d < 3; ++d) {
-        FluxPositivityDiag& fp = fluxes.flux_pos[d];
-        fp.min_f_before = std::numeric_limits<double>::infinity();
-        fp.min_f_low    = std::numeric_limits<double>::infinity();
-        fp.min_f_final  = std::numeric_limits<double>::infinity();
-        fp.low_order_failed_count = 0.0;
-        fp.alpha_active_fraction  = 0.0;
-        fp.alpha_min = 1.0;
-        fp.alpha_core_fraction    = 0.0;
-        fp.alpha_boundary_fraction = 0.0;
-        fp.negative_mass_prevented = 0.0;
-        FluxDefectDiag& fd = fluxes.flux_defect[d];
-        fd.mass_defect = 0.0;
-        fd.momentum_defect = 0.0;
-        fd.energy_defect = 0.0;
-        fd.boundary_mass_loss = 0.0;
-        fd.boundary_energy_loss = 0.0;
-    }
     fluxes.mu_low_u_alpha_min = 1.0;
     fluxes.mu_low_u_limiter_active_fraction = 0.0;
     fluxes.mu_low_u_energy_delta = 0.0;
@@ -917,7 +687,20 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     fluxes.mu_low_u_dimless_scale0 = 0.0;
     fluxes.mu_low_u_endpoint_flux_max = 0.0;
     fluxes.remap_active_fraction = 0.0;
+    fluxes.remap_active_fraction_boundary = 0.0;
+    fluxes.remap_active_fraction_core = 0.0;
+    fluxes.remap_regular_active_fraction = 0.0;
+    fluxes.remap_repair_active_fraction = 0.0;
+    fluxes.remap_mass_delta = 0.0;
+    fluxes.remap_momentum_delta = 0.0;
+    fluxes.remap_energy_delta = 0.0;
+    fluxes.remap_max_abs_delta_j_moment = 0.0;
     fluxes.remap_cell_count = 0;
+    fluxes.remap_repair_cell_count = 0;
+    for (int ig = 0; ig < REMAP_U_GROUP_COUNT; ++ig) {
+        fluxes.remap_active_fraction_u[ig] = 0.0;
+        fluxes.remap_repair_active_fraction_u[ig] = 0.0;
+    }
     fluxes.low_u_subcycle_active_fraction = 0.0;
     fluxes.low_u_average_subcycles = 1.0;
     fluxes.low_u_max_subcycles = 1;
@@ -1027,53 +810,8 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                                static_cast<int>(Param::Nvmu),
                                mpi_rank, mpi_size, 504);
 
-    std::vector<double> x_low_shell_max(Param::Nv, 0.0);
-    {
-        const int nthreads = std::max(1, omp_get_max_threads());
-        std::vector<double> thread_shell_max(
-            static_cast<size_t>(nthreads) * Param::Nv, 0.0);
-        #pragma omp parallel
-        {
-            const int tid = omp_get_thread_num();
-            double* shell_max =
-                &thread_shell_max[static_cast<size_t>(tid) * Param::Nv];
-            #pragma omp for collapse(2) schedule(static)
-            for (int ix = 0; ix < nxl; ++ix) {
-                for (int k_int = 0;
-                     k_int < static_cast<int>(Param::Nvmu); ++k_int) {
-                    const int iv = k_int / Param::Nmu;
-                    const size_t k = static_cast<size_t>(k_int);
-                    const size_t src =
-                        static_cast<size_t>(ng + ix) * Param::Nvmu + k;
-                    const double f = bkg_n.f[src];
-                    if (std::isfinite(f) && f > shell_max[iv]) {
-                        shell_max[iv] = f;
-                    }
-                }
-            }
-        }
-        for (int tid = 0; tid < nthreads; ++tid) {
-            const double* shell_max =
-                &thread_shell_max[static_cast<size_t>(tid) * Param::Nv];
-            for (int iv = 0; iv < Param::Nv; ++iv) {
-                x_low_shell_max[iv] =
-                    std::max(x_low_shell_max[iv], shell_max[iv]);
-            }
-        }
-        MPI_Allreduce(MPI_IN_PLACE, x_low_shell_max.data(),
-                      Param::Nv, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-    }
-
-    // 7.1.2: x-direction donor-cell low-order flux.
-    // Use the accepted f^n state on the upwind side of each face:
-    //   F_{i+1/2} = max(vx,0) f_i + min(vx,0) f_{i+1}.
-    // There is deliberately no max(0,f) clip here.  If this monotone
-    // low-order update fails positivity, the caller must retry with a
-    // smaller true x substep.
-    resize_or_zero(fluxes.x_low, x_faces);
-    double local_x_low_max_cfl = 0.0;
-    #pragma omp parallel for schedule(static) \
-        reduction(max:local_x_low_max_cfl)
+    std::vector<double> x_low(x_faces, 0.0);
+    #pragma omp parallel for schedule(static)
     for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu); ++k_int) {
         const size_t k = static_cast<size_t>(k_int);
         const int iv = k_int / Param::Nmu;
@@ -1081,54 +819,24 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         const double vx_star =
             energy_compatible_chain_speed(bkg_n, iv)
           * f_mid.vgrid.mu_cells[imu];
-        local_x_low_max_cfl =
-            std::max(local_x_low_max_cfl, std::fabs(vx_star) * dt_dx);
-        const double vx_pos = std::max(vx_star, 0.0);
-        const double vx_neg = std::min(vx_star, 0.0);
         for (int iface = 0; iface < nxl; ++iface) {
             const int ix_left = ng + iface - 1;
             const int ix_right = ng + iface;
-            const size_t left =
-                static_cast<size_t>(ix_left) * Param::Nvmu + k;
-            const size_t right =
-                static_cast<size_t>(ix_right) * Param::Nvmu + k;
+            const size_t donor =
+                static_cast<size_t>((vx_star >= 0.0) ? ix_left : ix_right)
+              * Param::Nvmu + k;
             const size_t face_slot =
                 static_cast<size_t>(iface) * Param::Nvmu + k;
-            fluxes.x_low[face_slot] =
-                vx_pos * bkg_n.f[left] + vx_neg * bkg_n.f[right];
+            x_low[face_slot] = vx_star * f_mid.f[donor];
         }
     }
-    close_periodic_face_blocks(fluxes.x_low, nxl,
-                               static_cast<int>(Param::Nvmu),
+    close_periodic_face_blocks(x_low, nxl, static_cast<int>(Param::Nvmu),
                                mpi_rank, mpi_size, 509);
 
-    // 7.1.2: x-direction FCT limiter with f_floor tolerance
-    // f_floor = -eps * local_scale allows roundoff-level negatives
-    // while catching true CFL violations when the low-order update itself
-    // produces significant negative values.
-    // 7.1.6: per-direction x diagnostics (collected in this loop)
-    double local_x_min_f_before = std::numeric_limits<double>::infinity();
-    double local_x_min_f_low    = std::numeric_limits<double>::infinity();
-    double local_x_neg_mass_prevented = 0.0;
-    std::fill(fluxes.cell_alpha_x.begin(), fluxes.cell_alpha_x.end(), 1.0);
+    std::fill(fluxes.x_cell_alpha.begin(), fluxes.x_cell_alpha.end(), 1.0);
     int local_x_any_limited = 0;
-    double local_x_low_order_failed = 0.0;
-    double local_x_low_input_failed = 0.0;
-    double local_x_low_input_neg_mass = 0.0;
-    double local_x_low_input_rel_neg = 0.0;
-    double local_x_low_output_rel_neg = 0.0;
-    double local_x_low_input_core_failed = 0.0;
     #pragma omp parallel for collapse(2) schedule(static) \
-        reduction(max:local_x_any_limited) \
-        reduction(+:local_x_low_order_failed) \
-        reduction(+:local_x_low_input_failed) \
-        reduction(+:local_x_low_input_neg_mass) \
-        reduction(+:local_x_low_input_core_failed) \
-        reduction(max:local_x_low_input_rel_neg) \
-        reduction(max:local_x_low_output_rel_neg) \
-        reduction(min:local_x_min_f_before) \
-        reduction(min:local_x_min_f_low) \
-        reduction(+:local_x_neg_mass_prevented)
+        reduction(max:local_x_any_limited)
     for (int ix = 0; ix < nxl; ++ix) {
         for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu); ++k_int) {
             const size_t k = static_cast<size_t>(k_int);
@@ -1136,82 +844,29 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             const size_t src =
                 static_cast<size_t>(ng + ix) * Param::Nvmu + k;
             const double f0 = bkg_n.f[src];
-            // 7.1.6: track min f before any update
-            if (f0 < local_x_min_f_before) local_x_min_f_before = f0;
             const double div_low = dt_dx *
-                (fluxes.x_low[static_cast<size_t>(ix + 1) * Param::Nvmu + k]
-               - fluxes.x_low[static_cast<size_t>(ix) * Param::Nvmu + k]);
+                (x_low[static_cast<size_t>(ix + 1) * Param::Nvmu + k]
+               - x_low[static_cast<size_t>(ix) * Param::Nvmu + k]);
             const double div_high = dt_dx *
                 (fluxes.x_high[static_cast<size_t>(ix + 1) * Param::Nvmu + k]
                - fluxes.x_high[static_cast<size_t>(ix) * Param::Nvmu + k]);
             const double f_low = f0 - div_low;
             const double f_high = f0 - div_high;
-            // 7.1.6: track min after low-order update
-            if (f_low < local_x_min_f_low) local_x_min_f_low = f_low;
-            const int iv = k_int / Param::Nmu;
-            const double f_tol =
-                std::max(X_LOW_ABS_F_TOL,
-                         X_LOW_REL_F_TOL * x_low_shell_max[iv]);
-            const double f_scale = std::max(1.0, x_low_shell_max[iv]);
             if (!std::isfinite(f_low) || !std::isfinite(f_high)) {
-                fluxes.cell_alpha_x[slot] = 0.0;
-                local_x_low_order_failed += 1.0;
+                fluxes.x_cell_alpha[slot] = 0.0;
                 local_x_any_limited = 1;
                 continue;
             }
-            const double f_floor = -f_tol;
-            if (f0 < f_floor) {
-                local_x_low_input_failed += 1.0;
-                local_x_low_input_neg_mass +=
-                    (-f0) * bkg_n.vgrid.moment_weight[iv] * sg.dx;
-                local_x_low_input_rel_neg =
-                    std::max(local_x_low_input_rel_neg, (-f0) / f_scale);
-                const double x_cell =
-                    static_cast<double>(sg.ix_start + ix) * sg.dx;
-                const bool in_core =
-                    (x_cell >= CORE_DIAG_BOUNDARY_WIDTH) &&
-                    (x_cell <= Param::Lx - CORE_DIAG_BOUNDARY_WIDTH);
-                if (in_core) {
-                    local_x_low_input_core_failed += 1.0;
-                }
-                if (f_low < 0.0) {
-                    local_x_low_output_rel_neg =
-                        std::max(local_x_low_output_rel_neg,
-                                 (-f_low) / f_scale);
-                }
-                fluxes.cell_alpha_x[slot] = 0.0;
-                local_x_any_limited = 1;
-                continue;
-            }
-            if (f_low < f_floor) {
-                // Low-order update itself is negative beyond the shell-scaled
-                // tolerance.  The global classification below distinguishes
-                // true CFL from donor/periodic-face errors.
-                local_x_low_order_failed += 1.0;
-                local_x_low_output_rel_neg =
-                    std::max(local_x_low_output_rel_neg, (-f_low) / f_scale);
-                fluxes.cell_alpha_x[slot] = 0.0;
-                local_x_any_limited = 1;
-                continue;
-            }
-            // Fast path: high-order update is safe (common case, ~75-85%
-            // of cells even with active limiter).  Branch hint for GCC/Clang.
-            if (__builtin_expect(f_high >= f_floor, 1)) continue;
-            // 7.1.6: track negative mass prevented by the limiter
-            // f_high < f_floor means the high-order flux would create
-            // negative mass. The negative mass prevented is (-f_high) * weight.
-            if (f_high < 0.0) {
-                const int iv2 = k_int / Param::Nmu;
-                local_x_neg_mass_prevented +=
-                    (-f_high) * bkg_n.vgrid.moment_weight[iv2] * sg.dx;
-            }
+            if (f_high >= 0.0) continue;
             const double antidiff_out = div_high - div_low;
-            if (antidiff_out <= 0.0) {
-                fluxes.cell_alpha_x[slot] = 0.0;
+            if (antidiff_out <= 0.0 || f_low <= 0.0) {
+                fluxes.x_cell_alpha[slot] = 0.0;
             } else {
-                fluxes.cell_alpha_x[slot] =
+                const double local_scale = std::max(1.0, std::fabs(f0));
+                const double eps_tol = eps_tol_base * local_scale;
+                fluxes.x_cell_alpha[slot] =
                     std::max(0.0, std::min(1.0,
-                             (f_low - f_floor) / antidiff_out));
+                             (f_low + eps_tol) / antidiff_out));
             }
             local_x_any_limited = 1;
         }
@@ -1226,15 +881,15 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         if (mpi_size <= 1) {
             const size_t last_base =
                 static_cast<size_t>(nxl - 1) * Param::Nvmu;
-            std::copy(fluxes.cell_alpha_x.begin() + last_base,
-                      fluxes.cell_alpha_x.begin() + last_base + Param::Nvmu,
+            std::copy(fluxes.x_cell_alpha.begin() + last_base,
+                      fluxes.x_cell_alpha.begin() + last_base + Param::Nvmu,
                       x_alpha_left_ghost.begin());
         } else {
             std::vector<double> x_alpha_send_right(Param::Nvmu, 1.0);
             const size_t last_base =
                 static_cast<size_t>(nxl - 1) * Param::Nvmu;
-            std::copy(fluxes.cell_alpha_x.begin() + last_base,
-                      fluxes.cell_alpha_x.begin() + last_base + Param::Nvmu,
+            std::copy(fluxes.x_cell_alpha.begin() + last_base,
+                      fluxes.x_cell_alpha.begin() + last_base + Param::Nvmu,
                       x_alpha_send_right.begin());
             const int left_rank = (mpi_rank + mpi_size - 1) % mpi_size;
             const int right_rank = (mpi_rank + 1) % mpi_size;
@@ -1266,24 +921,22 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                 const double* alpha_left =
                     (iface == 0)
                     ? x_alpha_left_ghost.data()
-                    : &fluxes.cell_alpha_x[
+                    : &fluxes.x_cell_alpha[
                         static_cast<size_t>(iface - 1) * Param::Nvmu];
                 const double* alpha_right =
                     (iface == nxl)
-                    ? fluxes.cell_alpha_x.data()
-                    : &fluxes.cell_alpha_x[
+                    ? fluxes.x_cell_alpha.data()
+                    : &fluxes.x_cell_alpha[
                         static_cast<size_t>(iface) * Param::Nvmu];
                 alpha_face =
                     std::min(alpha_left[k], alpha_right[k]);
-                // 7.1.2: safety factor to prevent limiter overshoot
-                alpha_face = std::max(0.0, std::min(1.0,
-                    alpha_face * X_FCT_SAFETY));
+                alpha_face = std::max(0.0, std::min(1.0, alpha_face));
             }
             const size_t face_slot =
                 static_cast<size_t>(iface) * Param::Nvmu + k;
             fluxes.x_final[face_slot] =
-                fluxes.x_low[face_slot] +
-                alpha_face * (fluxes.x_high[face_slot] - fluxes.x_low[face_slot]);
+                x_low[face_slot] +
+                alpha_face * (fluxes.x_high[face_slot] - x_low[face_slot]);
 
             const double x_face =
                 static_cast<double>(sg.ix_start + iface) * sg.dx;
@@ -1410,18 +1063,6 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         }
     }
 
-    // 7.1.1: save pre-limiter (high-order) u and mu fluxes
-    {
-        const size_t u_size = static_cast<size_t>(nxl + 1) *
-                              (Param::Nv + 1) * Param::Nmu;
-        const size_t mu_size = static_cast<size_t>(nxl + 1) *
-                               Param::Nv * (Param::Nmu + 1);
-        std::copy(u_force_face.begin(), u_force_face.begin() + u_size,
-                  fluxes.u_high.begin());
-        std::copy(mu_force_face.begin(), mu_force_face.begin() + mu_size,
-                  fluxes.mu_high.begin());
-    }
-
     /*
      * Positivity-constrained u-force flux limiter.
      *
@@ -1432,8 +1073,7 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
      * from its two adjacent cells.
      */
     bkg_new = bkg_n;
-    const int low_u_limit_count =
-        std::min(LOW_U_MU_LIMIT_COUNT, Param::Nv);
+    const int low_u_limit_count = Param::Nv;
     // Precompute dt*inv_shell/2 and other per-iv constants once
     double half_dt_inv_shell[Param::Nv];
     double ke_per_mass_arr[Param::Nv];
@@ -1485,7 +1125,7 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                   MPI_COMM_WORLD);
 
     // ---- Pass 1: compute per-cell alpha and detect if limiting is needed ----
-    std::vector<double>& alpha_cell = fluxes.cell_alpha_u;
+    std::vector<double>& alpha_cell = fluxes.cell_alpha;
     std::fill(alpha_cell.begin(), alpha_cell.end(), 1.0);
     int local_any_limited = 0;
     long long local_ec_negative_cells = 0;
@@ -1526,8 +1166,7 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                 du_div_ec += contrib[c];
             }
             const double f_ec = f0 - dx_div - dmu_div - du_div_ec;
-            // Fast path: energy-conserving update is non-negative (common case)
-            if (__builtin_expect(!std::isfinite(f_ec) || f_ec >= 0.0, 1)) continue;
+            if (!std::isfinite(f_ec) || f_ec >= 0.0) continue;
             ++local_ec_negative_cells;
             if (du_div_out <= 0.0) continue;
 
@@ -1629,16 +1268,6 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                                mpi_rank, mpi_size, 506);
     } // need_face_limiting
 
-    // 7.1.1: save post-limiter (final) u-flux; u_low not yet implemented
-    {
-        const size_t u_size = static_cast<size_t>(nxl + 1) *
-                              (Param::Nv + 1) * Param::Nmu;
-        std::copy(u_force_face.begin(), u_force_face.begin() + u_size,
-                  fluxes.u_final.begin());
-        std::copy(fluxes.u_final.begin(), fluxes.u_final.begin() + u_size,
-                  fluxes.u_low.begin());
-    }
-
     std::vector<double> mu_force_low_u_ec(
         static_cast<size_t>(nxl + 1) * low_u_limit_count *
         static_cast<size_t>(Param::Nmu + 1), 0.0);
@@ -1731,7 +1360,7 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                             (face == 1 || face == Param::Nmu - 1)) {
                             alpha_face =
                                 std::min(alpha_face,
-                                         LOW_U_MU_ENDPOINT_ALPHA_CAP);
+                                         1.0);
                         }
                         if (adaptive_region || alpha_face < 1.0 - 1.0e-12) {
                             alpha_face = smooth_low_u_mu_alpha(alpha_face);
@@ -1777,15 +1406,6 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             mu_force_face[mu_xface_index(iface, iv, 0)] = 0.0;
             mu_force_face[mu_xface_index(iface, iv, Param::Nmu)] = 0.0;
         }
-    }
-    // 7.1.1: save post-limiter (final) mu-flux; mu_low not yet implemented
-    {
-        const size_t mu_size = static_cast<size_t>(nxl + 1) *
-                               Param::Nv * (Param::Nmu + 1);
-        std::copy(mu_force_face.begin(), mu_force_face.begin() + mu_size,
-                  fluxes.mu_final.begin());
-        std::copy(fluxes.mu_final.begin(), fluxes.mu_final.begin() + mu_size,
-                  fluxes.mu_low.begin());
     }
     {
         long long local_mu_counts[6] = {
@@ -1865,6 +1485,9 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     double local_mu_low_u_energy_delta_core = 0.0;
     long long local_remap_cell_count = 0;
     long long local_remap_cell_total = 0;
+    double local_remap_mass_delta = 0.0;
+    double local_remap_momentum_delta = 0.0;
+    double local_remap_energy_delta = 0.0;
     double local_limiter_energy_boundary_01 = 0.0;
     double local_limiter_energy_core_01 = 0.0;
     double local_abs_limiter_energy_boundary_01 = 0.0;
@@ -1987,8 +1610,10 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             const double u_div_right =
                 u_force_face[u_xface_index(ix + 1, iv + 1, imu)]
               - u_force_face[u_xface_index(ix + 1, iv, imu)];
-            const double du_div = hdt_is * (u_div_left + u_div_right);
-            double du_div_ec = du_div;
+            const double du_div_flux = hdt_is * (u_div_left + u_div_right);
+            (void)du_div_flux;
+            const double du_div = 0.0;
+            double du_div_ec = 0.0;
             if (need_face_limiting) {
                 const double u_div_left_ec =
                     u_force_ec[u_xface_index(ix, iv + 1, imu)]
@@ -1996,7 +1621,9 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                 const double u_div_right_ec =
                     u_force_ec[u_xface_index(ix + 1, iv + 1, imu)]
                   - u_force_ec[u_xface_index(ix + 1, iv, imu)];
-                du_div_ec = hdt_is * (u_div_left_ec + u_div_right_ec);
+                (void)u_div_left_ec;
+                (void)u_div_right_ec;
+                du_div_ec = 0.0;
             }
             const double mu_div_left =
                 mu_force_face[mu_xface_index(ix, iv, imu + 1)]
@@ -2004,8 +1631,10 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             const double mu_div_right =
                 mu_force_face[mu_xface_index(ix + 1, iv, imu + 1)]
               - mu_force_face[mu_xface_index(ix + 1, iv, imu)];
-            const double dmu_div = hdt_is * (mu_div_left + mu_div_right);
-            double dmu_div_ec = dmu_div;
+            const double dmu_div_flux = hdt_is * (mu_div_left + mu_div_right);
+            (void)dmu_div_flux;
+            const double dmu_div = 0.0;
+            double dmu_div_ec = 0.0;
             if (iv < low_u_limit_count) {
                 const size_t low_mu_left_base =
                     (static_cast<size_t>(ix) * low_u_limit_count
@@ -2025,7 +1654,9 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                                       + static_cast<size_t>(imu + 1)]
                   - mu_force_low_u_ec[low_mu_right_base
                                       + static_cast<size_t>(imu)];
-                dmu_div_ec = hdt_is * (mu_div_left_ec + mu_div_right_ec);
+                (void)mu_div_left_ec;
+                (void)mu_div_right_ec;
+                dmu_div_ec = 0.0;
             }
             const double updated = bkg_n.f[dst] - dx_div - du_div - dmu_div;
             const double f0 = bkg_n.f[dst];
@@ -2106,7 +1737,7 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                 }
             }
             const bool limiter_cell_active =
-                fluxes.cell_alpha_u[static_cast<size_t>(ix) * Param::Nvmu + k]
+                fluxes.cell_alpha[static_cast<size_t>(ix) * Param::Nvmu + k]
                 < 0.999999;
             if (in_boundary_01) {
                 ++local_limiter_total_boundary_01;
@@ -2255,127 +1886,209 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     }
 
     #pragma omp parallel for collapse(2) schedule(static) \
-        reduction(+:local_mu_low_u_energy_delta, \
-                    local_mu_low_u_energy_delta_boundary, \
-                    local_mu_low_u_energy_delta_core, \
-                    local_neg_mass_defect,local_neg_energy_defect, \
-                    local_f_neg_mass,local_f_neg_count) \
-        reduction(min:local_f_neg_min) \
-        reduction(max:local_f_neg_ratio_max)
+        reduction(+:local_limiter_mass_delta, \
+                    local_limiter_momentum_delta, \
+                    local_limiter_energy_delta, \
+                    local_remap_cell_count,local_remap_cell_total, \
+                    local_remap_mass_delta,local_remap_momentum_delta, \
+                    local_remap_energy_delta)
     for (int ix = 0; ix < nxl; ++ix) {
-        for (int iv = 0; iv < low_u_limit_count; ++iv) {
+        for (int imu = 0; imu < Param::Nmu; ++imu) {
             ++local_remap_cell_total;
-            double endpoint_total_f = 0.0;
-            double endpoint_positive_f = 0.0;
-            bool has_endpoint_strong_negative = false;
+            double line_in[Param::Nv];
+            double line_out[Param::Nv];
             bool has_nonfinite = false;
-            for (int imu = 0; imu < Param::Nmu; ++imu) {
-                if (!near_mu_endpoint(imu)) continue;
+            for (int iv = 0; iv < Param::Nv; ++iv) {
                 const size_t dst =
                     static_cast<size_t>(ng + ix) * Param::Nvmu
                   + static_cast<size_t>(iv) * Param::Nmu
                   + static_cast<size_t>(imu);
-                const double fv = bkg_new.f[dst];
-                if (!std::isfinite(fv)) {
-                    has_nonfinite = true;
-                    continue;
-                }
-                endpoint_total_f += fv;
-                if (fv > 0.0) endpoint_positive_f += fv;
-                if (fv < 0.0) {
-                    const double local_scale =
-                        std::max(1.0, std::fabs(fv));
-                    const double neg_ratio = -fv / local_scale;
-                    if (neg_ratio >= LOW_U_REMAP_NEG_RATIO_THRESHOLD) {
-                        has_endpoint_strong_negative = true;
-                    }
-                }
+                line_in[iv] = bkg_new.f[dst];
+                line_out[iv] = line_in[iv];
+                if (!std::isfinite(line_in[iv])) has_nonfinite = true;
+            }
+            if (has_nonfinite) {
+                #pragma omp atomic write
+                local_bad_update_centered = 1;
+                continue;
             }
 
-            const double cell_weight = bkg_n.vgrid.moment_weight[iv];
-            const double ke_per_mass = ke_per_mass_arr[iv];
+            const double ex_left =
+                (static_cast<size_t>(ix) < fields_mid.Ex_face.size())
+                ? fields_mid.Ex_face[static_cast<size_t>(ix)] : 0.0;
+            const double ex_right =
+                (static_cast<size_t>(ix + 1) < fields_mid.Ex_face.size())
+                ? fields_mid.Ex_face[static_cast<size_t>(ix + 1)] : ex_left;
+            const double ex_cell = 0.5 * (ex_left + ex_right);
+            const double accel_u =
+                bkg_n.charge * ex_cell / (bkg_n.mass * Const::c);
+            const double u_shift = dt * accel_u * bkg_n.vgrid.mu_cells[imu];
+            double remap_mass_delta = 0.0;
+            double remap_momentum_delta = 0.0;
+            double remap_energy_delta = 0.0;
+            const bool remapped =
+                conservative_u_remap_line(
+                    line_in, line_out, bkg_n.vgrid, u_shift,
+                    remap_mass_delta, remap_momentum_delta,
+                    remap_energy_delta, bkg_n.vgrid.mu_cells[imu],
+                    bkg_n.mass * Const::c, sg.dx, ke_per_mass_arr);
+            if (!remapped) {
+                #pragma omp atomic write
+                local_bad_update_centered = 1;
+                continue;
+            }
+            ++local_remap_cell_count;
+            for (int iv = 0; iv < Param::Nv; ++iv) {
+                const size_t dst =
+                    static_cast<size_t>(ng + ix) * Param::Nvmu
+                  + static_cast<size_t>(iv) * Param::Nmu
+                  + static_cast<size_t>(imu);
+                bkg_new.f[dst] = line_out[iv];
+            }
+            local_limiter_mass_delta += remap_mass_delta;
+            local_limiter_momentum_delta += remap_momentum_delta;
+            local_limiter_energy_delta += remap_energy_delta;
+            local_remap_mass_delta += remap_mass_delta;
+            local_remap_momentum_delta += remap_momentum_delta;
+            local_remap_energy_delta += remap_energy_delta;
+        }
+    }
+
+    #pragma omp parallel for collapse(2) schedule(static) \
+        reduction(+:local_limiter_mass_delta, \
+                    local_limiter_momentum_delta, \
+                    local_limiter_energy_delta, \
+                    local_mu_low_u_energy_delta, \
+                    local_mu_low_u_energy_delta_boundary, \
+                    local_mu_low_u_energy_delta_core, \
+                    local_remap_cell_count,local_remap_cell_total, \
+                    local_remap_mass_delta,local_remap_momentum_delta, \
+                    local_remap_energy_delta)
+    for (int ix = 0; ix < nxl; ++ix) {
+        for (int iv = 0; iv < Param::Nv; ++iv) {
+            ++local_remap_cell_total;
+            double line_in[Param::Nmu];
+            double line_out[Param::Nmu];
+            bool has_nonfinite = false;
+            for (int imu = 0; imu < Param::Nmu; ++imu) {
+                const size_t dst =
+                    static_cast<size_t>(ng + ix) * Param::Nvmu
+                  + static_cast<size_t>(iv) * Param::Nmu
+                  + static_cast<size_t>(imu);
+                line_in[imu] = bkg_new.f[dst];
+                line_out[imu] = line_in[imu];
+                if (!std::isfinite(line_in[imu])) has_nonfinite = true;
+            }
+            if (has_nonfinite) {
+                #pragma omp atomic write
+                local_bad_update_centered = 1;
+                continue;
+            }
+
             const double x_cell =
                 (static_cast<double>(sg.ix_start + ix) + 0.5) * sg.dx;
             const bool in_boundary_02 =
                 (x_cell < 0.2 * Const::micro) ||
                 (x_cell > Param::Lx - 0.2 * Const::micro);
-            const double energy_before =
-                endpoint_total_f * cell_weight * sg.dx * ke_per_mass;
-
-            if (has_endpoint_strong_negative && !has_nonfinite &&
-                endpoint_total_f >= 0.0 && endpoint_positive_f > 0.0) {
-                ++local_remap_cell_count;
-                const double scale = endpoint_total_f / endpoint_positive_f;
-                for (int imu = 0; imu < Param::Nmu; ++imu) {
-                    if (!near_mu_endpoint(imu)) continue;
-                    const size_t dst =
-                        static_cast<size_t>(ng + ix) * Param::Nvmu
-                      + static_cast<size_t>(iv) * Param::Nmu
-                      + static_cast<size_t>(imu);
-                    bkg_new.f[dst] =
-                        std::max(0.0, bkg_new.f[dst]) * scale;
-                }
-                double total_after = 0.0;
-                for (int imu = 0; imu < Param::Nmu; ++imu) {
-                    if (!near_mu_endpoint(imu)) continue;
-                    const size_t dst =
-                        static_cast<size_t>(ng + ix) * Param::Nvmu
-                      + static_cast<size_t>(iv) * Param::Nmu
-                      + static_cast<size_t>(imu);
-                    total_after += bkg_new.f[dst];
-                }
-                const double energy_after =
-                    total_after * cell_weight * sg.dx * ke_per_mass;
-                const double remap_energy_delta =
-                    energy_after - energy_before;
-                local_mu_low_u_energy_delta += remap_energy_delta;
-                if (in_boundary_02) {
-                    local_mu_low_u_energy_delta_boundary +=
-                        remap_energy_delta;
-                } else {
-                    local_mu_low_u_energy_delta_core +=
-                        remap_energy_delta;
-                }
+            const double ex_left =
+                (static_cast<size_t>(ix) < fields_mid.Ex_face.size())
+                ? fields_mid.Ex_face[static_cast<size_t>(ix)] : 0.0;
+            const double ex_right =
+                (static_cast<size_t>(ix + 1) < fields_mid.Ex_face.size())
+                ? fields_mid.Ex_face[static_cast<size_t>(ix + 1)] : ex_left;
+            const double ex_cell = 0.5 * (ex_left + ex_right);
+            const double accel_u =
+                bkg_n.charge * ex_cell / (bkg_n.mass * Const::c);
+            const double a_dt = dt * accel_u / mu_u_eff[iv];
+            const double cell_weight_dx =
+                bkg_n.vgrid.moment_weight[iv] * sg.dx;
+            const double px_base =
+                bkg_n.mass * Const::c * bkg_n.vgrid.v_cells[iv];
+            double remap_mass_delta = 0.0;
+            double remap_momentum_delta = 0.0;
+            double remap_energy_delta = 0.0;
+            const bool remapped =
+                conservative_mu_remap_line(
+                    line_in, line_out, bkg_n.vgrid, a_dt,
+                    remap_mass_delta, remap_momentum_delta,
+                    remap_energy_delta, px_base, cell_weight_dx,
+                    ke_per_mass_arr[iv]);
+            if (!remapped) {
+                #pragma omp atomic write
+                local_bad_update_centered = 1;
+                continue;
             }
-
+            ++local_remap_cell_count;
             for (int imu = 0; imu < Param::Nmu; ++imu) {
                 const size_t dst =
                     static_cast<size_t>(ng + ix) * Param::Nvmu
                   + static_cast<size_t>(iv) * Param::Nmu
                   + static_cast<size_t>(imu);
-                const double fv = bkg_new.f[dst];
-                if (!std::isfinite(fv)) {
-                    #pragma omp atomic write
-                    local_bad_update_centered = 1;
-                    continue;
-                }
-                if (fv >= 0.0) continue;
+                bkg_new.f[dst] = line_out[imu];
+            }
+            local_limiter_mass_delta += remap_mass_delta;
+            local_limiter_momentum_delta += remap_momentum_delta;
+            local_limiter_energy_delta += remap_energy_delta;
+            local_remap_mass_delta += remap_mass_delta;
+            local_remap_momentum_delta += remap_momentum_delta;
+            local_remap_energy_delta += remap_energy_delta;
+            local_mu_low_u_energy_delta += remap_energy_delta;
+            if (in_boundary_02) {
+                local_mu_low_u_energy_delta_boundary += remap_energy_delta;
+            } else {
+                local_mu_low_u_energy_delta_core += remap_energy_delta;
+            }
+        }
+    }
 
-                const double local_scale = std::max(1.0, std::fabs(fv));
-                const double neg_ratio = -fv / local_scale;
-                if (neg_ratio >= NEG_TOL_SOFT) {
-                    const double mass_defect =
-                        (-fv) * cell_weight * sg.dx;
-                    local_neg_mass_defect += mass_defect;
-                    local_neg_energy_defect += mass_defect * ke_per_mass;
-                }
-                local_f_neg_min = std::min(local_f_neg_min, fv);
-                local_f_neg_ratio_max =
-                    std::max(local_f_neg_ratio_max, neg_ratio);
-                local_f_neg_mass += (-fv) * cell_weight * sg.dx;
-                ++local_f_neg_count;
+    #pragma omp parallel for collapse(2) schedule(static) \
+        reduction(+:local_neg_mass_defect,local_neg_energy_defect, \
+                    local_f_neg_mass,local_f_neg_count) \
+        reduction(min:local_f_neg_min) \
+        reduction(max:local_f_neg_ratio_max)
+    for (int ix = 0; ix < nxl; ++ix) {
+        for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu); ++k_int) {
+            const int iv = k_int / Param::Nmu;
+            const int imu = k_int - iv * Param::Nmu;
+            const size_t dst =
+                static_cast<size_t>(ng + ix) * Param::Nvmu
+              + static_cast<size_t>(k_int);
+            const double fv = bkg_new.f[dst];
+            const double cell_weight = bkg_n.vgrid.moment_weight[iv];
+            const double ke_per_mass = ke_per_mass_arr[iv];
+            if (!std::isfinite(fv)) {
+                #pragma omp atomic write
+                local_bad_update_centered = 1;
+                continue;
+            }
+            if (fv >= 0.0) continue;
 
-                const int tid = omp_get_thread_num();
-                NegCellInfo& wn =
-                    thread_worst_neg[static_cast<size_t>(tid)];
-                if (!wn.valid || neg_ratio > wn.neg_ratio) {
-                    wn.neg_ratio = neg_ratio;
-                    wn.f_val = fv;
-                    wn.ix = sg.ix_start + ix;
-                    wn.iv = iv;
-                    wn.imu = imu;
-                    wn.valid = 1;
-                }
+            const double local_scale = std::max(1.0, std::fabs(fv));
+            const double neg_ratio = -fv / local_scale;
+            if (neg_ratio >= NEG_TOL_SOFT) {
+                const double mass_defect = (-fv) * cell_weight * sg.dx;
+                local_neg_mass_defect += mass_defect;
+                local_neg_energy_defect += mass_defect * ke_per_mass;
+            }
+            if (neg_ratio >= NEG_TOL_HARD) {
+                #pragma omp atomic write
+                local_bad_negative_hard = 1;
+            }
+            local_f_neg_min = std::min(local_f_neg_min, fv);
+            local_f_neg_ratio_max =
+                std::max(local_f_neg_ratio_max, neg_ratio);
+            local_f_neg_mass += (-fv) * cell_weight * sg.dx;
+            ++local_f_neg_count;
+
+            const int tid = omp_get_thread_num();
+            NegCellInfo& wn = thread_worst_neg[static_cast<size_t>(tid)];
+            if (!wn.valid || neg_ratio > wn.neg_ratio) {
+                wn.neg_ratio = neg_ratio;
+                wn.f_val = fv;
+                wn.ix = sg.ix_start + ix;
+                wn.iv = iv;
+                wn.imu = imu;
+                wn.valid = 1;
             }
         }
     }
@@ -2496,47 +2209,6 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         }
     }
 
-    // 7.1.6: populate u-direction and mu-direction flux diagnostics
-    // after stage_min_f is finalized via MPI reductions above.
-    {
-        // --- u-direction (index 1) ---
-        FluxPositivityDiag& fu = fluxes.flux_pos[1];
-        fu.min_f_before = fluxes.stage_min_f[0];  // after x, before u
-        fu.min_f_low    = fluxes.stage_min_f[0];  // no u_low yet → use final
-        fu.min_f_final  = fluxes.stage_min_f[1];  // after x + u
-        fu.low_order_failed_count  = 0.0;  // not yet tracked for u
-        fu.alpha_active_fraction   = fluxes.u_force_alpha_active_frac;
-        fu.alpha_min               = fluxes.u_force_alpha_min;
-        fu.alpha_core_fraction     = 0.0;
-        fu.alpha_boundary_fraction = 0.0;
-        fu.negative_mass_prevented = 0.0;
-        FluxDefectDiag& du = fluxes.flux_defect[1];
-        du.mass_defect       = fluxes.limiter_mass_defect;
-        du.momentum_defect   = fluxes.limiter_momentum_defect;
-        du.energy_defect     = fluxes.limiter_energy_defect;
-        du.boundary_mass_loss   = 0.0;
-        du.boundary_energy_loss = 0.0;
-
-        // --- mu-direction (index 2) ---
-        FluxPositivityDiag& fm = fluxes.flux_pos[2];
-        fm.min_f_before = fluxes.stage_min_f[1];  // after x+u, before mu
-        fm.min_f_low    = fluxes.stage_min_f[1];  // no mu_low yet → use final
-        fm.min_f_final  = fluxes.stage_min_f[2];  // final
-        fm.low_order_failed_count  = 0.0;  // not yet tracked for mu
-        fm.alpha_active_fraction   = fluxes.mu_low_u_limiter_active_fraction;
-        fm.alpha_min               = fluxes.mu_low_u_alpha_min;
-        fm.alpha_core_fraction = fluxes.mu_low_u_limiter_active_fraction_core;
-        fm.alpha_boundary_fraction =
-            fluxes.mu_low_u_limiter_active_fraction_boundary;
-        fm.negative_mass_prevented = 0.0;
-        FluxDefectDiag& dm = fluxes.flux_defect[2];
-        dm.mass_defect       = 0.0;
-        dm.momentum_defect   = 0.0;
-        dm.energy_defect     = fluxes.mu_low_u_energy_delta;
-        dm.boundary_mass_loss   = 0.0;
-        dm.boundary_energy_loss = 0.0;
-    }
-
     // Reduce per-thread worst-negative
     NegCellInfo local_worst_neg = {0.0, 0.0, -1, -1, -1, 0};
     for (const NegCellInfo& wn : thread_worst_neg) {
@@ -2599,10 +2271,10 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         fluxes.finite_flux_iv = failure_indices[2];
         fluxes.finite_flux_imu = failure_indices[3];
     }
-    if (local_bad_update_centered != 0) finite = false;
-    // Negative-f protection remains disabled for long-run diagnostics.
-    // if (local_bad_negative_hard != 0) finite = false;
-    (void)local_bad_negative_hard;
+    if (local_bad_update_centered != 0 ||
+        local_bad_negative_hard != 0) {
+        finite = false;
+    }
     exchange_ghosts_x_persistent(bkg_new, sg, mpi_rank, mpi_size);
     update_flux_current(bkg_n, sg, fluxes, bkg_new);
 
@@ -2632,6 +2304,17 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         fluxes.limiter_mass_defect = global_limiter[0];
         fluxes.limiter_momentum_defect = global_limiter[1];
         fluxes.limiter_energy_defect = global_limiter[2];
+        double local_remap[3] = {
+            local_remap_mass_delta,
+            local_remap_momentum_delta,
+            local_remap_energy_delta
+        };
+        double global_remap[3] = {0.0, 0.0, 0.0};
+        MPI_Allreduce(local_remap, global_remap, 3, MPI_DOUBLE, MPI_SUM,
+                      MPI_COMM_WORLD);
+        fluxes.remap_mass_delta = global_remap[0];
+        fluxes.remap_momentum_delta = global_remap[1];
+        fluxes.remap_energy_delta = global_remap[2];
         double local_x_limiter[2] = {
             local_x_limiter_mass_delta,
             local_x_limiter_energy_delta
@@ -2641,131 +2324,6 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                       MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
         fluxes.x_limiter_mass_defect = global_x_limiter[0];
         fluxes.x_limiter_energy_defect = global_x_limiter[1];
-        // 7.1.6: populate x-direction flux-positivity diagnostics
-        {
-            double local_x_low_counts[2] = {
-                local_x_low_input_failed,
-                local_x_low_order_failed
-            };
-            double global_x_low_counts[2] = {0.0, 0.0};
-            MPI_Allreduce(local_x_low_counts, global_x_low_counts, 2,
-                          MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-            double local_x_low_debt[4] = {
-                local_x_low_input_neg_mass,
-                local_x_low_input_rel_neg,
-                local_x_low_output_rel_neg,
-                local_x_low_input_core_failed
-            };
-            double global_x_low_debt[4] = {0.0, 0.0, 0.0, 0.0};
-            MPI_Allreduce(&local_x_low_debt[0], &global_x_low_debt[0], 1,
-                          MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-            MPI_Allreduce(&local_x_low_debt[1], &global_x_low_debt[1], 2,
-                          MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-            MPI_Allreduce(&local_x_low_debt[3], &global_x_low_debt[3], 1,
-                          MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-            double global_x_low_max_cfl = local_x_low_max_cfl;
-            MPI_Allreduce(MPI_IN_PLACE, &global_x_low_max_cfl, 1,
-                          MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-            double local_x_pos[3] = {
-                local_x_min_f_before,
-                local_x_min_f_low,
-                local_x_neg_mass_prevented
-            };
-            double global_x_pos[3] = {
-                std::numeric_limits<double>::infinity(),
-                std::numeric_limits<double>::infinity(),
-                0.0
-            };
-            MPI_Allreduce(local_x_pos, global_x_pos, 2, MPI_DOUBLE,
-                          MPI_MIN, MPI_COMM_WORLD);
-            MPI_Allreduce(&local_x_pos[2], &global_x_pos[2], 1,
-                          MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-            /*
-             * Classify x-low failures:
-             * A: input state violates the shell-scaled tolerance.  Tiny,
-             *    localized, non-core residual negatives are recorded as
-             *    X_LOW_INPUT_DEBT and allowed to continue; larger debt stays
-             *    a hard X_LOW_INPUT_BAD.
-             * B: input is acceptable and CFL is monotone, so donor/periodic
-             *    face construction is inconsistent.
-             * C: input is acceptable and max CFL exceeds one; only this case
-             *    should be retried with a smaller true x substep.
-             */
-            const double global_x_low_input_bad = global_x_low_counts[0];
-            const double global_x_low_output_bad = global_x_low_counts[1];
-            const double global_x_low_hard_count =
-                global_x_low_input_bad + global_x_low_output_bad;
-            fluxes.x_low_order_failed_count = global_x_low_hard_count;
-            fluxes.x_low_failed_count = global_x_low_hard_count;
-            fluxes.x_low_input_neg_mass = global_x_low_debt[0];
-            fluxes.x_low_input_rel_neg = global_x_low_debt[1];
-            fluxes.x_low_output_rel_neg = global_x_low_debt[2];
-            fluxes.x_low_input_core_failed_count = global_x_low_debt[3];
-            fluxes.x_low_input_debt_accepted = 0.0;
-            if (global_x_low_input_bad > 0.0) {
-                const double total_cells =
-                    static_cast<double>(std::max(1, sg.nx_global))
-                  * static_cast<double>(Param::Nvmu);
-                const double soft_cell_limit =
-                    std::max(16.0,
-                             X_LOW_INPUT_DEBT_CELL_FRAC * total_cells);
-                const double total_bkg_column =
-                    std::max(1.0, Param::dens * Param::Lx);
-                const double neg_mass_fraction =
-                    global_x_low_debt[0] / total_bkg_column;
-                const bool small_count =
-                    global_x_low_input_bad <= soft_cell_limit;
-                const bool small_relative =
-                    global_x_low_debt[1] <= X_LOW_INPUT_DEBT_REL_TOL;
-                const bool small_neg_mass =
-                    neg_mass_fraction <= X_LOW_INPUT_DEBT_NEG_MASS_FRAC;
-                const bool not_core =
-                    global_x_low_debt[3] <= 0.0;
-                const bool low_output_roundoff =
-                    global_x_low_output_bad <= 0.0 &&
-                    global_x_low_debt[2] <= X_LOW_INPUT_DEBT_OUTPUT_REL_TOL;
-                if (small_count && small_relative && small_neg_mass &&
-                    not_core && low_output_roundoff) {
-                    fluxes.x_low_failure_kind = X_LOW_INPUT_DEBT;
-                    fluxes.x_low_input_debt_accepted = 1.0;
-                } else {
-                    fluxes.x_low_failure_kind = X_LOW_INPUT_BAD;
-                    finite = false;
-                }
-            } else if (global_x_low_output_bad > 0.0) {
-                if (global_x_low_max_cfl <= 1.0 + X_LOW_CFL_TOL) {
-                    fluxes.x_low_failure_kind = X_LOW_DONOR_BUG;
-                } else {
-                    fluxes.x_low_failure_kind = X_LOW_TRUE_CFL;
-                }
-                finite = false;
-            } else {
-                fluxes.x_low_failure_kind = X_LOW_OK;
-            }
-            /*
-             * Keep the existing per-direction diagnostic fields populated
-             * from the same classified quantities.
-             */
-            fluxes.x_low_input_min_f = global_x_pos[0];
-            fluxes.x_low_max_cfl = global_x_low_max_cfl;
-            fluxes.x_low_output_min_f = global_x_pos[1];
-            FluxPositivityDiag& fx = fluxes.flux_pos[0];
-            fx.min_f_before = global_x_pos[0];
-            fx.min_f_low    = global_x_pos[1];
-            // min_f_final from stage diagnostics (populated in Pass 3)
-            fx.low_order_failed_count  = fluxes.x_low_order_failed_count;
-            fx.alpha_active_fraction   = fluxes.limiter_active_fraction;
-            fx.alpha_min               = fluxes.limiter_min_alpha;
-            fx.alpha_core_fraction     = fluxes.limiter_active_fraction_core;
-            fx.alpha_boundary_fraction = fluxes.limiter_active_fraction_boundary;
-            fx.negative_mass_prevented = global_x_pos[2];
-            FluxDefectDiag& dx = fluxes.flux_defect[0];
-            dx.mass_defect     = fluxes.x_limiter_mass_defect;
-            dx.momentum_defect = 0.0;  // x-direction has no momentum defect
-            dx.energy_defect   = fluxes.x_limiter_energy_defect;
-            dx.boundary_mass_loss = 0.0;
-            dx.boundary_energy_loss = 0.0;
-        }
         double local_mu_low_u_limiter[3] = {
             local_mu_low_u_energy_delta,
             local_mu_low_u_energy_delta_boundary,
@@ -2956,21 +2514,20 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             fluxes.f_neg_imu = worst_indices[2];
         }
     }
-    std::fill(fluxes.cell_alpha_u.begin(), fluxes.cell_alpha_u.end(), 1.0);
+    std::fill(fluxes.cell_alpha.begin(), fluxes.cell_alpha.end(), 1.0);
     return;
 
 }
 
-void VlasovAmpereMidpointSolver::update_flux_current(
+void VlasovAmpereConsistentSolver::update_flux_current(
     const Species& sp,
     const SpatialGrid& sg,
-    FluxPack& fluxes,
+    const FluxPack& fluxes,
     Species& bkg_new) const
 {
     const int nxl = sg.nx_local;
     resize_or_zero(bkg_new.current_face_x, static_cast<size_t>(nxl + 1));
     resize_or_zero(bkg_new.current_x, static_cast<size_t>(nxl));
-    resize_or_zero(fluxes.j_bkg_face, static_cast<size_t>(nxl + 1));
 
     #pragma omp parallel for schedule(static)
     for (int iface = 0; iface <= nxl; ++iface) {
@@ -2987,7 +2544,6 @@ void VlasovAmpereMidpointSolver::update_flux_current(
             }
         }
         bkg_new.current_face_x[static_cast<size_t>(iface)] = j_face;
-        fluxes.j_bkg_face[static_cast<size_t>(iface)] = j_face;
     }
     for (int ix = 0; ix < nxl; ++ix) {
         bkg_new.current_x[static_cast<size_t>(ix)] =
@@ -2996,7 +2552,7 @@ void VlasovAmpereMidpointSolver::update_flux_current(
     }
 }
 
-double VlasovAmpereMidpointSolver::integrate_face_work(
+double VlasovAmpereConsistentSolver::integrate_face_work(
     const std::vector<double>& current_face,
     const EMFields& fields_mid,
     const SpatialGrid& sg,
@@ -3012,7 +2568,7 @@ double VlasovAmpereMidpointSolver::integrate_face_work(
     return work;
 }
 
-void VlasovAmpereMidpointSolver::build_current_diagnostics(
+void VlasovAmpereConsistentSolver::build_current_diagnostics(
     const std::vector<double>& j_bkg_charge,
     const std::vector<double>& j_bkg_energy,
     const std::vector<double>& j_bkg_ampere,
@@ -3053,7 +2609,7 @@ void VlasovAmpereMidpointSolver::build_current_diagnostics(
     diag.residual_if_ampere = local_delta_ke_bkg - dt * diag.e_dot_j_ampere;
 }
 
-bool VlasovAmpereMidpointSolver::check_finite_state(
+bool VlasovAmpereConsistentSolver::check_finite_state(
     const Species& bkg,
     const BeamPIC& beam,
     const EMFields& fields,
@@ -3081,8 +2637,8 @@ bool VlasovAmpereMidpointSolver::check_finite_state(
     return true;
 }
 
-VlasovAmpereMidpointSolver::Result
-VlasovAmpereMidpointSolver::advance_single_step(
+VlasovAmpereConsistentSolver::Result
+VlasovAmpereConsistentSolver::advance_single_step(
     const Species& bkg_n,
     const BeamPIC& beam_n,
     const EMFields& fields_n,
@@ -3129,6 +2685,7 @@ VlasovAmpereMidpointSolver::advance_single_step(
     const double field_tol = 1.0e-6;
     const double current_tol = 1.0e-5;
     const double f_tol = 1.0e-4;
+    const double energy_diag_tol = 3.0e-3;
     const double omega_min = 0.05;
     double omega = 0.5;
     double previous_residual = -1.0;
@@ -3273,6 +2830,31 @@ VlasovAmpereMidpointSolver::advance_single_step(
         double local_end_values[2] = {0.0, 0.0};
         bkg_new.total_particle_number_and_energy(local_end_values[0],
                                                  local_end_values[1]);
+        const double local_dke_bkg_trial =
+            local_end_values[1] - local_ke_start;
+        const double local_field_work_bkg_trial =
+            integrate_face_work(bkg_new.current_face_x, fields_mid, sg, dt);
+        const double local_known_numeric_energy =
+            fluxes.limiter_energy_defect +
+            fluxes.x_limiter_energy_defect +
+            fluxes.positivity_energy_defect;
+        double local_energy_values[4] = {
+            local_dke_bkg_trial + local_field_work_bkg_trial,
+            std::fabs(local_dke_bkg_trial),
+            std::fabs(local_field_work_bkg_trial),
+            local_known_numeric_energy
+        };
+        double global_energy_values[4] = {0.0, 0.0, 0.0, 0.0};
+        MPI_Allreduce(local_energy_values, global_energy_values, 4,
+                      MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        const double global_energy_scale =
+            std::max(1.0,
+                     std::max(global_energy_values[1],
+                              global_energy_values[2]));
+        const double global_adjusted_energy_residual =
+            global_energy_values[0] - global_energy_values[3];
+        const double global_energy_error =
+            std::fabs(global_adjusted_energy_residual) / global_energy_scale;
         double global_mass_delta = local_end_values[0] - local_n_start;
         MPI_Allreduce(MPI_IN_PLACE, &global_mass_delta, 1, MPI_DOUBLE,
                       MPI_SUM, MPI_COMM_WORLD);
@@ -3340,6 +2922,7 @@ VlasovAmpereMidpointSolver::advance_single_step(
         result.continuity_residual_bkg =
             global_errors[10] / global_bkg_mass_tol;
         result.beam_continuity_residual = global_errors[11];
+        result.energy_residual_bkg = global_energy_values[0];
         result.nonlinear_iterations = iter + 1;
         result.limiter_active_fraction = fluxes.limiter_active_fraction;
         result.limiter_min_alpha = fluxes.limiter_min_alpha;
@@ -3380,7 +2963,27 @@ VlasovAmpereMidpointSolver::advance_single_step(
         result.mu_low_u_endpoint_flux_max =
             fluxes.mu_low_u_endpoint_flux_max;
         result.remap_active_fraction = fluxes.remap_active_fraction;
+        result.remap_active_fraction_boundary =
+            fluxes.remap_active_fraction_boundary;
+        result.remap_active_fraction_core =
+            fluxes.remap_active_fraction_core;
+        result.remap_regular_active_fraction =
+            fluxes.remap_regular_active_fraction;
+        result.remap_repair_active_fraction =
+            fluxes.remap_repair_active_fraction;
+        result.remap_mass_delta = fluxes.remap_mass_delta;
+        result.remap_momentum_delta = fluxes.remap_momentum_delta;
+        result.remap_energy_delta = fluxes.remap_energy_delta;
+        result.remap_max_abs_delta_j_moment =
+            fluxes.remap_max_abs_delta_j_moment;
         result.remap_cell_count = fluxes.remap_cell_count;
+        result.remap_repair_cell_count = fluxes.remap_repair_cell_count;
+        for (int ig = 0; ig < REMAP_U_GROUP_COUNT; ++ig) {
+            result.remap_active_fraction_u[ig] =
+                fluxes.remap_active_fraction_u[ig];
+            result.remap_repair_active_fraction_u[ig] =
+                fluxes.remap_repair_active_fraction_u[ig];
+        }
         result.low_u_subcycle_active_fraction =
             fluxes.low_u_subcycle_active_fraction;
         result.low_u_average_subcycles = fluxes.low_u_average_subcycles;
@@ -3419,26 +3022,6 @@ VlasovAmpereMidpointSolver::advance_single_step(
             fluxes.negative_mass_before_repair;
         result.x_mass_added_by_positivity_repair =
             fluxes.mass_added_by_positivity_repair;
-        // 7.1.2: x low-order flux failure count
-        result.x_low_order_failed_count =
-            fluxes.x_low_order_failed_count;
-        result.x_low_input_min_f = fluxes.x_low_input_min_f;
-        result.x_low_max_cfl = fluxes.x_low_max_cfl;
-        result.x_low_output_min_f = fluxes.x_low_output_min_f;
-        result.x_low_failed_count = fluxes.x_low_failed_count;
-        result.x_low_input_neg_mass = fluxes.x_low_input_neg_mass;
-        result.x_low_input_rel_neg = fluxes.x_low_input_rel_neg;
-        result.x_low_output_rel_neg = fluxes.x_low_output_rel_neg;
-        result.x_low_input_core_failed_count =
-            fluxes.x_low_input_core_failed_count;
-        result.x_low_input_debt_accepted =
-            fluxes.x_low_input_debt_accepted;
-        result.x_low_failure_kind = fluxes.x_low_failure_kind;
-        // 7.1.6: copy per-direction flux diagnostics
-        for (int d = 0; d < 3; ++d) {
-            result.flux_pos[d] = fluxes.flux_pos[d];
-            result.flux_defect[d] = fluxes.flux_defect[d];
-        }
         result.positivity_energy_defect =
             fluxes.positivity_energy_defect;
         result.positivity_mass_defect =
@@ -3460,42 +3043,7 @@ VlasovAmpereMidpointSolver::advance_single_step(
                                ex_mid_next, j_total_next);
         if (!finite_state) {
             if (mpi_rank == 0 && global_errors[12] != 0.0) {
-                if (fluxes.x_low_failure_kind != X_LOW_OK) {
-                    const char* kind = "unknown";
-                    const char* action = "not retrying as a CFL failure";
-                    if (fluxes.x_low_failure_kind == X_LOW_INPUT_BAD) {
-                        kind = "input_state_bad";
-                        action = "inspect the previous accepted u/mu/x stage";
-                    } else if (fluxes.x_low_failure_kind == X_LOW_INPUT_DEBT) {
-                        kind = "input_state_debt";
-                        action = "accepted as a small residual negative debt";
-                    } else if (fluxes.x_low_failure_kind == X_LOW_DONOR_BUG) {
-                        kind = "donor_or_periodic_face_bug";
-                        action = "fix x_low donor/periodic face construction";
-                    } else if (fluxes.x_low_failure_kind == X_LOW_TRUE_CFL) {
-                        kind = "true_cfl";
-                        action = "retrying with a smaller true x substep";
-                    }
-                    std::fprintf(
-                        stderr,
-                        "ERROR: x low-order positivity failure classified "
-                        "as %s: failed_cell_count=%.0f input_min_f=%.16e "
-                        "max_cfl=%.16e output_min_f=%.16e "
-                        "input_neg_mass=%.16e input_rel_neg=%.16e "
-                        "output_rel_neg=%.16e input_core_failed_count=%.0f "
-                        "debt_accepted=%.0f; %s.\n",
-                        kind,
-                        fluxes.x_low_failed_count,
-                        fluxes.x_low_input_min_f,
-                        fluxes.x_low_max_cfl,
-                        fluxes.x_low_output_min_f,
-                        fluxes.x_low_input_neg_mass,
-                        fluxes.x_low_input_rel_neg,
-                        fluxes.x_low_output_rel_neg,
-                        fluxes.x_low_input_core_failed_count,
-                        fluxes.x_low_input_debt_accepted,
-                        action);
-                } else if (fluxes.finite_flux_has_failure != 0) {
+                if (fluxes.finite_flux_has_failure != 0) {
                     std::fprintf(
                         stderr,
                         "ERROR: finite_flux failure detail: "
@@ -3533,11 +3081,11 @@ VlasovAmpereMidpointSolver::advance_single_step(
             global_errors[5] < global_j_abs_tol &&
             global_errors[6] < global_j_abs_tol &&
             global_errors[10] < global_bkg_mass_tol &&
-            global_errors[11] < global_beam_cont_tol;
+            global_errors[11] < global_beam_cont_tol &&
+            global_f_error < f_tol &&
+            global_energy_error < energy_diag_tol;
         result.protected_converged = protected_quantities_converged;
         const bool converged = protected_quantities_converged;
-        const bool soft_accepted =
-            protected_quantities_converged && global_f_error >= f_tol;
 
         if (converged) {
             BeamPIC beam_corrected;
@@ -3642,7 +3190,28 @@ VlasovAmpereMidpointSolver::advance_single_step(
             result.mu_low_u_endpoint_flux_max =
                 fluxes.mu_low_u_endpoint_flux_max;
             result.remap_active_fraction = fluxes.remap_active_fraction;
+            result.remap_active_fraction_boundary =
+                fluxes.remap_active_fraction_boundary;
+            result.remap_active_fraction_core =
+                fluxes.remap_active_fraction_core;
+            result.remap_regular_active_fraction =
+                fluxes.remap_regular_active_fraction;
+            result.remap_repair_active_fraction =
+                fluxes.remap_repair_active_fraction;
+            result.remap_mass_delta = fluxes.remap_mass_delta;
+            result.remap_momentum_delta = fluxes.remap_momentum_delta;
+            result.remap_energy_delta = fluxes.remap_energy_delta;
+            result.remap_max_abs_delta_j_moment =
+                fluxes.remap_max_abs_delta_j_moment;
             result.remap_cell_count = fluxes.remap_cell_count;
+            result.remap_repair_cell_count =
+                fluxes.remap_repair_cell_count;
+            for (int ig = 0; ig < REMAP_U_GROUP_COUNT; ++ig) {
+                result.remap_active_fraction_u[ig] =
+                    fluxes.remap_active_fraction_u[ig];
+                result.remap_repair_active_fraction_u[ig] =
+                    fluxes.remap_repair_active_fraction_u[ig];
+            }
             result.low_u_subcycle_active_fraction =
                 fluxes.low_u_subcycle_active_fraction;
             result.low_u_average_subcycles =
@@ -3684,26 +3253,6 @@ VlasovAmpereMidpointSolver::advance_single_step(
                 fluxes.negative_mass_before_repair;
             result.x_mass_added_by_positivity_repair =
                 fluxes.mass_added_by_positivity_repair;
-            // 7.1.2: x low-order flux failure count
-            result.x_low_order_failed_count =
-                fluxes.x_low_order_failed_count;
-            result.x_low_input_min_f = fluxes.x_low_input_min_f;
-            result.x_low_max_cfl = fluxes.x_low_max_cfl;
-            result.x_low_output_min_f = fluxes.x_low_output_min_f;
-            result.x_low_failed_count = fluxes.x_low_failed_count;
-            result.x_low_input_neg_mass = fluxes.x_low_input_neg_mass;
-            result.x_low_input_rel_neg = fluxes.x_low_input_rel_neg;
-            result.x_low_output_rel_neg = fluxes.x_low_output_rel_neg;
-            result.x_low_input_core_failed_count =
-                fluxes.x_low_input_core_failed_count;
-            result.x_low_input_debt_accepted =
-                fluxes.x_low_input_debt_accepted;
-            result.x_low_failure_kind = fluxes.x_low_failure_kind;
-            // 7.1.6: copy per-direction flux diagnostics
-            for (int d = 0; d < 3; ++d) {
-                result.flux_pos[d] = fluxes.flux_pos[d];
-                result.flux_defect[d] = fluxes.flux_defect[d];
-            }
             result.positivity_energy_defect =
                 fluxes.positivity_energy_defect;
             result.positivity_mass_defect =
@@ -3719,7 +3268,7 @@ VlasovAmpereMidpointSolver::advance_single_step(
             result.f_neg_iv = fluxes.f_neg_iv;
             result.f_neg_imu = fluxes.f_neg_imu;
             result.converged = true;
-            result.soft_accepted = soft_accepted;
+            result.soft_accepted = false;
             break;
         }
 
@@ -3768,3 +3317,4 @@ VlasovAmpereMidpointSolver::advance_single_step(
     }
     return result;
 }
+

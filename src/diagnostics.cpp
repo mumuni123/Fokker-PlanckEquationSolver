@@ -1300,6 +1300,86 @@ void Diagnostics::write_electron_distribution(double time,
     }
 }
 
+// 7.1.6: per-direction flux-positivity diagnostics
+void Diagnostics::write_flux_positivity_diagnostics(
+    int step, double time,
+    const double min_f_before[3],
+    const double min_f_low[3],
+    const double min_f_final[3],
+    const double low_order_failed[3],
+    const double alpha_active[3],
+    const double alpha_min[3],
+    const double alpha_core[3],
+    const double alpha_boundary[3],
+    const double neg_mass_prevented[3],
+    int mpi_rank)
+{
+    if (mpi_rank != 0) return;
+    static std::ofstream flux_pos_file;
+    if (!flux_pos_file.is_open()) {
+        flux_pos_file.open("output/flux_positivity_diagnostics.dat");
+        flux_pos_file << std::scientific << std::setprecision(6);
+        flux_pos_file
+            << "step time[fs] direction "
+            << "min_f_before min_f_low min_f_final "
+            << "low_order_failed_count "
+            << "alpha_active_fraction alpha_min "
+            << "alpha_core_fraction alpha_boundary_fraction "
+            << "negative_mass_prevented[m^-2]\n";
+    }
+    const double time_fs = time / Const::femto;
+    const char* dir_names[3] = {"x", "u", "mu"};
+    for (int d = 0; d < 3; ++d) {
+        flux_pos_file
+            << step << " " << time_fs << " " << dir_names[d] << " "
+            << min_f_before[d] << " "
+            << min_f_low[d] << " "
+            << min_f_final[d] << " "
+            << low_order_failed[d] << " "
+            << alpha_active[d] << " "
+            << alpha_min[d] << " "
+            << alpha_core[d] << " "
+            << alpha_boundary[d] << " "
+            << neg_mass_prevented[d] << "\n";
+    }
+    flux_pos_file.flush();
+}
+
+// 7.1.6: per-direction flux-defect diagnostics
+void Diagnostics::write_stage_flux_defect_diagnostics(
+    int step, double time,
+    const double mass_defect[3],
+    const double momentum_defect[3],
+    const double energy_defect[3],
+    const double boundary_mass[3],
+    const double boundary_energy[3],
+    int mpi_rank)
+{
+    if (mpi_rank != 0) return;
+    static std::ofstream defect_file;
+    if (!defect_file.is_open()) {
+        defect_file.open("output/stage_flux_defect_diagnostics.dat");
+        defect_file << std::scientific << std::setprecision(6);
+        defect_file
+            << "step time[fs] direction "
+            << "mass_defect[m^-2] momentum_defect[kg*m/s/m^2] "
+            << "energy_defect[J/m^2] "
+            << "boundary_mass_loss[m^-2] boundary_energy_loss[J/m^2]\n";
+    }
+    const double time_fs = time / Const::femto;
+    const char* dir_names[3] = {"x", "u", "mu"};
+    for (int d = 0; d < 3; ++d) {
+        defect_file
+            << step << " " << time_fs << " " << dir_names[d] << " "
+            << mass_defect[d] << " "
+            << momentum_defect[d] << " "
+            << energy_defect[d] << " "
+            << boundary_mass[d] << " "
+            << boundary_energy[d] << "\n";
+    }
+    defect_file.flush();
+}
+
 void Diagnostics::advance_snapshot()
 {
     ++snapshot_count;

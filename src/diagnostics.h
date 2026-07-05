@@ -129,6 +129,29 @@ public:
         const std::vector<double>& low_u_neg_added_by_div,
         int mpi_rank);
 
+    // 7.1.6: write per-direction flux-positivity and defect diagnostics
+    void write_flux_positivity_diagnostics(
+        int step, double time,
+        const double flux_pos_min_f_before[3],
+        const double flux_pos_min_f_low[3],
+        const double flux_pos_min_f_final[3],
+        const double flux_pos_low_order_failed[3],
+        const double flux_pos_alpha_active[3],
+        const double flux_pos_alpha_min[3],
+        const double flux_pos_alpha_core[3],
+        const double flux_pos_alpha_boundary[3],
+        const double flux_pos_neg_mass_prevented[3],
+        int mpi_rank);
+
+    void write_stage_flux_defect_diagnostics(
+        int step, double time,
+        const double defect_mass[3],
+        const double defect_momentum[3],
+        const double defect_energy[3],
+        const double defect_boundary_mass[3],
+        const double defect_boundary_energy[3],
+        int mpi_rank);
+
     void write_fields(double time,
                       const EMFields& fields,
                       const SpatialGrid& sg,
