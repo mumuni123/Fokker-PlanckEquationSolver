@@ -10,6 +10,13 @@
 
 class VlasovAmpereMidpointSolver {
 public:
+    enum NegativeDebtLevel {
+        NEG_DEBT_OK = 0,
+        NEG_DEBT_WARN = 1,
+        NEG_DEBT_REPAIR = 2,
+        NEG_DEBT_ABORT = 3
+    };
+
     struct CurrentDiagnostics {
         double residual_if_charge;
         double residual_if_ampere;
@@ -146,6 +153,15 @@ public:
         double x_low_input_core_failed_count;
         double x_low_input_debt_accepted;
         int x_low_failure_kind;
+        double x_final_min_f;
+        double x_final_failed_count;
+        double x_final_failed_max_debt;
+        int x_final_worst_ix;
+        int x_final_worst_iv;
+        int x_final_worst_imu;
+        int x_final_failure_region;
+        double x_final_core_failed_count;
+        double x_final_boundary_failed_count;
         // 7.1.6: per-direction flux diagnostics (0=x, 1=u, 2=mu)
         FluxPositivityDiag flux_pos[3];
         FluxDefectDiag      flux_defect[3];
@@ -169,6 +185,28 @@ public:
         std::vector<long long> stage_neg_cell_count_boundary_by_u;
         double x_negative_mass_before_repair;
         double x_mass_added_by_positivity_repair;
+        double floor_repair_mass;
+        double floor_repair_energy;
+        double floor_repair_core_fraction;
+        int negative_debt_level;
+        double neg_mass_boundary;
+        double neg_mass_core;
+        double neg_mass_tail;
+        double neg_mass_total_guard;
+        double neg_mass_core_fraction;
+        double neg_energy_core_abs;
+        double neg_energy_core_fraction;
+        double neg_current_core_abs;
+        double neg_current_core_fraction;
+        double neg_debt_min_f_boundary;
+        double neg_debt_min_f_core;
+        double neg_debt_min_f_tail;
+        long long neg_cell_boundary;
+        long long neg_cell_core;
+        long long neg_cell_tail;
+        int trial_failure_downgraded;
+        int accepted_with_negative_debt;
+        int state_advanced;
         double positivity_energy_defect;
         double positivity_mass_defect;
         double u_force_alpha_min;
@@ -193,6 +231,47 @@ public:
         double u_flux_audit_final_xr_hi;
         LowOrderFailureAudit u_low_failure_audit;
         LowOrderFailureAudit mu_low_failure_audit;
+        int finite_failure_mask;
+        long long u_low_order_failed_count;
+        long long mu_low_order_failed_count;
+        long long u_final_negative_hard_count;
+        long long mu_final_negative_hard_count;
+        double mu_final_failed_max_debt;
+        int mu_final_worst_ix;
+        int mu_final_worst_iv;
+        int mu_final_worst_imu;
+        int mu_final_failure_region;
+        double mu_final_core_failed_count;
+        double mu_final_boundary_failed_count;
+        double mu_final_audit_f_base;
+        double mu_final_audit_f_low;
+        double mu_final_audit_f_high;
+        double mu_final_audit_f_final;
+        double mu_final_audit_f_floor;
+        double mu_final_audit_A_left;
+        double mu_final_audit_A_right;
+        double mu_final_audit_P_minus;
+        double mu_final_audit_Q_minus;
+        double mu_final_audit_R_minus;
+        double mu_final_audit_alpha_left_face;
+        double mu_final_audit_alpha_right_face;
+        double mu_final_audit_dt_inv_shell;
+        double mu_final_audit_mu_dot_lower;
+        double mu_final_audit_mu_dot_upper;
+        int finite_stage_failure_valid;
+        int finite_stage_failure_kind;
+        int finite_stage_failure_rank;
+        int finite_stage_failure_ix;
+        int finite_stage_failure_iv;
+        int finite_stage_failure_imu;
+        double finite_stage_failure_severity;
+        double finite_stage_failure_f_base;
+        double finite_stage_failure_f_low;
+        double finite_stage_failure_f_high;
+        double finite_stage_failure_f_final;
+        double finite_stage_failure_du_div;
+        double finite_stage_failure_dmu_div;
+        double finite_stage_failure_dx_div;
         double f_neg_min;
         double f_neg_ratio_max;
         double f_neg_mass_total;
@@ -241,6 +320,9 @@ private:
         std::vector<double> mu_high;
         std::vector<double> mu_low;
         std::vector<double> mu_final;
+        std::vector<double> mu_high_cell;
+        std::vector<double> mu_low_cell;
+        std::vector<double> mu_final_cell;
         std::vector<double> cell_alpha_mu;
         double x_low_order_failed_count;
         double x_low_input_min_f;
@@ -253,6 +335,15 @@ private:
         double x_low_input_core_failed_count;
         double x_low_input_debt_accepted;
         int x_low_failure_kind;
+        double x_final_min_f;
+        double x_final_failed_count;
+        double x_final_failed_max_debt;
+        int x_final_worst_ix;
+        int x_final_worst_iv;
+        int x_final_worst_imu;
+        int x_final_failure_region;
+        double x_final_core_failed_count;
+        double x_final_boundary_failed_count;
         // 7.1.6: per-direction flux diagnostics (0=x, 1=u, 2=mu)
         FluxPositivityDiag flux_pos[3];
         FluxDefectDiag      flux_defect[3];
@@ -307,6 +398,27 @@ private:
         std::vector<long long> stage_neg_cell_count_boundary_by_u;
         double negative_mass_before_repair;
         double mass_added_by_positivity_repair;
+        double floor_repair_mass;
+        double floor_repair_energy;
+        double floor_repair_core_fraction;
+        int negative_debt_level;
+        double neg_mass_boundary;
+        double neg_mass_core;
+        double neg_mass_tail;
+        double neg_mass_total_guard;
+        double neg_mass_core_fraction;
+        double neg_energy_core_abs;
+        double neg_energy_core_fraction;
+        double neg_current_core_abs;
+        double neg_current_core_fraction;
+        double neg_debt_min_f_boundary;
+        double neg_debt_min_f_core;
+        double neg_debt_min_f_tail;
+        long long neg_cell_boundary;
+        long long neg_cell_core;
+        long long neg_cell_tail;
+        int trial_failure_downgraded;
+        int accepted_with_negative_debt;
         double positivity_energy_defect;
         double positivity_mass_defect;
         double u_force_alpha_min;
@@ -331,6 +443,47 @@ private:
         double u_flux_audit_final_xr_hi;
         LowOrderFailureAudit u_low_failure_audit;
         LowOrderFailureAudit mu_low_failure_audit;
+        int finite_failure_mask;
+        long long u_low_order_failed_count;
+        long long mu_low_order_failed_count;
+        long long u_final_negative_hard_count;
+        long long mu_final_negative_hard_count;
+        double mu_final_failed_max_debt;
+        int mu_final_worst_ix;
+        int mu_final_worst_iv;
+        int mu_final_worst_imu;
+        int mu_final_failure_region;
+        double mu_final_core_failed_count;
+        double mu_final_boundary_failed_count;
+        double mu_final_audit_f_base;
+        double mu_final_audit_f_low;
+        double mu_final_audit_f_high;
+        double mu_final_audit_f_final;
+        double mu_final_audit_f_floor;
+        double mu_final_audit_A_left;
+        double mu_final_audit_A_right;
+        double mu_final_audit_P_minus;
+        double mu_final_audit_Q_minus;
+        double mu_final_audit_R_minus;
+        double mu_final_audit_alpha_left_face;
+        double mu_final_audit_alpha_right_face;
+        double mu_final_audit_dt_inv_shell;
+        double mu_final_audit_mu_dot_lower;
+        double mu_final_audit_mu_dot_upper;
+        int finite_stage_failure_valid;
+        int finite_stage_failure_kind;
+        int finite_stage_failure_rank;
+        int finite_stage_failure_ix;
+        int finite_stage_failure_iv;
+        int finite_stage_failure_imu;
+        double finite_stage_failure_severity;
+        double finite_stage_failure_f_base;
+        double finite_stage_failure_f_low;
+        double finite_stage_failure_f_high;
+        double finite_stage_failure_f_final;
+        double finite_stage_failure_du_div;
+        double finite_stage_failure_dmu_div;
+        double finite_stage_failure_dx_div;
         double f_neg_min;
         double f_neg_ratio_max;
         double f_neg_mass_total;
@@ -406,6 +559,16 @@ private:
                              const SpatialGrid& sg,
                              FluxPack& fluxes,
                              Species& bkg_new) const;
+    void conservative_floor_repair(Species& sp,
+                                   const SpatialGrid& sg,
+                                   int mpi_rank,
+                                   int mpi_size,
+                                   FluxPack& fluxes,
+                                   bool& finite) const;
+    void scan_negative_debt_guard(const Species& sp,
+                                  const SpatialGrid& sg,
+                                  const EMFields& fields_mid,
+                                  FluxPack& fluxes) const;
     double integrate_face_work(const std::vector<double>& current_face,
                                const EMFields& fields_mid,
                                const SpatialGrid& sg,

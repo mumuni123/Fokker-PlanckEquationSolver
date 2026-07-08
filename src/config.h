@@ -8,7 +8,7 @@ namespace Config {
     const bool enable_full_fe_output = false;
     const bool enable_progress_trace = false;
 
-    const int step_diagnostics_interval = 1;
+    const int step_diagnostics_interval = 100;
     const int progress_trace_initial_steps = 3;
     const int progress_trace_interval = 100;
 }

@@ -567,9 +567,12 @@ int main(int argc, char** argv)
     std::ofstream bkg_energy_monitor;
     std::ofstream boundary_core_monitor;
     std::ofstream x_low_monitor;
+    std::ofstream x_final_monitor;
+    std::ofstream mu_final_monitor;
     std::ofstream u_flux_audit;
     std::ofstream u_low_failure_audit;
     std::ofstream mu_low_failure_audit;
+    std::ofstream negative_debt_guard_monitor;
     if (mpi_rank == 0) {
         bkg_energy_monitor.open("output/bkg_energy_monitor.dat");
         bkg_energy_monitor
@@ -582,6 +585,9 @@ int main(int argc, char** argv)
             << "x_limiter_min_alpha_boundary  "
             << "x_negative_mass_before_repair[m^-2]  "
             << "x_mass_added_by_positivity_repair[m^-2]  "
+            << "floor_repair_mass[m^-2]  "
+            << "floor_repair_energy[J/m2]  "
+            << "floor_repair_core_fraction  "
             << "max_abs_J_bkg_charge[A/m2]  "
             << "max_abs_J_bkg_energy_diagnostic[A/m2]  "
             << "max_abs_J_bkg_ampere[A/m2]  "
@@ -671,6 +677,21 @@ int main(int argc, char** argv)
             << "low_order_failed_count\n";
         mu_low_failure_audit << std::scientific << std::setprecision(8);
 
+        negative_debt_guard_monitor.open("output/negative_debt_guard.dat");
+        negative_debt_guard_monitor
+            << "# step time[fs] level "
+            << "neg_mass_boundary neg_mass_core neg_mass_tail "
+            << "neg_mass_core_fraction "
+            << "neg_energy_core_abs neg_energy_core_fraction "
+            << "neg_current_core_abs neg_current_core_fraction "
+            << "min_f_boundary min_f_core min_f_tail "
+            << "neg_cell_boundary neg_cell_core neg_cell_tail "
+            << "trial_failure_downgraded accepted_with_negative_debt "
+            << "state_advanced converged failed "
+            << "coupled_iter residual_E residual_J_bkg\n";
+        negative_debt_guard_monitor << std::scientific
+                                    << std::setprecision(8);
+
         std::ofstream f_neg_monitor;
         f_neg_monitor.open("output/f_negativity_monitor.dat");
         f_neg_monitor
@@ -698,6 +719,8 @@ int main(int argc, char** argv)
             << "core_limiter_energy_relative_to_core_work  "
             << "x_limiter_active_fraction_boundary  "
             << "x_limiter_active_fraction_core  "
+            << "x_limiter_min_alpha_boundary  "
+            << "x_limiter_min_alpha_core  "
             << "max_abs_J_bkg_boundary[A/m2]  "
             << "max_abs_J_bkg_core[A/m2]  "
             << "J_bkg_core_to_boundary_ratio  "
@@ -712,18 +735,34 @@ int main(int argc, char** argv)
         x_low_monitor.open("output/x_low_diagnostics.dat");
         x_low_monitor
             << "# step  time[fs]  x_low_input_min_f  x_low_max_cfl  "
-            << "x_low_output_min_f  x_low_failed_count  "
-            << "x_low_input_neg_mass[m^-2]  x_low_input_rel_neg  "
-            << "x_low_output_rel_neg  x_low_input_core_failed_count  "
-            << "x_low_input_debt_accepted  x_low_failure_kind  "
-            << "prev_stage_valid  "
-            << "prev_after_x_min_f  prev_after_x_neg_mass[m^-2]  "
-            << "prev_after_x_neg_cell_count  "
-            << "prev_after_u_min_f  prev_after_u_neg_mass[m^-2]  "
-            << "prev_after_u_neg_cell_count  "
-            << "prev_after_mu_min_f  prev_after_mu_neg_mass[m^-2]  "
-            << "prev_after_mu_neg_cell_count\n";
+            << "x_low_output_min_f  x_low_failed_count\n";
         x_low_monitor << std::scientific << std::setprecision(8);
+
+        x_final_monitor.open("output/x_final_diagnostics.dat");
+        x_final_monitor
+            << "# step  time[fs]  x_final_min_f  "
+            << "x_final_failed_count  x_final_failed_max_debt  "
+            << "x_final_worst_ix  x_final_worst_iv  "
+            << "x_final_worst_imu  x_final_failure_region  "
+            << "x_final_core_failed_count  "
+            << "x_final_boundary_failed_count\n";
+        x_final_monitor << std::scientific << std::setprecision(8);
+
+        mu_final_monitor.open("output/mu_final_diagnostics.dat");
+        mu_final_monitor
+            << "# step  time[fs]  mu_final_min_f  "
+            << "mu_final_failed_count  mu_final_failed_max_debt  "
+            << "mu_final_worst_ix  mu_final_worst_iv  "
+            << "mu_final_worst_imu  mu_final_failure_region  "
+            << "mu_final_core_failed_count  "
+            << "mu_final_boundary_failed_count  "
+            << "mu_alpha_active_fraction  mu_alpha_min  "
+            << "mu_alpha_core_fraction  mu_alpha_boundary_fraction  "
+            << "mu_alpha_core_min  mu_alpha_boundary_min  "
+            << "mu_limiter_energy_delta[J/m2]  "
+            << "mu_limiter_mass_delta[m^-2]\n";
+        mu_final_monitor << std::scientific << std::setprecision(8);
+
     }
     bool last_accepted_stage_valid = false;
     double last_accepted_stage_min_f[3] = {0.0, 0.0, 0.0};
@@ -778,6 +817,9 @@ int main(int argc, char** argv)
         double x_limiter_min_alpha_boundary_step = 1.0;
         double x_negative_mass_before_repair_step = 0.0;
         double x_mass_added_by_positivity_repair_step = 0.0;
+        double floor_repair_mass_step = 0.0;
+        double floor_repair_energy_step = 0.0;
+        double floor_repair_core_fraction_step = 0.0;
         double positivity_energy_defect_step = 0.0;
         double positivity_mass_defect_step = 0.0;
         double u_limiter_mass_delta_step = 0.0;
@@ -795,6 +837,24 @@ int main(int argc, char** argv)
         double x_low_input_core_failed_count_step = 0.0;
         double x_low_input_debt_accepted_step = 0.0;
         int x_low_failure_kind_step = 0;
+        double x_final_min_f_step = 0.0;
+        double x_final_failed_count_step = 0.0;
+        double x_final_failed_max_debt_step = 0.0;
+        int x_final_worst_ix_step = -1;
+        int x_final_worst_iv_step = -1;
+        int x_final_worst_imu_step = -1;
+        int x_final_failure_region_step = -1;
+        double x_final_core_failed_count_step = 0.0;
+        double x_final_boundary_failed_count_step = 0.0;
+        double mu_final_min_f_step = 0.0;
+        double mu_final_failed_count_step = 0.0;
+        double mu_final_failed_max_debt_step = 0.0;
+        int mu_final_worst_ix_step = -1;
+        int mu_final_worst_iv_step = -1;
+        int mu_final_worst_imu_step = -1;
+        int mu_final_failure_region_step = -1;
+        double mu_final_core_failed_count_step = 0.0;
+        double mu_final_boundary_failed_count_step = 0.0;
         double mu_low_u_alpha_min_step = 1.0;
         double mu_low_u_limiter_active_fraction_step = 0.0;
         double mu_low_u_energy_delta_step = 0.0;
@@ -854,11 +914,145 @@ int main(int argc, char** argv)
             midpoint_solver.advance_background_and_fields(
                 bkg_step_start, beam_step_start, fields_step_start, sgrid,
                 dt, time, mpi_rank, mpi_size);
+        const bool negative_debt_attention =
+            midpoint_result.negative_debt_level >=
+            VlasovAmpereMidpointSolver::NEG_DEBT_WARN ||
+            midpoint_result.accepted_with_negative_debt != 0 ||
+            midpoint_result.trial_failure_downgraded != 0;
+        const bool abnormal_midpoint =
+            !midpoint_result.converged || midpoint_result.failed ||
+            negative_debt_attention;
         trace_progress(config, mpi_rank, step,
                        "after coupled midpoint FV solve");
 
+        auto write_low_order_failure_audit =
+            [&](std::ofstream& out,
+                const VlasovAmpereMidpointSolver::LowOrderFailureAudit&
+                    audit) {
+                if (!audit.valid) return;
+                const char* region =
+                    (audit.region != 0) ? "boundary" : "core";
+                out << step << "  "
+                    << time / Const::femto << "  "
+                    << audit.rank << "  "
+                    << audit.ix << "  "
+                    << audit.iv << "  "
+                    << audit.imu << "  "
+                    << region << "  "
+                    << audit.severity << "  "
+                    << audit.f_input << "  "
+                    << audit.f_after_x << "  "
+                    << audit.dx_div << "  "
+                    << audit.dmu_div_used << "  "
+                    << audit.du_div_low << "  "
+                    << audit.f_low << "  "
+                    << audit.left_lower_flux << "  "
+                    << audit.left_upper_flux << "  "
+                    << audit.right_lower_flux << "  "
+                    << audit.right_upper_flux << "  "
+                    << audit.left_lower_scale << "  "
+                    << audit.left_upper_scale << "  "
+                    << audit.right_lower_scale << "  "
+                    << audit.right_upper_scale << "  "
+                    << audit.left_lower_donor_index << "  "
+                    << audit.left_upper_donor_index << "  "
+                    << audit.right_lower_donor_index << "  "
+                    << audit.right_upper_donor_index << "  "
+                    << audit.left_lower_donor_f << "  "
+                    << audit.left_upper_donor_f << "  "
+                    << audit.right_lower_donor_f << "  "
+                    << audit.right_upper_donor_f << "  "
+                    << audit.lower_characteristic << "  "
+                    << audit.upper_characteristic << "  "
+                    << audit.moment_weight << "  "
+                    << audit.cell_budget << "  "
+                    << audit.low_order_failed_count << "\n";
+                out.flush();
+            };
+
+        if (mpi_rank == 0) {
+            negative_debt_guard_monitor
+                << step << " "
+                << time / Const::femto << " "
+                << midpoint_result.negative_debt_level << " "
+                << midpoint_result.neg_mass_boundary << " "
+                << midpoint_result.neg_mass_core << " "
+                << midpoint_result.neg_mass_tail << " "
+                << midpoint_result.neg_mass_core_fraction << " "
+                << midpoint_result.neg_energy_core_abs << " "
+                << midpoint_result.neg_energy_core_fraction << " "
+                << midpoint_result.neg_current_core_abs << " "
+                << midpoint_result.neg_current_core_fraction << " "
+                << midpoint_result.neg_debt_min_f_boundary << " "
+                << midpoint_result.neg_debt_min_f_core << " "
+                << midpoint_result.neg_debt_min_f_tail << " "
+                << midpoint_result.neg_cell_boundary << " "
+                << midpoint_result.neg_cell_core << " "
+                << midpoint_result.neg_cell_tail << " "
+                << midpoint_result.trial_failure_downgraded << " "
+                << midpoint_result.accepted_with_negative_debt << " "
+                << midpoint_result.state_advanced << " "
+                << midpoint_result.converged << " "
+                << midpoint_result.failed << " "
+                << midpoint_result.nonlinear_iterations << " "
+                << midpoint_result.residual_E << " "
+                << midpoint_result.residual_J_bkg << "\n";
+            if (abnormal_midpoint ||
+                step + 1 == nsteps ||
+                (config.enable_step_diagnostics &&
+                 config.step_diagnostics_interval > 0 &&
+                 step % config.step_diagnostics_interval == 0)) {
+                negative_debt_guard_monitor.flush();
+            }
+        }
+
         if (!midpoint_result.converged || midpoint_result.failed) {
             if (mpi_rank == 0) {
+                x_low_monitor << step << "  "
+                              << time / Const::femto << "  "
+                              << midpoint_result.x_low_input_min_f << "  "
+                              << midpoint_result.x_low_max_cfl << "  "
+                              << midpoint_result.x_low_output_min_f << "  "
+                              << midpoint_result.x_low_failed_count << "\n";
+                x_low_monitor.flush();
+                x_final_monitor << step << "  "
+                                << time / Const::femto << "  "
+                                << midpoint_result.x_final_min_f << "  "
+                                << midpoint_result.x_final_failed_count << "  "
+                                << midpoint_result.x_final_failed_max_debt << "  "
+                                << midpoint_result.x_final_worst_ix << "  "
+                                << midpoint_result.x_final_worst_iv << "  "
+                                << midpoint_result.x_final_worst_imu << "  "
+                                << midpoint_result.x_final_failure_region << "  "
+                                << midpoint_result.x_final_core_failed_count << "  "
+                                << midpoint_result.x_final_boundary_failed_count << "\n";
+                x_final_monitor.flush();
+                mu_final_monitor << step << "  "
+                                 << time / Const::femto << "  "
+                                 << midpoint_result.flux_pos[2].min_f_final << "  "
+                                 << midpoint_result.mu_final_negative_hard_count << "  "
+                                 << midpoint_result.mu_final_failed_max_debt << "  "
+                                 << midpoint_result.mu_final_worst_ix << "  "
+                                 << midpoint_result.mu_final_worst_iv << "  "
+                                 << midpoint_result.mu_final_worst_imu << "  "
+                                 << midpoint_result.mu_final_failure_region << "  "
+                                 << midpoint_result.mu_final_core_failed_count << "  "
+                                 << midpoint_result.mu_final_boundary_failed_count << "  "
+                                 << midpoint_result.flux_pos[2].alpha_active_fraction << "  "
+                                 << midpoint_result.flux_pos[2].alpha_min << "  "
+                                 << midpoint_result.flux_pos[2].alpha_core_fraction << "  "
+                                 << midpoint_result.flux_pos[2].alpha_boundary_fraction << "  "
+                                 << midpoint_result.mu_low_u_alpha_min_core << "  "
+                                 << midpoint_result.mu_low_u_alpha_min_boundary << "  "
+                                 << midpoint_result.flux_defect[2].energy_defect << "  "
+                                 << midpoint_result.flux_defect[2].mass_defect << "\n";
+                mu_final_monitor.flush();
+                write_low_order_failure_audit(
+                    u_low_failure_audit,
+                    midpoint_result.u_low_failure_audit);
+                write_low_order_failure_audit(
+                    mu_low_failure_audit,
+                    midpoint_result.mu_low_failure_audit);
                 std::fprintf(stderr,
                              "WARNING: coupled midpoint FV solve failed at "
                              "step %d, t = %.6e s; residual %.6e, "
@@ -877,7 +1071,19 @@ int main(int argc, char** argv)
                              "x_low_output_rel_neg %.6e, "
                              "x_low_input_core_failed_count %.0f, "
                              "x_low_input_debt_accepted %.0f, "
-                             "x_low_failure_kind %d. "
+                             "x_low_failure_kind %d, "
+                             "x_final(min %.6e, failed %.0f, "
+                             "max_debt %.6e, worst ix %d iv %d imu %d, "
+                             "region %d, core_failed %.0f, "
+                             "boundary_failed %.0f), "
+                             "finite_failure_mask %d, "
+                             "finite_counts(u_low %lld, u_final %lld, "
+                             "mu_low %lld, mu_final %lld), "
+                             "finite_stage(valid %d, kind %d, rank %d, "
+                             "ix %d, iv %d, imu %d, severity %.6e, "
+                             "f_base %.6e, f_low %.6e, f_high %.6e, "
+                             "f_final %.6e, dx_div %.6e, du_div %.6e, "
+                             "dmu_div %.6e). "
                              "previous accepted stage valid %d; "
                              "prev after_x(min %.6e, neg_mass %.6e, "
                              "neg_count %lld), "
@@ -885,7 +1091,9 @@ int main(int argc, char** argv)
                              "neg_count %lld), "
                              "after_mu(min %.6e, neg_mass %.6e, "
                              "neg_count %lld). "
-                             "Failed midpoint states are not accepted.\n",
+                             "Soft negative-debt failures are accepted only "
+                             "when state_advanced=1; frozen states remain "
+                             "hard failures.\n",
                              step, time,
                              midpoint_result.nonlinear_residual,
                              midpoint_result.residual_E,
@@ -912,6 +1120,34 @@ int main(int argc, char** argv)
                              midpoint_result.x_low_input_core_failed_count,
                              midpoint_result.x_low_input_debt_accepted,
                              midpoint_result.x_low_failure_kind,
+                             midpoint_result.x_final_min_f,
+                             midpoint_result.x_final_failed_count,
+                             midpoint_result.x_final_failed_max_debt,
+                             midpoint_result.x_final_worst_ix,
+                             midpoint_result.x_final_worst_iv,
+                             midpoint_result.x_final_worst_imu,
+                             midpoint_result.x_final_failure_region,
+                             midpoint_result.x_final_core_failed_count,
+                             midpoint_result.x_final_boundary_failed_count,
+                             midpoint_result.finite_failure_mask,
+                             midpoint_result.u_low_order_failed_count,
+                             midpoint_result.u_final_negative_hard_count,
+                             midpoint_result.mu_low_order_failed_count,
+                             midpoint_result.mu_final_negative_hard_count,
+                             midpoint_result.finite_stage_failure_valid,
+                             midpoint_result.finite_stage_failure_kind,
+                             midpoint_result.finite_stage_failure_rank,
+                             midpoint_result.finite_stage_failure_ix,
+                             midpoint_result.finite_stage_failure_iv,
+                             midpoint_result.finite_stage_failure_imu,
+                             midpoint_result.finite_stage_failure_severity,
+                             midpoint_result.finite_stage_failure_f_base,
+                             midpoint_result.finite_stage_failure_f_low,
+                             midpoint_result.finite_stage_failure_f_high,
+                             midpoint_result.finite_stage_failure_f_final,
+                             midpoint_result.finite_stage_failure_dx_div,
+                             midpoint_result.finite_stage_failure_du_div,
+                             midpoint_result.finite_stage_failure_dmu_div,
                              last_accepted_stage_valid ? 1 : 0,
                              last_accepted_stage_min_f[0],
                              last_accepted_stage_neg_mass[0],
@@ -923,8 +1159,49 @@ int main(int argc, char** argv)
                              last_accepted_stage_neg_mass[2],
                              last_accepted_stage_neg_cell_count[2]);
             }
-            MPI_Abort(MPI_COMM_WORLD, 8);
-            return 8;
+            const bool hard_negative_debt =
+                midpoint_result.negative_debt_level >=
+                VlasovAmpereMidpointSolver::NEG_DEBT_ABORT;
+            const bool frozen_output = midpoint_result.state_advanced == 0;
+            const bool soft_negative_debt_failure =
+                midpoint_result.trial_failure_downgraded != 0 &&
+                !hard_negative_debt && !frozen_output;
+            if (soft_negative_debt_failure) {
+                if (mpi_rank == 0) {
+                    std::fprintf(
+                        stderr,
+                        "WARNING: accepting downgraded midpoint failure at "
+                        "step %d with negative_debt_level=%d and "
+                        "state_advanced=%d.\n",
+                        step, midpoint_result.negative_debt_level,
+                        midpoint_result.state_advanced);
+                }
+            } else {
+                if (mpi_rank == 0) {
+                    std::fprintf(
+                        stderr,
+                        "ERROR: hard midpoint failure at step %d: "
+                        "negative_debt_level=%d state_advanced=%d "
+                        "trial_failure_downgraded=%d.\n",
+                        step, midpoint_result.negative_debt_level,
+                        midpoint_result.state_advanced,
+                        midpoint_result.trial_failure_downgraded);
+                }
+                MPI_Abort(MPI_COMM_WORLD, 8);
+                return 8;
+            }
+        }
+
+        if (midpoint_result.state_advanced == 0) {
+            if (mpi_rank == 0) {
+                std::fprintf(
+                    stderr,
+                    "ERROR: midpoint solver returned without advancing the "
+                    "state at step %d; aborting to prevent frozen output.\n",
+                    step);
+            }
+            MPI_Abort(MPI_COMM_WORLD, 9);
+            return 9;
         }
 
         bkg_e = midpoint_result.species_np1;
@@ -972,6 +1249,10 @@ int main(int argc, char** argv)
             midpoint_result.x_negative_mass_before_repair;
         x_mass_added_by_positivity_repair_step =
             midpoint_result.x_mass_added_by_positivity_repair;
+        floor_repair_mass_step = midpoint_result.floor_repair_mass;
+        floor_repair_energy_step = midpoint_result.floor_repair_energy;
+        floor_repair_core_fraction_step =
+            midpoint_result.floor_repair_core_fraction;
         positivity_energy_defect_step =
             midpoint_result.positivity_energy_defect;
         positivity_mass_defect_step =
@@ -998,6 +1279,33 @@ int main(int argc, char** argv)
         x_low_input_debt_accepted_step =
             midpoint_result.x_low_input_debt_accepted;
         x_low_failure_kind_step = midpoint_result.x_low_failure_kind;
+        x_final_min_f_step = midpoint_result.x_final_min_f;
+        x_final_failed_count_step = midpoint_result.x_final_failed_count;
+        x_final_failed_max_debt_step =
+            midpoint_result.x_final_failed_max_debt;
+        x_final_worst_ix_step = midpoint_result.x_final_worst_ix;
+        x_final_worst_iv_step = midpoint_result.x_final_worst_iv;
+        x_final_worst_imu_step = midpoint_result.x_final_worst_imu;
+        x_final_failure_region_step =
+            midpoint_result.x_final_failure_region;
+        x_final_core_failed_count_step =
+            midpoint_result.x_final_core_failed_count;
+        x_final_boundary_failed_count_step =
+            midpoint_result.x_final_boundary_failed_count;
+        mu_final_min_f_step = midpoint_result.flux_pos[2].min_f_final;
+        mu_final_failed_count_step =
+            static_cast<double>(midpoint_result.mu_final_negative_hard_count);
+        mu_final_failed_max_debt_step =
+            midpoint_result.mu_final_failed_max_debt;
+        mu_final_worst_ix_step = midpoint_result.mu_final_worst_ix;
+        mu_final_worst_iv_step = midpoint_result.mu_final_worst_iv;
+        mu_final_worst_imu_step = midpoint_result.mu_final_worst_imu;
+        mu_final_failure_region_step =
+            midpoint_result.mu_final_failure_region;
+        mu_final_core_failed_count_step =
+            midpoint_result.mu_final_core_failed_count;
+        mu_final_boundary_failed_count_step =
+            midpoint_result.mu_final_boundary_failed_count;
         if (mpi_rank == 0 && x_low_input_debt_accepted_step > 0.0) {
             std::fprintf(
                 stderr,
@@ -1077,7 +1385,10 @@ int main(int argc, char** argv)
         coupled_residual_beam_continuity_step =
             midpoint_result.beam_continuity_residual;
 
-        if (mpi_rank == 0) {
+        const bool write_flux_audit =
+            collect_step_diagnostics || abnormal_midpoint;
+        if (mpi_rank == 0 && write_flux_audit &&
+            midpoint_result.u_flux_audit_valid) {
             u_flux_audit << step << "  "
                          << time / Const::femto << "  "
                          << midpoint_result.u_flux_audit_valid << "  "
@@ -1100,51 +1411,7 @@ int main(int argc, char** argv)
                          << midpoint_result.u_flux_audit_final_xr_hi << "\n";
             u_flux_audit.flush();
         }
-        if (mpi_rank == 0) {
-            auto write_low_order_failure_audit =
-                [&](std::ofstream& out,
-                    const VlasovAmpereMidpointSolver::LowOrderFailureAudit&
-                        audit) {
-                    if (!audit.valid) return;
-                    const char* region =
-                        (audit.region != 0) ? "boundary" : "core";
-                    out << step << "  "
-                        << time / Const::femto << "  "
-                        << audit.rank << "  "
-                        << audit.ix << "  "
-                        << audit.iv << "  "
-                        << audit.imu << "  "
-                        << region << "  "
-                        << audit.severity << "  "
-                        << audit.f_input << "  "
-                        << audit.f_after_x << "  "
-                        << audit.dx_div << "  "
-                        << audit.dmu_div_used << "  "
-                        << audit.du_div_low << "  "
-                        << audit.f_low << "  "
-                        << audit.left_lower_flux << "  "
-                        << audit.left_upper_flux << "  "
-                        << audit.right_lower_flux << "  "
-                        << audit.right_upper_flux << "  "
-                        << audit.left_lower_scale << "  "
-                        << audit.left_upper_scale << "  "
-                        << audit.right_lower_scale << "  "
-                        << audit.right_upper_scale << "  "
-                        << audit.left_lower_donor_index << "  "
-                        << audit.left_upper_donor_index << "  "
-                        << audit.right_lower_donor_index << "  "
-                        << audit.right_upper_donor_index << "  "
-                        << audit.left_lower_donor_f << "  "
-                        << audit.left_upper_donor_f << "  "
-                        << audit.right_lower_donor_f << "  "
-                        << audit.right_upper_donor_f << "  "
-                        << audit.lower_characteristic << "  "
-                        << audit.upper_characteristic << "  "
-                        << audit.moment_weight << "  "
-                        << audit.cell_budget << "  "
-                        << audit.low_order_failed_count << "\n";
-                    out.flush();
-                };
+        if (mpi_rank == 0 && abnormal_midpoint) {
             write_low_order_failure_audit(
                 u_low_failure_audit,
                 midpoint_result.u_low_failure_audit);
@@ -1153,75 +1420,79 @@ int main(int argc, char** argv)
                 midpoint_result.mu_low_failure_audit);
         }
 
-        const double bkg_ke_step_end_for_residual =
-            bkg_ke_step_start + midpoint_result.delta_ke_bkg;
-        local_bkg_energy_residual_step =
-            (bkg_ke_step_end_for_residual - bkg_ke_step_start) + W_bkg_E;
-        const double local_bkg_energy_values[8] = {
-            bkg_ke_step_end_for_residual,
-            W_bkg_E,
-            local_bkg_energy_residual_step,
-            local_bkg_current_diag_step.residual_if_charge,
-            local_bkg_current_diag_step.residual_if_ampere,
-            local_bkg_current_diag_step.e_dot_j_charge,
-            local_bkg_current_diag_step.e_dot_j_energy,
-            local_bkg_current_diag_step.e_dot_j_ampere
-        };
-        double global_bkg_energy_values[8] = {
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-        };
-        MPI_Allreduce(local_bkg_energy_values, global_bkg_energy_values, 8,
-                      MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        const double local_current_max_values[5] = {
-            local_bkg_current_diag_step.max_abs_j_charge,
-            local_bkg_current_diag_step.max_abs_j_energy,
-            local_bkg_current_diag_step.max_abs_j_ampere,
-            local_bkg_current_diag_step.max_abs_j_charge_minus_ampere,
-            local_bkg_current_diag_step.max_abs_j_energy_minus_ampere
-        };
-        double global_current_max_values[5] = {
-            0.0, 0.0, 0.0, 0.0, 0.0
-        };
-        MPI_Allreduce(local_current_max_values, global_current_max_values, 5,
-                      MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-        global_bkg_current_diag_step.residual_if_charge =
-            global_bkg_energy_values[3];
-        global_bkg_current_diag_step.residual_if_ampere =
-            global_bkg_energy_values[4];
-        global_bkg_current_diag_step.e_dot_j_charge =
-            global_bkg_energy_values[5];
-        global_bkg_current_diag_step.e_dot_j_energy =
-            global_bkg_energy_values[6];
-        global_bkg_current_diag_step.e_dot_j_ampere =
-            global_bkg_energy_values[7];
-        global_bkg_current_diag_step.max_abs_j_charge =
-            global_current_max_values[0];
-        global_bkg_current_diag_step.max_abs_j_energy =
-            global_current_max_values[1];
-        global_bkg_current_diag_step.max_abs_j_ampere =
-            global_current_max_values[2];
-        global_bkg_current_diag_step.max_abs_j_charge_minus_ampere =
-            global_current_max_values[3];
-        global_bkg_current_diag_step.max_abs_j_energy_minus_ampere =
-            global_current_max_values[4];
-        const double global_dke_bkg_step =
-            global_bkg_energy_values[0] - global_bkg_ke_step_start;
-        const double global_W_bkg_E = global_bkg_energy_values[1];
-        bkg_energy_residual_step = global_bkg_energy_values[2];
-        const double bkg_energy_residual_den =
-            std::max(std::max(std::fabs(global_dke_bkg_step),
-                              std::fabs(global_W_bkg_E)),
-                     std::max(1.0,
-                              1.0e-12 *
-                              std::fabs(global_bkg_ke_step_start)));
-        bkg_energy_relative_residual_step =
-            std::fabs(bkg_energy_residual_step) /
-            bkg_energy_residual_den;
-        cumulative_bkg_energy_residual +=
-            bkg_energy_relative_residual_step;
-
         const bool write_periodic_monitors =
-            (step % 100 == 0) || (x_low_input_debt_accepted_step > 0.0);
+            collect_step_diagnostics || abnormal_midpoint ||
+            (x_low_input_debt_accepted_step > 0.0) ||
+            (x_final_failed_count_step > 0.0) ||
+            (mu_final_failed_count_step > 0.0);
+        if (write_periodic_monitors) {
+            const double bkg_ke_step_end_for_residual =
+                bkg_ke_step_start + midpoint_result.delta_ke_bkg;
+            local_bkg_energy_residual_step =
+                (bkg_ke_step_end_for_residual - bkg_ke_step_start) + W_bkg_E;
+            const double local_bkg_energy_values[8] = {
+                bkg_ke_step_end_for_residual,
+                W_bkg_E,
+                local_bkg_energy_residual_step,
+                local_bkg_current_diag_step.residual_if_charge,
+                local_bkg_current_diag_step.residual_if_ampere,
+                local_bkg_current_diag_step.e_dot_j_charge,
+                local_bkg_current_diag_step.e_dot_j_energy,
+                local_bkg_current_diag_step.e_dot_j_ampere
+            };
+            double global_bkg_energy_values[8] = {
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            };
+            MPI_Allreduce(local_bkg_energy_values, global_bkg_energy_values, 8,
+                          MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+            const double local_current_max_values[5] = {
+                local_bkg_current_diag_step.max_abs_j_charge,
+                local_bkg_current_diag_step.max_abs_j_energy,
+                local_bkg_current_diag_step.max_abs_j_ampere,
+                local_bkg_current_diag_step.max_abs_j_charge_minus_ampere,
+                local_bkg_current_diag_step.max_abs_j_energy_minus_ampere
+            };
+            double global_current_max_values[5] = {
+                0.0, 0.0, 0.0, 0.0, 0.0
+            };
+            MPI_Allreduce(local_current_max_values, global_current_max_values,
+                          5, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            global_bkg_current_diag_step.residual_if_charge =
+                global_bkg_energy_values[3];
+            global_bkg_current_diag_step.residual_if_ampere =
+                global_bkg_energy_values[4];
+            global_bkg_current_diag_step.e_dot_j_charge =
+                global_bkg_energy_values[5];
+            global_bkg_current_diag_step.e_dot_j_energy =
+                global_bkg_energy_values[6];
+            global_bkg_current_diag_step.e_dot_j_ampere =
+                global_bkg_energy_values[7];
+            global_bkg_current_diag_step.max_abs_j_charge =
+                global_current_max_values[0];
+            global_bkg_current_diag_step.max_abs_j_energy =
+                global_current_max_values[1];
+            global_bkg_current_diag_step.max_abs_j_ampere =
+                global_current_max_values[2];
+            global_bkg_current_diag_step.max_abs_j_charge_minus_ampere =
+                global_current_max_values[3];
+            global_bkg_current_diag_step.max_abs_j_energy_minus_ampere =
+                global_current_max_values[4];
+            const double global_dke_bkg_step =
+                global_bkg_energy_values[0] - global_bkg_ke_step_start;
+            const double global_W_bkg_E = global_bkg_energy_values[1];
+            bkg_energy_residual_step = global_bkg_energy_values[2];
+            const double bkg_energy_residual_den =
+                std::max(std::max(std::fabs(global_dke_bkg_step),
+                                  std::fabs(global_W_bkg_E)),
+                         std::max(1.0,
+                                  1.0e-12 *
+                                  std::fabs(global_bkg_ke_step_start)));
+            bkg_energy_relative_residual_step =
+                std::fabs(bkg_energy_residual_step) /
+                bkg_energy_residual_den;
+            cumulative_bkg_energy_residual +=
+                bkg_energy_relative_residual_step;
+        }
         if (mpi_rank == 0 && write_periodic_monitors) {
             bkg_energy_monitor << step << "  "
                                << time / Const::femto << "  "
@@ -1236,6 +1507,9 @@ int main(int argc, char** argv)
                                << x_limiter_min_alpha_boundary_step << "  "
                                << x_negative_mass_before_repair_step << "  "
                                << x_mass_added_by_positivity_repair_step << "  "
+                               << floor_repair_mass_step << "  "
+                               << floor_repair_energy_step << "  "
+                               << floor_repair_core_fraction_step << "  "
                                << global_bkg_current_diag_step.max_abs_j_charge << "  "
                                << global_bkg_current_diag_step.max_abs_j_energy << "  "
                                << global_bkg_current_diag_step.max_abs_j_ampere << "  "
@@ -1287,24 +1561,40 @@ int main(int argc, char** argv)
                           << x_low_input_min_f_step << "  "
                           << x_low_max_cfl_step << "  "
                           << x_low_output_min_f_step << "  "
-                          << x_low_failed_count_step << "  "
-                          << x_low_input_neg_mass_step << "  "
-                          << x_low_input_rel_neg_step << "  "
-                          << x_low_output_rel_neg_step << "  "
-                          << x_low_input_core_failed_count_step << "  "
-                          << x_low_input_debt_accepted_step << "  "
-                          << x_low_failure_kind_step << "  "
-                          << (last_accepted_stage_valid ? 1 : 0) << "  "
-                          << last_accepted_stage_min_f[0] << "  "
-                          << last_accepted_stage_neg_mass[0] << "  "
-                          << last_accepted_stage_neg_cell_count[0] << "  "
-                          << last_accepted_stage_min_f[1] << "  "
-                          << last_accepted_stage_neg_mass[1] << "  "
-                          << last_accepted_stage_neg_cell_count[1] << "  "
-                          << last_accepted_stage_min_f[2] << "  "
-                          << last_accepted_stage_neg_mass[2] << "  "
-                          << last_accepted_stage_neg_cell_count[2] << "\n";
+                          << x_low_failed_count_step << "\n";
             x_low_monitor.flush();
+            x_final_monitor << step << "  "
+                            << time / Const::femto << "  "
+                            << x_final_min_f_step << "  "
+                            << x_final_failed_count_step << "  "
+                            << x_final_failed_max_debt_step << "  "
+                            << x_final_worst_ix_step << "  "
+                            << x_final_worst_iv_step << "  "
+                            << x_final_worst_imu_step << "  "
+                            << x_final_failure_region_step << "  "
+                            << x_final_core_failed_count_step << "  "
+                            << x_final_boundary_failed_count_step << "\n";
+            x_final_monitor.flush();
+            mu_final_monitor << step << "  "
+                             << time / Const::femto << "  "
+                             << mu_final_min_f_step << "  "
+                             << mu_final_failed_count_step << "  "
+                             << mu_final_failed_max_debt_step << "  "
+                             << mu_final_worst_ix_step << "  "
+                             << mu_final_worst_iv_step << "  "
+                             << mu_final_worst_imu_step << "  "
+                             << mu_final_failure_region_step << "  "
+                             << mu_final_core_failed_count_step << "  "
+                             << mu_final_boundary_failed_count_step << "  "
+                             << midpoint_result.flux_pos[2].alpha_active_fraction << "  "
+                             << midpoint_result.flux_pos[2].alpha_min << "  "
+                             << midpoint_result.flux_pos[2].alpha_core_fraction << "  "
+                             << midpoint_result.flux_pos[2].alpha_boundary_fraction << "  "
+                             << mu_low_u_alpha_min_core_step << "  "
+                             << mu_low_u_alpha_min_boundary_step << "  "
+                             << midpoint_result.flux_defect[2].energy_defect << "  "
+                             << midpoint_result.flux_defect[2].mass_defect << "\n";
+            mu_final_monitor.flush();
         }
         if (collect_step_diagnostics) {
             diag.write_bkg_stage_negativity(
@@ -1373,7 +1663,8 @@ int main(int argc, char** argv)
                 bkg_e, sgrid, f_neg_snapshot);
 
             if (mpi_rank == 0) {
-                // f-negativity monitor: final accepted snapshot every 100 steps.
+                // f-negativity monitor: final accepted snapshot at the
+                // configured step-diagnostics cadence.
                 std::ofstream f_neg_monitor;
                 f_neg_monitor.open("output/f_negativity_monitor.dat",
                                    std::ios::app);
@@ -1389,7 +1680,7 @@ int main(int argc, char** argv)
                 f_neg_monitor.close();
             }
         }
-        if (step % 100 == 0) {
+        if (collect_step_diagnostics || abnormal_midpoint) {
             const double region_widths[2] = {
                 0.1 * Const::micro,
                 0.2 * Const::micro
@@ -1466,6 +1757,9 @@ int main(int argc, char** argv)
                         << midpoint_result
                                .region_limiter_active_fraction_core[ir]
                         << "  "
+                        << midpoint_result.limiter_min_alpha_boundary
+                        << "  "
+                        << midpoint_result.limiter_min_alpha_core << "  "
                         << region_diag.max_abs_J_bkg_boundary << "  "
                         << region_diag.max_abs_J_bkg_core << "  "
                         << j_core_to_boundary_ratio << "  "

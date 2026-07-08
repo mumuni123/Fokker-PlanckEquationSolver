@@ -19,20 +19,46 @@ const int BKG_STAGE_COUNT = 3;
 const int BKG_DIV_COMPONENT_COUNT = 3;
 const double CORE_DIAG_BOUNDARY_WIDTH = 0.2 * Const::micro;
 const int LOW_U_MU_LIMIT_COUNT = 6;
-const int LOW_U_ADAPTIVE_MAX_SUBCYCLES = 4;
-const double LOW_U_ADAPTIVE_CFL_THRESHOLD = 0.25;
 const double LOW_U_MU_ALPHA_SAFETY = 0.95;
 const double LOW_U_MU_ALPHA_SMOOTH = 0.25;
 const double LOW_U_MU_ENDPOINT_ALPHA_CAP = 0.5;
 // 7.1.2: safety factor for FCT face-alpha to prevent limiter overshoot
 const double X_FCT_SAFETY = 0.99;
-const double X_LOW_ABS_F_TOL = 1.0e-5;
+const double X_LOW_ABS_F_TOL = 1.0e-10;
 const double X_LOW_REL_F_TOL = 1.0e-10;
+const double X_FLOOR_MARGIN_FACTOR = 1.0;
+const double X_BOUNDARY_ISOLATION_WIDTH = 0.1 * Const::micro;
+const double X_BOUNDARY_BUDGET_FACTOR = 0.5;
 const double X_LOW_CFL_TOL = 1.0e-12;
 const double X_LOW_INPUT_DEBT_REL_TOL = 1.0e-8;
-const double X_LOW_INPUT_DEBT_NEG_MASS_FRAC = 1.0e-12;
+const double X_LOW_INPUT_DEBT_NEG_MASS_FRAC = 1.0e-8;
 const double X_LOW_INPUT_DEBT_CELL_FRAC = 1.0e-6;
 const double X_LOW_INPUT_DEBT_OUTPUT_REL_TOL = 1.0e-8;
+const double VELOCITY_LOW_ORDER_DEBT_REL_TOL = 1.0e-8;
+const double VELOCITY_LOW_ORDER_DEBT_MASS_FRAC = 1.0e-8;
+const double VELOCITY_LOW_OCCUPANCY_TAIL_REL_TOL = 1.0e-8;
+const double FLOOR_DEBT_ROUNDOFF_ABS_TOL = 1.0e-16;
+const double FLOOR_DEBT_HARD_ABS_TOL = 1.0e-14;
+const double FLOOR_DEBT_HARD_REL_TOL = 1.0e-8;
+const double FLOOR_DEBT_OLD_REL_TOL = 1.0e-8;
+const double FLOOR_REPAIR_CORE_MAX_ABS_NEG = 1.0e-8;
+const double FLOOR_REPAIR_CORE_NEG_MASS_FRAC = 1.0e-12;
+const double FLOOR_REPAIR_SOFT_NEG_MASS_FRAC = 1.0e-5;
+const double FLOOR_REPAIR_SOFT_REL_NEG_MAX = 1.0e3;
+const double FLOOR_REPAIR_SOFT_ENERGY_FRAC = 1.0e-4;
+const double FLOOR_REPAIR_CORE_ROUNDOFF_ABS = 1.0e-16;
+const double CORE_NEG_MASS_ACCEPT_FRAC = 1.0e-6;
+const double CORE_NEG_MASS_WARN_FRAC   = 1.0e-4;
+const double CORE_NEG_MASS_ABORT_FRAC  = 1.0e-3;
+const double CORE_NEG_ENERGY_ACCEPT_FRAC = 1.0e-5;
+const double CORE_NEG_ENERGY_WARN_FRAC   = 1.0e-3;
+const double CORE_NEG_ENERGY_ABORT_FRAC  = 1.0e-2;
+const double CORE_NEG_CURRENT_ACCEPT_FRAC = 1.0e-3;
+const double CORE_NEG_CURRENT_WARN_FRAC   = 1.0e-2;
+const double CORE_NEG_CURRENT_ABORT_FRAC  = 5.0e-2;
+const double TAIL_NEG_MASS_WARN_FRAC = 1.0e-3;
+const double BOUNDARY_NEG_MASS_WARN_FRAC = 1.0e-2;
+const double NEG_DEBT_CORE_BOUNDARY_WIDTH = 0.2 * Const::micro;
 
 enum XLowFailureKind {
     X_LOW_OK = 0,
@@ -40,6 +66,18 @@ enum XLowFailureKind {
     X_LOW_INPUT_BAD = 2,
     X_LOW_DONOR_BUG = 3,
     X_LOW_TRUE_CFL = 4
+};
+
+enum FiniteFailureKind {
+    FINITE_FAILURE_NONE = 0,
+    FINITE_FAILURE_U_LOW_ORDER = 1 << 0,
+    FINITE_FAILURE_U_FINAL_NEGATIVE = 1 << 1,
+    FINITE_FAILURE_MU_LOW_ORDER = 1 << 2,
+    FINITE_FAILURE_MU_FINAL_NEGATIVE = 1 << 3,
+    FINITE_FAILURE_CENTERED_UPDATE = 1 << 4,
+    FINITE_FAILURE_FINAL_NEGATIVE = 1 << 5,
+    FINITE_FAILURE_X_FINAL_POSITIVE = 1 << 6,
+    FINITE_FAILURE_FLOOR_REPAIR = 1 << 7
 };
 
 void resize_or_zero(std::vector<double>& values, size_t n)
@@ -124,6 +162,13 @@ inline size_t mu_xface_index(int iface, int iv, int face)
          + static_cast<size_t>(face);
 }
 
+inline size_t mu_cell_index(int ix, int iv, int face)
+{
+    return (static_cast<size_t>(ix) * Param::Nv
+          + static_cast<size_t>(iv)) * (Param::Nmu + 1)
+         + static_cast<size_t>(face);
+}
+
 double energy_compatible_chain_speed(const Species& sp, int iv)
 {
     const double shell = sp.vgrid.moment_weight[iv];
@@ -170,24 +215,162 @@ double smooth_low_u_mu_alpha(double alpha)
     return safe * (1.0 - LOW_U_MU_ALPHA_SMOOTH * (1.0 - safe));
 }
 
-int adaptive_low_u_subcycles(double out, double available)
+bool is_boundary_cell(double x_cell)
 {
-    if (!(out > 0.0) || !std::isfinite(out)) return 1;
-    const double cfl =
-        out / std::max(available, std::numeric_limits<double>::min());
-    if (cfl <= LOW_U_ADAPTIVE_CFL_THRESHOLD) return 1;
-    const int cycles =
-        static_cast<int>(std::ceil(cfl / LOW_U_ADAPTIVE_CFL_THRESHOLD));
-    return std::max(1, std::min(LOW_U_ADAPTIVE_MAX_SUBCYCLES, cycles));
+    return x_cell < CORE_DIAG_BOUNDARY_WIDTH ||
+           x_cell > Param::Lx - CORE_DIAG_BOUNDARY_WIDTH;
 }
 
-double max_abs_vector(const std::vector<double>& values, size_t n)
+bool is_x_isolation_cell(int global_ix, int nx_global, double dx)
 {
-    double result = 0.0;
-    for (size_t i = 0; i < n && i < values.size(); ++i) {
-        result = std::max(result, std::fabs(values[i]));
+    if (nx_global <= 0 || !(dx > 0.0)) return false;
+    const double x_cell = (static_cast<double>(global_ix) + 0.5) * dx;
+    const double domain_length = static_cast<double>(nx_global) * dx;
+    return x_cell < X_BOUNDARY_ISOLATION_WIDTH ||
+           x_cell > domain_length - X_BOUNDARY_ISOLATION_WIDTH;
+}
+
+double x_local_floor(double f0, double f_ref)
+{
+    const double scale = std::max(1.0,
+        std::max(std::fabs(f0), std::fabs(f_ref)));
+    return -std::max(X_LOW_ABS_F_TOL, X_LOW_REL_F_TOL * scale);
+}
+
+double velocity_local_floor(double f_ref0, double f_ref1)
+{
+    const double scale = std::max(1.0,
+        std::max(std::fabs(f_ref0), std::fabs(f_ref1)));
+    return -std::max(X_LOW_ABS_F_TOL, X_LOW_REL_F_TOL * scale);
+}
+
+struct FloorDebtDecision {
+    double scale;
+    double roundoff_tol;
+    double debt;
+    double rel_debt;
+    bool below_floor;
+    bool hard;
+};
+
+FloorDebtDecision classify_floor_debt(double f_value,
+                                      double f_floor,
+                                      double f_ref0,
+                                      double f_ref1,
+                                      bool soft_region,
+                                      bool old_debt_not_amplified)
+{
+    FloorDebtDecision d;
+    d.scale = std::max(1.0,
+        std::max(std::fabs(f_ref0), std::fabs(f_ref1)));
+    d.roundoff_tol = std::max(
+        FLOOR_DEBT_ROUNDOFF_ABS_TOL,
+        16.0 * std::numeric_limits<double>::epsilon() * d.scale);
+    d.debt = std::isfinite(f_value)
+        ? std::max(0.0, f_floor - f_value)
+        : std::numeric_limits<double>::infinity();
+    d.rel_debt = d.debt / d.scale;
+    d.below_floor = !std::isfinite(f_value) ||
+                    f_value < f_floor - d.roundoff_tol;
+
+    const bool clearly_large =
+        !std::isfinite(d.debt) ||
+        d.debt > FLOOR_DEBT_HARD_ABS_TOL ||
+        d.rel_debt > FLOOR_DEBT_HARD_REL_TOL;
+
+    /*
+     * Boundary, velocity-tail and pre-existing non-amplified debts are allowed
+     * to remain as diagnostics while they stay close to the local floor. Core
+     * cells still use the same roundoff gate, but any clearly large floor debt
+     * is a hard failure.
+     */
+    const bool diagnostic_region = soft_region || old_debt_not_amplified;
+    d.hard = d.below_floor && clearly_large;
+    if (diagnostic_region && d.below_floor && !clearly_large) {
+        d.hard = false;
     }
-    return result;
+    return d;
+}
+
+bool existing_debt_not_amplified(double f_before,
+                                 double f_after,
+                                 double f_floor_before,
+                                 double f_floor_after,
+                                 double scale)
+{
+    if (!std::isfinite(f_before) || !std::isfinite(f_after)) return false;
+    const double before_debt = std::max(0.0, f_floor_before - f_before);
+    const double after_debt = std::max(0.0, f_floor_after - f_after);
+    if (!(before_debt > 0.0) || !(after_debt > 0.0)) return false;
+    const double tolerance = std::max(FLOOR_DEBT_ROUNDOFF_ABS_TOL,
+        FLOOR_DEBT_OLD_REL_TOL * std::max(1.0, scale));
+    return after_debt <= before_debt + tolerance;
+}
+
+double effective_f_for_flux(double f)
+{
+    if (!std::isfinite(f)) return f;
+    return std::max(0.0, f);
+}
+
+double negative_debt_for_flux(double f)
+{
+    return (std::isfinite(f) && f < 0.0) ? -f : 0.0;
+}
+
+double kinetic_energy_per_particle(const Species& sp, int iv)
+{
+    return (sp.vgrid.gamma_cells[iv] - 1.0) *
+           sp.mass * Const::c * Const::c;
+}
+
+bool is_high_u_tail(int iv)
+{
+    const int start = std::max(0, (3 * Param::Nv) / 4);
+    return iv >= start;
+}
+
+bool is_low_occupancy_u_tail(int iv, double f_ref, double line_peak)
+{
+    const int low_occupancy_start = std::max(0, Param::Nv / 4);
+    if (iv < low_occupancy_start) return false;
+    if (!std::isfinite(f_ref) || !std::isfinite(line_peak)) return false;
+    if (!(line_peak > 0.0)) return false;
+    return std::fabs(f_ref) <=
+        VELOCITY_LOW_OCCUPANCY_TAIL_REL_TOL * line_peak;
+}
+
+bool is_u_tail_or_low_occupancy(int iv, double f_ref, double line_peak)
+{
+    return is_high_u_tail(iv) ||
+           is_low_occupancy_u_tail(iv, f_ref, line_peak);
+}
+
+bool accepts_existing_low_order_negative_debt(double f_base,
+                                              double f_low,
+                                              double scale,
+                                              bool boundary)
+{
+    if (!boundary) return false;
+    if (!std::isfinite(f_base) || !std::isfinite(f_low)) return false;
+    if (!(f_base < 0.0) || !(f_low < 0.0)) return false;
+    const double tol = VELOCITY_LOW_ORDER_DEBT_REL_TOL *
+                       std::max(1.0, scale);
+    const double base_debt = -f_base;
+    const double low_debt = -f_low;
+    const double new_debt = std::max(0.0, low_debt - base_debt);
+    return base_debt <= 2.0 * tol && new_debt <= tol;
+}
+
+bool accepts_low_order_negative_debt(double f_base,
+                                     double f_low,
+                                     double scale,
+                                     bool boundary,
+                                     bool velocity_tail)
+{
+    return velocity_tail &&
+           accepts_existing_low_order_negative_debt(f_base, f_low,
+                                                    scale, boundary);
 }
 
 void sync_cell_current_from_faces(Species& sp, int nxl)
@@ -234,6 +417,23 @@ struct UFluxAuditCandidate {
     int valid;
 };
 
+struct StageFailureCandidate {
+    double severity;
+    double f_base;
+    double f_low;
+    double f_high;
+    double f_final;
+    double du_div;
+    double dmu_div;
+    double dx_div;
+    int rank;
+    int ix;
+    int iv;
+    int imu;
+    int kind;
+    int valid;
+};
+
 FiniteFluxCandidate empty_finite_flux_candidate()
 {
     FiniteFluxCandidate info;
@@ -250,6 +450,94 @@ FiniteFluxCandidate empty_finite_flux_candidate()
     info.imu = -1;
     info.has_failure = 0;
     return info;
+}
+
+StageFailureCandidate empty_stage_failure_candidate()
+{
+    StageFailureCandidate info;
+    info.severity = 0.0;
+    info.f_base = 0.0;
+    info.f_low = 0.0;
+    info.f_high = 0.0;
+    info.f_final = 0.0;
+    info.du_div = 0.0;
+    info.dmu_div = 0.0;
+    info.dx_div = 0.0;
+    info.rank = -1;
+    info.ix = -1;
+    info.iv = -1;
+    info.imu = -1;
+    info.kind = FINITE_FAILURE_NONE;
+    info.valid = 0;
+    return info;
+}
+
+void update_stage_failure_candidate(StageFailureCandidate& info,
+                                    int kind,
+                                    int rank,
+                                    int ix,
+                                    int iv,
+                                    int imu,
+                                    double severity,
+                                    double f_base,
+                                    double f_low,
+                                    double f_high,
+                                    double f_final,
+                                    double du_div,
+                                    double dmu_div,
+                                    double dx_div)
+{
+    if (!std::isfinite(severity)) {
+        severity = std::numeric_limits<double>::infinity();
+    }
+    if (!info.valid || severity > info.severity) {
+        info.valid = 1;
+        info.kind = kind;
+        info.rank = rank;
+        info.ix = ix;
+        info.iv = iv;
+        info.imu = imu;
+        info.severity = severity;
+        info.f_base = f_base;
+        info.f_low = f_low;
+        info.f_high = f_high;
+        info.f_final = f_final;
+        info.du_div = du_div;
+        info.dmu_div = dmu_div;
+        info.dx_div = dx_div;
+    }
+}
+
+const char* finite_failure_kind_name(int kind)
+{
+    if (kind == FINITE_FAILURE_U_LOW_ORDER) return "u_low_order_failed";
+    if (kind == FINITE_FAILURE_U_FINAL_NEGATIVE) {
+        return "u_final_negative_hard";
+    }
+    if (kind == FINITE_FAILURE_MU_LOW_ORDER) return "mu_low_order_failed";
+    if (kind == FINITE_FAILURE_MU_FINAL_NEGATIVE) {
+        return "mu_final_negative_hard";
+    }
+    if (kind == FINITE_FAILURE_CENTERED_UPDATE) return "centered_update";
+    if (kind == FINITE_FAILURE_FINAL_NEGATIVE) return "final_negative_hard";
+    if (kind == FINITE_FAILURE_X_FINAL_POSITIVE) {
+        return "x_final_positive_failure";
+    }
+    if (kind == FINITE_FAILURE_FLOOR_REPAIR) return "floor_repair_failed";
+    return "unknown";
+}
+
+int finite_failure_kind_priority(int kind)
+{
+    if (kind == FINITE_FAILURE_MU_FINAL_NEGATIVE) return 100;
+    if (kind == FINITE_FAILURE_X_FINAL_POSITIVE) return 90;
+    if (kind == FINITE_FAILURE_FLOOR_REPAIR) return 85;
+    if (kind == FINITE_FAILURE_U_FINAL_NEGATIVE) return 80;
+    if (kind == FINITE_FAILURE_MU_LOW_ORDER) return 70;
+    if (kind == FINITE_FAILURE_U_LOW_ORDER) return 60;
+    if (kind == FINITE_FAILURE_CENTERED_UPDATE) return 50;
+    if (kind == FINITE_FAILURE_FINAL_NEGATIVE) return 40;
+    return 0;
 }
 
 }
@@ -471,6 +759,69 @@ VlasovAmpereMidpointSolver::advance_with_fixed_substeps(
             combined.x_low_failure_kind =
                 std::max(combined.x_low_failure_kind,
                          sub.x_low_failure_kind);
+            combined.x_final_min_f =
+                std::min(combined.x_final_min_f, sub.x_final_min_f);
+            combined.x_final_failed_count += sub.x_final_failed_count;
+            combined.x_final_core_failed_count +=
+                sub.x_final_core_failed_count;
+            combined.x_final_boundary_failed_count +=
+                sub.x_final_boundary_failed_count;
+            if (sub.x_final_failed_max_debt >
+                combined.x_final_failed_max_debt) {
+                combined.x_final_failed_max_debt =
+                    sub.x_final_failed_max_debt;
+                combined.x_final_worst_ix = sub.x_final_worst_ix;
+                combined.x_final_worst_iv = sub.x_final_worst_iv;
+                combined.x_final_worst_imu = sub.x_final_worst_imu;
+                combined.x_final_failure_region =
+                    sub.x_final_failure_region;
+            }
+            combined.mu_final_negative_hard_count +=
+                sub.mu_final_negative_hard_count;
+            combined.mu_final_core_failed_count +=
+                sub.mu_final_core_failed_count;
+            combined.mu_final_boundary_failed_count +=
+                sub.mu_final_boundary_failed_count;
+            if (sub.mu_final_failed_max_debt >
+                combined.mu_final_failed_max_debt) {
+                combined.mu_final_failed_max_debt =
+                    sub.mu_final_failed_max_debt;
+                combined.mu_final_worst_ix = sub.mu_final_worst_ix;
+                combined.mu_final_worst_iv = sub.mu_final_worst_iv;
+                combined.mu_final_worst_imu = sub.mu_final_worst_imu;
+                combined.mu_final_failure_region =
+                    sub.mu_final_failure_region;
+                combined.mu_final_audit_f_base =
+                    sub.mu_final_audit_f_base;
+                combined.mu_final_audit_f_low =
+                    sub.mu_final_audit_f_low;
+                combined.mu_final_audit_f_high =
+                    sub.mu_final_audit_f_high;
+                combined.mu_final_audit_f_final =
+                    sub.mu_final_audit_f_final;
+                combined.mu_final_audit_f_floor =
+                    sub.mu_final_audit_f_floor;
+                combined.mu_final_audit_A_left =
+                    sub.mu_final_audit_A_left;
+                combined.mu_final_audit_A_right =
+                    sub.mu_final_audit_A_right;
+                combined.mu_final_audit_P_minus =
+                    sub.mu_final_audit_P_minus;
+                combined.mu_final_audit_Q_minus =
+                    sub.mu_final_audit_Q_minus;
+                combined.mu_final_audit_R_minus =
+                    sub.mu_final_audit_R_minus;
+                combined.mu_final_audit_alpha_left_face =
+                    sub.mu_final_audit_alpha_left_face;
+                combined.mu_final_audit_alpha_right_face =
+                    sub.mu_final_audit_alpha_right_face;
+                combined.mu_final_audit_dt_inv_shell =
+                    sub.mu_final_audit_dt_inv_shell;
+                combined.mu_final_audit_mu_dot_lower =
+                    sub.mu_final_audit_mu_dot_lower;
+                combined.mu_final_audit_mu_dot_upper =
+                    sub.mu_final_audit_mu_dot_upper;
+            }
             for (int ir = 0; ir < 2; ++ir) {
                 combined.region_u_limiter_energy_boundary[ir] +=
                     sub.region_u_limiter_energy_boundary[ir];
@@ -529,6 +880,49 @@ VlasovAmpereMidpointSolver::advance_with_fixed_substeps(
                 sub.x_negative_mass_before_repair;
             combined.x_mass_added_by_positivity_repair +=
                 sub.x_mass_added_by_positivity_repair;
+            combined.floor_repair_mass += sub.floor_repair_mass;
+            combined.floor_repair_energy += sub.floor_repair_energy;
+            combined.floor_repair_core_fraction =
+                std::max(combined.floor_repair_core_fraction,
+                         sub.floor_repair_core_fraction);
+            combined.negative_debt_level =
+                std::max(combined.negative_debt_level,
+                         sub.negative_debt_level);
+            combined.neg_mass_boundary += sub.neg_mass_boundary;
+            combined.neg_mass_core += sub.neg_mass_core;
+            combined.neg_mass_tail += sub.neg_mass_tail;
+            combined.neg_mass_total_guard += sub.neg_mass_total_guard;
+            combined.neg_mass_core_fraction =
+                std::max(combined.neg_mass_core_fraction,
+                         sub.neg_mass_core_fraction);
+            combined.neg_energy_core_abs += sub.neg_energy_core_abs;
+            combined.neg_energy_core_fraction =
+                std::max(combined.neg_energy_core_fraction,
+                         sub.neg_energy_core_fraction);
+            combined.neg_current_core_abs += sub.neg_current_core_abs;
+            combined.neg_current_core_fraction =
+                std::max(combined.neg_current_core_fraction,
+                         sub.neg_current_core_fraction);
+            combined.neg_debt_min_f_boundary =
+                std::min(combined.neg_debt_min_f_boundary,
+                         sub.neg_debt_min_f_boundary);
+            combined.neg_debt_min_f_core =
+                std::min(combined.neg_debt_min_f_core,
+                         sub.neg_debt_min_f_core);
+            combined.neg_debt_min_f_tail =
+                std::min(combined.neg_debt_min_f_tail,
+                         sub.neg_debt_min_f_tail);
+            combined.neg_cell_boundary += sub.neg_cell_boundary;
+            combined.neg_cell_core += sub.neg_cell_core;
+            combined.neg_cell_tail += sub.neg_cell_tail;
+            combined.trial_failure_downgraded =
+                std::max(combined.trial_failure_downgraded,
+                         sub.trial_failure_downgraded);
+            combined.accepted_with_negative_debt =
+                std::max(combined.accepted_with_negative_debt,
+                         sub.accepted_with_negative_debt);
+            combined.state_advanced =
+                std::min(combined.state_advanced, sub.state_advanced);
             combined.positivity_energy_defect +=
                 sub.positivity_energy_defect;
             combined.positivity_mass_defect +=
@@ -584,6 +978,48 @@ VlasovAmpereMidpointSolver::advance_with_fixed_substeps(
                      combined.mu_low_failure_audit.severity)) {
                 combined.mu_low_failure_audit =
                     sub.mu_low_failure_audit;
+            }
+            combined.finite_failure_mask |= sub.finite_failure_mask;
+            combined.u_low_order_failed_count +=
+                sub.u_low_order_failed_count;
+            combined.mu_low_order_failed_count +=
+                sub.mu_low_order_failed_count;
+            combined.u_final_negative_hard_count +=
+                sub.u_final_negative_hard_count;
+            combined.mu_final_negative_hard_count +=
+                sub.mu_final_negative_hard_count;
+            if (sub.finite_stage_failure_valid &&
+                (!combined.finite_stage_failure_valid ||
+                 sub.finite_stage_failure_severity >
+                     combined.finite_stage_failure_severity)) {
+                combined.finite_stage_failure_valid =
+                    sub.finite_stage_failure_valid;
+                combined.finite_stage_failure_kind =
+                    sub.finite_stage_failure_kind;
+                combined.finite_stage_failure_rank =
+                    sub.finite_stage_failure_rank;
+                combined.finite_stage_failure_ix =
+                    sub.finite_stage_failure_ix;
+                combined.finite_stage_failure_iv =
+                    sub.finite_stage_failure_iv;
+                combined.finite_stage_failure_imu =
+                    sub.finite_stage_failure_imu;
+                combined.finite_stage_failure_severity =
+                    sub.finite_stage_failure_severity;
+                combined.finite_stage_failure_f_base =
+                    sub.finite_stage_failure_f_base;
+                combined.finite_stage_failure_f_low =
+                    sub.finite_stage_failure_f_low;
+                combined.finite_stage_failure_f_high =
+                    sub.finite_stage_failure_f_high;
+                combined.finite_stage_failure_f_final =
+                    sub.finite_stage_failure_f_final;
+                combined.finite_stage_failure_du_div =
+                    sub.finite_stage_failure_du_div;
+                combined.finite_stage_failure_dmu_div =
+                    sub.finite_stage_failure_dmu_div;
+                combined.finite_stage_failure_dx_div =
+                    sub.finite_stage_failure_dx_div;
             }
             combined.f_neg_min =
                 std::min(combined.f_neg_min, sub.f_neg_min);
@@ -664,8 +1100,7 @@ VlasovAmpereMidpointSolver::advance_background_and_fields(
         if (result.converged && !result.failed) {
             return result;
         }
-        if (result.x_low_failure_kind == X_LOW_INPUT_BAD ||
-            result.x_low_failure_kind == X_LOW_DONOR_BUG) {
+        if (result.x_low_failure_kind == X_LOW_DONOR_BUG) {
             return result;
         }
         if (trial == 6) {
@@ -825,6 +1260,15 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
     result.x_low_input_core_failed_count = 0.0;
     result.x_low_input_debt_accepted = 0.0;
     result.x_low_failure_kind = X_LOW_OK;
+    result.x_final_min_f = std::numeric_limits<double>::infinity();
+    result.x_final_failed_count = 0.0;
+    result.x_final_failed_max_debt = 0.0;
+    result.x_final_worst_ix = -1;
+    result.x_final_worst_iv = -1;
+    result.x_final_worst_imu = -1;
+    result.x_final_failure_region = -1;
+    result.x_final_core_failed_count = 0.0;
+    result.x_final_boundary_failed_count = 0.0;
     // 7.1.6: reset per-direction flux diagnostics
     for (int d = 0; d < 3; ++d) {
         FluxPositivityDiag& fp = result.flux_pos[d];
@@ -875,6 +1319,28 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
         BKG_STAGE_COUNT * Param::Nv, 0);
     result.x_negative_mass_before_repair = 0.0;
     result.x_mass_added_by_positivity_repair = 0.0;
+    result.floor_repair_mass = 0.0;
+    result.floor_repair_energy = 0.0;
+    result.floor_repair_core_fraction = 0.0;
+    result.negative_debt_level = NEG_DEBT_OK;
+    result.neg_mass_boundary = 0.0;
+    result.neg_mass_core = 0.0;
+    result.neg_mass_tail = 0.0;
+    result.neg_mass_total_guard = 0.0;
+    result.neg_mass_core_fraction = 0.0;
+    result.neg_energy_core_abs = 0.0;
+    result.neg_energy_core_fraction = 0.0;
+    result.neg_current_core_abs = 0.0;
+    result.neg_current_core_fraction = 0.0;
+    result.neg_debt_min_f_boundary = 0.0;
+    result.neg_debt_min_f_core = 0.0;
+    result.neg_debt_min_f_tail = 0.0;
+    result.neg_cell_boundary = 0;
+    result.neg_cell_core = 0;
+    result.neg_cell_tail = 0;
+    result.trial_failure_downgraded = 0;
+    result.accepted_with_negative_debt = 0;
+    result.state_advanced = 0;
     result.positivity_energy_defect = 0.0;
     result.positivity_mass_defect = 0.0;
     result.u_force_alpha_min = 1.0;
@@ -899,6 +1365,47 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
     result.u_flux_audit_final_xr_hi = 0.0;
     result.u_low_failure_audit = empty_low_order_failure_audit();
     result.mu_low_failure_audit = empty_low_order_failure_audit();
+    result.finite_failure_mask = FINITE_FAILURE_NONE;
+    result.u_low_order_failed_count = 0;
+    result.mu_low_order_failed_count = 0;
+    result.u_final_negative_hard_count = 0;
+    result.mu_final_negative_hard_count = 0;
+    result.mu_final_failed_max_debt = 0.0;
+    result.mu_final_worst_ix = -1;
+    result.mu_final_worst_iv = -1;
+    result.mu_final_worst_imu = -1;
+    result.mu_final_failure_region = -1;
+    result.mu_final_core_failed_count = 0.0;
+    result.mu_final_boundary_failed_count = 0.0;
+    result.mu_final_audit_f_base = 0.0;
+    result.mu_final_audit_f_low = 0.0;
+    result.mu_final_audit_f_high = 0.0;
+    result.mu_final_audit_f_final = 0.0;
+    result.mu_final_audit_f_floor = 0.0;
+    result.mu_final_audit_A_left = 0.0;
+    result.mu_final_audit_A_right = 0.0;
+    result.mu_final_audit_P_minus = 0.0;
+    result.mu_final_audit_Q_minus = 0.0;
+    result.mu_final_audit_R_minus = 0.0;
+    result.mu_final_audit_alpha_left_face = 0.0;
+    result.mu_final_audit_alpha_right_face = 0.0;
+    result.mu_final_audit_dt_inv_shell = 0.0;
+    result.mu_final_audit_mu_dot_lower = 0.0;
+    result.mu_final_audit_mu_dot_upper = 0.0;
+    result.finite_stage_failure_valid = 0;
+    result.finite_stage_failure_kind = FINITE_FAILURE_NONE;
+    result.finite_stage_failure_rank = -1;
+    result.finite_stage_failure_ix = -1;
+    result.finite_stage_failure_iv = -1;
+    result.finite_stage_failure_imu = -1;
+    result.finite_stage_failure_severity = 0.0;
+    result.finite_stage_failure_f_base = 0.0;
+    result.finite_stage_failure_f_low = 0.0;
+    result.finite_stage_failure_f_high = 0.0;
+    result.finite_stage_failure_f_final = 0.0;
+    result.finite_stage_failure_du_div = 0.0;
+    result.finite_stage_failure_dmu_div = 0.0;
+    result.finite_stage_failure_dx_div = 0.0;
     result.f_neg_min = 0.0;
     result.f_neg_ratio_max = 0.0;
     result.f_neg_mass_total = 0.0;
@@ -1002,6 +1509,12 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                    static_cast<size_t>(nxl + 1) * Param::Nv * (Param::Nmu + 1));
     resize_or_zero(fluxes.mu_final,
                    static_cast<size_t>(nxl + 1) * Param::Nv * (Param::Nmu + 1));
+    resize_or_zero(fluxes.mu_high_cell,
+                   static_cast<size_t>(nxl) * Param::Nv * (Param::Nmu + 1));
+    resize_or_zero(fluxes.mu_low_cell,
+                   static_cast<size_t>(nxl) * Param::Nv * (Param::Nmu + 1));
+    resize_or_zero(fluxes.mu_final_cell,
+                   static_cast<size_t>(nxl) * Param::Nv * (Param::Nmu + 1));
     resize_or_zero(fluxes.cell_alpha_mu, cells);
     fluxes.limiter_active_fraction = 0.0;
     fluxes.limiter_min_alpha = 1.0;
@@ -1025,6 +1538,15 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     fluxes.x_low_input_core_failed_count = 0.0;
     fluxes.x_low_input_debt_accepted = 0.0;
     fluxes.x_low_failure_kind = X_LOW_OK;
+    fluxes.x_final_min_f = std::numeric_limits<double>::infinity();
+    fluxes.x_final_failed_count = 0.0;
+    fluxes.x_final_failed_max_debt = 0.0;
+    fluxes.x_final_worst_ix = -1;
+    fluxes.x_final_worst_iv = -1;
+    fluxes.x_final_worst_imu = -1;
+    fluxes.x_final_failure_region = -1;
+    fluxes.x_final_core_failed_count = 0.0;
+    fluxes.x_final_boundary_failed_count = 0.0;
     // 7.1.6: zero per-direction flux diagnostics
     for (int d = 0; d < 3; ++d) {
         FluxPositivityDiag& fp = fluxes.flux_pos[d];
@@ -1095,6 +1617,27 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         BKG_STAGE_COUNT * Param::Nv, 0);
     fluxes.negative_mass_before_repair = 0.0;
     fluxes.mass_added_by_positivity_repair = 0.0;
+    fluxes.floor_repair_mass = 0.0;
+    fluxes.floor_repair_energy = 0.0;
+    fluxes.floor_repair_core_fraction = 0.0;
+    fluxes.negative_debt_level = NEG_DEBT_OK;
+    fluxes.neg_mass_boundary = 0.0;
+    fluxes.neg_mass_core = 0.0;
+    fluxes.neg_mass_tail = 0.0;
+    fluxes.neg_mass_total_guard = 0.0;
+    fluxes.neg_mass_core_fraction = 0.0;
+    fluxes.neg_energy_core_abs = 0.0;
+    fluxes.neg_energy_core_fraction = 0.0;
+    fluxes.neg_current_core_abs = 0.0;
+    fluxes.neg_current_core_fraction = 0.0;
+    fluxes.neg_debt_min_f_boundary = 0.0;
+    fluxes.neg_debt_min_f_core = 0.0;
+    fluxes.neg_debt_min_f_tail = 0.0;
+    fluxes.neg_cell_boundary = 0;
+    fluxes.neg_cell_core = 0;
+    fluxes.neg_cell_tail = 0;
+    fluxes.trial_failure_downgraded = 0;
+    fluxes.accepted_with_negative_debt = 0;
     fluxes.positivity_energy_defect = 0.0;
     fluxes.positivity_mass_defect = 0.0;
     fluxes.u_force_alpha_min = 1.0;
@@ -1119,6 +1662,47 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     fluxes.u_flux_audit_final_xr_hi = 0.0;
     fluxes.u_low_failure_audit = empty_low_order_failure_audit();
     fluxes.mu_low_failure_audit = empty_low_order_failure_audit();
+    fluxes.finite_failure_mask = FINITE_FAILURE_NONE;
+    fluxes.u_low_order_failed_count = 0;
+    fluxes.mu_low_order_failed_count = 0;
+    fluxes.u_final_negative_hard_count = 0;
+    fluxes.mu_final_negative_hard_count = 0;
+    fluxes.mu_final_failed_max_debt = 0.0;
+    fluxes.mu_final_worst_ix = -1;
+    fluxes.mu_final_worst_iv = -1;
+    fluxes.mu_final_worst_imu = -1;
+    fluxes.mu_final_failure_region = -1;
+    fluxes.mu_final_core_failed_count = 0.0;
+    fluxes.mu_final_boundary_failed_count = 0.0;
+    fluxes.mu_final_audit_f_base = 0.0;
+    fluxes.mu_final_audit_f_low = 0.0;
+    fluxes.mu_final_audit_f_high = 0.0;
+    fluxes.mu_final_audit_f_final = 0.0;
+    fluxes.mu_final_audit_f_floor = 0.0;
+    fluxes.mu_final_audit_A_left = 0.0;
+    fluxes.mu_final_audit_A_right = 0.0;
+    fluxes.mu_final_audit_P_minus = 0.0;
+    fluxes.mu_final_audit_Q_minus = 0.0;
+    fluxes.mu_final_audit_R_minus = 0.0;
+    fluxes.mu_final_audit_alpha_left_face = 0.0;
+    fluxes.mu_final_audit_alpha_right_face = 0.0;
+    fluxes.mu_final_audit_dt_inv_shell = 0.0;
+    fluxes.mu_final_audit_mu_dot_lower = 0.0;
+    fluxes.mu_final_audit_mu_dot_upper = 0.0;
+    fluxes.finite_stage_failure_valid = 0;
+    fluxes.finite_stage_failure_kind = FINITE_FAILURE_NONE;
+    fluxes.finite_stage_failure_rank = -1;
+    fluxes.finite_stage_failure_ix = -1;
+    fluxes.finite_stage_failure_iv = -1;
+    fluxes.finite_stage_failure_imu = -1;
+    fluxes.finite_stage_failure_severity = 0.0;
+    fluxes.finite_stage_failure_f_base = 0.0;
+    fluxes.finite_stage_failure_f_low = 0.0;
+    fluxes.finite_stage_failure_f_high = 0.0;
+    fluxes.finite_stage_failure_f_final = 0.0;
+    fluxes.finite_stage_failure_du_div = 0.0;
+    fluxes.finite_stage_failure_dmu_div = 0.0;
+    fluxes.finite_stage_failure_dx_div = 0.0;
     fluxes.f_neg_min = 0.0;
     fluxes.f_neg_ratio_max = 0.0;
     fluxes.f_neg_mass_total = 0.0;
@@ -1139,14 +1723,100 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     fluxes.finite_flux_imu = -1;
     fluxes.finite_flux_has_failure = 0;
 
+    auto publish_stage_failure =
+        [&](const StageFailureCandidate& local_failure) {
+            struct {
+                double value;
+                int rank;
+            } local_loc, global_loc;
+            local_loc.value =
+                local_failure.valid ? local_failure.severity : 0.0;
+            local_loc.rank = mpi_rank;
+            global_loc.value = 0.0;
+            global_loc.rank = -1;
+            MPI_Allreduce(&local_loc, &global_loc, 1, MPI_DOUBLE_INT,
+                          MPI_MAXLOC, MPI_COMM_WORLD);
+            double values[8] = {0.0};
+            int indices[6] = {-1, -1, -1, -1, FINITE_FAILURE_NONE, 0};
+            if (local_failure.valid && mpi_rank == global_loc.rank) {
+                values[0] = local_failure.severity;
+                values[1] = local_failure.f_base;
+                values[2] = local_failure.f_low;
+                values[3] = local_failure.f_high;
+                values[4] = local_failure.f_final;
+                values[5] = local_failure.du_div;
+                values[6] = local_failure.dmu_div;
+                values[7] = local_failure.dx_div;
+                indices[0] = local_failure.rank;
+                indices[1] = local_failure.ix;
+                indices[2] = local_failure.iv;
+                indices[3] = local_failure.imu;
+                indices[4] = local_failure.kind;
+                indices[5] = local_failure.valid;
+            }
+            if (global_loc.value > 0.0 && global_loc.rank >= 0) {
+                MPI_Bcast(values, 8, MPI_DOUBLE, global_loc.rank,
+                          MPI_COMM_WORLD);
+                MPI_Bcast(indices, 6, MPI_INT, global_loc.rank,
+                          MPI_COMM_WORLD);
+                const int old_priority = fluxes.finite_stage_failure_valid
+                    ? finite_failure_kind_priority(
+                        fluxes.finite_stage_failure_kind)
+                    : -1;
+                const int new_priority =
+                    finite_failure_kind_priority(indices[4]);
+                if (!fluxes.finite_stage_failure_valid ||
+                    new_priority > old_priority ||
+                    (new_priority == old_priority &&
+                     values[0] > fluxes.finite_stage_failure_severity)) {
+                    fluxes.finite_stage_failure_valid = indices[5];
+                    fluxes.finite_stage_failure_rank = indices[0];
+                    fluxes.finite_stage_failure_ix = indices[1];
+                    fluxes.finite_stage_failure_iv = indices[2];
+                    fluxes.finite_stage_failure_imu = indices[3];
+                    fluxes.finite_stage_failure_kind = indices[4];
+                    fluxes.finite_stage_failure_severity = values[0];
+                    fluxes.finite_stage_failure_f_base = values[1];
+                    fluxes.finite_stage_failure_f_low = values[2];
+                    fluxes.finite_stage_failure_f_high = values[3];
+                    fluxes.finite_stage_failure_f_final = values[4];
+                    fluxes.finite_stage_failure_du_div = values[5];
+                    fluxes.finite_stage_failure_dmu_div = values[6];
+                    fluxes.finite_stage_failure_dx_div = values[7];
+                }
+            }
+        };
+
     const double dt_dx = dt / sg.dx;
     double local_negative_mass = 0.0;
-    const double eps_tol_base = 1.0e-12;
     const bool collect_stage_diagnostics = step_diagnostics_enabled_;
+    double chain_speed_by_iv[Param::Nv];
+    for (int iv = 0; iv < Param::Nv; ++iv) {
+        chain_speed_by_iv[iv] = energy_compatible_chain_speed(bkg_n, iv);
+    }
+    std::vector<unsigned char> x_cell_isolation(static_cast<size_t>(nxl), 0);
+    std::vector<unsigned char> x_cell_boundary(static_cast<size_t>(nxl), 0);
+    std::vector<unsigned char> x_face_boundary(static_cast<size_t>(nxl + 1), 0);
+    for (int ix = 0; ix < nxl; ++ix) {
+        const int global_ix = sg.ix_start + ix;
+        const double x_center =
+            (static_cast<double>(global_ix) + 0.5) * sg.dx;
+        x_cell_isolation[static_cast<size_t>(ix)] =
+            is_x_isolation_cell(global_ix, sg.nx_global, sg.dx) ? 1 : 0;
+        x_cell_boundary[static_cast<size_t>(ix)] =
+            is_boundary_cell(x_center) ? 1 : 0;
+    }
+    for (int iface = 0; iface <= nxl; ++iface) {
+        const double x_face =
+            static_cast<double>(sg.ix_start + iface) * sg.dx;
+        x_face_boundary[static_cast<size_t>(iface)] =
+            is_boundary_cell(x_face) ? 1 : 0;
+    }
 
     Species f_mid = bkg_n;
+    int local_f_mid_nonfinite = 0;
     #pragma omp parallel for collapse(2) schedule(static) \
-        reduction(+:local_negative_mass)
+        reduction(+:local_negative_mass,local_f_mid_nonfinite)
     for (int ix = 0; ix < nxl; ++ix) {
         for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu); ++k_int) {
             const int iv = k_int / Param::Nmu;
@@ -1155,12 +1825,22 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
               + static_cast<size_t>(k_int);
             f_mid.f[offset] =
                 0.5 * (bkg_n.f[offset] + bkg_guess_np1.f[offset]);
+            if (!std::isfinite(f_mid.f[offset])) {
+                ++local_f_mid_nonfinite;
+            }
             const double f0 = bkg_n.f[offset];
             if (f0 < 0.0) {
                 local_negative_mass +=
-                    -f0 * bkg_n.vgrid.moment_weight[iv] * sg.dx;
+                    negative_debt_for_flux(f0) *
+                    bkg_n.vgrid.moment_weight[iv] * sg.dx;
             }
         }
+    }
+    int global_f_mid_nonfinite = local_f_mid_nonfinite;
+    MPI_Allreduce(MPI_IN_PLACE, &global_f_mid_nonfinite, 1, MPI_INT,
+                  MPI_MAX, MPI_COMM_WORLD);
+    if (global_f_mid_nonfinite != 0) {
+        finite = false;
     }
     exchange_ghosts_x_persistent(f_mid, sg, mpi_rank, mpi_size);
 
@@ -1170,8 +1850,7 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         const int iv = k_int / Param::Nmu;
         const int imu = k_int - iv * Param::Nmu;
         const double vx_star =
-            energy_compatible_chain_speed(bkg_n, iv)
-          * f_mid.vgrid.mu_cells[imu];
+            chain_speed_by_iv[iv] * f_mid.vgrid.mu_cells[imu];
         for (int iface = 0; iface < nxl; ++iface) {
             const int ix_left = ng + iface - 1;
             const int ix_right = ng + iface;
@@ -1190,43 +1869,6 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                                static_cast<int>(Param::Nvmu),
                                mpi_rank, mpi_size, 504);
 
-    std::vector<double> x_low_shell_max(Param::Nv, 0.0);
-    {
-        const int nthreads = std::max(1, omp_get_max_threads());
-        std::vector<double> thread_shell_max(
-            static_cast<size_t>(nthreads) * Param::Nv, 0.0);
-        #pragma omp parallel
-        {
-            const int tid = omp_get_thread_num();
-            double* shell_max =
-                &thread_shell_max[static_cast<size_t>(tid) * Param::Nv];
-            #pragma omp for collapse(2) schedule(static)
-            for (int ix = 0; ix < nxl; ++ix) {
-                for (int k_int = 0;
-                     k_int < static_cast<int>(Param::Nvmu); ++k_int) {
-                    const int iv = k_int / Param::Nmu;
-                    const size_t k = static_cast<size_t>(k_int);
-                    const size_t src =
-                        static_cast<size_t>(ng + ix) * Param::Nvmu + k;
-                    const double f = bkg_n.f[src];
-                    if (std::isfinite(f) && f > shell_max[iv]) {
-                        shell_max[iv] = f;
-                    }
-                }
-            }
-        }
-        for (int tid = 0; tid < nthreads; ++tid) {
-            const double* shell_max =
-                &thread_shell_max[static_cast<size_t>(tid) * Param::Nv];
-            for (int iv = 0; iv < Param::Nv; ++iv) {
-                x_low_shell_max[iv] =
-                    std::max(x_low_shell_max[iv], shell_max[iv]);
-            }
-        }
-        MPI_Allreduce(MPI_IN_PLACE, x_low_shell_max.data(),
-                      Param::Nv, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-    }
-
     // 7.1.2: x-direction donor-cell low-order flux.
     // Use the accepted f^n state on the upwind side of each face:
     //   F_{i+1/2} = max(vx,0) f_i + min(vx,0) f_{i+1}.
@@ -1242,8 +1884,7 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         const int iv = k_int / Param::Nmu;
         const int imu = k_int - iv * Param::Nmu;
         const double vx_star =
-            energy_compatible_chain_speed(bkg_n, iv)
-          * f_mid.vgrid.mu_cells[imu];
+            chain_speed_by_iv[iv] * f_mid.vgrid.mu_cells[imu];
         local_x_low_max_cfl =
             std::max(local_x_low_max_cfl, std::fabs(vx_star) * dt_dx);
         const double vx_pos = std::max(vx_star, 0.0);
@@ -1258,17 +1899,20 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             const size_t face_slot =
                 static_cast<size_t>(iface) * Param::Nvmu + k;
             fluxes.x_low[face_slot] =
-                vx_pos * bkg_n.f[left] + vx_neg * bkg_n.f[right];
+                vx_pos * effective_f_for_flux(bkg_n.f[left]) +
+                vx_neg * effective_f_for_flux(bkg_n.f[right]);
         }
     }
     close_periodic_face_blocks(fluxes.x_low, nxl,
                                static_cast<int>(Param::Nvmu),
                                mpi_rank, mpi_size, 509);
 
-    // 7.1.2: x-direction FCT limiter with f_floor tolerance
-    // f_floor = -eps * local_scale allows roundoff-level negatives
-    // while catching true CFL violations when the low-order update itself
-    // produces significant negative values.
+    // 6.2/6.3/6.4: x-direction positivity FCT with a donor-cell low-order
+    // base.  Cells near the floor only block outgoing antidiffusion; incoming
+    // antidiffusion is still controlled by the donor cell on each face.
+    // Boundary isolation is limited to cells inside the configured physical
+    // width and tightens only those cells' outgoing antidiffusion budget.
+    // cell_alpha_x stores the per-cell R^- budget for outgoing antidiffusion.
     // 7.1.6: per-direction x diagnostics (collected in this loop)
     double local_x_min_f_before = std::numeric_limits<double>::infinity();
     double local_x_min_f_low    = std::numeric_limits<double>::infinity();
@@ -1281,12 +1925,14 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     double local_x_low_input_rel_neg = 0.0;
     double local_x_low_output_rel_neg = 0.0;
     double local_x_low_input_core_failed = 0.0;
+    double local_x_low_debt_accepted = 0.0;
     #pragma omp parallel for collapse(2) schedule(static) \
         reduction(max:local_x_any_limited) \
         reduction(+:local_x_low_order_failed) \
         reduction(+:local_x_low_input_failed) \
         reduction(+:local_x_low_input_neg_mass) \
         reduction(+:local_x_low_input_core_failed) \
+        reduction(+:local_x_low_debt_accepted) \
         reduction(max:local_x_low_input_rel_neg) \
         reduction(max:local_x_low_output_rel_neg) \
         reduction(min:local_x_min_f_before) \
@@ -1298,85 +1944,136 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             const size_t slot = static_cast<size_t>(ix) * Param::Nvmu + k;
             const size_t src =
                 static_cast<size_t>(ng + ix) * Param::Nvmu + k;
-            const double f0 = bkg_n.f[src];
+            const double f_raw = bkg_n.f[src];
+            const double f0 = effective_f_for_flux(f_raw);
             // 7.1.6: track min f before any update
-            if (f0 < local_x_min_f_before) local_x_min_f_before = f0;
+            if (f_raw < local_x_min_f_before) local_x_min_f_before = f_raw;
             const double div_low = dt_dx *
                 (fluxes.x_low[static_cast<size_t>(ix + 1) * Param::Nvmu + k]
                - fluxes.x_low[static_cast<size_t>(ix) * Param::Nvmu + k]);
-            const double div_high = dt_dx *
-                (fluxes.x_high[static_cast<size_t>(ix + 1) * Param::Nvmu + k]
-               - fluxes.x_high[static_cast<size_t>(ix) * Param::Nvmu + k]);
             const double f_low = f0 - div_low;
-            const double f_high = f0 - div_high;
             // 7.1.6: track min after low-order update
             if (f_low < local_x_min_f_low) local_x_min_f_low = f_low;
             const int iv = k_int / Param::Nmu;
-            const double f_tol =
-                std::max(X_LOW_ABS_F_TOL,
-                         X_LOW_REL_F_TOL * x_low_shell_max[iv]);
-            const double f_scale = std::max(1.0, x_low_shell_max[iv]);
-            if (!std::isfinite(f_low) || !std::isfinite(f_high)) {
+            const double f_scale =
+                std::max(1.0, std::max(std::fabs(f0), std::fabs(f_low)));
+            const double f_floor = x_local_floor(f0, f_low);
+            const double input_floor = x_local_floor(f0, f0);
+            const double f_tol = -f_floor;
+            const bool boundary =
+                x_cell_boundary[static_cast<size_t>(ix)] != 0;
+            const bool velocity_tail = is_high_u_tail(iv);
+            if (!std::isfinite(f_low)) {
                 fluxes.cell_alpha_x[slot] = 0.0;
                 local_x_low_order_failed += 1.0;
                 local_x_any_limited = 1;
                 continue;
             }
-            const double f_floor = -f_tol;
-            if (f0 < f_floor) {
-                local_x_low_input_failed += 1.0;
-                local_x_low_input_neg_mass +=
-                    (-f0) * bkg_n.vgrid.moment_weight[iv] * sg.dx;
+            const FloorDebtDecision input_debt =
+                classify_floor_debt(f_raw, input_floor, f0, f_low,
+                                    boundary || velocity_tail, true);
+            if (input_debt.debt > 0.0) {
+                if (std::isfinite(f_raw) && f_raw < 0.0) {
+                    local_x_low_input_neg_mass +=
+                        (-f_raw) * bkg_n.vgrid.moment_weight[iv] * sg.dx;
+                }
                 local_x_low_input_rel_neg =
-                    std::max(local_x_low_input_rel_neg, (-f0) / f_scale);
-                const double x_cell =
-                    static_cast<double>(sg.ix_start + ix) * sg.dx;
-                const bool in_core =
-                    (x_cell >= CORE_DIAG_BOUNDARY_WIDTH) &&
-                    (x_cell <= Param::Lx - CORE_DIAG_BOUNDARY_WIDTH);
-                if (in_core) {
+                    std::max(local_x_low_input_rel_neg,
+                             input_debt.rel_debt);
+                if (!boundary && input_debt.hard) {
                     local_x_low_input_core_failed += 1.0;
                 }
+            }
+            if (input_debt.below_floor) {
+                if (input_debt.hard) {
+                    local_x_low_input_failed += 1.0;
+                } else {
+                    local_x_low_debt_accepted += 1.0;
+                }
                 if (f_low < 0.0) {
+                    const double output_floor = x_local_floor(f0, f_low);
+                    const FloorDebtDecision output_from_bad_input =
+                        classify_floor_debt(f_low, output_floor, f0, f_low,
+                                            boundary || velocity_tail,
+                                            true);
                     local_x_low_output_rel_neg =
                         std::max(local_x_low_output_rel_neg,
-                                 (-f_low) / f_scale);
+                                 output_from_bad_input.rel_debt);
                 }
                 fluxes.cell_alpha_x[slot] = 0.0;
                 local_x_any_limited = 1;
                 continue;
             }
-            if (f_low < f_floor) {
+            const bool old_debt_not_amplified =
+                existing_debt_not_amplified(f_raw, f_low, input_floor,
+                                            f_floor, f_scale);
+            const FloorDebtDecision low_debt =
+                classify_floor_debt(f_low, f_floor, f0, f_low,
+                                    boundary || velocity_tail,
+                                    old_debt_not_amplified);
+            if (low_debt.debt > 0.0) {
+                local_x_low_output_rel_neg =
+                    std::max(local_x_low_output_rel_neg,
+                             low_debt.rel_debt);
+            }
+            if (low_debt.below_floor && low_debt.hard) {
                 // Low-order update itself is negative beyond the shell-scaled
                 // tolerance.  The global classification below distinguishes
                 // true CFL from donor/periodic-face errors.
                 local_x_low_order_failed += 1.0;
-                local_x_low_output_rel_neg =
-                    std::max(local_x_low_output_rel_neg, (-f_low) / f_scale);
+                fluxes.cell_alpha_x[slot] = 0.0;
+                local_x_any_limited = 1;
+                continue;
+            } else if (low_debt.below_floor) {
+                local_x_low_debt_accepted += 1.0;
                 fluxes.cell_alpha_x[slot] = 0.0;
                 local_x_any_limited = 1;
                 continue;
             }
-            // Fast path: high-order update is safe (common case, ~75-85%
-            // of cells even with active limiter).  Branch hint for GCC/Clang.
-            if (__builtin_expect(f_high >= f_floor, 1)) continue;
-            // 7.1.6: track negative mass prevented by the limiter
-            // f_high < f_floor means the high-order flux would create
-            // negative mass. The negative mass prevented is (-f_high) * weight.
-            if (f_high < 0.0) {
-                const int iv2 = k_int / Param::Nmu;
-                local_x_neg_mass_prevented +=
-                    (-f_high) * bkg_n.vgrid.moment_weight[iv2] * sg.dx;
-            }
-            const double antidiff_out = div_high - div_low;
-            if (antidiff_out <= 0.0) {
+
+            const double a_left =
+                fluxes.x_high[static_cast<size_t>(ix) * Param::Nvmu + k]
+              - fluxes.x_low[static_cast<size_t>(ix) * Param::Nvmu + k];
+            const double a_right =
+                fluxes.x_high[static_cast<size_t>(ix + 1) * Param::Nvmu + k]
+              - fluxes.x_low[static_cast<size_t>(ix + 1) * Param::Nvmu + k];
+            if (!std::isfinite(a_left) || !std::isfinite(a_right)) {
                 fluxes.cell_alpha_x[slot] = 0.0;
-            } else {
-                fluxes.cell_alpha_x[slot] =
-                    std::max(0.0, std::min(1.0,
-                             (f_low - f_floor) / antidiff_out));
+                local_x_any_limited = 1;
+                continue;
             }
-            local_x_any_limited = 1;
+
+            const double p_minus =
+                dt_dx * (std::max(0.0, a_right) +
+                         std::max(0.0, -a_left));
+            if (p_minus <= 0.0) {
+                continue;
+            }
+            const double floor_margin = X_FLOOR_MARGIN_FACTOR * f_tol;
+            if (f_low <= f_floor + floor_margin) {
+                fluxes.cell_alpha_x[slot] = 0.0;
+                local_x_any_limited = 1;
+                local_x_neg_mass_prevented +=
+                    p_minus * bkg_n.vgrid.moment_weight[iv] * sg.dx;
+                continue;
+            }
+            const double q_minus = std::max(0.0, f_low - f_floor);
+            const bool x_isolation_cell =
+                x_cell_isolation[static_cast<size_t>(ix)] != 0;
+            const double q_budget = x_isolation_cell
+                ? X_BOUNDARY_BUDGET_FACTOR * q_minus
+                : q_minus;
+            const double r_minus =
+                std::max(0.0, std::min(1.0, q_budget / p_minus));
+            if (r_minus < 1.0) {
+                fluxes.cell_alpha_x[slot] = r_minus;
+                local_x_any_limited = 1;
+                const double limited_out = (1.0 - r_minus) * p_minus;
+                local_x_neg_mass_prevented +=
+                    limited_out * bkg_n.vgrid.moment_weight[iv] * sg.dx;
+            } else {
+                fluxes.cell_alpha_x[slot] = 1.0;
+            }
         }
     }
 
@@ -1384,21 +2081,30 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     MPI_Allreduce(MPI_IN_PLACE, &global_x_any_limited, 1, MPI_INT,
                   MPI_MAX, MPI_COMM_WORLD);
     std::vector<double> x_alpha_left_ghost;
+    std::vector<double> x_alpha_right_ghost;
     if (global_x_any_limited != 0 && nxl > 0) {
         x_alpha_left_ghost.assign(Param::Nvmu, 1.0);
+        x_alpha_right_ghost.assign(Param::Nvmu, 1.0);
         if (mpi_size <= 1) {
             const size_t last_base =
                 static_cast<size_t>(nxl - 1) * Param::Nvmu;
             std::copy(fluxes.cell_alpha_x.begin() + last_base,
                       fluxes.cell_alpha_x.begin() + last_base + Param::Nvmu,
                       x_alpha_left_ghost.begin());
+            std::copy(fluxes.cell_alpha_x.begin(),
+                      fluxes.cell_alpha_x.begin() + Param::Nvmu,
+                      x_alpha_right_ghost.begin());
         } else {
             std::vector<double> x_alpha_send_right(Param::Nvmu, 1.0);
+            std::vector<double> x_alpha_send_left(Param::Nvmu, 1.0);
             const size_t last_base =
                 static_cast<size_t>(nxl - 1) * Param::Nvmu;
             std::copy(fluxes.cell_alpha_x.begin() + last_base,
                       fluxes.cell_alpha_x.begin() + last_base + Param::Nvmu,
                       x_alpha_send_right.begin());
+            std::copy(fluxes.cell_alpha_x.begin(),
+                      fluxes.cell_alpha_x.begin() + Param::Nvmu,
+                      x_alpha_send_left.begin());
             const int left_rank = (mpi_rank + mpi_size - 1) % mpi_size;
             const int right_rank = (mpi_rank + 1) % mpi_size;
             MPI_Sendrecv(x_alpha_send_right.data(),
@@ -1407,6 +2113,13 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                          x_alpha_left_ghost.data(),
                          static_cast<int>(Param::Nvmu), MPI_DOUBLE,
                          left_rank, 510, MPI_COMM_WORLD,
+                         MPI_STATUS_IGNORE);
+            MPI_Sendrecv(x_alpha_send_left.data(),
+                         static_cast<int>(Param::Nvmu), MPI_DOUBLE,
+                         left_rank, 511,
+                         x_alpha_right_ghost.data(),
+                         static_cast<int>(Param::Nvmu), MPI_DOUBLE,
+                         right_rank, 511, MPI_COMM_WORLD,
                          MPI_STATUS_IGNORE);
         }
     }
@@ -1426,21 +2139,31 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             const size_t k = static_cast<size_t>(k_int);
             double alpha_face = 1.0;
             if (global_x_any_limited != 0) {
-                const double* alpha_left =
+                const double* r_left =
                     (iface == 0)
                     ? x_alpha_left_ghost.data()
                     : &fluxes.cell_alpha_x[
                         static_cast<size_t>(iface - 1) * Param::Nvmu];
-                const double* alpha_right =
+                const double* r_right =
                     (iface == nxl)
-                    ? fluxes.cell_alpha_x.data()
+                    ? x_alpha_right_ghost.data()
                     : &fluxes.cell_alpha_x[
                         static_cast<size_t>(iface) * Param::Nvmu];
-                alpha_face =
-                    std::min(alpha_left[k], alpha_right[k]);
-                // 7.1.2: safety factor to prevent limiter overshoot
-                alpha_face = std::max(0.0, std::min(1.0,
-                    alpha_face * X_FCT_SAFETY));
+                const size_t face_slot =
+                    static_cast<size_t>(iface) * Param::Nvmu + k;
+                const double antidiff =
+                    fluxes.x_high[face_slot] - fluxes.x_low[face_slot];
+                if (!std::isfinite(antidiff)) {
+                    alpha_face = 0.0;
+                } else if (antidiff > 0.0) {
+                    alpha_face = r_left[k];
+                } else if (antidiff < 0.0) {
+                    alpha_face = r_right[k];
+                }
+                if (alpha_face < 0.999999) {
+                    alpha_face = std::max(0.0, std::min(1.0,
+                        alpha_face * X_FCT_SAFETY));
+                }
             }
             const size_t face_slot =
                 static_cast<size_t>(iface) * Param::Nvmu + k;
@@ -1448,11 +2171,8 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                 fluxes.x_low[face_slot] +
                 alpha_face * (fluxes.x_high[face_slot] - fluxes.x_low[face_slot]);
 
-            const double x_face =
-                static_cast<double>(sg.ix_start + iface) * sg.dx;
             const bool boundary =
-                (x_face < CORE_DIAG_BOUNDARY_WIDTH) ||
-                (x_face > Param::Lx - CORE_DIAG_BOUNDARY_WIDTH);
+                x_face_boundary[static_cast<size_t>(iface)] != 0;
             if (boundary) {
                 ++local_x_total_boundary;
                 if (alpha_face < 0.999999) ++local_x_active_boundary;
@@ -1469,6 +2189,153 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     close_periodic_face_blocks(fluxes.x_final, nxl,
                                static_cast<int>(Param::Nvmu),
                                mpi_rank, mpi_size, 505);
+
+    double local_x_final_min_f = std::numeric_limits<double>::infinity();
+    double local_x_final_failed_count = 0.0;
+    double local_x_final_core_failed_count = 0.0;
+    double local_x_final_boundary_failed_count = 0.0;
+    double local_x_final_max_debt = 0.0;
+    double local_x_final_nonfinite_count = 0.0;
+    const int x_final_audit_threads = std::max(1, omp_get_max_threads());
+    std::vector<StageFailureCandidate> thread_x_final_failure(
+        static_cast<size_t>(x_final_audit_threads),
+        empty_stage_failure_candidate());
+
+    #pragma omp parallel for collapse(2) schedule(static) \
+        reduction(min:local_x_final_min_f) \
+        reduction(+:local_x_final_failed_count, \
+                    local_x_final_core_failed_count, \
+                    local_x_final_boundary_failed_count, \
+                    local_x_final_nonfinite_count) \
+        reduction(max:local_x_final_max_debt)
+    for (int ix = 0; ix < nxl; ++ix) {
+        for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu); ++k_int) {
+            const size_t k = static_cast<size_t>(k_int);
+            const size_t src =
+                static_cast<size_t>(ng + ix) * Param::Nvmu + k;
+            const int iv = k_int / Param::Nmu;
+            const int imu = k_int - iv * Param::Nmu;
+            const double f_raw = bkg_n.f[src];
+            const double f0 = effective_f_for_flux(f_raw);
+            const double dx_div =
+                dt_dx *
+                (fluxes.x_final[
+                     static_cast<size_t>(ix + 1) * Param::Nvmu + k]
+               - fluxes.x_final[
+                     static_cast<size_t>(ix) * Param::Nvmu + k]);
+            const double f_after_x_check = f0 - dx_div;
+            if (!std::isfinite(f_after_x_check)) {
+                ++local_x_final_nonfinite_count;
+                const int tid = omp_get_thread_num();
+                update_stage_failure_candidate(
+                    thread_x_final_failure[static_cast<size_t>(tid)],
+                    FINITE_FAILURE_X_FINAL_POSITIVE, mpi_rank,
+                    sg.ix_start + ix, iv, imu,
+                    std::numeric_limits<double>::infinity(),
+                    f_raw, 0.0, 0.0, f_after_x_check,
+                    0.0, 0.0, dx_div);
+                continue;
+            }
+            local_x_final_min_f =
+                std::min(local_x_final_min_f, f_after_x_check);
+            const double f_floor = x_local_floor(f0, f_after_x_check);
+            const double f0_floor = x_local_floor(f0, f0);
+            const bool boundary =
+                x_cell_boundary[static_cast<size_t>(ix)] != 0;
+            const bool velocity_tail = is_high_u_tail(iv);
+            const double f_scale =
+                std::max(1.0, std::max(std::fabs(f0),
+                                       std::fabs(f_after_x_check)));
+            const bool old_debt_not_amplified =
+                existing_debt_not_amplified(f_raw, f_after_x_check,
+                                            f0_floor, f_floor, f_scale);
+            const FloorDebtDecision debt_decision =
+                classify_floor_debt(f_after_x_check, f_floor, f0,
+                                    f_after_x_check,
+                                    boundary || velocity_tail,
+                                    old_debt_not_amplified);
+            if (debt_decision.debt > 0.0) {
+                local_x_final_max_debt =
+                    std::max(local_x_final_max_debt,
+                             debt_decision.debt);
+            }
+            if (debt_decision.below_floor && debt_decision.hard) {
+                ++local_x_final_failed_count;
+                if (boundary) {
+                    ++local_x_final_boundary_failed_count;
+                } else {
+                    ++local_x_final_core_failed_count;
+                }
+                const int tid = omp_get_thread_num();
+                update_stage_failure_candidate(
+                    thread_x_final_failure[static_cast<size_t>(tid)],
+                    FINITE_FAILURE_X_FINAL_POSITIVE, mpi_rank,
+                    sg.ix_start + ix, iv, imu, debt_decision.debt,
+                    f_raw, 0.0, 0.0, f_after_x_check,
+                    0.0, 0.0, dx_div);
+            }
+        }
+    }
+
+    double global_x_final_min_f = local_x_final_min_f;
+    MPI_Allreduce(MPI_IN_PLACE, &global_x_final_min_f, 1,
+                  MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+    if (!std::isfinite(global_x_final_min_f)) {
+        global_x_final_min_f = 0.0;
+    }
+    double local_x_final_counts[4] = {
+        local_x_final_failed_count,
+        local_x_final_core_failed_count,
+        local_x_final_boundary_failed_count,
+        local_x_final_nonfinite_count
+    };
+    double global_x_final_counts[4] = {0.0, 0.0, 0.0, 0.0};
+    MPI_Allreduce(local_x_final_counts, global_x_final_counts, 4,
+                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    double global_x_final_max_debt = local_x_final_max_debt;
+    MPI_Allreduce(MPI_IN_PLACE, &global_x_final_max_debt, 1,
+                  MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    fluxes.x_final_min_f = global_x_final_min_f;
+    fluxes.x_final_failed_count = global_x_final_counts[0];
+    fluxes.x_final_core_failed_count = global_x_final_counts[1];
+    fluxes.x_final_boundary_failed_count = global_x_final_counts[2];
+    fluxes.x_final_failed_max_debt =
+        std::max(fluxes.x_final_failed_max_debt,
+                 global_x_final_max_debt);
+
+    StageFailureCandidate local_x_final_failure =
+        empty_stage_failure_candidate();
+    for (const StageFailureCandidate& audit : thread_x_final_failure) {
+        if (audit.valid &&
+            (!local_x_final_failure.valid ||
+             audit.severity > local_x_final_failure.severity)) {
+            local_x_final_failure = audit;
+        }
+    }
+    if (fluxes.x_final_failed_count > 0.0) {
+        fluxes.trial_failure_downgraded = 1;
+        publish_stage_failure(local_x_final_failure);
+        if (fluxes.finite_stage_failure_valid != 0 &&
+            fluxes.finite_stage_failure_kind ==
+                FINITE_FAILURE_X_FINAL_POSITIVE) {
+            fluxes.x_final_failed_max_debt =
+                std::max(fluxes.x_final_failed_max_debt,
+                         fluxes.finite_stage_failure_severity);
+            fluxes.x_final_worst_ix = fluxes.finite_stage_failure_ix;
+            fluxes.x_final_worst_iv = fluxes.finite_stage_failure_iv;
+            fluxes.x_final_worst_imu = fluxes.finite_stage_failure_imu;
+            const double x_cell =
+                (static_cast<double>(fluxes.x_final_worst_ix) + 0.5) *
+                sg.dx;
+            fluxes.x_final_failure_region =
+                is_boundary_cell(x_cell) ? 1 : 0;
+        }
+    }
+    if (global_x_final_counts[3] > 0.0) {
+        fluxes.finite_failure_mask |= FINITE_FAILURE_X_FINAL_POSITIVE;
+        finite = false;
+        publish_stage_failure(local_x_final_failure);
+    }
 
     /*
      * Yee-face force flux. The same x-face midpoint distribution is used for:
@@ -1594,10 +2461,12 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                          static_cast<size_t>(ix + 1) * Param::Nvmu + k]
                    - fluxes.x_final[
                          static_cast<size_t>(ix) * Param::Nvmu + k]);
-                f_base[iv] = bkg_n.f[src] - dx_div;
-                const double local_scale =
-                    std::max(1.0, std::fabs(f_base[iv]));
-                f_floor[iv] = -eps_tol_base * local_scale;
+                f_base[iv] = effective_f_for_flux(
+                    effective_f_for_flux(bkg_n.f[src]) - dx_div);
+                f_floor[iv] =
+                    -std::max(X_LOW_ABS_F_TOL,
+                              X_LOW_REL_F_TOL *
+                              std::max(1.0, std::fabs(f_base[iv])));
                 low_out[iv] = 0.0;
                 theta[iv] = 1.0;
             }
@@ -1758,7 +2627,10 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     int local_any_limited = 0;
     long long local_ec_negative_cells = 0;
     long long local_u_low_order_failed = 0;
+    long long local_u_low_order_debt_accepted = 0;
+    double local_u_low_order_debt_mass = 0.0;
     double local_u_min_f_low = std::numeric_limits<double>::infinity();
+    const bool collect_u_flux_audit = collect_stage_diagnostics;
     const int u_audit_threads = std::max(1, omp_get_max_threads());
     std::vector<UFluxAuditCandidate> thread_u_audit(
         static_cast<size_t>(u_audit_threads),
@@ -1766,6 +2638,9 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     std::vector<LowOrderFailureAudit> thread_u_low_failure(
         static_cast<size_t>(u_audit_threads),
         empty_low_order_failure_audit());
+    std::vector<StageFailureCandidate> thread_stage_u_low_failure(
+        static_cast<size_t>(u_audit_threads),
+        empty_stage_failure_candidate());
     auto u_low_scale_at = [&](int ix, int face, int imu) -> double {
         if (face <= 0 || face >= Param::Nv) return 0.0;
         const double ex_left =
@@ -1799,11 +2674,38 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                      static_cast<size_t>(ix + 1) * Param::Nvmu + k]
                - fluxes.x_final[
                      static_cast<size_t>(ix) * Param::Nvmu + k]);
-            return bkg_n.f[src] - dx_div;
+            return effective_f_for_flux(
+                effective_f_for_flux(bkg_n.f[src]) - dx_div);
+        };
+    auto u_line_peak_after_x_at =
+        [&](int ix, int imu) -> double {
+            double peak = 0.0;
+            for (int iv = 0; iv < Param::Nv; ++iv) {
+                const size_t k =
+                    static_cast<size_t>(iv) * Param::Nmu
+                  + static_cast<size_t>(imu);
+                const size_t src =
+                    static_cast<size_t>(ng + ix) * Param::Nvmu + k;
+                const double dx_div =
+                    dt_dx *
+                    (fluxes.x_final[
+                         static_cast<size_t>(ix + 1) * Param::Nvmu + k]
+                   - fluxes.x_final[
+                         static_cast<size_t>(ix) * Param::Nvmu + k]);
+                const double f_after_x =
+                    effective_f_for_flux(
+                        effective_f_for_flux(bkg_n.f[src]) - dx_div);
+                if (std::isfinite(f_after_x) && f_after_x > peak) {
+                    peak = f_after_x;
+                }
+            }
+            return peak;
         };
     #pragma omp parallel for collapse(2) schedule(static) \
         reduction(max:local_any_limited) \
-        reduction(+:local_ec_negative_cells,local_u_low_order_failed) \
+        reduction(+:local_ec_negative_cells,local_u_low_order_failed, \
+                    local_u_low_order_debt_accepted, \
+                    local_u_low_order_debt_mass) \
         reduction(min:local_u_min_f_low)
     for (int ix = 0; ix < nxl; ++ix) {
         for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu); ++k_int) {
@@ -1814,13 +2716,14 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                 static_cast<size_t>(ix) * Param::Nvmu + k;
             const size_t src =
                 static_cast<size_t>(ng + ix) * Param::Nvmu + k;
-            const double f0 = bkg_n.f[src];
+            const double f_raw = bkg_n.f[src];
+            const double f0 = effective_f_for_flux(f_raw);
             const double hdt_is = half_dt_inv_shell[iv];
             const double dx_div =
                 dt_dx *
                 (fluxes.x_final[static_cast<size_t>(ix + 1) * Param::Nvmu + k]
                - fluxes.x_final[static_cast<size_t>(ix) * Param::Nvmu + k]);
-            const double f_after_x = f0 - dx_div;
+            const double f_after_x = effective_f_for_flux(f0 - dx_div);
             const double dt_inv_shell = 2.0 * hdt_is;
             const double u_div_low =
                 fluxes.u_low_cell[u_cell_index(ix, iv + 1, imu)]
@@ -1831,7 +2734,9 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
               - fluxes.u_high_cell[u_cell_index(ix, iv, imu)];
             const double du_div_high = dt_inv_shell * u_div_high;
             const double local_scale = std::max(1.0, std::fabs(f_after_x));
-            const double f_floor = -eps_tol_base * local_scale;
+            const double f_floor =
+                -std::max(X_LOW_ABS_F_TOL,
+                          X_LOW_REL_F_TOL * local_scale);
             const double f_low = f_after_x - du_div_low;
             const double f_high = f_after_x - du_div_high;
             local_u_min_f_low = std::min(local_u_min_f_low, f_low);
@@ -1843,23 +2748,31 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                 local_any_limited = 1;
                 audit_alpha = 0.0;
                 audit_severity = std::numeric_limits<double>::infinity();
-                const int tid = omp_get_thread_num();
-                UFluxAuditCandidate& audit =
-                    thread_u_audit[static_cast<size_t>(tid)];
-                if (!audit.valid || audit_severity > audit.severity) {
-                    audit.valid = 1;
-                    audit.severity = audit_severity;
-                    audit.f0 = f0;
-                    audit.f_low = f_low;
-                    audit.f_high = f_high;
-                    audit.alpha = audit_alpha;
-                    audit.du_div_low = du_div_low;
-                    audit.du_div_high = du_div_high;
-                    audit.ix = sg.ix_start + ix;
-                    audit.iv = iv;
-                    audit.imu = imu;
+                if (collect_u_flux_audit) {
+                    const int tid = omp_get_thread_num();
+                    UFluxAuditCandidate& audit =
+                        thread_u_audit[static_cast<size_t>(tid)];
+                    if (!audit.valid || audit_severity > audit.severity) {
+                        audit.valid = 1;
+                        audit.severity = audit_severity;
+                        audit.f0 = f_raw;
+                        audit.f_low = f_low;
+                        audit.f_high = f_high;
+                        audit.alpha = audit_alpha;
+                        audit.du_div_low = du_div_low;
+                        audit.du_div_high = du_div_high;
+                        audit.ix = sg.ix_start + ix;
+                        audit.iv = iv;
+                        audit.imu = imu;
+                    }
                 }
                 const int low_tid = omp_get_thread_num();
+                update_stage_failure_candidate(
+                    thread_stage_u_low_failure[static_cast<size_t>(low_tid)],
+                    FINITE_FAILURE_U_LOW_ORDER, mpi_rank,
+                    sg.ix_start + ix, iv, imu, audit_severity,
+                    f_after_x, f_low, f_high, f_low,
+                    du_div_low, 0.0, dx_div);
                 LowOrderFailureAudit& low_audit =
                     thread_u_low_failure[static_cast<size_t>(low_tid)];
                 if (!low_audit.valid ||
@@ -1882,21 +2795,16 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                         u_low_donor_iv_at(right_lower_scale, lower_face);
                     const int right_upper_donor =
                         u_low_donor_iv_at(right_upper_scale, upper_face);
-                    const double x_cell =
-                        (static_cast<double>(sg.ix_start + ix) + 0.5)
-                      * sg.dx;
                     low_audit.valid = 1;
                     low_audit.rank = mpi_rank;
                     low_audit.ix = sg.ix_start + ix;
                     low_audit.iv = iv;
                     low_audit.imu = imu;
                     low_audit.region =
-                        (x_cell < CORE_DIAG_BOUNDARY_WIDTH ||
-                         x_cell > Param::Lx - CORE_DIAG_BOUNDARY_WIDTH)
-                        ? 1 : 0;
+                        x_cell_boundary[static_cast<size_t>(ix)] ? 1 : 0;
                     low_audit.severity = audit_severity;
-                    low_audit.f_input = f0;
-                    low_audit.f_after_x = f0 - dx_div;
+                    low_audit.f_input = f_raw;
+                    low_audit.f_after_x = f_after_x;
                     low_audit.dx_div = dx_div;
                     low_audit.dmu_div_used = 0.0;
                     low_audit.du_div_low = du_div_low;
@@ -1937,27 +2845,57 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             }
             if (f_low < f_floor) {
                 alpha_cell[ix_k] = 0.0;
-                ++local_u_low_order_failed;
                 local_any_limited = 1;
                 audit_alpha = 0.0;
                 audit_severity = std::max(0.0, -f_low);
-                const int tid = omp_get_thread_num();
-                UFluxAuditCandidate& audit =
-                    thread_u_audit[static_cast<size_t>(tid)];
-                if (!audit.valid || audit_severity > audit.severity) {
-                    audit.valid = 1;
-                    audit.severity = audit_severity;
-                    audit.f0 = f0;
-                    audit.f_low = f_low;
-                    audit.f_high = f_high;
-                    audit.alpha = audit_alpha;
-                    audit.du_div_low = du_div_low;
-                    audit.du_div_high = du_div_high;
-                    audit.ix = sg.ix_start + ix;
-                    audit.iv = iv;
-                    audit.imu = imu;
+                const double line_peak = u_line_peak_after_x_at(ix, imu);
+                const bool accepted_debt =
+                    accepts_low_order_negative_debt(
+                        f_after_x, f_low, local_scale,
+                        x_cell_boundary[static_cast<size_t>(ix)] != 0,
+                        is_u_tail_or_low_occupancy(iv, f_after_x,
+                                                   line_peak));
+                if (accepted_debt) {
+                    ++local_u_low_order_debt_accepted;
+                    local_u_low_order_debt_mass +=
+                        std::max(0.0, -f_low) *
+                        bkg_n.vgrid.moment_weight[iv] * sg.dx;
+                    const int debt_tid = omp_get_thread_num();
+                    update_stage_failure_candidate(
+                        thread_stage_u_low_failure[
+                            static_cast<size_t>(debt_tid)],
+                        FINITE_FAILURE_U_LOW_ORDER, mpi_rank,
+                        sg.ix_start + ix, iv, imu, audit_severity,
+                        f_after_x, f_low, f_high, f_low,
+                        du_div_low, 0.0, dx_div);
+                    continue;
+                }
+                ++local_u_low_order_failed;
+                if (collect_u_flux_audit) {
+                    const int tid = omp_get_thread_num();
+                    UFluxAuditCandidate& audit =
+                        thread_u_audit[static_cast<size_t>(tid)];
+                    if (!audit.valid || audit_severity > audit.severity) {
+                        audit.valid = 1;
+                        audit.severity = audit_severity;
+                        audit.f0 = f_raw;
+                        audit.f_low = f_low;
+                        audit.f_high = f_high;
+                        audit.alpha = audit_alpha;
+                        audit.du_div_low = du_div_low;
+                        audit.du_div_high = du_div_high;
+                        audit.ix = sg.ix_start + ix;
+                        audit.iv = iv;
+                        audit.imu = imu;
+                    }
                 }
                 const int low_tid = omp_get_thread_num();
+                update_stage_failure_candidate(
+                    thread_stage_u_low_failure[static_cast<size_t>(low_tid)],
+                    FINITE_FAILURE_U_LOW_ORDER, mpi_rank,
+                    sg.ix_start + ix, iv, imu, audit_severity,
+                    f_after_x, f_low, f_high, f_low,
+                    du_div_low, 0.0, dx_div);
                 LowOrderFailureAudit& low_audit =
                     thread_u_low_failure[static_cast<size_t>(low_tid)];
                 if (!low_audit.valid ||
@@ -1980,21 +2918,16 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                         u_low_donor_iv_at(right_lower_scale, lower_face);
                     const int right_upper_donor =
                         u_low_donor_iv_at(right_upper_scale, upper_face);
-                    const double x_cell =
-                        (static_cast<double>(sg.ix_start + ix) + 0.5)
-                      * sg.dx;
                     low_audit.valid = 1;
                     low_audit.rank = mpi_rank;
                     low_audit.ix = sg.ix_start + ix;
                     low_audit.iv = iv;
                     low_audit.imu = imu;
                     low_audit.region =
-                        (x_cell < CORE_DIAG_BOUNDARY_WIDTH ||
-                         x_cell > Param::Lx - CORE_DIAG_BOUNDARY_WIDTH)
-                        ? 1 : 0;
+                        x_cell_boundary[static_cast<size_t>(ix)] ? 1 : 0;
                     low_audit.severity = audit_severity;
-                    low_audit.f_input = f0;
-                    low_audit.f_after_x = f0 - dx_div;
+                    low_audit.f_input = f_raw;
+                    low_audit.f_after_x = f_after_x;
                     low_audit.dx_div = dx_div;
                     low_audit.dmu_div_used = 0.0;
                     low_audit.du_div_low = du_div_low;
@@ -2053,21 +2986,23 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             audit_severity =
                 std::max(0.0, -std::min(f_low, f_high));
             if (audit_severity > 0.0) {
-                const int tid = omp_get_thread_num();
-                UFluxAuditCandidate& audit =
-                    thread_u_audit[static_cast<size_t>(tid)];
-                if (!audit.valid || audit_severity > audit.severity) {
-                    audit.valid = 1;
-                    audit.severity = audit_severity;
-                    audit.f0 = f0;
-                    audit.f_low = f_low;
-                    audit.f_high = f_high;
-                    audit.alpha = audit_alpha;
-                    audit.du_div_low = du_div_low;
-                    audit.du_div_high = du_div_high;
-                    audit.ix = sg.ix_start + ix;
-                    audit.iv = iv;
-                    audit.imu = imu;
+                if (collect_u_flux_audit) {
+                    const int tid = omp_get_thread_num();
+                    UFluxAuditCandidate& audit =
+                        thread_u_audit[static_cast<size_t>(tid)];
+                    if (!audit.valid || audit_severity > audit.severity) {
+                        audit.valid = 1;
+                        audit.severity = audit_severity;
+                        audit.f0 = f_raw;
+                        audit.f_low = f_low;
+                        audit.f_high = f_high;
+                        audit.alpha = audit_alpha;
+                        audit.du_div_low = du_div_low;
+                        audit.du_div_high = du_div_high;
+                        audit.ix = sg.ix_start + ix;
+                        audit.iv = iv;
+                        audit.imu = imu;
+                    }
                 }
             }
         }
@@ -2079,59 +3014,92 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         local_u_low_order_failed;
     MPI_Allreduce(MPI_IN_PLACE, &global_u_low_order_failed_for_audit, 1,
                   MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
-    (void)local_ec_negative_cells;
-    UFluxAuditCandidate local_u_audit = empty_u_flux_audit_candidate();
-    for (const UFluxAuditCandidate& audit : thread_u_audit) {
+    long long global_u_low_order_debt_accepted =
+        local_u_low_order_debt_accepted;
+    MPI_Allreduce(MPI_IN_PLACE, &global_u_low_order_debt_accepted, 1,
+                  MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
+    double global_u_low_order_debt_mass = local_u_low_order_debt_mass;
+    MPI_Allreduce(MPI_IN_PLACE, &global_u_low_order_debt_mass, 1,
+                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    const double total_bkg_column_for_debt =
+        std::max(1.0, Param::dens * Param::Lx);
+    const bool u_debt_mass_exceeded =
+        global_u_low_order_debt_mass / total_bkg_column_for_debt >
+        VELOCITY_LOW_ORDER_DEBT_MASS_FRAC;
+    if (global_u_low_order_failed_for_audit > 0 || u_debt_mass_exceeded) {
+        finite = false;
+        fluxes.finite_failure_mask |= FINITE_FAILURE_U_LOW_ORDER;
+    }
+    fluxes.u_low_order_failed_count =
+        global_u_low_order_failed_for_audit +
+        (u_debt_mass_exceeded ? global_u_low_order_debt_accepted : 0);
+    fluxes.flux_pos[1].negative_mass_prevented =
+        global_u_low_order_debt_mass;
+    StageFailureCandidate local_stage_u_low_failure =
+        empty_stage_failure_candidate();
+    for (const StageFailureCandidate& audit : thread_stage_u_low_failure) {
         if (audit.valid &&
-            (!local_u_audit.valid ||
-             audit.severity > local_u_audit.severity)) {
-            local_u_audit = audit;
+            (!local_stage_u_low_failure.valid ||
+             audit.severity > local_stage_u_low_failure.severity)) {
+            local_stage_u_low_failure = audit;
         }
     }
-    struct {
-        double value;
-        int rank;
-    } local_u_audit_loc, global_u_audit_loc;
-    local_u_audit_loc.value =
-        local_u_audit.valid ? local_u_audit.severity : 0.0;
-    local_u_audit_loc.rank = mpi_rank;
-    global_u_audit_loc.value = 0.0;
-    global_u_audit_loc.rank = -1;
-    MPI_Allreduce(&local_u_audit_loc, &global_u_audit_loc, 1,
-                  MPI_DOUBLE_INT, MPI_MAXLOC, MPI_COMM_WORLD);
-    double u_audit_values[7] = {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
-    int u_audit_indices[4] = {-1, -1, -1, -1};
-    if (local_u_audit.valid && mpi_rank == global_u_audit_loc.rank) {
-        u_audit_values[0] = local_u_audit.severity;
-        u_audit_values[1] = local_u_audit.f0;
-        u_audit_values[2] = local_u_audit.f_low;
-        u_audit_values[3] = local_u_audit.f_high;
-        u_audit_values[4] = local_u_audit.alpha;
-        u_audit_values[5] = local_u_audit.du_div_low;
-        u_audit_values[6] = local_u_audit.du_div_high;
-        u_audit_indices[0] = mpi_rank;
-        u_audit_indices[1] = local_u_audit.ix;
-        u_audit_indices[2] = local_u_audit.iv;
-        u_audit_indices[3] = local_u_audit.imu;
-    }
-    if (global_u_audit_loc.value > 0.0 &&
-        global_u_audit_loc.rank >= 0) {
-        MPI_Bcast(u_audit_values, 7, MPI_DOUBLE,
-                  global_u_audit_loc.rank, MPI_COMM_WORLD);
-        MPI_Bcast(u_audit_indices, 4, MPI_INT,
-                  global_u_audit_loc.rank, MPI_COMM_WORLD);
-        fluxes.u_flux_audit_valid = 1;
-        fluxes.u_flux_audit_rank = u_audit_indices[0];
-        fluxes.u_flux_audit_ix = u_audit_indices[1];
-        fluxes.u_flux_audit_iv = u_audit_indices[2];
-        fluxes.u_flux_audit_imu = u_audit_indices[3];
-        fluxes.u_flux_audit_severity = u_audit_values[0];
-        fluxes.u_flux_audit_f0 = u_audit_values[1];
-        fluxes.u_flux_audit_f_low = u_audit_values[2];
-        fluxes.u_flux_audit_f_high = u_audit_values[3];
-        fluxes.u_flux_audit_alpha = u_audit_values[4];
-        fluxes.u_flux_audit_du_div_low = u_audit_values[5];
-        fluxes.u_flux_audit_du_div_high = u_audit_values[6];
+    publish_stage_failure(local_stage_u_low_failure);
+    (void)local_ec_negative_cells;
+    if (collect_u_flux_audit) {
+        UFluxAuditCandidate local_u_audit = empty_u_flux_audit_candidate();
+        for (const UFluxAuditCandidate& audit : thread_u_audit) {
+            if (audit.valid &&
+                (!local_u_audit.valid ||
+                 audit.severity > local_u_audit.severity)) {
+                local_u_audit = audit;
+            }
+        }
+        struct {
+            double value;
+            int rank;
+        } local_u_audit_loc, global_u_audit_loc;
+        local_u_audit_loc.value =
+            local_u_audit.valid ? local_u_audit.severity : 0.0;
+        local_u_audit_loc.rank = mpi_rank;
+        global_u_audit_loc.value = 0.0;
+        global_u_audit_loc.rank = -1;
+        MPI_Allreduce(&local_u_audit_loc, &global_u_audit_loc, 1,
+                      MPI_DOUBLE_INT, MPI_MAXLOC, MPI_COMM_WORLD);
+        double u_audit_values[7] = {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
+        int u_audit_indices[4] = {-1, -1, -1, -1};
+        if (local_u_audit.valid && mpi_rank == global_u_audit_loc.rank) {
+            u_audit_values[0] = local_u_audit.severity;
+            u_audit_values[1] = local_u_audit.f0;
+            u_audit_values[2] = local_u_audit.f_low;
+            u_audit_values[3] = local_u_audit.f_high;
+            u_audit_values[4] = local_u_audit.alpha;
+            u_audit_values[5] = local_u_audit.du_div_low;
+            u_audit_values[6] = local_u_audit.du_div_high;
+            u_audit_indices[0] = mpi_rank;
+            u_audit_indices[1] = local_u_audit.ix;
+            u_audit_indices[2] = local_u_audit.iv;
+            u_audit_indices[3] = local_u_audit.imu;
+        }
+        if (global_u_audit_loc.value > 0.0 &&
+            global_u_audit_loc.rank >= 0) {
+            MPI_Bcast(u_audit_values, 7, MPI_DOUBLE,
+                      global_u_audit_loc.rank, MPI_COMM_WORLD);
+            MPI_Bcast(u_audit_indices, 4, MPI_INT,
+                      global_u_audit_loc.rank, MPI_COMM_WORLD);
+            fluxes.u_flux_audit_valid = 1;
+            fluxes.u_flux_audit_rank = u_audit_indices[0];
+            fluxes.u_flux_audit_ix = u_audit_indices[1];
+            fluxes.u_flux_audit_iv = u_audit_indices[2];
+            fluxes.u_flux_audit_imu = u_audit_indices[3];
+            fluxes.u_flux_audit_severity = u_audit_values[0];
+            fluxes.u_flux_audit_f0 = u_audit_values[1];
+            fluxes.u_flux_audit_f_low = u_audit_values[2];
+            fluxes.u_flux_audit_f_high = u_audit_values[3];
+            fluxes.u_flux_audit_alpha = u_audit_values[4];
+            fluxes.u_flux_audit_du_div_low = u_audit_values[5];
+            fluxes.u_flux_audit_du_div_high = u_audit_values[6];
+        }
     }
     LowOrderFailureAudit local_u_low_audit =
         empty_low_order_failure_audit();
@@ -2252,18 +3220,17 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                     fluxes.u_high_cell[face_idx] -
                     fluxes.u_low_cell[face_idx];
                 double alpha_face = 1.0;
-                if (face > 0 && face < Param::Nv && antidiff > 0.0) {
+                if (face > 0 && face < Param::Nv && antidiff != 0.0) {
                     const size_t k_lo =
                         static_cast<size_t>(ix) * Param::Nvmu +
                         static_cast<size_t>(face - 1) * Param::Nmu
                       + static_cast<size_t>(imu);
-                    alpha_face = alpha_cell[k_lo];
-                } else if (face > 0 && face < Param::Nv && antidiff < 0.0) {
                     const size_t k_hi =
                         static_cast<size_t>(ix) * Param::Nvmu +
                         static_cast<size_t>(face) * Param::Nmu
                       + static_cast<size_t>(imu);
-                    alpha_face = alpha_cell[k_hi];
+                    alpha_face = std::min(alpha_cell[k_lo],
+                                          alpha_cell[k_hi]);
                 }
                 alpha_face = std::max(0.0, std::min(1.0, alpha_face));
                 if (face <= low_u_limit_count &&
@@ -2311,23 +3278,105 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             }
         }
     }
-
-    std::vector<double> mu_force_low_u_ec(
-        static_cast<size_t>(nxl + 1) * low_u_limit_count *
-        static_cast<size_t>(Param::Nmu + 1), 0.0);
-    for (int iface = 0; iface <= nxl; ++iface) {
-        for (int iv = 0; iv < low_u_limit_count; ++iv) {
-            for (int face = 0; face <= Param::Nmu; ++face) {
-                const size_t low_idx =
-                    (static_cast<size_t>(iface) * low_u_limit_count
-                   + static_cast<size_t>(iv)) *
-                    static_cast<size_t>(Param::Nmu + 1)
-                  + static_cast<size_t>(face);
-                mu_force_low_u_ec[low_idx] =
-                    mu_force_face[mu_xface_index(iface, iv, face)];
+    {
+        long long local_u_final_negative_hard = 0;
+        long long local_u_final_nonfinite = 0;
+        const int u_final_threads = std::max(1, omp_get_max_threads());
+        std::vector<StageFailureCandidate> thread_u_final_failure(
+            static_cast<size_t>(u_final_threads),
+            empty_stage_failure_candidate());
+        #pragma omp parallel for collapse(2) schedule(static) \
+            reduction(+:local_u_final_negative_hard,local_u_final_nonfinite)
+        for (int ix = 0; ix < nxl; ++ix) {
+            for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu);
+                 ++k_int) {
+                const int iv = k_int / Param::Nmu;
+                const int imu = k_int - iv * Param::Nmu;
+                const size_t k = static_cast<size_t>(k_int);
+                const size_t src =
+                    static_cast<size_t>(ng + ix) * Param::Nvmu + k;
+                const double dx_div =
+                    dt_dx *
+                    (fluxes.x_final[
+                         static_cast<size_t>(ix + 1) * Param::Nvmu + k]
+                   - fluxes.x_final[
+                         static_cast<size_t>(ix) * Param::Nvmu + k]);
+                const double f_base =
+                    effective_f_for_flux(
+                        effective_f_for_flux(bkg_n.f[src]) - dx_div);
+                const double du_div =
+                    (dt * bkg_n.vgrid.inv_moment_weight[iv]) *
+                    (fluxes.u_final_cell[u_cell_index(ix, iv + 1, imu)]
+                   - fluxes.u_final_cell[u_cell_index(ix, iv, imu)]);
+                const double f_u_final = f_base - du_div;
+                const double du_div_low =
+                    (dt * bkg_n.vgrid.inv_moment_weight[iv]) *
+                    (fluxes.u_low_cell[u_cell_index(ix, iv + 1, imu)]
+                   - fluxes.u_low_cell[u_cell_index(ix, iv, imu)]);
+                const double du_div_high =
+                    (dt * bkg_n.vgrid.inv_moment_weight[iv]) *
+                    (fluxes.u_high_cell[u_cell_index(ix, iv + 1, imu)]
+                   - fluxes.u_high_cell[u_cell_index(ix, iv, imu)]);
+                const double f_low = f_base - du_div_low;
+                const double f_high = f_base - du_div_high;
+                const double local_scale = std::max(1.0, std::fabs(f_base));
+                const double f_floor =
+                    -std::max(X_LOW_ABS_F_TOL,
+                              NEG_TOL_SOFT * local_scale);
+                if (!std::isfinite(f_u_final)) {
+                    ++local_u_final_nonfinite;
+                    ++local_u_final_negative_hard;
+                    const int tid = omp_get_thread_num();
+                    update_stage_failure_candidate(
+                        thread_u_final_failure[static_cast<size_t>(tid)],
+                        FINITE_FAILURE_U_FINAL_NEGATIVE, mpi_rank,
+                        sg.ix_start + ix, iv, imu,
+                        std::numeric_limits<double>::infinity(),
+                        f_base, f_low, f_high, f_u_final,
+                        du_div, 0.0, dx_div);
+                } else if (f_u_final < f_floor) {
+                    ++local_u_final_negative_hard;
+                    const double severity = std::max(0.0, -f_u_final);
+                    const int tid = omp_get_thread_num();
+                    update_stage_failure_candidate(
+                        thread_u_final_failure[static_cast<size_t>(tid)],
+                        FINITE_FAILURE_U_FINAL_NEGATIVE, mpi_rank,
+                        sg.ix_start + ix, iv, imu, severity,
+                        f_base, f_low, f_high, f_u_final,
+                        du_div, 0.0, dx_div);
+                }
             }
         }
+        long long global_u_final_counts[2] = {
+            local_u_final_negative_hard,
+            local_u_final_nonfinite
+        };
+        MPI_Allreduce(MPI_IN_PLACE, global_u_final_counts, 2,
+                      MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
+        const long long global_u_final_negative_hard =
+            global_u_final_counts[0];
+        const long long global_u_final_nonfinite =
+            global_u_final_counts[1];
+        if (global_u_final_nonfinite > 0) {
+            fluxes.finite_failure_mask |= FINITE_FAILURE_U_FINAL_NEGATIVE;
+            finite = false;
+        } else if (global_u_final_negative_hard > 0) {
+            fluxes.trial_failure_downgraded = 1;
+        }
+        fluxes.u_final_negative_hard_count =
+            global_u_final_negative_hard;
+        StageFailureCandidate local_u_final_failure =
+            empty_stage_failure_candidate();
+        for (const StageFailureCandidate& audit : thread_u_final_failure) {
+            if (audit.valid &&
+                (!local_u_final_failure.valid ||
+                 audit.severity > local_u_final_failure.severity)) {
+                local_u_final_failure = audit;
+            }
+        }
+        publish_stage_failure(local_u_final_failure);
     }
+
     long long local_mu_low_u_face_active = 0;
     long long local_mu_low_u_face_total = 0;
     long long local_mu_low_u_face_active_boundary = 0;
@@ -2341,6 +3390,9 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     double local_mu_low_u_alpha_min = 1.0;
     double local_mu_low_u_alpha_min_boundary = 1.0;
     double local_mu_low_u_alpha_min_core = 1.0;
+    double local_mu_fct_min_f_low = std::numeric_limits<double>::infinity();
+    long long local_mu_fct_low_order_failed = 0;
+    std::fill(fluxes.cell_alpha_mu.begin(), fluxes.cell_alpha_mu.end(), 1.0);
     #pragma omp parallel for collapse(2) schedule(static) \
         reduction(+:local_mu_low_u_face_active, \
                     local_mu_low_u_face_total, \
@@ -2350,72 +3402,183 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                     local_mu_low_u_face_total_core, \
                     local_low_u_subcycle_active, \
                     local_low_u_subcycle_total, \
-                    local_low_u_subcycle_sum) \
+                    local_low_u_subcycle_sum, \
+                    local_mu_fct_low_order_failed) \
         reduction(min:local_mu_low_u_alpha_min, \
                       local_mu_low_u_alpha_min_boundary, \
-                      local_mu_low_u_alpha_min_core) \
+                      local_mu_low_u_alpha_min_core, \
+                      local_mu_fct_min_f_low) \
         reduction(max:local_low_u_max_subcycles)
-    for (int iface = 0; iface < nxl; ++iface) {
-        for (int iv = 0; iv < low_u_limit_count; ++iv) {
-            const int ix_left = ng + iface - 1;
-            const int ix_right = ng + iface;
-            const double x_face =
-                static_cast<double>(sg.ix_start + iface) * sg.dx;
-            const bool boundary =
-                (x_face < CORE_DIAG_BOUNDARY_WIDTH) ||
-                (x_face > Param::Lx - CORE_DIAG_BOUNDARY_WIDTH);
+    for (int ix = 0; ix < nxl; ++ix) {
+        for (int iv = 0; iv < Param::Nv; ++iv) {
+            double f_base[Param::Nmu];
+            double f_floor[Param::Nmu];
+            double f_low[Param::Nmu];
+            double raw_low[Param::Nmu + 1];
+            double raw_high[Param::Nmu + 1];
+            double antidiff[Param::Nmu + 1];
+            double p_minus[Param::Nmu];
+            double q_minus[Param::Nmu];
+            double r_minus[Param::Nmu];
+            double scale_face[Param::Nmu + 1];
+            double low_out[Param::Nmu];
+            double theta[Param::Nmu];
+            const double hdt_is = half_dt_inv_shell[iv];
+            const double dt_inv_shell = 2.0 * hdt_is;
+            for (int imu = 0; imu < Param::Nmu; ++imu) {
+                const size_t k =
+                    static_cast<size_t>(iv) * Param::Nmu
+                  + static_cast<size_t>(imu);
+                const size_t src =
+                    static_cast<size_t>(ng + ix) * Param::Nvmu + k;
+                const double dx_div =
+                    dt_dx *
+                    (fluxes.x_final[
+                         static_cast<size_t>(ix + 1) * Param::Nvmu + k]
+                   - fluxes.x_final[
+                         static_cast<size_t>(ix) * Param::Nvmu + k]);
+                const double u_div =
+                    fluxes.u_final_cell[u_cell_index(ix, iv + 1, imu)]
+                  - fluxes.u_final_cell[u_cell_index(ix, iv, imu)];
+                const double du_div = dt_inv_shell * u_div;
+                f_base[imu] =
+                    effective_f_for_flux(
+                        effective_f_for_flux(
+                            effective_f_for_flux(bkg_n.f[src]) - dx_div)
+                        - du_div);
+                f_floor[imu] = velocity_local_floor(f_base[imu],
+                                                    f_base[imu]);
+                f_low[imu] = f_base[imu];
+                p_minus[imu] = 0.0;
+                q_minus[imu] = 0.0;
+                r_minus[imu] = 1.0;
+                low_out[imu] = 0.0;
+                theta[imu] = 1.0;
+            }
+            for (int face = 0; face <= Param::Nmu; ++face) {
+                raw_low[face] = 0.0;
+                raw_high[face] = 0.0;
+                antidiff[face] = 0.0;
+                scale_face[face] = 0.0;
+            }
+            const double ex_left =
+                (static_cast<size_t>(ix) < fields_mid.Ex_face.size())
+                ? fields_mid.Ex_face[static_cast<size_t>(ix)] : 0.0;
+            const double ex_right =
+                (static_cast<size_t>(ix + 1) < fields_mid.Ex_face.size())
+                ? fields_mid.Ex_face[static_cast<size_t>(ix + 1)] : ex_left;
+            const double accel_u =
+                bkg_n.charge * 0.5 * (ex_left + ex_right) /
+                (bkg_n.mass * Const::c);
             for (int face = 1; face < Param::Nmu; ++face) {
-                const size_t face_idx = mu_xface_index(iface, iv, face);
-                double& ff = mu_force_face[face_idx];
-                double alpha_face = 1.0;
-                if (ff != 0.0 && std::isfinite(ff)) {
-                    const int donor_imu = (ff > 0.0) ? face - 1 : face;
-                    const size_t left_donor =
-                        static_cast<size_t>(ix_left) * Param::Nvmu
-                      + static_cast<size_t>(iv) * Param::Nmu
-                      + static_cast<size_t>(donor_imu);
-                    const size_t right_donor =
-                        static_cast<size_t>(ix_right) * Param::Nvmu
-                      + static_cast<size_t>(iv) * Param::Nmu
-                      + static_cast<size_t>(donor_imu);
-                    const double donor_face_f =
-                        0.5 * (f_mid.f[left_donor] + f_mid.f[right_donor]);
-                    const double available = std::max(0.0, donor_face_f);
-                    const double full_out =
-                        half_dt_inv_shell[iv] * std::fabs(ff);
-                    if (!std::isfinite(donor_face_f) ||
-                        !std::isfinite(full_out)) {
-                        alpha_face = 0.0;
-                    } else if (full_out > 0.0) {
-                        const int subcycles =
-                            adaptive_low_u_subcycles(full_out, available);
-                        ++local_low_u_subcycle_total;
-                        local_low_u_subcycle_sum += subcycles;
-                        local_low_u_max_subcycles =
-                            std::max(local_low_u_max_subcycles, subcycles);
-                        const bool adaptive_region = subcycles > 1;
-                        if (adaptive_region) {
-                            ++local_low_u_subcycle_active;
-                        }
-                        const double full_alpha =
-                            std::min(1.0, available / full_out);
-                        alpha_face = full_alpha;
-                        if (adaptive_region &&
-                            (face == 1 || face == Param::Nmu - 1)) {
-                            alpha_face =
-                                std::min(alpha_face,
-                                         LOW_U_MU_ENDPOINT_ALPHA_CAP);
-                        }
-                        if (adaptive_region || alpha_face < 1.0 - 1.0e-12) {
-                            alpha_face = smooth_low_u_mu_alpha(alpha_face);
-                        }
-                    }
-                    alpha_face = std::max(0.0, std::min(1.0, alpha_face));
-                    ff *= alpha_face;
-                } else if (!std::isfinite(ff)) {
-                    alpha_face = 0.0;
-                    ff = 0.0;
+                const double mu_dot =
+                    accel_u * bkg_n.vgrid.mu_face_factor[face] /
+                    mu_u_eff[iv];
+                const double scale =
+                    bkg_n.vgrid.mu_flux_scale[iv] * mu_dot;
+                const int donor_imu = (scale >= 0.0) ? face - 1 : face;
+                scale_face[face] = scale;
+                raw_low[face] = scale * f_base[donor_imu];
+                raw_high[face] =
+                    scale * 0.5 * (f_base[face - 1] + f_base[face]);
+                const double donor_decrement =
+                    (scale >= 0.0)
+                    ? dt_inv_shell * std::max(0.0, raw_low[face])
+                    : dt_inv_shell * std::max(0.0, -raw_low[face]);
+                low_out[donor_imu] += donor_decrement;
+            }
+            for (int imu = 0; imu < Param::Nmu; ++imu) {
+                if (low_out[imu] > 0.0) {
+                    const double budget =
+                        std::max(0.0, f_base[imu] - f_floor[imu]);
+                    theta[imu] =
+                        std::max(0.0, std::min(1.0, budget / low_out[imu]));
                 }
+            }
+            for (int face = 1; face < Param::Nmu; ++face) {
+                const int donor_imu =
+                    (scale_face[face] >= 0.0) ? face - 1 : face;
+                raw_low[face] *= theta[donor_imu];
+            }
+            for (int face = 0; face <= Param::Nmu; ++face) {
+                const size_t idx = mu_cell_index(ix, iv, face);
+                fluxes.mu_low_cell[idx] = raw_low[face];
+                fluxes.mu_high_cell[idx] = raw_high[face];
+                antidiff[face] = raw_high[face] - raw_low[face];
+                fluxes.mu_final_cell[idx] = raw_low[face];
+            }
+            for (int imu = 0; imu < Param::Nmu; ++imu) {
+                const size_t cell_alpha_idx =
+                    static_cast<size_t>(ix) * Param::Nvmu
+                  + static_cast<size_t>(iv) * Param::Nmu
+                  + static_cast<size_t>(imu);
+                const double dmu_low =
+                    dt_inv_shell *
+                    (raw_low[imu + 1] - raw_low[imu]);
+                const double dmu_high =
+                    dt_inv_shell *
+                    (raw_high[imu + 1] - raw_high[imu]);
+                f_low[imu] = f_base[imu] - dmu_low;
+                f_floor[imu] = velocity_local_floor(f_base[imu],
+                                                    f_low[imu]);
+                const double f_high = f_base[imu] - dmu_high;
+                local_mu_fct_min_f_low =
+                    std::min(local_mu_fct_min_f_low, f_low[imu]);
+                if (!std::isfinite(f_low[imu]) ||
+                    f_low[imu] < f_floor[imu]) {
+                    ++local_mu_fct_low_order_failed;
+                    fluxes.cell_alpha_mu[cell_alpha_idx] = 0.0;
+                    r_minus[imu] = 0.0;
+                    continue;
+                }
+                p_minus[imu] =
+                    dt_inv_shell *
+                    (std::max(0.0, antidiff[imu + 1]) +
+                     std::max(0.0, -antidiff[imu]));
+                q_minus[imu] = std::max(0.0, f_low[imu] - f_floor[imu]);
+                if (p_minus[imu] > 0.0) {
+                    if (f_low[imu] <=
+                        f_floor[imu] + X_FLOOR_MARGIN_FACTOR *
+                        (-f_floor[imu])) {
+                        r_minus[imu] = 0.0;
+                    } else {
+                        r_minus[imu] =
+                            std::max(0.0,
+                                     std::min(1.0,
+                                              q_minus[imu] /
+                                              p_minus[imu]));
+                    }
+                }
+                if (!std::isfinite(f_high)) {
+                    r_minus[imu] = 0.0;
+                }
+                fluxes.cell_alpha_mu[cell_alpha_idx] = r_minus[imu];
+            }
+            const bool boundary =
+                x_cell_boundary[static_cast<size_t>(ix)] != 0;
+            for (int face = 1; face < Param::Nmu; ++face) {
+                const size_t face_idx = mu_cell_index(ix, iv, face);
+                const double antidiff =
+                    fluxes.mu_high_cell[face_idx] -
+                    fluxes.mu_low_cell[face_idx];
+                const double antidiff_limited =
+                    std::isfinite(antidiff) ? antidiff : 0.0;
+                double alpha_face = 1.0;
+                if (!std::isfinite(antidiff)) {
+                    alpha_face = 0.0;
+                } else if (antidiff > 0.0) {
+                    alpha_face = r_minus[face - 1];
+                } else if (antidiff < 0.0) {
+                    alpha_face = r_minus[face];
+                }
+                alpha_face = std::max(0.0, std::min(1.0, alpha_face));
+                if (iv < low_u_limit_count &&
+                    alpha_face < 1.0 - 1.0e-12) {
+                    alpha_face = smooth_low_u_mu_alpha(alpha_face);
+                }
+                fluxes.mu_final_cell[face_idx] =
+                    fluxes.mu_low_cell[face_idx] +
+                    alpha_face * antidiff_limited;
                 if (alpha_face < 0.999999) {
                     ++local_mu_low_u_face_active;
                     if (boundary) {
@@ -2425,6 +3588,8 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                     }
                 }
                 ++local_mu_low_u_face_total;
+                ++local_low_u_subcycle_total;
+                ++local_low_u_subcycle_sum;
                 local_mu_low_u_alpha_min =
                     std::min(local_mu_low_u_alpha_min, alpha_face);
                 if (boundary) {
@@ -2441,38 +3606,382 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             }
         }
     }
-    close_periodic_face_blocks(mu_force_face, nxl,
-                               Param::Nv * (Param::Nmu + 1),
-                               mpi_rank, mpi_size, 507);
     #pragma omp parallel for collapse(2) schedule(static)
     for (int iface = 0; iface <= nxl; ++iface) {
         for (int iv = 0; iv < Param::Nv; ++iv) {
-            mu_force_face[mu_xface_index(iface, iv, 0)] = 0.0;
-            mu_force_face[mu_xface_index(iface, iv, Param::Nmu)] = 0.0;
+            for (int face = 0; face <= Param::Nmu; ++face) {
+                double low_val = 0.0;
+                double high_val = 0.0;
+                double final_val = 0.0;
+                if (nxl > 0) {
+                    if (iface == 0) {
+                        low_val =
+                            fluxes.mu_low_cell[
+                                mu_cell_index(0, iv, face)];
+                        high_val =
+                            fluxes.mu_high_cell[
+                                mu_cell_index(0, iv, face)];
+                        final_val =
+                            fluxes.mu_final_cell[
+                                mu_cell_index(0, iv, face)];
+                    } else if (iface == nxl) {
+                        low_val =
+                            fluxes.mu_low_cell[
+                                mu_cell_index(nxl - 1, iv, face)];
+                        high_val =
+                            fluxes.mu_high_cell[
+                                mu_cell_index(nxl - 1, iv, face)];
+                        final_val =
+                            fluxes.mu_final_cell[
+                                mu_cell_index(nxl - 1, iv, face)];
+                    } else {
+                        low_val = 0.5 *
+                            (fluxes.mu_low_cell[
+                                 mu_cell_index(iface - 1, iv, face)]
+                           + fluxes.mu_low_cell[
+                                 mu_cell_index(iface, iv, face)]);
+                        high_val = 0.5 *
+                            (fluxes.mu_high_cell[
+                                 mu_cell_index(iface - 1, iv, face)]
+                           + fluxes.mu_high_cell[
+                                 mu_cell_index(iface, iv, face)]);
+                        final_val = 0.5 *
+                            (fluxes.mu_final_cell[
+                                 mu_cell_index(iface - 1, iv, face)]
+                           + fluxes.mu_final_cell[
+                                 mu_cell_index(iface, iv, face)]);
+                    }
+                }
+                fluxes.mu_low[mu_xface_index(iface, iv, face)] = low_val;
+                fluxes.mu_high[mu_xface_index(iface, iv, face)] = high_val;
+                fluxes.mu_final[mu_xface_index(iface, iv, face)] = final_val;
+                mu_force_face[mu_xface_index(iface, iv, face)] = final_val;
+            }
         }
     }
-    // 7.1.1: save post-limiter (final) mu-flux; mu_low not yet implemented
     {
-        const size_t mu_size = static_cast<size_t>(nxl + 1) *
-                               Param::Nv * (Param::Nmu + 1);
-        std::copy(mu_force_face.begin(), mu_force_face.begin() + mu_size,
-                  fluxes.mu_final.begin());
-        std::copy(fluxes.mu_final.begin(), fluxes.mu_final.begin() + mu_size,
-                  fluxes.mu_low.begin());
+        long long local_mu_final_negative_hard = 0;
+        long long local_mu_final_nonfinite = 0;
+        long long local_mu_final_core_failed = 0;
+        long long local_mu_final_boundary_failed = 0;
+        double local_mu_final_roundoff_debt_max = 0.0;
+        const int mu_final_threads = std::max(1, omp_get_max_threads());
+        std::vector<StageFailureCandidate> thread_mu_final_failure(
+            static_cast<size_t>(mu_final_threads),
+            empty_stage_failure_candidate());
+        #pragma omp parallel for collapse(2) schedule(static) \
+            reduction(+:local_mu_final_negative_hard, \
+                        local_mu_final_nonfinite, \
+                        local_mu_final_core_failed, \
+                        local_mu_final_boundary_failed) \
+            reduction(max:local_mu_final_roundoff_debt_max)
+        for (int ix = 0; ix < nxl; ++ix) {
+            for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu);
+                 ++k_int) {
+                const int iv = k_int / Param::Nmu;
+                const int imu = k_int - iv * Param::Nmu;
+                const size_t k = static_cast<size_t>(k_int);
+                const size_t src =
+                    static_cast<size_t>(ng + ix) * Param::Nvmu + k;
+                const double dx_div =
+                    dt_dx *
+                    (fluxes.x_final[
+                         static_cast<size_t>(ix + 1) * Param::Nvmu + k]
+                   - fluxes.x_final[
+                         static_cast<size_t>(ix) * Param::Nvmu + k]);
+                const double du_div =
+                    (dt * bkg_n.vgrid.inv_moment_weight[iv]) *
+                    (fluxes.u_final_cell[u_cell_index(ix, iv + 1, imu)]
+                   - fluxes.u_final_cell[u_cell_index(ix, iv, imu)]);
+                const double f_base =
+                    effective_f_for_flux(
+                        effective_f_for_flux(
+                            effective_f_for_flux(bkg_n.f[src]) - dx_div)
+                        - du_div);
+                const double dmu_div =
+                    (dt * bkg_n.vgrid.inv_moment_weight[iv]) *
+                    (fluxes.mu_final_cell[mu_cell_index(ix, iv, imu + 1)]
+                   - fluxes.mu_final_cell[mu_cell_index(ix, iv, imu)]);
+                const double f_mu_final = f_base - dmu_div;
+                const double dmu_div_low =
+                    (dt * bkg_n.vgrid.inv_moment_weight[iv]) *
+                    (fluxes.mu_low_cell[mu_cell_index(ix, iv, imu + 1)]
+                   - fluxes.mu_low_cell[mu_cell_index(ix, iv, imu)]);
+                const double dmu_div_high =
+                    (dt * bkg_n.vgrid.inv_moment_weight[iv]) *
+                    (fluxes.mu_high_cell[mu_cell_index(ix, iv, imu + 1)]
+                   - fluxes.mu_high_cell[mu_cell_index(ix, iv, imu)]);
+                const double f_low = f_base - dmu_div_low;
+                const double f_high = f_base - dmu_div_high;
+                if (!std::isfinite(f_mu_final) ||
+                    !std::isfinite(f_base) ||
+                    !std::isfinite(f_low) ||
+                    !std::isfinite(f_high)) {
+                    ++local_mu_final_nonfinite;
+                    ++local_mu_final_negative_hard;
+                    const int tid = omp_get_thread_num();
+                    update_stage_failure_candidate(
+                        thread_mu_final_failure[static_cast<size_t>(tid)],
+                        FINITE_FAILURE_MU_FINAL_NEGATIVE, mpi_rank,
+                        sg.ix_start + ix, iv, imu,
+                        std::numeric_limits<double>::infinity(),
+                        f_base, f_low, f_high, f_mu_final,
+                        du_div, dmu_div, dx_div);
+                    continue;
+                }
+                const double f_floor = velocity_local_floor(f_base, f_low);
+                const double base_floor =
+                    velocity_local_floor(f_base, f_base);
+                const bool boundary =
+                    x_cell_boundary[static_cast<size_t>(ix)] != 0;
+                const bool velocity_tail = is_high_u_tail(iv);
+                const double local_scale =
+                    std::max(1.0, std::max(std::fabs(f_base),
+                                           std::fabs(f_mu_final)));
+                const bool old_debt_not_amplified =
+                    existing_debt_not_amplified(f_base, f_mu_final,
+                                                base_floor, f_floor,
+                                                local_scale);
+                const FloorDebtDecision debt_decision =
+                    classify_floor_debt(f_mu_final, f_floor, f_base, f_low,
+                                        boundary || velocity_tail,
+                                        old_debt_not_amplified);
+                if (debt_decision.debt > 0.0) {
+                    local_mu_final_roundoff_debt_max =
+                        std::max(local_mu_final_roundoff_debt_max,
+                                 debt_decision.debt);
+                }
+                if (debt_decision.below_floor && debt_decision.hard) {
+                    ++local_mu_final_negative_hard;
+                    if (boundary) {
+                        ++local_mu_final_boundary_failed;
+                    } else {
+                        ++local_mu_final_core_failed;
+                    }
+                    const int tid = omp_get_thread_num();
+                    update_stage_failure_candidate(
+                        thread_mu_final_failure[static_cast<size_t>(tid)],
+                        FINITE_FAILURE_MU_FINAL_NEGATIVE, mpi_rank,
+                        sg.ix_start + ix, iv, imu, debt_decision.debt,
+                        f_base, f_low, f_high, f_mu_final,
+                        du_div, dmu_div, dx_div);
+                }
+            }
+        }
+        long long global_mu_final_counts[4] = {
+            local_mu_final_negative_hard,
+            local_mu_final_nonfinite,
+            local_mu_final_core_failed,
+            local_mu_final_boundary_failed
+        };
+        MPI_Allreduce(MPI_IN_PLACE, global_mu_final_counts, 4,
+                      MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
+        const long long global_mu_final_negative_hard =
+            global_mu_final_counts[0];
+        const long long global_mu_final_nonfinite =
+            global_mu_final_counts[1];
+        double global_mu_final_roundoff_debt_max =
+            local_mu_final_roundoff_debt_max;
+        MPI_Allreduce(MPI_IN_PLACE, &global_mu_final_roundoff_debt_max, 1,
+                      MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        if (global_mu_final_nonfinite > 0) {
+            fluxes.finite_failure_mask |= FINITE_FAILURE_MU_FINAL_NEGATIVE;
+            finite = false;
+        } else if (global_mu_final_negative_hard > 0) {
+            fluxes.trial_failure_downgraded = 1;
+        }
+        fluxes.mu_final_negative_hard_count =
+            global_mu_final_negative_hard;
+        fluxes.mu_final_core_failed_count =
+            static_cast<double>(global_mu_final_counts[2]);
+        fluxes.mu_final_boundary_failed_count =
+            static_cast<double>(global_mu_final_counts[3]);
+        fluxes.mu_final_failed_max_debt =
+            std::max(fluxes.mu_final_failed_max_debt,
+                     global_mu_final_roundoff_debt_max);
+        StageFailureCandidate local_mu_final_failure =
+            empty_stage_failure_candidate();
+        for (const StageFailureCandidate& audit : thread_mu_final_failure) {
+            if (audit.valid &&
+                (!local_mu_final_failure.valid ||
+                 audit.severity > local_mu_final_failure.severity)) {
+                local_mu_final_failure = audit;
+            }
+        }
+        publish_stage_failure(local_mu_final_failure);
+        if (global_mu_final_negative_hard > 0 &&
+            fluxes.finite_stage_failure_valid != 0 &&
+            fluxes.finite_stage_failure_kind ==
+                FINITE_FAILURE_MU_FINAL_NEGATIVE) {
+            fluxes.mu_final_failed_max_debt =
+                fluxes.finite_stage_failure_severity;
+            fluxes.mu_final_worst_ix = fluxes.finite_stage_failure_ix;
+            fluxes.mu_final_worst_iv = fluxes.finite_stage_failure_iv;
+            fluxes.mu_final_worst_imu = fluxes.finite_stage_failure_imu;
+            const int local_ix =
+                fluxes.mu_final_worst_ix - sg.ix_start;
+            if (local_ix >= 0 && local_ix < nxl) {
+                fluxes.mu_final_failure_region =
+                    x_cell_boundary[static_cast<size_t>(local_ix)] != 0
+                    ? 1 : 0;
+            } else {
+                const double x_cell =
+                    (static_cast<double>(fluxes.mu_final_worst_ix) + 0.5) *
+                    sg.dx;
+                fluxes.mu_final_failure_region =
+                    is_boundary_cell(x_cell) ? 1 : 0;
+            }
+            double audit_values[15] = {0.0};
+            const int owner_rank = fluxes.finite_stage_failure_rank;
+            if (mpi_rank == owner_rank &&
+                local_ix >= 0 && local_ix < nxl &&
+                fluxes.mu_final_worst_iv >= 0 &&
+                fluxes.mu_final_worst_iv < Param::Nv &&
+                fluxes.mu_final_worst_imu >= 0 &&
+                fluxes.mu_final_worst_imu < Param::Nmu) {
+                const int iv = fluxes.mu_final_worst_iv;
+                const int imu = fluxes.mu_final_worst_imu;
+                const double dt_inv_shell =
+                    dt * bkg_n.vgrid.inv_moment_weight[iv];
+                const double A_left =
+                    fluxes.mu_high_cell[
+                        mu_cell_index(local_ix, iv, imu)]
+                  - fluxes.mu_low_cell[
+                        mu_cell_index(local_ix, iv, imu)];
+                const double A_right =
+                    fluxes.mu_high_cell[
+                        mu_cell_index(local_ix, iv, imu + 1)]
+                  - fluxes.mu_low_cell[
+                        mu_cell_index(local_ix, iv, imu + 1)];
+                const double f_base =
+                    fluxes.finite_stage_failure_f_base;
+                const double f_low =
+                    fluxes.finite_stage_failure_f_low;
+                const double f_high =
+                    fluxes.finite_stage_failure_f_high;
+                const double f_final =
+                    fluxes.finite_stage_failure_f_final;
+                const double f_floor =
+                    velocity_local_floor(f_base, f_low);
+                const double p_minus =
+                    dt_inv_shell *
+                    (std::max(0.0, A_right) +
+                     std::max(0.0, -A_left));
+                const double q_minus =
+                    std::max(0.0, f_low - f_floor);
+                double r_minus = 1.0;
+                if (p_minus > 0.0) {
+                    if (f_low <= f_floor +
+                        X_FLOOR_MARGIN_FACTOR * (-f_floor)) {
+                        r_minus = 0.0;
+                    } else {
+                        r_minus =
+                            std::max(0.0,
+                                     std::min(1.0,
+                                              q_minus / p_minus));
+                    }
+                }
+                auto alpha_at_face = [&](int face) -> double {
+                    if (face <= 0 || face >= Param::Nmu) return 1.0;
+                    const double low =
+                        fluxes.mu_low_cell[
+                            mu_cell_index(local_ix, iv, face)];
+                    const double high =
+                        fluxes.mu_high_cell[
+                            mu_cell_index(local_ix, iv, face)];
+                    const double final =
+                        fluxes.mu_final_cell[
+                            mu_cell_index(local_ix, iv, face)];
+                    const double A = high - low;
+                    if (!std::isfinite(A) || A == 0.0) {
+                        return 1.0;
+                    }
+                    return std::max(0.0,
+                                    std::min(1.0, (final - low) / A));
+                };
+                const double ex_left =
+                    (static_cast<size_t>(local_ix) <
+                     fields_mid.Ex_face.size())
+                    ? fields_mid.Ex_face[static_cast<size_t>(local_ix)]
+                    : 0.0;
+                const double ex_right =
+                    (static_cast<size_t>(local_ix + 1) <
+                     fields_mid.Ex_face.size())
+                    ? fields_mid.Ex_face[static_cast<size_t>(local_ix + 1)]
+                    : ex_left;
+                const double accel_u =
+                    bkg_n.charge * 0.5 * (ex_left + ex_right) /
+                    (bkg_n.mass * Const::c);
+                auto mu_dot_at_face = [&](int face) -> double {
+                    if (face <= 0 || face >= Param::Nmu) return 0.0;
+                    return accel_u * bkg_n.vgrid.mu_face_factor[face] /
+                           mu_u_eff[iv];
+                };
+                audit_values[0] = f_base;
+                audit_values[1] = f_low;
+                audit_values[2] = f_high;
+                audit_values[3] = f_final;
+                audit_values[4] = f_floor;
+                audit_values[5] = A_left;
+                audit_values[6] = A_right;
+                audit_values[7] = p_minus;
+                audit_values[8] = q_minus;
+                audit_values[9] = r_minus;
+                audit_values[10] = alpha_at_face(imu);
+                audit_values[11] = alpha_at_face(imu + 1);
+                audit_values[12] = dt_inv_shell;
+                audit_values[13] = mu_dot_at_face(imu);
+                audit_values[14] = mu_dot_at_face(imu + 1);
+            }
+            if (owner_rank >= 0) {
+                MPI_Bcast(audit_values, 15, MPI_DOUBLE, owner_rank,
+                          MPI_COMM_WORLD);
+            }
+            fluxes.mu_final_audit_f_base = audit_values[0];
+            fluxes.mu_final_audit_f_low = audit_values[1];
+            fluxes.mu_final_audit_f_high = audit_values[2];
+            fluxes.mu_final_audit_f_final = audit_values[3];
+            fluxes.mu_final_audit_f_floor = audit_values[4];
+            fluxes.mu_final_audit_A_left = audit_values[5];
+            fluxes.mu_final_audit_A_right = audit_values[6];
+            fluxes.mu_final_audit_P_minus = audit_values[7];
+            fluxes.mu_final_audit_Q_minus = audit_values[8];
+            fluxes.mu_final_audit_R_minus = audit_values[9];
+            fluxes.mu_final_audit_alpha_left_face = audit_values[10];
+            fluxes.mu_final_audit_alpha_right_face = audit_values[11];
+            fluxes.mu_final_audit_dt_inv_shell = audit_values[12];
+            fluxes.mu_final_audit_mu_dot_lower = audit_values[13];
+            fluxes.mu_final_audit_mu_dot_upper = audit_values[14];
+        }
     }
     {
         const int mu_audit_threads = std::max(1, omp_get_max_threads());
         std::vector<LowOrderFailureAudit> thread_mu_low_failure(
             static_cast<size_t>(mu_audit_threads),
             empty_low_order_failure_audit());
+        std::vector<StageFailureCandidate> thread_stage_mu_low_failure(
+            static_cast<size_t>(mu_audit_threads),
+            empty_stage_failure_candidate());
+        std::vector<LowOrderFailureAudit> thread_mu_low_debt_failure(
+            static_cast<size_t>(mu_audit_threads),
+            empty_low_order_failure_audit());
+        std::vector<StageFailureCandidate> thread_stage_mu_low_debt_failure(
+            static_cast<size_t>(mu_audit_threads),
+            empty_stage_failure_candidate());
         long long local_mu_low_order_failed = 0;
-        auto mu_dot_at = [&](int iface, int iv, int face) -> double {
+        long long local_mu_low_order_debt_accepted = 0;
+        double local_mu_low_order_debt_mass = 0.0;
+        auto mu_dot_at = [&](int ix, int iv, int face) -> double {
             if (face <= 0 || face >= Param::Nmu) return 0.0;
-            const double ex_face =
-                (static_cast<size_t>(iface) < fields_mid.Ex_face.size())
-                ? fields_mid.Ex_face[static_cast<size_t>(iface)] : 0.0;
+            const double ex_left =
+                (static_cast<size_t>(ix) < fields_mid.Ex_face.size())
+                ? fields_mid.Ex_face[static_cast<size_t>(ix)] : 0.0;
+            const double ex_right =
+                (static_cast<size_t>(ix + 1) < fields_mid.Ex_face.size())
+                ? fields_mid.Ex_face[static_cast<size_t>(ix + 1)] : ex_left;
             const double accel_u =
-                bkg_n.charge * ex_face / (bkg_n.mass * Const::c);
+                bkg_n.charge * 0.5 * (ex_left + ex_right) /
+                (bkg_n.mass * Const::c);
             return accel_u * bkg_n.vgrid.mu_face_factor[face]
                  / mu_u_eff[iv];
         };
@@ -2481,7 +3990,9 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             return (characteristic >= 0.0) ? face - 1 : face;
         };
         #pragma omp parallel for collapse(2) schedule(static) \
-            reduction(+:local_mu_low_order_failed)
+            reduction(+:local_mu_low_order_failed, \
+                        local_mu_low_order_debt_accepted, \
+                        local_mu_low_order_debt_mass)
         for (int ix = 0; ix < nxl; ++ix) {
             for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu);
                  ++k_int) {
@@ -2502,21 +4013,28 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                   - fluxes.u_final_cell[u_cell_index(ix, iv, imu)];
                 const double du_div = (2.0 * hdt_is) * u_div;
                 const double mu_left_lower =
-                    fluxes.mu_low[mu_xface_index(ix, iv, imu)];
+                    fluxes.mu_low_cell[mu_cell_index(ix, iv, imu)];
                 const double mu_left_upper =
-                    fluxes.mu_low[mu_xface_index(ix, iv, imu + 1)];
-                const double mu_right_lower =
-                    fluxes.mu_low[mu_xface_index(ix + 1, iv, imu)];
-                const double mu_right_upper =
-                    fluxes.mu_low[mu_xface_index(ix + 1, iv, imu + 1)];
+                    fluxes.mu_low_cell[mu_cell_index(ix, iv, imu + 1)];
+                const double mu_right_lower = mu_left_lower;
+                const double mu_right_upper = mu_left_upper;
                 const double dmu_div_low =
-                    hdt_is * ((mu_left_upper - mu_left_lower)
-                            + (mu_right_upper - mu_right_lower));
-                const double f_before_mu = bkg_n.f[src] - dx_div - du_div;
+                    (2.0 * hdt_is) * (mu_left_upper - mu_left_lower);
+                const double dmu_div_high =
+                    (2.0 * hdt_is) *
+                    (fluxes.mu_high_cell[mu_cell_index(ix, iv, imu + 1)]
+                   - fluxes.mu_high_cell[mu_cell_index(ix, iv, imu)]);
+                const double f_before_mu =
+                    effective_f_for_flux(
+                        effective_f_for_flux(
+                            effective_f_for_flux(bkg_n.f[src]) - dx_div)
+                        - du_div);
                 const double f_mu_low = f_before_mu - dmu_div_low;
+                const double f_mu_high = f_before_mu - dmu_div_high;
                 const double local_scale =
                     std::max(1.0, std::fabs(f_before_mu));
-                const double f_floor = -eps_tol_base * local_scale;
+                const double f_floor =
+                    velocity_local_floor(f_before_mu, f_mu_low);
                 bool failed = false;
                 double severity = 0.0;
                 if (!std::isfinite(f_mu_low)) {
@@ -2527,8 +4045,94 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                     severity = -f_mu_low;
                 }
                 if (!failed) continue;
-                ++local_mu_low_order_failed;
                 const int tid = omp_get_thread_num();
+                const bool boundary =
+                    x_cell_boundary[static_cast<size_t>(ix)] != 0;
+                const bool accepted_debt =
+                    accepts_existing_low_order_negative_debt(
+                        f_before_mu, f_mu_low, local_scale,
+                        boundary);
+                if (accepted_debt) {
+                    ++local_mu_low_order_debt_accepted;
+                    local_mu_low_order_debt_mass +=
+                        std::max(0.0, -f_mu_low) *
+                        bkg_n.vgrid.moment_weight[iv] * sg.dx;
+                    update_stage_failure_candidate(
+                        thread_stage_mu_low_debt_failure[
+                            static_cast<size_t>(tid)],
+                        FINITE_FAILURE_MU_LOW_ORDER, mpi_rank,
+                        sg.ix_start + ix, iv, imu, severity,
+                        f_before_mu, f_mu_low, f_mu_high, f_mu_low,
+                        du_div, dmu_div_low, dx_div);
+                    LowOrderFailureAudit& debt_audit =
+                        thread_mu_low_debt_failure[static_cast<size_t>(tid)];
+                    if (!debt_audit.valid ||
+                        severity > debt_audit.severity) {
+                        const int lower_face = imu;
+                        const int upper_face = imu + 1;
+                        const double left_lower_mu_dot =
+                            mu_dot_at(ix, iv, lower_face);
+                        const double left_upper_mu_dot =
+                            mu_dot_at(ix, iv, upper_face);
+                        const double right_lower_mu_dot = left_lower_mu_dot;
+                        const double right_upper_mu_dot = left_upper_mu_dot;
+                        const double lower_char =
+                            0.5 * (left_lower_mu_dot + right_lower_mu_dot);
+                        const double upper_char =
+                            0.5 * (left_upper_mu_dot + right_upper_mu_dot);
+                        debt_audit.valid = 1;
+                        debt_audit.rank = mpi_rank;
+                        debt_audit.ix = sg.ix_start + ix;
+                        debt_audit.iv = iv;
+                        debt_audit.imu = imu;
+                        debt_audit.region = boundary ? 1 : 0;
+                        debt_audit.severity = severity;
+                        debt_audit.f_input = f_before_mu;
+                        debt_audit.f_after_x =
+                            effective_f_for_flux(
+                                effective_f_for_flux(bkg_n.f[src]) -
+                                dx_div);
+                        debt_audit.dx_div = dx_div;
+                        debt_audit.dmu_div_used = dmu_div_low;
+                        debt_audit.du_div_low = du_div;
+                        debt_audit.f_low = f_mu_low;
+                        debt_audit.left_lower_flux = mu_left_lower;
+                        debt_audit.left_upper_flux = mu_left_upper;
+                        debt_audit.right_lower_flux = mu_right_lower;
+                        debt_audit.right_upper_flux = mu_right_upper;
+                        debt_audit.left_lower_scale = left_lower_mu_dot;
+                        debt_audit.left_upper_scale = left_upper_mu_dot;
+                        debt_audit.right_lower_scale = right_lower_mu_dot;
+                        debt_audit.right_upper_scale = right_upper_mu_dot;
+                        debt_audit.left_lower_donor_f = 0.0;
+                        debt_audit.left_upper_donor_f = 0.0;
+                        debt_audit.right_lower_donor_f = 0.0;
+                        debt_audit.right_upper_donor_f = 0.0;
+                        debt_audit.lower_characteristic = lower_char;
+                        debt_audit.upper_characteristic = upper_char;
+                        debt_audit.moment_weight =
+                            bkg_n.vgrid.moment_weight[iv];
+                        debt_audit.cell_budget =
+                            std::isfinite(f_mu_low)
+                            ? f_mu_low - f_floor : 0.0;
+                        debt_audit.left_lower_donor_index =
+                            mu_donor_imu_at(left_lower_mu_dot, lower_face);
+                        debt_audit.left_upper_donor_index =
+                            mu_donor_imu_at(left_upper_mu_dot, upper_face);
+                        debt_audit.right_lower_donor_index =
+                            mu_donor_imu_at(right_lower_mu_dot, lower_face);
+                        debt_audit.right_upper_donor_index =
+                            mu_donor_imu_at(right_upper_mu_dot, upper_face);
+                    }
+                    continue;
+                }
+                ++local_mu_low_order_failed;
+                update_stage_failure_candidate(
+                    thread_stage_mu_low_failure[static_cast<size_t>(tid)],
+                    FINITE_FAILURE_MU_LOW_ORDER, mpi_rank,
+                    sg.ix_start + ix, iv, imu, severity,
+                    f_before_mu, f_mu_low, f_mu_high, f_mu_low,
+                    du_div, dmu_div_low, dx_div);
                 LowOrderFailureAudit& audit =
                     thread_mu_low_failure[static_cast<size_t>(tid)];
                 if (!audit.valid || severity > audit.severity) {
@@ -2538,29 +4142,23 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                         mu_dot_at(ix, iv, lower_face);
                     const double left_upper_mu_dot =
                         mu_dot_at(ix, iv, upper_face);
-                    const double right_lower_mu_dot =
-                        mu_dot_at(ix + 1, iv, lower_face);
-                    const double right_upper_mu_dot =
-                        mu_dot_at(ix + 1, iv, upper_face);
+                    const double right_lower_mu_dot = left_lower_mu_dot;
+                    const double right_upper_mu_dot = left_upper_mu_dot;
                     const double lower_char =
                         0.5 * (left_lower_mu_dot + right_lower_mu_dot);
                     const double upper_char =
                         0.5 * (left_upper_mu_dot + right_upper_mu_dot);
-                    const double x_cell =
-                        (static_cast<double>(sg.ix_start + ix) + 0.5)
-                      * sg.dx;
                     audit.valid = 1;
                     audit.rank = mpi_rank;
                     audit.ix = sg.ix_start + ix;
                     audit.iv = iv;
                     audit.imu = imu;
-                    audit.region =
-                        (x_cell < CORE_DIAG_BOUNDARY_WIDTH ||
-                         x_cell > Param::Lx - CORE_DIAG_BOUNDARY_WIDTH)
-                        ? 1 : 0;
+                    audit.region = boundary ? 1 : 0;
                     audit.severity = severity;
                     audit.f_input = f_before_mu;
-                    audit.f_after_x = bkg_n.f[src] - dx_div;
+                    audit.f_after_x =
+                        effective_f_for_flux(
+                            effective_f_for_flux(bkg_n.f[src]) - dx_div);
                     audit.dx_div = dx_div;
                     audit.dmu_div_used = dmu_div_low;
                     audit.du_div_low = du_div;
@@ -2597,13 +4195,71 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             local_mu_low_order_failed;
         MPI_Allreduce(MPI_IN_PLACE, &global_mu_low_order_failed, 1,
                       MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
+        long long global_mu_low_order_debt_accepted =
+            local_mu_low_order_debt_accepted;
+        MPI_Allreduce(MPI_IN_PLACE, &global_mu_low_order_debt_accepted, 1,
+                      MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
+        double global_mu_low_order_debt_mass =
+            local_mu_low_order_debt_mass;
+        MPI_Allreduce(MPI_IN_PLACE, &global_mu_low_order_debt_mass, 1,
+                      MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        const bool mu_debt_mass_exceeded =
+            global_mu_low_order_debt_mass / total_bkg_column_for_debt >
+            VELOCITY_LOW_ORDER_DEBT_MASS_FRAC;
+        if (global_mu_low_order_failed > 0 || mu_debt_mass_exceeded) {
+            fluxes.finite_failure_mask |= FINITE_FAILURE_MU_LOW_ORDER;
+            finite = false;
+        }
+        fluxes.mu_low_order_failed_count =
+            global_mu_low_order_failed +
+            (mu_debt_mass_exceeded ? global_mu_low_order_debt_accepted : 0);
+        fluxes.flux_pos[2].negative_mass_prevented =
+            global_mu_low_order_debt_mass;
+        const bool publish_mu_low_hard_failure =
+            global_mu_low_order_failed > 0;
+        const bool publish_mu_low_debt_failure =
+            !publish_mu_low_hard_failure && mu_debt_mass_exceeded;
+        StageFailureCandidate local_stage_mu_low_failure =
+            empty_stage_failure_candidate();
+        if (publish_mu_low_hard_failure) {
+            for (const StageFailureCandidate& audit :
+                 thread_stage_mu_low_failure) {
+                if (audit.valid &&
+                    (!local_stage_mu_low_failure.valid ||
+                     audit.severity > local_stage_mu_low_failure.severity)) {
+                    local_stage_mu_low_failure = audit;
+                }
+            }
+        } else if (publish_mu_low_debt_failure) {
+            for (const StageFailureCandidate& audit :
+                 thread_stage_mu_low_debt_failure) {
+                if (audit.valid &&
+                    (!local_stage_mu_low_failure.valid ||
+                     audit.severity > local_stage_mu_low_failure.severity)) {
+                    local_stage_mu_low_failure = audit;
+                }
+            }
+        }
+        publish_stage_failure(local_stage_mu_low_failure);
         LowOrderFailureAudit local_mu_low_audit =
             empty_low_order_failure_audit();
-        for (const LowOrderFailureAudit& audit : thread_mu_low_failure) {
-            if (audit.valid &&
-                (!local_mu_low_audit.valid ||
-                 audit.severity > local_mu_low_audit.severity)) {
-                local_mu_low_audit = audit;
+        if (publish_mu_low_hard_failure) {
+            for (const LowOrderFailureAudit& audit :
+                 thread_mu_low_failure) {
+                if (audit.valid &&
+                    (!local_mu_low_audit.valid ||
+                     audit.severity > local_mu_low_audit.severity)) {
+                    local_mu_low_audit = audit;
+                }
+            }
+        } else if (publish_mu_low_debt_failure) {
+            for (const LowOrderFailureAudit& audit :
+                 thread_mu_low_debt_failure) {
+                if (audit.valid &&
+                    (!local_mu_low_audit.valid ||
+                     audit.severity > local_mu_low_audit.severity)) {
+                    local_mu_low_audit = audit;
+                }
             }
         }
         struct {
@@ -2641,7 +4297,7 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             mu_low_values[21] = local_mu_low_audit.moment_weight;
             mu_low_values[22] = local_mu_low_audit.cell_budget;
             mu_low_values[23] =
-                static_cast<double>(global_mu_low_order_failed);
+                static_cast<double>(fluxes.mu_low_order_failed_count);
             mu_low_indices[0] = local_mu_low_audit.rank;
             mu_low_indices[1] = local_mu_low_audit.ix;
             mu_low_indices[2] = local_mu_low_audit.iv;
@@ -2728,14 +4384,11 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             const double u_div_cell = u_xl_hi - u_xl_lo;
             const double du_div_final =
                 (2.0 * hdt_is) * u_div_cell;
-            const double mu_div_left =
-                mu_force_face[mu_xface_index(ix, iv, imu + 1)]
-              - mu_force_face[mu_xface_index(ix, iv, imu)];
-            const double mu_div_right =
-                mu_force_face[mu_xface_index(ix + 1, iv, imu + 1)]
-              - mu_force_face[mu_xface_index(ix + 1, iv, imu)];
+            const double mu_div_cell =
+                fluxes.mu_final_cell[mu_cell_index(ix, iv, imu + 1)]
+              - fluxes.mu_final_cell[mu_cell_index(ix, iv, imu)];
             const double dmu_div =
-                hdt_is * (mu_div_left + mu_div_right);
+                (2.0 * hdt_is) * mu_div_cell;
             final_values[0] = du_div_final;
             final_values[1] =
                 bkg_n.f[dst] - dx_div - du_div_final - dmu_div;
@@ -2850,6 +4503,7 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
     double local_f_neg_min = 0.0;
     double local_f_neg_ratio_max = 0.0;
     double local_f_neg_mass = 0.0;
+    double local_final_min_f = std::numeric_limits<double>::infinity();
     long long local_f_neg_count = 0;
     const int nthreads = std::max(1, omp_get_max_threads());
     std::vector<FiniteFluxCandidate> thread_flux_failures(
@@ -2930,6 +4584,7 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                     local_limiter_total_core_02, \
                     local_f_neg_mass,local_f_neg_count) \
         reduction(min:local_f_neg_min) \
+        reduction(min:local_final_min_f) \
         reduction(max:local_f_neg_ratio_max)
     for (int ix = 0; ix < nxl; ++ix) {
         for (int k_int = 0; k_int < static_cast<int>(Param::Nvmu); ++k_int) {
@@ -2955,58 +4610,37 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                 fluxes.u_high_cell[u_cell_index(ix, iv + 1, imu)]
               - fluxes.u_high_cell[u_cell_index(ix, iv, imu)];
             const double du_div_ec = (2.0 * hdt_is) * u_div_ec;
-            const double mu_div_left =
-                mu_force_face[mu_xface_index(ix, iv, imu + 1)]
-              - mu_force_face[mu_xface_index(ix, iv, imu)];
-            const double mu_div_right =
-                mu_force_face[mu_xface_index(ix + 1, iv, imu + 1)]
-              - mu_force_face[mu_xface_index(ix + 1, iv, imu)];
-            const double dmu_div = hdt_is * (mu_div_left + mu_div_right);
-            double dmu_div_ec = dmu_div;
-            if (iv < low_u_limit_count) {
-                const size_t low_mu_left_base =
-                    (static_cast<size_t>(ix) * low_u_limit_count
-                   + static_cast<size_t>(iv)) *
-                    static_cast<size_t>(Param::Nmu + 1);
-                const size_t low_mu_right_base =
-                    (static_cast<size_t>(ix + 1) * low_u_limit_count
-                   + static_cast<size_t>(iv)) *
-                    static_cast<size_t>(Param::Nmu + 1);
-                const double mu_div_left_ec =
-                    mu_force_low_u_ec[low_mu_left_base
-                                      + static_cast<size_t>(imu + 1)]
-                  - mu_force_low_u_ec[low_mu_left_base
-                                      + static_cast<size_t>(imu)];
-                const double mu_div_right_ec =
-                    mu_force_low_u_ec[low_mu_right_base
-                                      + static_cast<size_t>(imu + 1)]
-                  - mu_force_low_u_ec[low_mu_right_base
-                                      + static_cast<size_t>(imu)];
-                dmu_div_ec = hdt_is * (mu_div_left_ec + mu_div_right_ec);
-            }
-            const double updated = bkg_n.f[dst] - dx_div - du_div - dmu_div;
-            const double f0 = bkg_n.f[dst];
-            const double local_scale = std::max(1.0, std::fabs(f0));
+            const double mu_div =
+                fluxes.mu_final_cell[mu_cell_index(ix, iv, imu + 1)]
+              - fluxes.mu_final_cell[mu_cell_index(ix, iv, imu)];
+            const double dmu_div = (2.0 * hdt_is) * mu_div;
+            const double mu_div_ec =
+                fluxes.mu_high_cell[mu_cell_index(ix, iv, imu + 1)]
+              - fluxes.mu_high_cell[mu_cell_index(ix, iv, imu)];
+            const double dmu_div_ec = (2.0 * hdt_is) * mu_div_ec;
+            const double f_raw = bkg_n.f[dst];
+            const double f0_eff = effective_f_for_flux(f_raw);
+            const double f_after_x_raw = f_raw - dx_div;
+            const double f_before_mu_raw = f_after_x_raw - du_div;
+            const double updated = f_before_mu_raw - dmu_div;
+            local_final_min_f = std::min(local_final_min_f, updated);
+            const double local_scale = std::max(1.0, std::fabs(f0_eff));
             const double cell_weight = bkg_n.vgrid.moment_weight[iv];
             const double ke_per_mass = ke_per_mass_arr[iv];
-            const double x_cell =
-                (static_cast<double>(sg.ix_start + ix) + 0.5) * sg.dx;
             const bool in_boundary_01 =
-                (x_cell < 0.1 * Const::micro) ||
-                (x_cell > Param::Lx - 0.1 * Const::micro);
+                x_cell_isolation[static_cast<size_t>(ix)] != 0;
             const bool in_boundary_02 =
-                (x_cell < 0.2 * Const::micro) ||
-                (x_cell > Param::Lx - 0.2 * Const::micro);
+                x_cell_boundary[static_cast<size_t>(ix)] != 0;
             if (collect_stage_diagnostics) {
                 const double stage_f[BKG_STAGE_COUNT] = {
-                    f0 - dx_div,
-                    f0 - dx_div - du_div,
+                    f_after_x_raw,
+                    f_before_mu_raw,
                     updated
                 };
                 StageThreadStats& stats =
                     thread_stage[static_cast<size_t>(omp_get_thread_num())];
                 if (iv == 0) {
-                    const double f0_neg = std::max(0.0, -f0);
+                    const double f0_neg = std::max(0.0, -f_raw);
                     const double after_dx_neg = std::max(0.0, -stage_f[0]);
                     const double after_du_neg = std::max(0.0, -stage_f[1]);
                     const double after_dmu_neg = std::max(0.0, -stage_f[2]);
@@ -3089,7 +4723,7 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                     x_limiter_delta_n * ke_per_mass;
             }
             const double mu_limiter_delta_f = dmu_div_ec - dmu_div;
-            if (mu_limiter_delta_f != 0.0 && iv < low_u_limit_count) {
+            if (mu_limiter_delta_f != 0.0) {
                 const double mu_limiter_delta_e =
                     mu_limiter_delta_f * cell_weight * sg.dx * ke_per_mass;
                 local_mu_low_u_energy_delta += mu_limiter_delta_e;
@@ -3144,7 +4778,7 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                 severity = std::numeric_limits<double>::infinity();
                 max_negative = std::numeric_limits<double>::infinity();
                 relative_negative = std::numeric_limits<double>::infinity();
-            } else if (updated < 0.0 && iv >= low_u_limit_count) {
+            } else if (updated < 0.0) {
                 const double neg_ratio = -updated / local_scale;
                 if (neg_ratio >= NEG_TOL_HARD) {
                     #pragma omp atomic write
@@ -3163,7 +4797,7 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             }
 
             // Track f-negativity for diagnostics (all levels)
-            if (updated < 0.0 && iv >= low_u_limit_count) {
+            if (updated < 0.0) {
                 local_f_neg_min = std::min(local_f_neg_min, updated);
                 const double neg_ratio = (updated < 0.0)
                     ? (-updated) / local_scale : 0.0;
@@ -3196,7 +4830,7 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                     candidate.max_negative = max_negative;
                     candidate.relative_negative = relative_negative;
                     candidate.updated = updated;
-                    candidate.f0 = f0;
+                    candidate.f0 = f_raw;
                     candidate.dx_div = dx_div;
                     candidate.du_div = du_div;
                     candidate.dmu_div = dmu_div;
@@ -3211,67 +4845,14 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         }
     }
 
-    #pragma omp parallel for collapse(2) schedule(static) \
-        reduction(+:local_mu_low_u_energy_delta, \
-                    local_mu_low_u_energy_delta_boundary, \
-                    local_mu_low_u_energy_delta_core, \
-                    local_neg_mass_defect,local_neg_energy_defect, \
-                    local_f_neg_mass,local_f_neg_count) \
-        reduction(min:local_f_neg_min) \
-        reduction(max:local_f_neg_ratio_max)
-    for (int ix = 0; ix < nxl; ++ix) {
-        for (int iv = 0; iv < low_u_limit_count; ++iv) {
-            ++local_remap_cell_total;
-            const double cell_weight = bkg_n.vgrid.moment_weight[iv];
-            const double ke_per_mass = ke_per_mass_arr[iv];
-            /*
-             * Do not repair endpoint negatives with max(0,f) scaling.  7.1.3
-             * requires positivity control to enter through conservative
-             * fluxes.  Strong endpoint negatives remain in the existing
-             * negative-mass diagnostics so the preceding u/mu flux limiter can
-             * be fixed instead of hiding the defect with a post-update clip.
-             */
-            for (int imu = 0; imu < Param::Nmu; ++imu) {
-                const size_t dst =
-                    static_cast<size_t>(ng + ix) * Param::Nvmu
-                  + static_cast<size_t>(iv) * Param::Nmu
-                  + static_cast<size_t>(imu);
-                const double fv = bkg_new.f[dst];
-                if (!std::isfinite(fv)) {
-                    #pragma omp atomic write
-                    local_bad_update_centered = 1;
-                    continue;
-                }
-                if (fv >= 0.0) continue;
+    local_remap_cell_total +=
+        static_cast<long long>(nxl) *
+        static_cast<long long>(low_u_limit_count);
 
-                const double local_scale = std::max(1.0, std::fabs(fv));
-                const double neg_ratio = -fv / local_scale;
-                if (neg_ratio >= NEG_TOL_SOFT) {
-                    const double mass_defect =
-                        (-fv) * cell_weight * sg.dx;
-                    local_neg_mass_defect += mass_defect;
-                    local_neg_energy_defect += mass_defect * ke_per_mass;
-                }
-                local_f_neg_min = std::min(local_f_neg_min, fv);
-                local_f_neg_ratio_max =
-                    std::max(local_f_neg_ratio_max, neg_ratio);
-                local_f_neg_mass += (-fv) * cell_weight * sg.dx;
-                ++local_f_neg_count;
-
-                const int tid = omp_get_thread_num();
-                NegCellInfo& wn =
-                    thread_worst_neg[static_cast<size_t>(tid)];
-                if (!wn.valid || neg_ratio > wn.neg_ratio) {
-                    wn.neg_ratio = neg_ratio;
-                    wn.f_val = fv;
-                    wn.ix = sg.ix_start + ix;
-                    wn.iv = iv;
-                    wn.imu = imu;
-                    wn.valid = 1;
-                }
-            }
-        }
-    }
+    double global_final_min_f = local_final_min_f;
+    MPI_Allreduce(MPI_IN_PLACE, &global_final_min_f, 1,
+                  MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+    if (!std::isfinite(global_final_min_f)) global_final_min_f = 0.0;
 
     if (collect_stage_diagnostics) {
         std::vector<double> local_stage_min_f(
@@ -3395,9 +4976,6 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         double global_u_min_f_low = local_u_min_f_low;
         MPI_Allreduce(MPI_IN_PLACE, &global_u_min_f_low, 1,
                       MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
-        long long global_u_low_order_failed = local_u_low_order_failed;
-        MPI_Allreduce(MPI_IN_PLACE, &global_u_low_order_failed, 1,
-                      MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
         // --- u-direction (index 1) ---
         FluxPositivityDiag& fu = fluxes.flux_pos[1];
         fu.min_f_before = fluxes.stage_min_f[0];  // after x, before u
@@ -3405,12 +4983,11 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
             std::isfinite(global_u_min_f_low) ? global_u_min_f_low : 0.0;
         fu.min_f_final  = fluxes.stage_min_f[1];  // after x + u
         fu.low_order_failed_count =
-            static_cast<double>(global_u_low_order_failed);
+            static_cast<double>(fluxes.u_low_order_failed_count);
         fu.alpha_active_fraction   = fluxes.u_force_alpha_active_frac;
         fu.alpha_min               = fluxes.u_force_alpha_min;
         fu.alpha_core_fraction     = 0.0;
         fu.alpha_boundary_fraction = 0.0;
-        fu.negative_mass_prevented = 0.0;
         FluxDefectDiag& du = fluxes.flux_defect[1];
         du.mass_defect       = fluxes.limiter_mass_defect;
         du.momentum_defect   = fluxes.limiter_momentum_defect;
@@ -3421,15 +4998,19 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         // --- mu-direction (index 2) ---
         FluxPositivityDiag& fm = fluxes.flux_pos[2];
         fm.min_f_before = fluxes.stage_min_f[1];  // after x+u, before mu
-        fm.min_f_low    = fluxes.stage_min_f[1];  // no mu_low yet → use final
+        double global_mu_min_f_low = local_mu_fct_min_f_low;
+        MPI_Allreduce(MPI_IN_PLACE, &global_mu_min_f_low, 1,
+                      MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+        fm.min_f_low    =
+            std::isfinite(global_mu_min_f_low) ? global_mu_min_f_low : 0.0;
         fm.min_f_final  = fluxes.stage_min_f[2];  // final
-        fm.low_order_failed_count  = 0.0;  // not yet tracked for mu
+        fm.low_order_failed_count =
+            static_cast<double>(fluxes.mu_low_order_failed_count);
         fm.alpha_active_fraction   = fluxes.mu_low_u_limiter_active_fraction;
         fm.alpha_min               = fluxes.mu_low_u_alpha_min;
         fm.alpha_core_fraction = fluxes.mu_low_u_limiter_active_fraction_core;
         fm.alpha_boundary_fraction =
             fluxes.mu_low_u_limiter_active_fraction_boundary;
-        fm.negative_mass_prevented = 0.0;
         FluxDefectDiag& dm = fluxes.flux_defect[2];
         dm.mass_defect       = 0.0;
         dm.momentum_defect   = 0.0;
@@ -3500,109 +5081,152 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
         fluxes.finite_flux_iv = failure_indices[2];
         fluxes.finite_flux_imu = failure_indices[3];
     }
-    if (local_bad_update_centered != 0) finite = false;
-    // Negative-f protection remains disabled for long-run diagnostics.
-    // if (local_bad_negative_hard != 0) finite = false;
-    (void)local_bad_negative_hard;
+    if (local_bad_update_centered != 0) {
+        fluxes.finite_failure_mask |= FINITE_FAILURE_CENTERED_UPDATE;
+        finite = false;
+    }
+    if (local_bad_negative_hard != 0) {
+        fluxes.trial_failure_downgraded = 1;
+    }
+    conservative_floor_repair(bkg_new, sg, mpi_rank, mpi_size, fluxes,
+                              finite);
     exchange_ghosts_x_persistent(bkg_new, sg, mpi_rank, mpi_size);
     update_flux_current(bkg_n, sg, fluxes, bkg_new);
-
-    MPI_Allreduce(&local_negative_mass, &fluxes.negative_mass_before_repair,
-                  1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-    {
-        double local_pos[2] = {
-            local_neg_mass_defect,
-            local_neg_energy_defect
-        };
-        double global_pos[2] = { 0.0, 0.0 };
-        MPI_Allreduce(local_pos, global_pos, 2, MPI_DOUBLE, MPI_SUM,
-                      MPI_COMM_WORLD);
-        fluxes.mass_added_by_positivity_repair = 0.0;
-        fluxes.positivity_mass_defect = global_pos[0];
-        fluxes.positivity_energy_defect = global_pos[1];
+    scan_negative_debt_guard(bkg_new, sg, fields_mid, fluxes);
+    if (fluxes.negative_debt_level == NEG_DEBT_ABORT) {
+        fluxes.finite_failure_mask |= FINITE_FAILURE_FLOOR_REPAIR;
+        finite = false;
     }
+    /*
+     * Soft-debt downgrade:
+     * u_final_negative_hard, x_final_positive_failure, and x_low
+     * input_state_bad can be pure finite, microscopic residual debt after
+     * the conservative floor repair.  Once the full state scan reports
+     * NEG_DEBT_OK, these diagnostics should not freeze the solver.  Keep
+     * NaN/Inf, floor-repair failures, centered-update failures, real CFL or
+     * donor bugs, and macroscopic/core debt as hard failures.
+     */
     {
-        double local_limiter[3] = {
+        const int soft_debt_mask =
+            FINITE_FAILURE_U_FINAL_NEGATIVE |
+            FINITE_FAILURE_MU_FINAL_NEGATIVE |
+            FINITE_FAILURE_X_FINAL_POSITIVE;
+        const int hard_failure_mask =
+            fluxes.finite_failure_mask & ~soft_debt_mask;
+        const bool nonfinite_stage_failure =
+            fluxes.finite_stage_failure_valid != 0 &&
+            !std::isfinite(fluxes.finite_stage_failure_severity);
+        const double total_bkg_column =
+            std::max(1.0, Param::dens * Param::Lx);
+        const double x_low_neg_mass_fraction =
+            fluxes.x_low_input_neg_mass / total_bkg_column;
+        const bool x_low_input_soft_debt =
+            fluxes.x_low_failure_kind == X_LOW_INPUT_BAD &&
+            x_low_neg_mass_fraction <= X_LOW_INPUT_DEBT_NEG_MASS_FRAC &&
+            fluxes.x_low_output_rel_neg <=
+                X_LOW_INPUT_DEBT_OUTPUT_REL_TOL;
+        const bool finite_soft_debt_only =
+            fluxes.negative_debt_level == NEG_DEBT_OK &&
+            hard_failure_mask == FINITE_FAILURE_NONE &&
+            !nonfinite_stage_failure &&
+            (fluxes.finite_failure_mask != FINITE_FAILURE_NONE ||
+             x_low_input_soft_debt);
+        if (finite_soft_debt_only) {
+            if (!finite) {
+                finite = true;
+            }
+            fluxes.trial_failure_downgraded = 1;
+            fluxes.accepted_with_negative_debt = 1;
+            fluxes.finite_failure_mask &= soft_debt_mask;
+            if (x_low_input_soft_debt) {
+                fluxes.x_low_failure_kind = X_LOW_INPUT_DEBT;
+                fluxes.x_low_input_debt_accepted =
+                    std::max(1.0, fluxes.x_low_input_debt_accepted);
+            }
+        }
+    }
+
+    {
+        double local_sum_diag[8] = {
+            local_negative_mass,
+            local_neg_mass_defect,
+            local_neg_energy_defect,
             local_limiter_mass_delta,
             local_limiter_momentum_delta,
-            local_limiter_energy_delta
-        };
-        double global_limiter[3] = { 0.0, 0.0, 0.0 };
-        MPI_Allreduce(local_limiter, global_limiter, 3, MPI_DOUBLE, MPI_SUM,
-                      MPI_COMM_WORLD);
-        fluxes.limiter_mass_defect = global_limiter[0];
-        fluxes.limiter_momentum_defect = global_limiter[1];
-        fluxes.limiter_energy_defect = global_limiter[2];
-        double local_x_limiter[2] = {
+            local_limiter_energy_delta,
             local_x_limiter_mass_delta,
             local_x_limiter_energy_delta
         };
-        double global_x_limiter[2] = {0.0, 0.0};
-        MPI_Allreduce(local_x_limiter, global_x_limiter, 2,
-                      MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        fluxes.x_limiter_mass_defect = global_x_limiter[0];
-        fluxes.x_limiter_energy_defect = global_x_limiter[1];
+        double global_sum_diag[8] = {
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        };
+        MPI_Allreduce(local_sum_diag, global_sum_diag, 8, MPI_DOUBLE,
+                      MPI_SUM, MPI_COMM_WORLD);
+        fluxes.negative_mass_before_repair = global_sum_diag[0];
+        fluxes.mass_added_by_positivity_repair = fluxes.floor_repair_mass;
+        fluxes.positivity_mass_defect = global_sum_diag[1];
+        fluxes.positivity_energy_defect =
+            global_sum_diag[2] + fluxes.floor_repair_energy;
+        fluxes.limiter_mass_defect = global_sum_diag[3];
+        fluxes.limiter_momentum_defect = global_sum_diag[4];
+        fluxes.limiter_energy_defect = global_sum_diag[5];
+        fluxes.x_limiter_mass_defect = global_sum_diag[6];
+        fluxes.x_limiter_energy_defect = global_sum_diag[7];
         // 7.1.6: populate x-direction flux-positivity diagnostics
         {
-            double local_x_low_counts[2] = {
+            double local_x_low_sum[6] = {
                 local_x_low_input_failed,
-                local_x_low_order_failed
-            };
-            double global_x_low_counts[2] = {0.0, 0.0};
-            MPI_Allreduce(local_x_low_counts, global_x_low_counts, 2,
-                          MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-            double local_x_low_debt[4] = {
+                local_x_low_order_failed,
                 local_x_low_input_neg_mass,
-                local_x_low_input_rel_neg,
-                local_x_low_output_rel_neg,
-                local_x_low_input_core_failed
-            };
-            double global_x_low_debt[4] = {0.0, 0.0, 0.0, 0.0};
-            MPI_Allreduce(&local_x_low_debt[0], &global_x_low_debt[0], 1,
-                          MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-            MPI_Allreduce(&local_x_low_debt[1], &global_x_low_debt[1], 2,
-                          MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-            MPI_Allreduce(&local_x_low_debt[3], &global_x_low_debt[3], 1,
-                          MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-            double global_x_low_max_cfl = local_x_low_max_cfl;
-            MPI_Allreduce(MPI_IN_PLACE, &global_x_low_max_cfl, 1,
-                          MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-            double local_x_pos[3] = {
-                local_x_min_f_before,
-                local_x_min_f_low,
+                local_x_low_input_core_failed,
+                local_x_low_debt_accepted,
                 local_x_neg_mass_prevented
             };
-            double global_x_pos[3] = {
-                std::numeric_limits<double>::infinity(),
-                std::numeric_limits<double>::infinity(),
-                0.0
-            };
-            MPI_Allreduce(local_x_pos, global_x_pos, 2, MPI_DOUBLE,
-                          MPI_MIN, MPI_COMM_WORLD);
-            MPI_Allreduce(&local_x_pos[2], &global_x_pos[2], 1,
+            double global_x_low_sum[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+            MPI_Allreduce(local_x_low_sum, global_x_low_sum, 6,
                           MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+
+            double local_x_low_max[3] = {
+                local_x_low_input_rel_neg,
+                local_x_low_output_rel_neg,
+                local_x_low_max_cfl
+            };
+            double global_x_low_max[3] = {0.0, 0.0, 0.0};
+            MPI_Allreduce(local_x_low_max, global_x_low_max, 3,
+                          MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+
+            double local_x_pos_min[2] = {
+                local_x_min_f_before,
+                local_x_min_f_low
+            };
+            double global_x_pos_min[2] = {
+                std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::infinity()
+            };
+            MPI_Allreduce(local_x_pos_min, global_x_pos_min, 2, MPI_DOUBLE,
+                          MPI_MIN, MPI_COMM_WORLD);
             /*
              * Classify x-low failures:
              * A: input state violates the shell-scaled tolerance.  Tiny,
-             *    localized, non-core residual negatives are recorded as
-             *    X_LOW_INPUT_DEBT and allowed to continue; larger debt stays
-             *    a hard X_LOW_INPUT_BAD.
+             *    residual negatives are recorded as X_LOW_INPUT_DEBT and
+             *    handed to the global core-debt guard.  Input-state debt is
+             *    not treated as an x-low CFL/donor failure.
              * B: input is acceptable and CFL is monotone, so donor/periodic
              *    face construction is inconsistent.
              * C: input is acceptable and max CFL exceeds one; only this case
              *    should be retried with a smaller true x substep.
              */
-            const double global_x_low_input_bad = global_x_low_counts[0];
-            const double global_x_low_output_bad = global_x_low_counts[1];
+            const double global_x_low_input_bad = global_x_low_sum[0];
+            const double global_x_low_output_bad = global_x_low_sum[1];
             const double global_x_low_hard_count =
-                global_x_low_input_bad + global_x_low_output_bad;
+                global_x_low_output_bad;
             fluxes.x_low_order_failed_count = global_x_low_hard_count;
             fluxes.x_low_failed_count = global_x_low_hard_count;
-            fluxes.x_low_input_neg_mass = global_x_low_debt[0];
-            fluxes.x_low_input_rel_neg = global_x_low_debt[1];
-            fluxes.x_low_output_rel_neg = global_x_low_debt[2];
-            fluxes.x_low_input_core_failed_count = global_x_low_debt[3];
-            fluxes.x_low_input_debt_accepted = 0.0;
+            fluxes.x_low_input_neg_mass = global_x_low_sum[2];
+            fluxes.x_low_input_rel_neg = global_x_low_max[0];
+            fluxes.x_low_output_rel_neg = global_x_low_max[1];
+            fluxes.x_low_input_core_failed_count = global_x_low_sum[3];
+            fluxes.x_low_input_debt_accepted = global_x_low_sum[4];
             if (global_x_low_input_bad > 0.0) {
                 const double total_cells =
                     static_cast<double>(std::max(1, sg.nx_global))
@@ -3613,28 +5237,39 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
                 const double total_bkg_column =
                     std::max(1.0, Param::dens * Param::Lx);
                 const double neg_mass_fraction =
-                    global_x_low_debt[0] / total_bkg_column;
+                    global_x_low_sum[2] / total_bkg_column;
                 const bool small_count =
                     global_x_low_input_bad <= soft_cell_limit;
                 const bool small_relative =
-                    global_x_low_debt[1] <= X_LOW_INPUT_DEBT_REL_TOL;
+                    global_x_low_max[0] <= X_LOW_INPUT_DEBT_REL_TOL;
                 const bool small_neg_mass =
                     neg_mass_fraction <= X_LOW_INPUT_DEBT_NEG_MASS_FRAC;
                 const bool not_core =
-                    global_x_low_debt[3] <= 0.0;
+                    global_x_low_sum[3] <= 0.0;
                 const bool low_output_roundoff =
                     global_x_low_output_bad <= 0.0 &&
-                    global_x_low_debt[2] <= X_LOW_INPUT_DEBT_OUTPUT_REL_TOL;
+                    global_x_low_max[1] <= X_LOW_INPUT_DEBT_OUTPUT_REL_TOL;
                 if (small_count && small_relative && small_neg_mass &&
                     not_core && low_output_roundoff) {
                     fluxes.x_low_failure_kind = X_LOW_INPUT_DEBT;
-                    fluxes.x_low_input_debt_accepted = 1.0;
+                    fluxes.x_low_input_debt_accepted =
+                        std::max(1.0, fluxes.x_low_input_debt_accepted);
                 } else {
-                    fluxes.x_low_failure_kind = X_LOW_INPUT_BAD;
-                    finite = false;
+                    /*
+                     * Input-state debt is inherited from the previous
+                     * accepted stage.  It is diagnostic here; hard stopping
+                     * is reserved for the global core-debt guard after the
+                     * full updated state is available.
+                     */
+                    fluxes.x_low_failure_kind = X_LOW_INPUT_DEBT;
+                    fluxes.x_low_input_debt_accepted =
+                        std::max(1.0, fluxes.x_low_input_debt_accepted);
+                    fluxes.trial_failure_downgraded = 1;
                 }
+            } else if (fluxes.x_low_input_debt_accepted > 0.0) {
+                fluxes.x_low_failure_kind = X_LOW_INPUT_DEBT;
             } else if (global_x_low_output_bad > 0.0) {
-                if (global_x_low_max_cfl <= 1.0 + X_LOW_CFL_TOL) {
+                if (global_x_low_max[2] <= 1.0 + X_LOW_CFL_TOL) {
                     fluxes.x_low_failure_kind = X_LOW_DONOR_BUG;
                 } else {
                     fluxes.x_low_failure_kind = X_LOW_TRUE_CFL;
@@ -3647,19 +5282,19 @@ void VlasovAmpereMidpointSolver::compute_vlasov_midpoint_residual(
              * Keep the existing per-direction diagnostic fields populated
              * from the same classified quantities.
              */
-            fluxes.x_low_input_min_f = global_x_pos[0];
-            fluxes.x_low_max_cfl = global_x_low_max_cfl;
-            fluxes.x_low_output_min_f = global_x_pos[1];
+            fluxes.x_low_input_min_f = global_x_pos_min[0];
+            fluxes.x_low_max_cfl = global_x_low_max[2];
+            fluxes.x_low_output_min_f = global_x_pos_min[1];
             FluxPositivityDiag& fx = fluxes.flux_pos[0];
-            fx.min_f_before = global_x_pos[0];
-            fx.min_f_low    = global_x_pos[1];
-            // min_f_final from stage diagnostics (populated in Pass 3)
+            fx.min_f_before = global_x_pos_min[0];
+            fx.min_f_low    = global_x_pos_min[1];
+            fx.min_f_final  = global_final_min_f;
             fx.low_order_failed_count  = fluxes.x_low_order_failed_count;
             fx.alpha_active_fraction   = fluxes.limiter_active_fraction;
             fx.alpha_min               = fluxes.limiter_min_alpha;
             fx.alpha_core_fraction     = fluxes.limiter_active_fraction_core;
             fx.alpha_boundary_fraction = fluxes.limiter_active_fraction_boundary;
-            fx.negative_mass_prevented = global_x_pos[2];
+            fx.negative_mass_prevented = global_x_low_sum[5];
             FluxDefectDiag& dx = fluxes.flux_defect[0];
             dx.mass_defect     = fluxes.x_limiter_mass_defect;
             dx.momentum_defect = 0.0;  // x-direction has no momentum defect
@@ -3878,13 +5513,12 @@ void VlasovAmpereMidpointSolver::update_flux_current(
         double j_face = 0.0;
         const size_t face_base = static_cast<size_t>(iface) * Param::Nvmu;
         for (int iv = 0; iv < Param::Nv; ++iv) {
-            const double shell = sp.vgrid.moment_weight[iv];
+            const double q_shell = sp.charge * sp.vgrid.moment_weight[iv];
             for (int imu = 0; imu < Param::Nmu; ++imu) {
                 const size_t k =
                     static_cast<size_t>(iv) * Param::Nmu
                   + static_cast<size_t>(imu);
-                j_face += sp.charge * shell *
-                          fluxes.x_final[face_base + k];
+                j_face += q_shell * fluxes.x_final[face_base + k];
             }
         }
         bkg_new.current_face_x[static_cast<size_t>(iface)] = j_face;
@@ -3894,6 +5528,477 @@ void VlasovAmpereMidpointSolver::update_flux_current(
         bkg_new.current_x[static_cast<size_t>(ix)] =
             0.5 * (bkg_new.current_face_x[static_cast<size_t>(ix)]
                  + bkg_new.current_face_x[static_cast<size_t>(ix + 1)]);
+    }
+}
+
+void VlasovAmpereMidpointSolver::scan_negative_debt_guard(
+    const Species& sp,
+    const SpatialGrid& sg,
+    const EMFields& fields_mid,
+    FluxPack& fluxes) const
+{
+    (void)fields_mid;
+    const int ng = sg.nghost;
+    const int nxl = sg.nx_local;
+
+    double local_values[16] = {0.0};
+    double local_min[3] = {
+        std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::infinity()
+    };
+
+    for (int ix = 0; ix < nxl; ++ix) {
+        const int ix_g = ng + ix;
+        const int global_ix = sg.ix_start + ix;
+        const double x_cell =
+            (static_cast<double>(global_ix) + 0.5) * sg.dx;
+        const bool boundary =
+            (x_cell < NEG_DEBT_CORE_BOUNDARY_WIDTH) ||
+            (x_cell > Param::Lx - NEG_DEBT_CORE_BOUNDARY_WIDTH);
+        for (int iv = 0; iv < Param::Nv; ++iv) {
+            const double mass_weight =
+                sp.vgrid.moment_weight[iv] * sg.dx;
+            const double kinetic = kinetic_energy_per_particle(sp, iv);
+            for (int imu = 0; imu < Param::Nmu; ++imu) {
+                const size_t slot =
+                    static_cast<size_t>(ix_g) * Param::Nvmu +
+                    static_cast<size_t>(iv) * Param::Nmu +
+                    static_cast<size_t>(imu);
+                const double f = sp.f[slot];
+                if (!std::isfinite(f)) {
+                    local_values[15] = 1.0;
+                    continue;
+                }
+
+                const bool velocity_tail =
+                    (iv <= 1 || iv >= Param::Nv - 2 ||
+                     imu <= 1 || imu >= Param::Nmu - 2);
+                const int region = boundary ? 0 : (velocity_tail ? 2 : 1);
+                const double abs_j_weight =
+                    std::fabs(sp.charge * sp.vgrid.moment_weight[iv] *
+                              sp.vgrid.vx_cells[static_cast<size_t>(iv) *
+                                                Param::Nmu +
+                                                static_cast<size_t>(imu)]) *
+                    sg.dx;
+
+                if (f > 0.0) {
+                    const double pos_mass = f * mass_weight;
+                    const double pos_energy = pos_mass * kinetic;
+                    const double pos_current = std::fabs(f) * abs_j_weight;
+                    if (region == 1) {
+                        local_values[4] += pos_mass;
+                        local_values[7] += pos_energy;
+                        local_values[9] += pos_current;
+                    }
+                    local_values[10] += pos_mass;
+                    local_values[11] += pos_energy;
+                } else if (f < 0.0) {
+                    const double debt = -f;
+                    const double neg_mass = debt * mass_weight;
+                    const double neg_energy = neg_mass * kinetic;
+                    const double neg_current = debt * abs_j_weight;
+                    if (region == 0) {
+                        local_values[0] += neg_mass;
+                    } else if (region == 1) {
+                        local_values[1] += neg_mass;
+                        local_values[5] += neg_energy;
+                        local_values[8] += neg_current;
+                    } else {
+                        local_values[2] += neg_mass;
+                    }
+                    local_values[3] += neg_mass;
+                    local_values[6] += neg_energy;
+                    local_min[region] = std::min(local_min[region], f);
+                    local_values[12 + region] += 1.0;
+                }
+            }
+        }
+    }
+
+    MPI_Allreduce(MPI_IN_PLACE, local_values, 16, MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, local_min, 3, MPI_DOUBLE, MPI_MIN,
+                  MPI_COMM_WORLD);
+
+    fluxes.neg_mass_boundary = local_values[0];
+    fluxes.neg_mass_core = local_values[1];
+    fluxes.neg_mass_tail = local_values[2];
+    fluxes.neg_mass_total_guard = local_values[3];
+    fluxes.neg_mass_core_fraction =
+        local_values[1] / std::max(local_values[4], 1.0);
+    fluxes.neg_energy_core_abs = local_values[5];
+    fluxes.neg_energy_core_fraction =
+        local_values[5] / std::max(local_values[7], 1.0);
+    fluxes.neg_current_core_abs = local_values[8];
+    fluxes.neg_current_core_fraction =
+        local_values[8] / std::max(local_values[9], 1.0);
+    fluxes.neg_debt_min_f_boundary =
+        std::isfinite(local_min[0]) ? local_min[0] : 0.0;
+    fluxes.neg_debt_min_f_core =
+        std::isfinite(local_min[1]) ? local_min[1] : 0.0;
+    fluxes.neg_debt_min_f_tail =
+        std::isfinite(local_min[2]) ? local_min[2] : 0.0;
+    fluxes.neg_cell_boundary =
+        static_cast<long long>(std::llround(local_values[12]));
+    fluxes.neg_cell_core =
+        static_cast<long long>(std::llround(local_values[13]));
+    fluxes.neg_cell_tail =
+        static_cast<long long>(std::llround(local_values[14]));
+
+    int level = (local_values[15] > 0.0) ? NEG_DEBT_ABORT : NEG_DEBT_OK;
+    const bool core_abort =
+        fluxes.neg_mass_core_fraction > CORE_NEG_MASS_ABORT_FRAC ||
+        fluxes.neg_energy_core_fraction > CORE_NEG_ENERGY_ABORT_FRAC ||
+        fluxes.neg_current_core_fraction > CORE_NEG_CURRENT_ABORT_FRAC;
+    const bool core_repair =
+        fluxes.neg_mass_core_fraction > CORE_NEG_MASS_WARN_FRAC ||
+        fluxes.neg_energy_core_fraction > CORE_NEG_ENERGY_WARN_FRAC ||
+        fluxes.neg_current_core_fraction > CORE_NEG_CURRENT_WARN_FRAC;
+    const bool core_warn =
+        fluxes.neg_mass_core_fraction > CORE_NEG_MASS_ACCEPT_FRAC ||
+        fluxes.neg_energy_core_fraction > CORE_NEG_ENERGY_ACCEPT_FRAC ||
+        fluxes.neg_current_core_fraction > CORE_NEG_CURRENT_ACCEPT_FRAC;
+    if (core_abort) {
+        level = NEG_DEBT_ABORT;
+    } else if (core_repair) {
+        level = NEG_DEBT_REPAIR;
+    } else if (core_warn) {
+        level = NEG_DEBT_WARN;
+    }
+
+    const double total_positive_mass = std::max(local_values[10], 1.0);
+    const double boundary_fraction = local_values[0] / total_positive_mass;
+    const double tail_fraction = local_values[2] / total_positive_mass;
+    if (level < NEG_DEBT_WARN &&
+        (boundary_fraction > BOUNDARY_NEG_MASS_WARN_FRAC ||
+         tail_fraction > TAIL_NEG_MASS_WARN_FRAC)) {
+        level = NEG_DEBT_WARN;
+    }
+    fluxes.negative_debt_level = level;
+    fluxes.accepted_with_negative_debt =
+        (level == NEG_DEBT_WARN || level == NEG_DEBT_REPAIR) ? 1 : 0;
+}
+
+void VlasovAmpereMidpointSolver::conservative_floor_repair(
+    Species& sp,
+    const SpatialGrid& sg,
+    int mpi_rank,
+    int mpi_size,
+    FluxPack& fluxes,
+    bool& finite) const
+{
+    (void)mpi_size;
+    const int ng = sg.nghost;
+    const int nxl = sg.nx_local;
+    double local_neg_mass = 0.0;
+    double local_total_pos_mass = 0.0;
+    double local_core_neg_mass = 0.0;
+    double local_soft_neg_mass = 0.0;
+    double local_core_neg_energy = 0.0;
+    double local_soft_neg_energy = 0.0;
+    double local_total_pos_energy = 0.0;
+    double local_min_f = std::numeric_limits<double>::infinity();
+    double local_core_max_abs_neg = 0.0;
+    double local_soft_max_abs_neg = 0.0;
+    double local_soft_max_rel_neg = 0.0;
+
+    #pragma omp parallel for collapse(2) schedule(static) \
+        reduction(+:local_neg_mass,local_total_pos_mass,local_core_neg_mass) \
+        reduction(+:local_soft_neg_mass,local_core_neg_energy) \
+        reduction(+:local_soft_neg_energy,local_total_pos_energy) \
+        reduction(min:local_min_f) \
+        reduction(max:local_core_max_abs_neg,local_soft_max_abs_neg) \
+        reduction(max:local_soft_max_rel_neg)
+    for (int ix = 0; ix < nxl; ++ix) {
+        for (int imu = 0; imu < Param::Nmu; ++imu) {
+            const int ix_g = ng + ix;
+            const int global_ix = sg.ix_start + ix;
+            const double x_cell =
+                (static_cast<double>(global_ix) + 0.5) * sg.dx;
+            const bool boundary = is_boundary_cell(x_cell);
+            double line_peak = 0.0;
+            for (int iv = 0; iv < Param::Nv; ++iv) {
+                const size_t slot =
+                    static_cast<size_t>(ix_g) * Param::Nvmu +
+                    static_cast<size_t>(iv) * Param::Nmu +
+                    static_cast<size_t>(imu);
+                const double f = sp.f[slot];
+                if (std::isfinite(f)) {
+                    line_peak = std::max(line_peak, f);
+                }
+            }
+            for (int iv = 0; iv < Param::Nv; ++iv) {
+                const size_t slot =
+                    static_cast<size_t>(ix_g) * Param::Nvmu +
+                    static_cast<size_t>(iv) * Param::Nmu +
+                    static_cast<size_t>(imu);
+                const double f = sp.f[slot];
+                local_min_f = std::min(local_min_f, f);
+                const double cell_weight = sp.vgrid.moment_weight[iv];
+                if (std::isfinite(f) && f > 0.0) {
+                    const double pos_mass = f * cell_weight * sg.dx;
+                    local_total_pos_mass += pos_mass;
+                    local_total_pos_energy +=
+                        pos_mass * kinetic_energy_per_particle(sp, iv);
+                } else if (std::isfinite(f) && f < 0.0) {
+                    const double debt = -f;
+                    const double neg_mass = debt * cell_weight * sg.dx;
+                    const double neg_energy =
+                        neg_mass * kinetic_energy_per_particle(sp, iv);
+                    local_neg_mass += neg_mass;
+                    const bool velocity_tail =
+                        is_u_tail_or_low_occupancy(iv, debt, line_peak);
+                    if (boundary || velocity_tail) {
+                        local_soft_neg_mass += neg_mass;
+                        local_soft_neg_energy += neg_energy;
+                        local_soft_max_abs_neg =
+                            std::max(local_soft_max_abs_neg, debt);
+                        const double local_scale =
+                            std::max(std::max(line_peak, debt),
+                                     std::numeric_limits<double>::min());
+                        local_soft_max_rel_neg =
+                            std::max(local_soft_max_rel_neg,
+                                     debt / local_scale);
+                    } else {
+                        local_core_max_abs_neg =
+                            std::max(local_core_max_abs_neg, debt);
+                        if (debt > FLOOR_REPAIR_CORE_ROUNDOFF_ABS) {
+                            local_core_neg_mass += neg_mass;
+                            local_core_neg_energy += neg_energy;
+                        }
+                    }
+                } else if (!std::isfinite(f)) {
+                    local_neg_mass =
+                        std::numeric_limits<double>::infinity();
+                    local_core_max_abs_neg =
+                        std::numeric_limits<double>::infinity();
+                }
+            }
+        }
+    }
+
+    double global_sums[7] = {
+        local_neg_mass, local_total_pos_mass, local_core_neg_mass,
+        local_soft_neg_mass, local_core_neg_energy,
+        local_soft_neg_energy, local_total_pos_energy
+    };
+    MPI_Allreduce(MPI_IN_PLACE, global_sums, 7, MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+    double global_min_f = local_min_f;
+    MPI_Allreduce(MPI_IN_PLACE, &global_min_f, 1, MPI_DOUBLE, MPI_MIN,
+                  MPI_COMM_WORLD);
+    double global_max_values[3] = {
+        local_core_max_abs_neg, local_soft_max_abs_neg,
+        local_soft_max_rel_neg
+    };
+    MPI_Allreduce(MPI_IN_PLACE, global_max_values, 3, MPI_DOUBLE, MPI_MAX,
+                  MPI_COMM_WORLD);
+
+    const double global_neg_mass = global_sums[0];
+    const double global_total_mass = std::max(1.0, global_sums[1]);
+    const double global_core_neg_mass = global_sums[2];
+    const double global_soft_neg_mass = global_sums[3];
+    const double global_total_energy = std::max(1.0, global_sums[6]);
+    const double global_core_max_abs_neg = global_max_values[0];
+    const double global_soft_max_abs_neg = global_max_values[1];
+    const double global_soft_max_rel_neg = global_max_values[2];
+    const double global_core_fraction =
+        (global_neg_mass > 0.0) ? global_core_neg_mass / global_neg_mass : 0.0;
+    if (!(global_neg_mass > 0.0)) {
+        fluxes.floor_repair_mass = 0.0;
+        fluxes.floor_repair_energy = 0.0;
+        fluxes.floor_repair_core_fraction = 0.0;
+        return;
+    }
+
+    const double neg_mass_fraction = global_neg_mass / global_total_mass;
+    const double core_neg_mass_fraction =
+        global_core_neg_mass / global_total_mass;
+    const double soft_neg_mass_fraction =
+        global_soft_neg_mass / global_total_mass;
+    const double core_energy_fraction =
+        std::fabs(global_sums[4]) / global_total_energy;
+    const double soft_energy_fraction =
+        std::fabs(global_sums[5]) / global_total_energy;
+    const bool core_contaminated =
+        core_neg_mass_fraction > CORE_NEG_MASS_ABORT_FRAC ||
+        core_energy_fraction > CORE_NEG_ENERGY_ABORT_FRAC;
+    const bool repairable =
+        std::isfinite(global_neg_mass) &&
+        std::isfinite(global_core_max_abs_neg) &&
+        std::isfinite(global_soft_max_abs_neg) &&
+        std::isfinite(global_soft_max_rel_neg) &&
+        !core_contaminated;
+    if (!repairable) {
+        fluxes.finite_failure_mask |= FINITE_FAILURE_FLOOR_REPAIR;
+        fluxes.finite_stage_failure_valid = 1;
+        fluxes.finite_stage_failure_kind = FINITE_FAILURE_FLOOR_REPAIR;
+        fluxes.finite_stage_failure_rank = 0;
+        fluxes.finite_stage_failure_ix = -1;
+        fluxes.finite_stage_failure_iv = -1;
+        fluxes.finite_stage_failure_imu = -1;
+        fluxes.finite_stage_failure_severity =
+            std::max(global_core_max_abs_neg, global_soft_max_abs_neg);
+        fluxes.finite_stage_failure_f_base = global_neg_mass;
+        fluxes.finite_stage_failure_f_low = neg_mass_fraction;
+        fluxes.finite_stage_failure_f_high = global_soft_max_rel_neg;
+        fluxes.finite_stage_failure_f_final = global_min_f;
+        fluxes.finite_stage_failure_dx_div = global_core_fraction;
+        fluxes.finite_stage_failure_du_div = core_energy_fraction;
+        fluxes.finite_stage_failure_dmu_div = soft_neg_mass_fraction;
+        finite = false;
+        if (mpi_rank == 0) {
+            std::fprintf(
+                stderr,
+                "ERROR: conservative floor repair rejected negative debt: "
+                "min_f=%.16e core_max_abs_neg=%.16e "
+                "soft_max_abs_neg=%.16e soft_max_rel_neg=%.16e "
+                "neg_mass=%.16e neg_mass_fraction=%.16e "
+                "core_neg_mass_fraction=%.16e soft_neg_mass_fraction=%.16e "
+                "core_energy_fraction=%.16e soft_energy_fraction=%.16e "
+                "core_fraction=%.16e\n",
+                global_min_f, global_core_max_abs_neg,
+                global_soft_max_abs_neg, global_soft_max_rel_neg,
+                global_neg_mass, neg_mass_fraction,
+                core_neg_mass_fraction, soft_neg_mass_fraction,
+                core_energy_fraction, soft_energy_fraction,
+                global_core_fraction);
+        }
+        fluxes.floor_repair_mass = 0.0;
+        fluxes.floor_repair_energy = 0.0;
+        fluxes.floor_repair_core_fraction = global_core_fraction;
+        return;
+    }
+
+    double local_repair_mass = 0.0;
+    double local_repair_energy = 0.0;
+    double local_repair_core_mass = 0.0;
+    int local_repair_failed = 0;
+
+    for (int ix = 0; ix < nxl; ++ix) {
+        const int ix_g = ng + ix;
+        const int global_ix = sg.ix_start + ix;
+        const double x_cell =
+            (static_cast<double>(global_ix) + 0.5) * sg.dx;
+        const bool boundary = is_boundary_cell(x_cell);
+        for (int imu = 0; imu < Param::Nmu; ++imu) {
+            double line_peak = 0.0;
+            for (int iv = 0; iv < Param::Nv; ++iv) {
+                const size_t slot =
+                    static_cast<size_t>(ix_g) * Param::Nvmu +
+                    static_cast<size_t>(iv) * Param::Nmu +
+                    static_cast<size_t>(imu);
+                if (std::isfinite(sp.f[slot])) {
+                    line_peak = std::max(line_peak, sp.f[slot]);
+                }
+            }
+            for (int iv = 0; iv < Param::Nv; ++iv) {
+                const size_t slot =
+                    static_cast<size_t>(ix_g) * Param::Nvmu +
+                    static_cast<size_t>(iv) * Param::Nmu +
+                    static_cast<size_t>(imu);
+                const double f_neg = sp.f[slot];
+                if (!(std::isfinite(f_neg) && f_neg < 0.0)) continue;
+
+                const double target_weight = sp.vgrid.moment_weight[iv];
+                double need_mass = -f_neg * target_weight * sg.dx;
+                const double original_need = need_mass;
+                const double added_energy =
+                    original_need * kinetic_energy_per_particle(sp, iv);
+                double removed_energy = 0.0;
+                sp.f[slot] = 0.0;
+
+                for (int radius = 1;
+                     radius < Param::Nv && need_mass > 0.0; ++radius) {
+                    for (int side = -1; side <= 1 && need_mass > 0.0;
+                         side += 2) {
+                        const int jv = iv + side * radius;
+                        if (jv < 0 || jv >= Param::Nv) continue;
+                        const size_t donor =
+                            static_cast<size_t>(ix_g) * Param::Nvmu +
+                            static_cast<size_t>(jv) * Param::Nmu +
+                            static_cast<size_t>(imu);
+                        const double donor_f = sp.f[donor];
+                        if (!(std::isfinite(donor_f) && donor_f > 0.0)) {
+                            continue;
+                        }
+                        const double donor_weight =
+                            sp.vgrid.moment_weight[jv];
+                        const double donor_mass =
+                            donor_f * donor_weight * sg.dx;
+                        const double take = std::min(need_mass, donor_mass);
+                        sp.f[donor] -= take / (donor_weight * sg.dx);
+                        need_mass -= take;
+                        removed_energy +=
+                            take * kinetic_energy_per_particle(sp, jv);
+                    }
+                }
+
+                if (need_mass >
+                    FLOOR_REPAIR_CORE_NEG_MASS_FRAC *
+                    std::max(1.0, original_need)) {
+                    local_repair_failed = 1;
+                }
+                const bool velocity_tail =
+                    is_u_tail_or_low_occupancy(iv, -f_neg, line_peak);
+                if (!boundary && !velocity_tail) {
+                    local_repair_core_mass += original_need;
+                }
+                local_repair_mass += original_need - need_mass;
+                local_repair_energy += added_energy - removed_energy;
+            }
+        }
+    }
+
+    int global_repair_failed = local_repair_failed;
+    MPI_Allreduce(MPI_IN_PLACE, &global_repair_failed, 1, MPI_INT, MPI_MAX,
+                  MPI_COMM_WORLD);
+    double repair_sums[3] = {
+        local_repair_mass, local_repair_energy, local_repair_core_mass
+    };
+    MPI_Allreduce(MPI_IN_PLACE, repair_sums, 3, MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+
+    fluxes.floor_repair_mass = repair_sums[0];
+    fluxes.floor_repair_energy = repair_sums[1];
+    fluxes.floor_repair_core_fraction =
+        (repair_sums[0] > 0.0) ? repair_sums[2] / repair_sums[0] : 0.0;
+    fluxes.mass_added_by_positivity_repair = repair_sums[0];
+    fluxes.positivity_energy_defect += repair_sums[1];
+    if (global_repair_failed != 0) {
+        if (fluxes.floor_repair_core_fraction < CORE_NEG_MASS_ACCEPT_FRAC) {
+            fluxes.trial_failure_downgraded = 1;
+        } else {
+            fluxes.finite_failure_mask |= FINITE_FAILURE_FLOOR_REPAIR;
+            fluxes.finite_stage_failure_valid = 1;
+            fluxes.finite_stage_failure_kind = FINITE_FAILURE_FLOOR_REPAIR;
+            fluxes.finite_stage_failure_rank = 0;
+            fluxes.finite_stage_failure_ix = -1;
+            fluxes.finite_stage_failure_iv = -1;
+            fluxes.finite_stage_failure_imu = -1;
+            fluxes.finite_stage_failure_severity =
+                std::max(fluxes.floor_repair_mass,
+                         std::fabs(fluxes.floor_repair_energy));
+            fluxes.finite_stage_failure_f_base = fluxes.floor_repair_mass;
+            fluxes.finite_stage_failure_f_low =
+                fluxes.floor_repair_core_fraction;
+            fluxes.finite_stage_failure_f_high = global_repair_failed;
+            fluxes.finite_stage_failure_f_final = 0.0;
+            fluxes.finite_stage_failure_dx_div = 0.0;
+            fluxes.finite_stage_failure_du_div = fluxes.floor_repair_energy;
+            fluxes.finite_stage_failure_dmu_div = 0.0;
+            finite = false;
+            if (mpi_rank == 0) {
+                std::fprintf(
+                    stderr,
+                    "ERROR: conservative floor repair could not find enough "
+                    "same-x same-mu donor mass: repaired_mass=%.16e "
+                    "energy_delta=%.16e core_fraction=%.16e\n",
+                    fluxes.floor_repair_mass, fluxes.floor_repair_energy,
+                    fluxes.floor_repair_core_fraction);
+            }
+        }
     }
 }
 
@@ -3969,6 +6074,19 @@ bool VlasovAmpereMidpointSolver::check_finite_state(
     }
     for (size_t i = 0; i < beam.current_face_x.size(); ++i) {
         if (!std::isfinite(beam.current_face_x[i])) return false;
+    }
+    for (size_t i = 0; i < beam.particles.size(); ++i) {
+        const BeamParticle& p = beam.particles[i];
+        if (!std::isfinite(p.x) ||
+            !std::isfinite(p.px) ||
+            !std::isfinite(p.weight)) {
+            return false;
+        }
+        const double pnorm = p.px / (Const::me * Const::c);
+        const double gamma = std::sqrt(1.0 + pnorm * pnorm);
+        const double ke = p.weight * (gamma - 1.0) *
+                          Const::me * Const::c * Const::c;
+        if (!std::isfinite(gamma) || !std::isfinite(ke)) return false;
     }
     for (size_t i = 0; i < fields.Ex_face.size(); ++i) {
         if (!std::isfinite(fields.Ex_face[i])) return false;
@@ -4153,9 +6271,18 @@ VlasovAmpereMidpointSolver::advance_single_step(
         double local_delta_j_total = 0.0;
         double local_delta_j_bkg = 0.0;
         double local_delta_j_beam = 0.0;
-        if (have_previous_current) {
-            for (int iface = 0; iface < nxl; ++iface) {
-                const size_t slot = static_cast<size_t>(iface);
+        double local_max_j_total = 0.0;
+        double local_max_j_bkg = 0.0;
+        double local_max_j_beam = 0.0;
+        for (int iface = 0; iface < nxl; ++iface) {
+            const size_t slot = static_cast<size_t>(iface);
+            local_max_j_total =
+                std::max(local_max_j_total, std::fabs(j_total_next[slot]));
+            local_max_j_bkg =
+                std::max(local_max_j_bkg, std::fabs(j_bkg_next[slot]));
+            local_max_j_beam =
+                std::max(local_max_j_beam, std::fabs(j_beam_next[slot]));
+            if (have_previous_current) {
                 local_delta_j_total =
                     std::max(local_delta_j_total,
                              std::fabs(j_total_next[slot]
@@ -4178,12 +6305,18 @@ VlasovAmpereMidpointSolver::advance_single_step(
         MPI_Allreduce(MPI_IN_PLACE, &global_mass_delta, 1, MPI_DOUBLE,
                       MPI_SUM, MPI_COMM_WORLD);
         const double local_beam_continuity = beam_continuity_predictor;
-        const double local_max_j_total =
-            max_abs_vector(j_total_next, static_cast<size_t>(nxl));
-        const double local_max_j_bkg =
-            max_abs_vector(j_bkg_next, static_cast<size_t>(nxl));
-        const double local_max_j_beam =
-            max_abs_vector(j_beam_next, static_cast<size_t>(nxl));
+        const double macro_explosion_limit = 1.0e100;
+        const bool local_macro_invalid =
+            !std::isfinite(local_end_values[0]) ||
+            !std::isfinite(local_end_values[1]) ||
+            !std::isfinite(local_abs_ex) ||
+            !std::isfinite(local_max_j_bkg) ||
+            !std::isfinite(local_max_j_beam) ||
+            std::fabs(local_end_values[0]) > macro_explosion_limit ||
+            std::fabs(local_end_values[1]) > macro_explosion_limit ||
+            local_abs_ex > macro_explosion_limit ||
+            local_max_j_bkg > macro_explosion_limit ||
+            local_max_j_beam > macro_explosion_limit;
         const double local_errors[13] = {
             local_delta_ex,
             local_abs_ex,
@@ -4197,7 +6330,7 @@ VlasovAmpereMidpointSolver::advance_single_step(
             local_max_j_beam,
             std::fabs(global_mass_delta),
             local_beam_continuity,
-            finite_flux ? 0.0 : 1.0
+            (finite_flux && !local_macro_invalid) ? 0.0 : 1.0
         };
         double global_errors[13] = {
             0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
@@ -4320,6 +6453,29 @@ VlasovAmpereMidpointSolver::advance_single_step(
             fluxes.negative_mass_before_repair;
         result.x_mass_added_by_positivity_repair =
             fluxes.mass_added_by_positivity_repair;
+        result.floor_repair_mass = fluxes.floor_repair_mass;
+        result.floor_repair_energy = fluxes.floor_repair_energy;
+        result.floor_repair_core_fraction =
+            fluxes.floor_repair_core_fraction;
+        result.negative_debt_level = fluxes.negative_debt_level;
+        result.neg_mass_boundary = fluxes.neg_mass_boundary;
+        result.neg_mass_core = fluxes.neg_mass_core;
+        result.neg_mass_tail = fluxes.neg_mass_tail;
+        result.neg_mass_total_guard = fluxes.neg_mass_total_guard;
+        result.neg_mass_core_fraction = fluxes.neg_mass_core_fraction;
+        result.neg_energy_core_abs = fluxes.neg_energy_core_abs;
+        result.neg_energy_core_fraction = fluxes.neg_energy_core_fraction;
+        result.neg_current_core_abs = fluxes.neg_current_core_abs;
+        result.neg_current_core_fraction = fluxes.neg_current_core_fraction;
+        result.neg_debt_min_f_boundary = fluxes.neg_debt_min_f_boundary;
+        result.neg_debt_min_f_core = fluxes.neg_debt_min_f_core;
+        result.neg_debt_min_f_tail = fluxes.neg_debt_min_f_tail;
+        result.neg_cell_boundary = fluxes.neg_cell_boundary;
+        result.neg_cell_core = fluxes.neg_cell_core;
+        result.neg_cell_tail = fluxes.neg_cell_tail;
+        result.trial_failure_downgraded = fluxes.trial_failure_downgraded;
+        result.accepted_with_negative_debt =
+            fluxes.accepted_with_negative_debt;
         // 7.1.2: x low-order flux failure count
         result.x_low_order_failed_count =
             fluxes.x_low_order_failed_count;
@@ -4335,6 +6491,48 @@ VlasovAmpereMidpointSolver::advance_single_step(
         result.x_low_input_debt_accepted =
             fluxes.x_low_input_debt_accepted;
         result.x_low_failure_kind = fluxes.x_low_failure_kind;
+        result.x_final_min_f = fluxes.x_final_min_f;
+        result.x_final_failed_count = fluxes.x_final_failed_count;
+        result.x_final_failed_max_debt = fluxes.x_final_failed_max_debt;
+        result.x_final_worst_ix = fluxes.x_final_worst_ix;
+        result.x_final_worst_iv = fluxes.x_final_worst_iv;
+        result.x_final_worst_imu = fluxes.x_final_worst_imu;
+        result.x_final_failure_region = fluxes.x_final_failure_region;
+        result.x_final_core_failed_count =
+            fluxes.x_final_core_failed_count;
+        result.x_final_boundary_failed_count =
+            fluxes.x_final_boundary_failed_count;
+        result.mu_final_failed_max_debt =
+            fluxes.mu_final_failed_max_debt;
+        result.mu_final_worst_ix = fluxes.mu_final_worst_ix;
+        result.mu_final_worst_iv = fluxes.mu_final_worst_iv;
+        result.mu_final_worst_imu = fluxes.mu_final_worst_imu;
+        result.mu_final_failure_region =
+            fluxes.mu_final_failure_region;
+        result.mu_final_core_failed_count =
+            fluxes.mu_final_core_failed_count;
+        result.mu_final_boundary_failed_count =
+            fluxes.mu_final_boundary_failed_count;
+        result.mu_final_audit_f_base = fluxes.mu_final_audit_f_base;
+        result.mu_final_audit_f_low = fluxes.mu_final_audit_f_low;
+        result.mu_final_audit_f_high = fluxes.mu_final_audit_f_high;
+        result.mu_final_audit_f_final = fluxes.mu_final_audit_f_final;
+        result.mu_final_audit_f_floor = fluxes.mu_final_audit_f_floor;
+        result.mu_final_audit_A_left = fluxes.mu_final_audit_A_left;
+        result.mu_final_audit_A_right = fluxes.mu_final_audit_A_right;
+        result.mu_final_audit_P_minus = fluxes.mu_final_audit_P_minus;
+        result.mu_final_audit_Q_minus = fluxes.mu_final_audit_Q_minus;
+        result.mu_final_audit_R_minus = fluxes.mu_final_audit_R_minus;
+        result.mu_final_audit_alpha_left_face =
+            fluxes.mu_final_audit_alpha_left_face;
+        result.mu_final_audit_alpha_right_face =
+            fluxes.mu_final_audit_alpha_right_face;
+        result.mu_final_audit_dt_inv_shell =
+            fluxes.mu_final_audit_dt_inv_shell;
+        result.mu_final_audit_mu_dot_lower =
+            fluxes.mu_final_audit_mu_dot_lower;
+        result.mu_final_audit_mu_dot_upper =
+            fluxes.mu_final_audit_mu_dot_upper;
         // 7.1.6: copy per-direction flux diagnostics
         for (int d = 0; d < 3; ++d) {
             result.flux_pos[d] = fluxes.flux_pos[d];
@@ -4372,6 +6570,41 @@ VlasovAmpereMidpointSolver::advance_single_step(
             fluxes.u_flux_audit_final_xr_hi;
         result.u_low_failure_audit = fluxes.u_low_failure_audit;
         result.mu_low_failure_audit = fluxes.mu_low_failure_audit;
+        result.finite_failure_mask = fluxes.finite_failure_mask;
+        result.u_low_order_failed_count =
+            fluxes.u_low_order_failed_count;
+        result.mu_low_order_failed_count =
+            fluxes.mu_low_order_failed_count;
+        result.u_final_negative_hard_count =
+            fluxes.u_final_negative_hard_count;
+        result.mu_final_negative_hard_count =
+            fluxes.mu_final_negative_hard_count;
+        result.finite_stage_failure_valid =
+            fluxes.finite_stage_failure_valid;
+        result.finite_stage_failure_kind =
+            fluxes.finite_stage_failure_kind;
+        result.finite_stage_failure_rank =
+            fluxes.finite_stage_failure_rank;
+        result.finite_stage_failure_ix = fluxes.finite_stage_failure_ix;
+        result.finite_stage_failure_iv = fluxes.finite_stage_failure_iv;
+        result.finite_stage_failure_imu =
+            fluxes.finite_stage_failure_imu;
+        result.finite_stage_failure_severity =
+            fluxes.finite_stage_failure_severity;
+        result.finite_stage_failure_f_base =
+            fluxes.finite_stage_failure_f_base;
+        result.finite_stage_failure_f_low =
+            fluxes.finite_stage_failure_f_low;
+        result.finite_stage_failure_f_high =
+            fluxes.finite_stage_failure_f_high;
+        result.finite_stage_failure_f_final =
+            fluxes.finite_stage_failure_f_final;
+        result.finite_stage_failure_du_div =
+            fluxes.finite_stage_failure_du_div;
+        result.finite_stage_failure_dmu_div =
+            fluxes.finite_stage_failure_dmu_div;
+        result.finite_stage_failure_dx_div =
+            fluxes.finite_stage_failure_dx_div;
         result.f_neg_min = fluxes.f_neg_min;
         result.f_neg_ratio_max = fluxes.f_neg_ratio_max;
         result.f_neg_mass_total = fluxes.f_neg_mass_total;
@@ -4386,6 +6619,7 @@ VlasovAmpereMidpointSolver::advance_single_step(
                                ex_mid_next, j_total_next);
         if (!finite_state) {
             if (mpi_rank == 0 && global_errors[12] != 0.0) {
+                bool printed_detail = false;
                 if (fluxes.x_low_failure_kind != X_LOW_OK) {
                     const char* kind = "unknown";
                     const char* action = "not retrying as a CFL failure";
@@ -4421,7 +6655,40 @@ VlasovAmpereMidpointSolver::advance_single_step(
                         fluxes.x_low_input_core_failed_count,
                         fluxes.x_low_input_debt_accepted,
                         action);
-                } else if (fluxes.finite_flux_has_failure != 0) {
+                    printed_detail = true;
+                }
+                if (fluxes.finite_stage_failure_valid != 0) {
+                    std::fprintf(
+                        stderr,
+                        "ERROR: finite stage failure classified as %s: "
+                        "mask=%d counts(u_low=%lld,u_final=%lld,"
+                        "mu_low=%lld,mu_final=%lld) "
+                        "rank=%d ix=%d iv=%d imu=%d "
+                        "severity=%.16e f_base=%.16e f_low=%.16e "
+                        "f_high=%.16e f_final=%.16e "
+                        "dx_div=%.16e du_div=%.16e dmu_div=%.16e\n",
+                        finite_failure_kind_name(
+                            fluxes.finite_stage_failure_kind),
+                        fluxes.finite_failure_mask,
+                        fluxes.u_low_order_failed_count,
+                        fluxes.u_final_negative_hard_count,
+                        fluxes.mu_low_order_failed_count,
+                        fluxes.mu_final_negative_hard_count,
+                        fluxes.finite_stage_failure_rank,
+                        fluxes.finite_stage_failure_ix,
+                        fluxes.finite_stage_failure_iv,
+                        fluxes.finite_stage_failure_imu,
+                        fluxes.finite_stage_failure_severity,
+                        fluxes.finite_stage_failure_f_base,
+                        fluxes.finite_stage_failure_f_low,
+                        fluxes.finite_stage_failure_f_high,
+                        fluxes.finite_stage_failure_f_final,
+                        fluxes.finite_stage_failure_dx_div,
+                        fluxes.finite_stage_failure_du_div,
+                        fluxes.finite_stage_failure_dmu_div);
+                    printed_detail = true;
+                }
+                if (fluxes.finite_flux_has_failure != 0) {
                     std::fprintf(
                         stderr,
                         "ERROR: finite_flux failure detail: "
@@ -4440,11 +6707,15 @@ VlasovAmpereMidpointSolver::advance_single_step(
                         fluxes.finite_flux_dx_div,
                         fluxes.finite_flux_du_div,
                         fluxes.finite_flux_dmu_div);
-                } else {
+                    printed_detail = true;
+                }
+                if (!printed_detail) {
                     std::fprintf(
                         stderr,
                         "ERROR: finite_flux failure detail unavailable; "
-                        "no negative/non-finite centered update was recorded\n");
+                        "finite_failure_mask=%d and no stage/centered "
+                        "failure audit was recorded\n",
+                        fluxes.finite_failure_mask);
                 }
             }
             result.failed = true;
@@ -4610,6 +6881,33 @@ VlasovAmpereMidpointSolver::advance_single_step(
                 fluxes.negative_mass_before_repair;
             result.x_mass_added_by_positivity_repair =
                 fluxes.mass_added_by_positivity_repair;
+            result.floor_repair_mass = fluxes.floor_repair_mass;
+            result.floor_repair_energy = fluxes.floor_repair_energy;
+            result.floor_repair_core_fraction =
+                fluxes.floor_repair_core_fraction;
+            result.negative_debt_level = fluxes.negative_debt_level;
+            result.neg_mass_boundary = fluxes.neg_mass_boundary;
+            result.neg_mass_core = fluxes.neg_mass_core;
+            result.neg_mass_tail = fluxes.neg_mass_tail;
+            result.neg_mass_total_guard = fluxes.neg_mass_total_guard;
+            result.neg_mass_core_fraction = fluxes.neg_mass_core_fraction;
+            result.neg_energy_core_abs = fluxes.neg_energy_core_abs;
+            result.neg_energy_core_fraction =
+                fluxes.neg_energy_core_fraction;
+            result.neg_current_core_abs = fluxes.neg_current_core_abs;
+            result.neg_current_core_fraction =
+                fluxes.neg_current_core_fraction;
+            result.neg_debt_min_f_boundary =
+                fluxes.neg_debt_min_f_boundary;
+            result.neg_debt_min_f_core = fluxes.neg_debt_min_f_core;
+            result.neg_debt_min_f_tail = fluxes.neg_debt_min_f_tail;
+            result.neg_cell_boundary = fluxes.neg_cell_boundary;
+            result.neg_cell_core = fluxes.neg_cell_core;
+            result.neg_cell_tail = fluxes.neg_cell_tail;
+            result.trial_failure_downgraded =
+                fluxes.trial_failure_downgraded;
+            result.accepted_with_negative_debt =
+                fluxes.accepted_with_negative_debt;
             // 7.1.2: x low-order flux failure count
             result.x_low_order_failed_count =
                 fluxes.x_low_order_failed_count;
@@ -4625,6 +6923,19 @@ VlasovAmpereMidpointSolver::advance_single_step(
             result.x_low_input_debt_accepted =
                 fluxes.x_low_input_debt_accepted;
             result.x_low_failure_kind = fluxes.x_low_failure_kind;
+            result.x_final_min_f = fluxes.x_final_min_f;
+            result.x_final_failed_count = fluxes.x_final_failed_count;
+            result.x_final_failed_max_debt =
+                fluxes.x_final_failed_max_debt;
+            result.x_final_worst_ix = fluxes.x_final_worst_ix;
+            result.x_final_worst_iv = fluxes.x_final_worst_iv;
+            result.x_final_worst_imu = fluxes.x_final_worst_imu;
+            result.x_final_failure_region =
+                fluxes.x_final_failure_region;
+            result.x_final_core_failed_count =
+                fluxes.x_final_core_failed_count;
+            result.x_final_boundary_failed_count =
+                fluxes.x_final_boundary_failed_count;
             // 7.1.6: copy per-direction flux diagnostics
             for (int d = 0; d < 3; ++d) {
                 result.flux_pos[d] = fluxes.flux_pos[d];
@@ -4664,6 +6975,80 @@ VlasovAmpereMidpointSolver::advance_single_step(
                 fluxes.u_flux_audit_final_xr_hi;
             result.u_low_failure_audit = fluxes.u_low_failure_audit;
             result.mu_low_failure_audit = fluxes.mu_low_failure_audit;
+            result.finite_failure_mask = fluxes.finite_failure_mask;
+            result.u_low_order_failed_count =
+                fluxes.u_low_order_failed_count;
+            result.mu_low_order_failed_count =
+                fluxes.mu_low_order_failed_count;
+            result.u_final_negative_hard_count =
+                fluxes.u_final_negative_hard_count;
+            result.mu_final_negative_hard_count =
+                fluxes.mu_final_negative_hard_count;
+            result.mu_final_failed_max_debt =
+                fluxes.mu_final_failed_max_debt;
+            result.mu_final_worst_ix = fluxes.mu_final_worst_ix;
+            result.mu_final_worst_iv = fluxes.mu_final_worst_iv;
+            result.mu_final_worst_imu = fluxes.mu_final_worst_imu;
+            result.mu_final_failure_region =
+                fluxes.mu_final_failure_region;
+            result.mu_final_core_failed_count =
+                fluxes.mu_final_core_failed_count;
+            result.mu_final_boundary_failed_count =
+                fluxes.mu_final_boundary_failed_count;
+            result.mu_final_audit_f_base = fluxes.mu_final_audit_f_base;
+            result.mu_final_audit_f_low = fluxes.mu_final_audit_f_low;
+            result.mu_final_audit_f_high = fluxes.mu_final_audit_f_high;
+            result.mu_final_audit_f_final =
+                fluxes.mu_final_audit_f_final;
+            result.mu_final_audit_f_floor =
+                fluxes.mu_final_audit_f_floor;
+            result.mu_final_audit_A_left = fluxes.mu_final_audit_A_left;
+            result.mu_final_audit_A_right =
+                fluxes.mu_final_audit_A_right;
+            result.mu_final_audit_P_minus =
+                fluxes.mu_final_audit_P_minus;
+            result.mu_final_audit_Q_minus =
+                fluxes.mu_final_audit_Q_minus;
+            result.mu_final_audit_R_minus =
+                fluxes.mu_final_audit_R_minus;
+            result.mu_final_audit_alpha_left_face =
+                fluxes.mu_final_audit_alpha_left_face;
+            result.mu_final_audit_alpha_right_face =
+                fluxes.mu_final_audit_alpha_right_face;
+            result.mu_final_audit_dt_inv_shell =
+                fluxes.mu_final_audit_dt_inv_shell;
+            result.mu_final_audit_mu_dot_lower =
+                fluxes.mu_final_audit_mu_dot_lower;
+            result.mu_final_audit_mu_dot_upper =
+                fluxes.mu_final_audit_mu_dot_upper;
+            result.finite_stage_failure_valid =
+                fluxes.finite_stage_failure_valid;
+            result.finite_stage_failure_kind =
+                fluxes.finite_stage_failure_kind;
+            result.finite_stage_failure_rank =
+                fluxes.finite_stage_failure_rank;
+            result.finite_stage_failure_ix =
+                fluxes.finite_stage_failure_ix;
+            result.finite_stage_failure_iv =
+                fluxes.finite_stage_failure_iv;
+            result.finite_stage_failure_imu =
+                fluxes.finite_stage_failure_imu;
+            result.finite_stage_failure_severity =
+                fluxes.finite_stage_failure_severity;
+            result.finite_stage_failure_f_base =
+                fluxes.finite_stage_failure_f_base;
+            result.finite_stage_failure_f_low =
+                fluxes.finite_stage_failure_f_low;
+            result.finite_stage_failure_f_high =
+                fluxes.finite_stage_failure_f_high;
+            result.finite_stage_failure_f_final =
+                fluxes.finite_stage_failure_f_final;
+            result.finite_stage_failure_du_div =
+                fluxes.finite_stage_failure_du_div;
+            result.finite_stage_failure_dmu_div =
+                fluxes.finite_stage_failure_dmu_div;
+            result.finite_stage_failure_dx_div =
+                fluxes.finite_stage_failure_dx_div;
             result.f_neg_min = fluxes.f_neg_min;
             result.f_neg_ratio_max = fluxes.f_neg_ratio_max;
             result.f_neg_mass_total = fluxes.f_neg_mass_total;
@@ -4673,6 +7058,11 @@ VlasovAmpereMidpointSolver::advance_single_step(
             result.f_neg_imu = fluxes.f_neg_imu;
             result.converged = true;
             result.soft_accepted = soft_accepted;
+            result.accepted_with_negative_debt =
+                (result.negative_debt_level == NEG_DEBT_WARN ||
+                 result.negative_debt_level == NEG_DEBT_REPAIR)
+                ? 1 : result.accepted_with_negative_debt;
+            result.state_advanced = 1;
             break;
         }
 
