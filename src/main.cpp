@@ -91,6 +91,10 @@ struct BoundaryCoreDiagnostics {
     double max_abs_Ex_core;
     double W_bkg_E_boundary;
     double W_bkg_E_core;
+    double anomaly_inward_E;
+    double anomaly_inward_J;
+    double anomaly_inward_n;
+    double anomaly_inward_Mneg;
 };
 
 struct FNegativitySnapshotDiagnostics {
@@ -137,6 +141,10 @@ void reset_boundary_core_diagnostics(BoundaryCoreDiagnostics& diag,
     diag.max_abs_Ex_core = 0.0;
     diag.W_bkg_E_boundary = 0.0;
     diag.W_bkg_E_core = 0.0;
+    diag.anomaly_inward_E = 0.0;
+    diag.anomaly_inward_J = 0.0;
+    diag.anomaly_inward_n = 0.0;
+    diag.anomaly_inward_Mneg = 0.0;
 }
 
 void reset_f_negativity_snapshot_diagnostics(
@@ -359,6 +367,38 @@ void compute_boundary_core_diagnostics(
     MPI_Allreduce(MPI_IN_PLACE, counts, 4, MPI_LONG_LONG_INT, MPI_SUM,
                   MPI_COMM_WORLD);
 
+    // Dynamic inward-propagation diagnostic.  Thresholds are tied to the
+    // current core envelope, so the 0.2 um belt remains a test isolation
+    // width rather than becoming a moving physical boundary.
+    double local_extent[4] = {0.0,0.0,0.0,0.0};
+    const double e_trigger=1.25*std::max(1.0,maxes[3]);
+    const double j_trigger=1.25*std::max(std::fabs(Param::jb),maxes[1]);
+    for (int ix=0;ix<nxl;++ix) {
+        const double x=(static_cast<double>(sg.ix_start+ix)+0.5)*sg.dx;
+        const double inward=std::min(x,Param::Lx-x);
+        const size_t xb=static_cast<size_t>(ng+ix)*Param::Nvmu;
+        double n=0.0,nneg=0.0;
+        for (int iv=0;iv<Param::Nv;++iv) {
+            const double w=electrons.vgrid.moment_weight[iv];
+            for (int imu=0;imu<Param::Nmu;++imu) {
+                const double f=electrons.f[xb+static_cast<size_t>(iv)*Param::Nmu+imu];
+                n += f*w;
+                if (f<0.0) nneg += (-f)*w;
+            }
+        }
+        const double ex=(static_cast<size_t>(ix)<fields.Ex.size())
+            ? std::fabs(fields.Ex[static_cast<size_t>(ix)]) : 0.0;
+        const double j=(static_cast<size_t>(ix)<electrons.current_x.size())
+            ? std::fabs(electrons.current_x[static_cast<size_t>(ix)]) : 0.0;
+        if (ex>e_trigger) local_extent[0]=std::max(local_extent[0],inward);
+        if (j>j_trigger) local_extent[1]=std::max(local_extent[1],inward);
+        if (std::fabs(n-Param::dens)>1.0e-5*Param::dens)
+            local_extent[2]=std::max(local_extent[2],inward);
+        if (nneg>1.0e-8*std::max(1.0,std::fabs(n)))
+            local_extent[3]=std::max(local_extent[3],inward);
+    }
+    MPI_Allreduce(MPI_IN_PLACE,local_extent,4,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+
     (void)mpi_rank;
     (void)mpi_size;
     diag.neg_mass_boundary = sums[0];
@@ -385,6 +425,10 @@ void compute_boundary_core_diagnostics(
     diag.max_abs_Ex_core = maxes[3];
     diag.W_bkg_E_boundary = sums[6];
     diag.W_bkg_E_core = sums[7];
+    diag.anomaly_inward_E=local_extent[0];
+    diag.anomaly_inward_J=local_extent[1];
+    diag.anomaly_inward_n=local_extent[2];
+    diag.anomaly_inward_Mneg=local_extent[3];
 }
 
 const char* classify_boundary_core_state(double neg_mass_core_fraction,
@@ -393,13 +437,11 @@ const char* classify_boundary_core_state(double neg_mass_core_fraction,
                                          double j_core_to_boundary_ratio)
 {
     if (neg_mass_core_fraction > 0.2 ||
-        neg_cell_core_fraction > 0.2 ||
         limiter_core_fraction > 0.2 ||
         j_core_to_boundary_ratio > 0.5) {
         return "core_contaminated";
     }
     if (neg_mass_core_fraction < 0.05 &&
-        neg_cell_core_fraction < 0.05 &&
         limiter_core_fraction < 0.05 &&
         j_core_to_boundary_ratio < 0.2) {
         return "boundary_only";
@@ -464,12 +506,10 @@ int main(int argc, char** argv)
                Param::nx, Param::dx, Param::Lx);
         printf("Density profile: uniform plasma over full domain, n0 = %.3e /m^3\n",
                Param::dens);
-        printf("Electron momentum grid: Nu x Nmu = %d x %d, nonuniform u with %d cells below u = %.3f\n",
-               Param::Nv, Param::Nmu,
-               Param::momentum_refined_cells,
-               Param::momentum_refined_u);
-        printf("Electron momentum domain: 0 <= u <= %.3f, vx = c u mu / sqrt(1+u^2)\n",
-               Param::momentum_umax);
+        printf("Electron momentum grid: Nu_parallel x Nu_perp = %d x %d, conservative cylindrical mass M\n",
+               Param::Nv, Param::Nmu);
+        printf("Electron momentum domain: |u_parallel| <= %.3f, 0 <= u_perp <= %.3f, vx = c u_parallel / gamma\n",
+               Param::momentum_umax, Param::momentum_umax);
         printf("Spatial boundary: periodic in x for background electrons and electrostatic field; beam is open\n");
         printf("Electrostatic update: face-centered dE/dt = -J_total/eps0; zero mode evolves explicitly\n");
         printf("Field solver: %s\n", field_solver_name());
@@ -570,9 +610,11 @@ int main(int argc, char** argv)
     std::ofstream x_final_monitor;
     std::ofstream mu_final_monitor;
     std::ofstream u_flux_audit;
+    std::ofstream u_origin_audit;
     std::ofstream u_low_failure_audit;
     std::ofstream mu_low_failure_audit;
     std::ofstream negative_debt_guard_monitor;
+    std::ofstream trial_boundary_debt_monitor;
     if (mpi_rank == 0) {
         bkg_energy_monitor.open("output/bkg_energy_monitor.dat");
         bkg_energy_monitor
@@ -641,6 +683,18 @@ int main(int argc, char** argv)
             << "u_final_xright_lower  u_final_xright_upper\n";
         u_flux_audit << std::scientific << std::setprecision(8);
 
+        u_origin_audit.open("output/u_origin_audit.dat");
+        u_origin_audit
+            << "# step time[fs] rank ix_global iv imu region "
+            << "f_raw f_after_x f_u_low f_u_high f_u_final "
+            << "u_lower_flux u_upper_flux "
+            << "u_lower_donor_iv u_upper_donor_iv "
+            << "u_lower_donor_f u_upper_donor_f "
+            << "C_u alpha_cell alpha_face "
+            << "line_positive_peak line_negative_mass allowed_debt "
+            << "failure_kind\n";
+        u_origin_audit << std::scientific << std::setprecision(8);
+
         u_low_failure_audit.open("output/u_low_failure_audit.dat");
         u_low_failure_audit
             << "# step  time[fs]  rank  ix_global  iv  imu  region  "
@@ -679,17 +733,77 @@ int main(int argc, char** argv)
 
         negative_debt_guard_monitor.open("output/negative_debt_guard.dat");
         negative_debt_guard_monitor
-            << "# step time[fs] level "
+            << "# step time[fs] accepted long_run_diagnostic level "
             << "neg_mass_boundary neg_mass_core neg_mass_tail "
             << "neg_mass_core_fraction "
+            << "neg_mass_boundary_fraction neg_mass_tail_fraction "
             << "neg_energy_core_abs neg_energy_core_fraction "
+            << "neg_energy_boundary_abs neg_energy_boundary_fraction "
             << "neg_current_core_abs neg_current_core_fraction "
             << "min_f_boundary min_f_core min_f_tail "
             << "neg_cell_boundary neg_cell_core neg_cell_tail "
+            << "debt_action limiter_reason "
+            << "alpha_core_min alpha_boundary_min alpha_tail_min "
+            << "limiter_modified_J_bkg_norm "
+            << "limiter_modified_J_bkg_boundary_norm "
+            << "limiter_modified_energy_norm "
+            << "low_u_mu_neg_mass_fraction "
+            << "low_u_mu_neg_energy_fraction "
+            << "low_u_mu_neg_current_fraction "
+            << "boundary_force_Cu_max boundary_force_Cmu_max "
+            << "boundary_force_nsub_max "
+            << "boundary_force_remap_cell_count "
+            << "boundary_mu_low_L1_before boundary_mu_low_L1_after "
+            << "boundary_mu_high_L1_after "
+            << "J_bkg_neg_boundary delta_E_neg_boundary "
+            << "boundary_force_remap_mass_loss "
+            << "boundary_force_remap_energy_loss "
+            << "alpha_interface_BQ_min alpha_interface_QC_min "
+            << "interface_BQ_flux interface_BQ_high_correction "
+            << "interface_QC_flux_into_core "
+            << "interface_QC_high_correction_into_core "
+            << "boundary_energy_diagnostic_invalid "
             << "trial_failure_downgraded accepted_with_negative_debt "
-            << "state_advanced converged failed "
+            << "state_advanced soft_unconverged converged failed "
             << "coupled_iter residual_E residual_J_bkg\n";
         negative_debt_guard_monitor << std::scientific
+                                    << std::setprecision(8);
+
+        trial_boundary_debt_monitor.open("output/trial_boundary_debt.dat");
+        trial_boundary_debt_monitor
+            << "# step time[fs] accepted state_advanced soft_unconverged "
+            << "level neg_mass_boundary neg_mass_core neg_mass_tail "
+            << "neg_mass_core_fraction "
+            << "neg_mass_boundary_fraction neg_mass_tail_fraction "
+            << "neg_energy_core_abs neg_energy_core_fraction "
+            << "neg_energy_boundary_abs neg_energy_boundary_fraction "
+            << "neg_current_core_abs neg_current_core_fraction "
+            << "min_f_boundary min_f_core min_f_tail "
+            << "neg_cell_boundary neg_cell_core neg_cell_tail "
+            << "debt_action limiter_reason "
+            << "alpha_core_min alpha_boundary_min alpha_tail_min "
+            << "limiter_modified_J_bkg_norm "
+            << "limiter_modified_J_bkg_boundary_norm "
+            << "limiter_modified_energy_norm "
+            << "low_u_mu_neg_mass_fraction "
+            << "low_u_mu_neg_energy_fraction "
+            << "low_u_mu_neg_current_fraction "
+            << "boundary_force_Cu_max boundary_force_Cmu_max "
+            << "boundary_force_nsub_max "
+            << "boundary_force_remap_cell_count "
+            << "boundary_mu_low_L1_before boundary_mu_low_L1_after "
+            << "boundary_mu_high_L1_after "
+            << "J_bkg_neg_boundary delta_E_neg_boundary "
+            << "boundary_force_remap_mass_loss "
+            << "boundary_force_remap_energy_loss "
+            << "alpha_interface_BQ_min alpha_interface_QC_min "
+            << "interface_BQ_flux interface_BQ_high_correction "
+            << "interface_QC_flux_into_core "
+            << "interface_QC_high_correction_into_core "
+            << "boundary_energy_diagnostic_invalid "
+            << "trial_failure_downgraded limiter_reason_repeat "
+            << "coupled_iter residual_E residual_J_bkg failed\n";
+        trial_boundary_debt_monitor << std::scientific
                                     << std::setprecision(8);
 
         std::ofstream f_neg_monitor;
@@ -697,7 +811,8 @@ int main(int argc, char** argv)
         f_neg_monitor
             << "# accepted_snapshot: statistics scan final accepted bkg_e.f; "
             << "neg_ratio_max uses max positive f as scale\n"
-            << "# step  time[fs]  min_f  neg_ratio_max  "
+            << "# step  time[fs]  accepted  state_advanced  "
+            << "soft_unconverged  min_f  neg_ratio_max  "
             << "neg_mass_total[m^-2]  neg_cell_count  "
             << "x_worst  u_worst  mu_worst\n";
         f_neg_monitor << std::scientific << std::setprecision(8);
@@ -705,7 +820,8 @@ int main(int argc, char** argv)
 
         boundary_core_monitor.open("output/boundary_core_diagnostics.dat");
         boundary_core_monitor
-            << "# step  time[fs]  boundary_width[um]  "
+            << "# step  time[fs]  accepted  state_advanced  "
+            << "soft_unconverged  boundary_width[um]  "
             << "neg_mass_boundary[m^-2]  neg_mass_core[m^-2]  "
             << "neg_mass_core_fraction  "
             << "neg_cell_count_boundary  neg_cell_count_core  "
@@ -729,6 +845,8 @@ int main(int argc, char** argv)
             << "mean_abs_J_bkg_core[A/m2]  "
             << "max_abs_Ex_boundary[V/m]  max_abs_Ex_core[V/m]  "
             << "W_bkg_E_boundary[J/m2]  W_bkg_E_core[J/m2]  "
+            << "anomaly_inward_E[um]  anomaly_inward_J[um]  "
+            << "anomaly_inward_n[um]  anomaly_inward_Mneg[um]  "
             << "conclusion\n";
         boundary_core_monitor << std::scientific << std::setprecision(8);
 
@@ -971,16 +1089,23 @@ int main(int argc, char** argv)
             };
 
         if (mpi_rank == 0) {
-            negative_debt_guard_monitor
+            trial_boundary_debt_monitor
                 << step << " "
                 << time / Const::femto << " "
+                << 0 << " "
+                << midpoint_result.state_advanced << " "
+                << midpoint_result.soft_unconverged << " "
                 << midpoint_result.negative_debt_level << " "
                 << midpoint_result.neg_mass_boundary << " "
                 << midpoint_result.neg_mass_core << " "
                 << midpoint_result.neg_mass_tail << " "
                 << midpoint_result.neg_mass_core_fraction << " "
+                << midpoint_result.neg_mass_boundary_fraction << " "
+                << midpoint_result.neg_mass_tail_fraction << " "
                 << midpoint_result.neg_energy_core_abs << " "
                 << midpoint_result.neg_energy_core_fraction << " "
+                << midpoint_result.neg_energy_boundary_abs << " "
+                << midpoint_result.neg_energy_boundary_fraction << " "
                 << midpoint_result.neg_current_core_abs << " "
                 << midpoint_result.neg_current_core_fraction << " "
                 << midpoint_result.neg_debt_min_f_boundary << " "
@@ -989,24 +1114,57 @@ int main(int argc, char** argv)
                 << midpoint_result.neg_cell_boundary << " "
                 << midpoint_result.neg_cell_core << " "
                 << midpoint_result.neg_cell_tail << " "
+                << midpoint_result.debt_action << " "
+                << midpoint_result.limiter_reason << " "
+                << midpoint_result.alpha_core_min << " "
+                << midpoint_result.alpha_boundary_min << " "
+                << midpoint_result.alpha_tail_min << " "
+                << midpoint_result.limiter_modified_J_bkg_norm << " "
+                << midpoint_result.limiter_modified_J_bkg_boundary_norm << " "
+                << midpoint_result.limiter_modified_energy_norm << " "
+                << midpoint_result.low_u_mu_neg_mass_fraction << " "
+                << midpoint_result.low_u_mu_neg_energy_fraction << " "
+                << midpoint_result.low_u_mu_neg_current_fraction << " "
+                << midpoint_result.boundary_force_Cu_max << " "
+                << midpoint_result.boundary_force_Cmu_max << " "
+                << midpoint_result.boundary_force_nsub_max << " "
+                << midpoint_result.boundary_force_remap_cell_count << " "
+                << midpoint_result.boundary_mu_low_L1_before << " "
+                << midpoint_result.boundary_mu_low_L1_after << " "
+                << midpoint_result.boundary_mu_high_L1_after << " "
+                << midpoint_result.J_bkg_neg_boundary << " "
+                << midpoint_result.delta_E_neg_boundary << " "
+                << midpoint_result.boundary_force_remap_mass_loss << " "
+                << midpoint_result.boundary_force_remap_energy_loss << " "
+                << midpoint_result.alpha_interface_BQ_min << " "
+                << midpoint_result.alpha_interface_QC_min << " "
+                << midpoint_result.interface_BQ_flux << " "
+                << midpoint_result.interface_BQ_high_correction << " "
+                << midpoint_result.interface_QC_flux_into_core << " "
+                << midpoint_result.interface_QC_high_correction_into_core << " "
+                << midpoint_result.boundary_energy_diagnostic_invalid << " "
                 << midpoint_result.trial_failure_downgraded << " "
-                << midpoint_result.accepted_with_negative_debt << " "
-                << midpoint_result.state_advanced << " "
-                << midpoint_result.converged << " "
-                << midpoint_result.failed << " "
+                << midpoint_result.limiter_reason << " "
                 << midpoint_result.nonlinear_iterations << " "
                 << midpoint_result.residual_E << " "
-                << midpoint_result.residual_J_bkg << "\n";
+                << midpoint_result.residual_J_bkg << " "
+                << midpoint_result.failed << " "
+                << "\n";
             if (abnormal_midpoint ||
                 step + 1 == nsteps ||
                 (config.enable_step_diagnostics &&
                  config.step_diagnostics_interval > 0 &&
                  step % config.step_diagnostics_interval == 0)) {
-                negative_debt_guard_monitor.flush();
+                trial_boundary_debt_monitor.flush();
             }
         }
 
-        if (!midpoint_result.converged || midpoint_result.failed) {
+        const bool midpoint_soft_accepted =
+            midpoint_result.soft_unconverged &&
+            midpoint_result.state_advanced != 0 &&
+            !midpoint_result.failed;
+        if ((!midpoint_result.converged && !midpoint_soft_accepted) ||
+            midpoint_result.failed) {
             if (mpi_rank == 0) {
                 x_low_monitor << step << "  "
                               << time / Const::femto << "  "
@@ -1207,6 +1365,79 @@ int main(int argc, char** argv)
         bkg_e = midpoint_result.species_np1;
         beam = midpoint_result.beam_np1;
         fields = midpoint_result.fields_np1;
+        if (mpi_rank == 0) {
+            const int long_run_diagnostic =
+                midpoint_result.soft_unconverged ? 1 : 0;
+            negative_debt_guard_monitor
+                << step << " "
+                << time / Const::femto << " "
+                << 1 << " "
+                << long_run_diagnostic << " "
+                << midpoint_result.negative_debt_level << " "
+                << midpoint_result.neg_mass_boundary << " "
+                << midpoint_result.neg_mass_core << " "
+                << midpoint_result.neg_mass_tail << " "
+                << midpoint_result.neg_mass_core_fraction << " "
+                << midpoint_result.neg_mass_boundary_fraction << " "
+                << midpoint_result.neg_mass_tail_fraction << " "
+                << midpoint_result.neg_energy_core_abs << " "
+                << midpoint_result.neg_energy_core_fraction << " "
+                << midpoint_result.neg_energy_boundary_abs << " "
+                << midpoint_result.neg_energy_boundary_fraction << " "
+                << midpoint_result.neg_current_core_abs << " "
+                << midpoint_result.neg_current_core_fraction << " "
+                << midpoint_result.neg_debt_min_f_boundary << " "
+                << midpoint_result.neg_debt_min_f_core << " "
+                << midpoint_result.neg_debt_min_f_tail << " "
+                << midpoint_result.neg_cell_boundary << " "
+                << midpoint_result.neg_cell_core << " "
+                << midpoint_result.neg_cell_tail << " "
+                << midpoint_result.debt_action << " "
+                << midpoint_result.limiter_reason << " "
+                << midpoint_result.alpha_core_min << " "
+                << midpoint_result.alpha_boundary_min << " "
+                << midpoint_result.alpha_tail_min << " "
+                << midpoint_result.limiter_modified_J_bkg_norm << " "
+                << midpoint_result.limiter_modified_J_bkg_boundary_norm << " "
+                << midpoint_result.limiter_modified_energy_norm << " "
+                << midpoint_result.low_u_mu_neg_mass_fraction << " "
+                << midpoint_result.low_u_mu_neg_energy_fraction << " "
+                << midpoint_result.low_u_mu_neg_current_fraction << " "
+                << midpoint_result.boundary_force_Cu_max << " "
+                << midpoint_result.boundary_force_Cmu_max << " "
+                << midpoint_result.boundary_force_nsub_max << " "
+                << midpoint_result.boundary_force_remap_cell_count << " "
+                << midpoint_result.boundary_mu_low_L1_before << " "
+                << midpoint_result.boundary_mu_low_L1_after << " "
+                << midpoint_result.boundary_mu_high_L1_after << " "
+                << midpoint_result.J_bkg_neg_boundary << " "
+                << midpoint_result.delta_E_neg_boundary << " "
+                << midpoint_result.boundary_force_remap_mass_loss << " "
+                << midpoint_result.boundary_force_remap_energy_loss << " "
+                << midpoint_result.alpha_interface_BQ_min << " "
+                << midpoint_result.alpha_interface_QC_min << " "
+                << midpoint_result.interface_BQ_flux << " "
+                << midpoint_result.interface_BQ_high_correction << " "
+                << midpoint_result.interface_QC_flux_into_core << " "
+                << midpoint_result.interface_QC_high_correction_into_core << " "
+                << midpoint_result.boundary_energy_diagnostic_invalid << " "
+                << midpoint_result.trial_failure_downgraded << " "
+                << midpoint_result.accepted_with_negative_debt << " "
+                << midpoint_result.state_advanced << " "
+                << midpoint_result.soft_unconverged << " "
+                << midpoint_result.converged << " "
+                << midpoint_result.failed << " "
+                << midpoint_result.nonlinear_iterations << " "
+                << midpoint_result.residual_E << " "
+                << midpoint_result.residual_J_bkg << "\n";
+            if (abnormal_midpoint ||
+                step + 1 == nsteps ||
+                (config.enable_step_diagnostics &&
+                 config.step_diagnostics_interval > 0 &&
+                 step % config.step_diagnostics_interval == 0)) {
+                negative_debt_guard_monitor.flush();
+            }
+        }
         latest_bkg_energy_current_face =
             midpoint_result.j_bkg_energy_debug_face;
         moments_current = true;
@@ -1279,6 +1510,7 @@ int main(int argc, char** argv)
         x_low_input_debt_accepted_step =
             midpoint_result.x_low_input_debt_accepted;
         x_low_failure_kind_step = midpoint_result.x_low_failure_kind;
+        (void)x_low_failure_kind_step;
         x_final_min_f_step = midpoint_result.x_final_min_f;
         x_final_failed_count_step = midpoint_result.x_final_failed_count;
         x_final_failed_max_debt_step =
@@ -1410,6 +1642,50 @@ int main(int argc, char** argv)
                          << midpoint_result.u_flux_audit_final_xr_lo << "  "
                          << midpoint_result.u_flux_audit_final_xr_hi << "\n";
             u_flux_audit.flush();
+        }
+        if (mpi_rank == 0 && midpoint_result.u_flux_audit_valid) {
+            const double x_cell =
+                (static_cast<double>(midpoint_result.u_flux_audit_ix) + 0.5) *
+                sgrid.dx;
+            const int region =
+                (x_cell < 0.1 * Const::micro ||
+                 x_cell > Param::Lx - 0.1 * Const::micro) ? 1 : 0;
+            u_origin_audit << step << "  "
+                           << time / Const::femto << "  "
+                           << midpoint_result.u_flux_audit_rank << "  "
+                           << midpoint_result.u_flux_audit_ix << "  "
+                           << midpoint_result.u_flux_audit_iv << "  "
+                           << midpoint_result.u_flux_audit_imu << "  "
+                           << region << "  "
+                           << midpoint_result.u_flux_audit_f0 << "  "
+                           << midpoint_result.u_flux_audit_f_after_x << "  "
+                           << midpoint_result.u_flux_audit_f_low << "  "
+                           << midpoint_result.u_flux_audit_f_high << "  "
+                           << midpoint_result.u_flux_audit_updated << "  "
+                           << midpoint_result.u_flux_audit_lower_flux << "  "
+                           << midpoint_result.u_flux_audit_upper_flux << "  "
+                           << midpoint_result.u_flux_audit_lower_donor_iv
+                           << "  "
+                           << midpoint_result.u_flux_audit_upper_donor_iv
+                           << "  "
+                           << midpoint_result.u_flux_audit_lower_donor_f
+                           << "  "
+                           << midpoint_result.u_flux_audit_upper_donor_f
+                           << "  "
+                           << midpoint_result.u_flux_audit_cfl << "  "
+                           << midpoint_result.u_flux_audit_alpha << "  "
+                           << midpoint_result.u_flux_audit_alpha << "  "
+                           << midpoint_result
+                                  .u_flux_audit_line_positive_peak << "  "
+                           << midpoint_result
+                                  .u_flux_audit_line_negative_mass << "  "
+                           << midpoint_result.u_flux_audit_allowed_debt
+                           << "  "
+                           << midpoint_result.u_flux_audit_failure_kind
+                           << "\n";
+            if (abnormal_midpoint) {
+                u_origin_audit.flush();
+            }
         }
         if (mpi_rank == 0 && abnormal_midpoint) {
             write_low_order_failure_audit(
@@ -1599,6 +1875,7 @@ int main(int argc, char** argv)
         if (collect_step_diagnostics) {
             diag.write_bkg_stage_negativity(
                 step, time, coupled_iter_step,
+                midpoint_result.soft_unconverged,
                 midpoint_result.stage_min_f,
                 midpoint_result.stage_neg_mass,
                 midpoint_result.stage_neg_cell_count,
@@ -1607,6 +1884,7 @@ int main(int argc, char** argv)
                 mpi_rank);
             diag.write_bkg_stage_by_u_diagnostics(
                 step, time, coupled_iter_step,
+                midpoint_result.soft_unconverged,
                 midpoint_result.stage_min_f_core_by_u,
                 midpoint_result.stage_neg_mass_core_by_u,
                 midpoint_result.stage_neg_cell_count_core_by_u,
@@ -1670,6 +1948,9 @@ int main(int argc, char** argv)
                                    std::ios::app);
                 f_neg_monitor << step << "  "
                               << time / Const::femto << "  "
+                              << 1 << "  "
+                              << midpoint_result.state_advanced << "  "
+                              << midpoint_result.soft_unconverged << "  "
                               << f_neg_snapshot.min_f << "  "
                               << f_neg_snapshot.neg_ratio_max << "  "
                               << f_neg_snapshot.neg_mass_total << "  "
@@ -1734,6 +2015,9 @@ int main(int argc, char** argv)
                     boundary_core_monitor
                         << step << "  "
                         << time / Const::femto << "  "
+                        << 1 << "  "
+                        << midpoint_result.state_advanced << "  "
+                        << midpoint_result.soft_unconverged << "  "
                         << region_widths[ir] / Const::micro << "  "
                         << region_diag.neg_mass_boundary << "  "
                         << region_diag.neg_mass_core << "  "
@@ -1771,6 +2055,10 @@ int main(int argc, char** argv)
                         << region_diag.max_abs_Ex_core << "  "
                         << region_diag.W_bkg_E_boundary << "  "
                         << region_diag.W_bkg_E_core << "  "
+                        << region_diag.anomaly_inward_E/Const::micro << "  "
+                        << region_diag.anomaly_inward_J/Const::micro << "  "
+                        << region_diag.anomaly_inward_n/Const::micro << "  "
+                        << region_diag.anomaly_inward_Mneg/Const::micro << "  "
                         << conclusion << "\n";
                 }
             }
@@ -1838,7 +2126,9 @@ int main(int argc, char** argv)
                 total_energy_delta - E_src_in_step + E_src_out_step
                 - collision_energy_step;
 
-            diag.write_step_diagnostics(step, time, bkg_e, beam, fields,
+            diag.write_step_diagnostics(step, time,
+                                        midpoint_result.soft_unconverged,
+                                        bkg_e, beam, fields,
                                         sgrid, mpi_rank, mpi_size,
                                         nsub_v1, nsub_mu1,
                                         nsub_v2, nsub_mu2,
@@ -1873,6 +2163,24 @@ int main(int argc, char** argv)
                                         local_bkg_current_diag_step.e_dot_j_ampere,
                                         local_bkg_current_diag_step.residual_if_charge,
                                         local_bkg_current_diag_step.residual_if_ampere,
+                                        midpoint_result.boundary_force_Cu_max,
+                                        midpoint_result.boundary_force_Cmu_max,
+                                        midpoint_result.boundary_force_nsub_max,
+                                        midpoint_result.boundary_force_remap_cell_count,
+                                        midpoint_result.boundary_mu_low_L1_before,
+                                        midpoint_result.boundary_mu_low_L1_after,
+                                        midpoint_result.boundary_mu_high_L1_after,
+                                        midpoint_result.J_bkg_neg_boundary,
+                                        midpoint_result.delta_E_neg_boundary,
+                                        midpoint_result.boundary_force_remap_mass_loss,
+                                        midpoint_result.boundary_force_remap_energy_loss,
+                                        midpoint_result.alpha_interface_BQ_min,
+                                        midpoint_result.alpha_interface_QC_min,
+                                        midpoint_result.interface_BQ_flux,
+                                        midpoint_result.interface_BQ_high_correction,
+                                        midpoint_result.interface_QC_flux_into_core,
+                                        midpoint_result.interface_QC_high_correction_into_core,
+                                        midpoint_result.boundary_energy_diagnostic_invalid,
                                         coupled_iter_step,
                                         coupled_residual_E_step,
                                         coupled_residual_J_bkg_step,

@@ -41,6 +41,7 @@ public:
                            int nsub_mu = 0);
 
     void write_step_diagnostics(int step, double time,
+                                bool soft_unconverged,
                                 const Species& electrons,
                                 const BeamPIC& beam,
                                 const EMFields& fields,
@@ -88,6 +89,24 @@ public:
                                 double bkg_current_e_dot_ampere,
                                 double bkg_residual_if_charge_current,
                                 double bkg_residual_if_ampere_current,
+                                double boundary_force_Cu_max,
+                                double boundary_force_Cmu_max,
+                                int boundary_force_nsub_max,
+                                long long boundary_force_remap_cell_count,
+                                double boundary_mu_low_L1_before,
+                                double boundary_mu_low_L1_after,
+                                double boundary_mu_high_L1_after,
+                                double J_bkg_neg_boundary,
+                                double delta_E_neg_boundary,
+                                double boundary_force_remap_mass_loss,
+                                double boundary_force_remap_energy_loss,
+                                double alpha_interface_BQ_min,
+                                double alpha_interface_QC_min,
+                                double interface_BQ_flux,
+                                double interface_BQ_high_correction,
+                                double interface_QC_flux_into_core,
+                                double interface_QC_high_correction_into_core,
+                                double boundary_energy_diagnostic_invalid,
                                 int coupled_iter,
                                 double coupled_residual_E,
                                 double coupled_residual_J_bkg,
@@ -107,6 +126,7 @@ public:
 
     void write_bkg_stage_negativity(
         int step, double time, int coupled_iter,
+        bool soft_unconverged,
         const std::vector<double>& min_f,
         const std::vector<double>& neg_mass,
         const std::vector<long long>& neg_cell_count,
@@ -116,6 +136,7 @@ public:
 
     void write_bkg_stage_by_u_diagnostics(
         int step, double time, int coupled_iter,
+        bool soft_unconverged,
         const std::vector<double>& min_f_core_by_u,
         const std::vector<double>& neg_mass_core_by_u,
         const std::vector<long long>& neg_cell_count_core_by_u,

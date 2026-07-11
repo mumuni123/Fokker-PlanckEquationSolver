@@ -4,6 +4,7 @@ project(FokkerPlanckSolver CXX)
 # 为兼容 GCC 4.8.5 使用 C++11
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -O3 -Wall")
 option(FP_ENABLE_DEBUG_DIAGNOSTICS "Compile debug diagnostics support" OFF)
+option(FP_BUILD_PPM_CTU_TESTS "Build standalone PPM reconstruction checks" OFF)
 
 # MPI: 通过 mpicxx 封装器自动处理（在 PBS 脚本中通过
 # -DCMAKE_CXX_COMPILER=mpicxx 指定）。
@@ -11,6 +12,11 @@ option(FP_ENABLE_DEBUG_DIAGNOSTICS "Compile debug diagnostics support" OFF)
 find_package(MPI QUIET)
 if(MPI_CXX_FOUND)
     include_directories(${MPI_CXX_INCLUDE_PATH})
+endif()
+
+if(FP_BUILD_PPM_CTU_TESTS)
+    add_executable(ppm_ctu_reconstruction_test tests/ppm_ctu_reconstruction_test.cpp)
+    target_include_directories(ppm_ctu_reconstruction_test PRIVATE src)
 endif()
 
 # 查找 OpenMP
@@ -22,8 +28,8 @@ set(SOURCES
     src/main.cpp
     src/config.cpp
     src/species.cpp
-    src/vlasov.cpp
     src/vlasov_ampere_midpoint.cpp
+    src/cylindrical_vlasov_midpoint.cpp
     src/maxwell.cpp
     src/collision.cpp
     src/diagnostics.cpp

@@ -251,7 +251,9 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
 #endif
         if (step_enabled) {
             step_file.open((output_dir + "/step_diagnostics.dat").c_str());
-            step_file << "# step  time[fs]  max_abs_Ex[V/m]  x_at_max_abs_Ex[m]  "
+            step_file << "# step  time[fs]  accepted  state_advanced  "
+                      << "soft_unconverged  "
+                      << "max_abs_Ex[V/m]  x_at_max_abs_Ex[m]  "
                       << "gauss_residual_int[m^-2]  gauss_residual_abs_max[m^-3]  "
                       << "gauss_residual_abs_max_over_n0  "
                       << "N_bkg_e  "
@@ -281,6 +283,22 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                       << "E_dot_J_bkg_ampere[W/m2]  "
                       << "residual_if_charge_current[J/m2]  "
                       << "residual_if_ampere_current[J/m2]  "
+                      << "boundary_force_Cu_max  boundary_force_Cmu_max  "
+                      << "boundary_force_nsub_max  "
+                      << "boundary_force_remap_cell_count  "
+                      << "boundary_mu_low_L1_before  "
+                      << "boundary_mu_low_L1_after  "
+                      << "boundary_mu_high_L1_after  "
+                      << "J_bkg_neg_boundary[A/m2]  "
+                      << "delta_E_neg_boundary[V/m]  "
+                      << "boundary_force_remap_mass_loss[m^-2]  "
+                      << "boundary_force_remap_energy_loss[J/m2]  "
+                      << "alpha_interface_BQ_min  alpha_interface_QC_min  "
+                      << "interface_BQ_flux  "
+                      << "interface_BQ_high_correction  "
+                      << "interface_QC_flux_into_core  "
+                      << "interface_QC_high_correction_into_core  "
+                      << "boundary_energy_diagnostic_invalid  "
                       << "coupled_iter  coupled_residual_E  "
                       << "coupled_residual_J_bkg  coupled_residual_J_beam  "
                       << "x_limiter_active_fraction  x_limiter_min_alpha  "
@@ -301,7 +319,8 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
             bkg_stage_file.open(
                 (output_dir + "/bkg_stage_diagnostics.dat").c_str());
             bkg_stage_file
-                << "# step  time[fs]  coupled_iter  stage  "
+                << "# step  time[fs]  accepted  state_advanced  "
+                << "soft_unconverged  coupled_iter  stage  "
                 << "min_f  negative_mass[m^-2]  positive_mass[m^-2]  "
                 << "total_mass_raw[m^-2]  total_mass_clipped[m^-2]  "
                 << "N_bkg_change[m^-2]  "
@@ -312,7 +331,8 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
             bkg_stage_by_u_file.open(
                 (output_dir + "/bkg_stage_by_u_diagnostics.dat").c_str());
             bkg_stage_by_u_file
-                << "# step  time[fs]  coupled_iter  stage  u_index  "
+                << "# step  time[fs]  accepted  state_advanced  "
+                << "soft_unconverged  coupled_iter  stage  u_index  "
                 << "min_f_core_by_u  neg_mass_core_by_u[m^-2]  "
                 << "neg_cell_count_core_by_u  "
                 << "min_f_boundary_by_u  neg_mass_boundary_by_u[m^-2]  "
@@ -546,6 +566,7 @@ void Diagnostics::write_debug_state(int step, double time,
 }
 
 void Diagnostics::write_step_diagnostics(int step, double time,
+                                         bool soft_unconverged,
                                          const Species& electrons,
                                          const BeamPIC& beam,
                                          const EMFields& fields,
@@ -591,11 +612,29 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                                          double bkg_current_e_dot_charge,
                                          double bkg_current_e_dot_energy,
                                          double bkg_current_e_dot_ampere,
-                                         double bkg_residual_if_charge_current,
-                                         double bkg_residual_if_ampere_current,
-                                         int coupled_iter,
-                                         double coupled_residual_E,
-                                         double coupled_residual_J_bkg,
+                                    double bkg_residual_if_charge_current,
+                                    double bkg_residual_if_ampere_current,
+                                    double boundary_force_Cu_max,
+                                    double boundary_force_Cmu_max,
+                                    int boundary_force_nsub_max,
+                                    long long boundary_force_remap_cell_count,
+                                    double boundary_mu_low_L1_before,
+                                    double boundary_mu_low_L1_after,
+                                    double boundary_mu_high_L1_after,
+                                    double J_bkg_neg_boundary,
+                                    double delta_E_neg_boundary,
+                                    double boundary_force_remap_mass_loss,
+                                    double boundary_force_remap_energy_loss,
+                                    double alpha_interface_BQ_min,
+                                    double alpha_interface_QC_min,
+                                    double interface_BQ_flux,
+                                    double interface_BQ_high_correction,
+                                    double interface_QC_flux_into_core,
+                                    double interface_QC_high_correction_into_core,
+                                    double boundary_energy_diagnostic_invalid,
+                                    int coupled_iter,
+                                    double coupled_residual_E,
+                                    double coupled_residual_J_bkg,
                                          double coupled_residual_J_beam,
                                          double local_max_loss_u_high,
                                          double local_x_at_max_loss_u_high,
@@ -762,6 +801,9 @@ void Diagnostics::write_step_diagnostics(int step, double time,
 
         step_file << step << "  "
                   << time / Const::femto << "  "
+                  << 1 << "  "
+                  << 1 << "  "
+                  << (soft_unconverged ? 1 : 0) << "  "
                   << global_max_abs_Ex << "  "
                   << global_x_at_max_abs_Ex << "  "
                   << global_charge_residual_int << "  "
@@ -809,6 +851,24 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << global_energy[22] << "  "
                   << global_energy[23] << "  "
                   << global_energy[24] << "  "
+                  << boundary_force_Cu_max << "  "
+                  << boundary_force_Cmu_max << "  "
+                  << boundary_force_nsub_max << "  "
+                  << boundary_force_remap_cell_count << "  "
+                  << boundary_mu_low_L1_before << "  "
+                  << boundary_mu_low_L1_after << "  "
+                  << boundary_mu_high_L1_after << "  "
+                  << J_bkg_neg_boundary << "  "
+                  << delta_E_neg_boundary << "  "
+                  << boundary_force_remap_mass_loss << "  "
+                  << boundary_force_remap_energy_loss << "  "
+                  << alpha_interface_BQ_min << "  "
+                  << alpha_interface_QC_min << "  "
+                  << interface_BQ_flux << "  "
+                  << interface_BQ_high_correction << "  "
+                  << interface_QC_flux_into_core << "  "
+                  << interface_QC_high_correction_into_core << "  "
+                  << boundary_energy_diagnostic_invalid << "  "
                   << static_cast<int>(global_coupled_values[0]) << "  "
                   << global_coupled_values[1] << "  "
                   << global_coupled_values[2] << "  "
@@ -906,6 +966,7 @@ void Diagnostics::write_bkg_stage_diagnostics(
 
 void Diagnostics::write_bkg_stage_negativity(
     int step, double time, int coupled_iter,
+    bool soft_unconverged,
     const std::vector<double>& min_f,
     const std::vector<double>& neg_mass,
     const std::vector<long long>& neg_cell_count,
@@ -930,6 +991,9 @@ void Diagnostics::write_bkg_stage_negativity(
             ? core_low_u_min_f[istage] : 0.0;
         bkg_stage_file << step << "  "
                        << time / Const::femto << "  "
+                       << 1 << "  "
+                       << 1 << "  "
+                       << (soft_unconverged ? 1 : 0) << "  "
                        << coupled_iter << "  "
                        << stages[istage] << "  "
                        << min_value << "  "
@@ -947,6 +1011,7 @@ void Diagnostics::write_bkg_stage_negativity(
 
 void Diagnostics::write_bkg_stage_by_u_diagnostics(
     int step, double time, int coupled_iter,
+    bool soft_unconverged,
     const std::vector<double>& min_f_core_by_u,
     const std::vector<double>& neg_mass_core_by_u,
     const std::vector<long long>& neg_cell_count_core_by_u,
@@ -982,6 +1047,9 @@ void Diagnostics::write_bkg_stage_by_u_diagnostics(
                 ? neg_cell_count_boundary_by_u[slot] : 0;
             bkg_stage_by_u_file << step << "  "
                                 << time / Const::femto << "  "
+                                << 1 << "  "
+                                << 1 << "  "
+                                << (soft_unconverged ? 1 : 0) << "  "
                                 << coupled_iter << "  "
                                 << stages[istage] << "  "
                                 << iv << "  "
@@ -1279,22 +1347,25 @@ void Diagnostics::write_electron_distribution(double time,
 
     std::ofstream out(fname.str().c_str());
     out << "# time[fs] = " << time / Const::femto << "\n";
-    out << "# x[um]  u[p/(m c)]  mu  f_e[u^-3 m^-3]\n";
+    out << (electrons.cylindrical_mass_representation
+            ? "# x[um]  u_parallel[p/(m c)]  u_perp[p/(m c)]  f_e[u^-3 m^-3]\n"
+            : "# x[um]  u[p/(m c)]  mu  f_e[u^-3 m^-3]\n");
     out << std::scientific << std::setprecision(8);
 
     const int ng = sg.nghost;
     for (int ix = 0; ix < sg.nx_local; ++ix) {
         const int ix_g = ix + ng;
         const double x_um = sg.x(ix_g) / Const::micro;
-        const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
         for (int iv = 0; iv < Param::Nv; ++iv) {
             const double u = electrons.vgrid.v(iv);
-            const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
             for (int imu = 0; imu < Param::Nmu; ++imu) {
-                out << x_um << "  "
-                    << u << "  "
-                    << electrons.vgrid.mu(imu) << "  "
-                    << electrons.f[row + imu] << "\n";
+                const double coordinate_1 = electrons.cylindrical_mass_representation
+                    ? electrons.cgrid.upar_cells[iv] : u;
+                const double coordinate_2 = electrons.cylindrical_mass_representation
+                    ? electrons.cgrid.uperp_cells[imu] : electrons.vgrid.mu(imu);
+                out << x_um << "  " << coordinate_1 << "  " << coordinate_2
+                    << "  " << electrons.distribution_value(ix_g, iv, imu)
+                    << "\n";
             }
         }
     }

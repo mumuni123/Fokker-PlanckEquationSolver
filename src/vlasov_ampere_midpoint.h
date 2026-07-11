@@ -103,6 +103,15 @@ public:
         double field_work_bkg;
         double field_work_beam;
         double energy_residual_bkg;
+        double energy_pair_residual_bkg;
+        double beam_lag_energy_residual;
+        double limiter_energy_defect_positive;
+        double limiter_energy_defect_negative;
+        double limiter_energy_defect_core;
+        double limiter_energy_defect_boundary;
+        double u_boundary_particle_outflow;
+        double u_boundary_momentum_outflow;
+        double u_boundary_energy_outflow;
         double continuity_residual_bkg;
         double beam_continuity_residual;
         double nonlinear_residual;
@@ -194,8 +203,12 @@ public:
         double neg_mass_tail;
         double neg_mass_total_guard;
         double neg_mass_core_fraction;
+        double neg_mass_boundary_fraction;
+        double neg_mass_tail_fraction;
         double neg_energy_core_abs;
         double neg_energy_core_fraction;
+        double neg_energy_boundary_abs;
+        double neg_energy_boundary_fraction;
         double neg_current_core_abs;
         double neg_current_core_fraction;
         double neg_debt_min_f_boundary;
@@ -204,6 +217,35 @@ public:
         long long neg_cell_boundary;
         long long neg_cell_core;
         long long neg_cell_tail;
+        int debt_action;
+        int limiter_reason;
+        double alpha_core_min;
+        double alpha_boundary_min;
+        double alpha_tail_min;
+        double limiter_modified_J_bkg_norm;
+        double limiter_modified_J_bkg_boundary_norm;
+        double limiter_modified_energy_norm;
+        double low_u_mu_neg_mass_fraction;
+        double low_u_mu_neg_energy_fraction;
+        double low_u_mu_neg_current_fraction;
+        double boundary_force_Cu_max;
+        double boundary_force_Cmu_max;
+        int boundary_force_nsub_max;
+        long long boundary_force_remap_cell_count;
+        double boundary_mu_low_L1_before;
+        double boundary_mu_low_L1_after;
+        double boundary_mu_high_L1_after;
+        double J_bkg_neg_boundary;
+        double delta_E_neg_boundary;
+        double boundary_force_remap_mass_loss;
+        double boundary_force_remap_energy_loss;
+        double alpha_interface_BQ_min;
+        double alpha_interface_QC_min;
+        double interface_BQ_flux;
+        double interface_BQ_high_correction;
+        double interface_QC_flux_into_core;
+        double interface_QC_high_correction_into_core;
+        double boundary_energy_diagnostic_invalid;
         int trial_failure_downgraded;
         int accepted_with_negative_debt;
         int state_advanced;
@@ -218,6 +260,7 @@ public:
         int u_flux_audit_imu;
         double u_flux_audit_severity;
         double u_flux_audit_f0;
+        double u_flux_audit_f_after_x;
         double u_flux_audit_f_low;
         double u_flux_audit_f_high;
         double u_flux_audit_alpha;
@@ -229,6 +272,17 @@ public:
         double u_flux_audit_final_xl_hi;
         double u_flux_audit_final_xr_lo;
         double u_flux_audit_final_xr_hi;
+        double u_flux_audit_lower_flux;
+        double u_flux_audit_upper_flux;
+        double u_flux_audit_lower_donor_f;
+        double u_flux_audit_upper_donor_f;
+        double u_flux_audit_cfl;
+        double u_flux_audit_line_positive_peak;
+        double u_flux_audit_line_negative_mass;
+        double u_flux_audit_allowed_debt;
+        int u_flux_audit_lower_donor_iv;
+        int u_flux_audit_upper_donor_iv;
+        int u_flux_audit_failure_kind;
         LowOrderFailureAudit u_low_failure_audit;
         LowOrderFailureAudit mu_low_failure_audit;
         int finite_failure_mask;
@@ -283,6 +337,7 @@ public:
         bool converged;
         bool failed;
         bool soft_accepted;
+        bool soft_unconverged;
         bool protected_converged;
         int substeps_used;
     };
@@ -303,6 +358,12 @@ public:
                                          int mpi_size);
 
 private:
+    /*
+     * Legacy FluxPack removed.  The cylindrical solver keeps its phase-space
+     * fluxes as iteration-local storage so old (u,mu) arrays cannot be used
+     * by a future caller accidentally.
+     */
+#if 0
     struct FluxPack {
         std::vector<double> x_high;
         std::vector<double> x_low;
@@ -407,8 +468,12 @@ private:
         double neg_mass_tail;
         double neg_mass_total_guard;
         double neg_mass_core_fraction;
+        double neg_mass_boundary_fraction;
+        double neg_mass_tail_fraction;
         double neg_energy_core_abs;
         double neg_energy_core_fraction;
+        double neg_energy_boundary_abs;
+        double neg_energy_boundary_fraction;
         double neg_current_core_abs;
         double neg_current_core_fraction;
         double neg_debt_min_f_boundary;
@@ -417,6 +482,35 @@ private:
         long long neg_cell_boundary;
         long long neg_cell_core;
         long long neg_cell_tail;
+        int debt_action;
+        int limiter_reason;
+        double alpha_core_min;
+        double alpha_boundary_min;
+        double alpha_tail_min;
+        double limiter_modified_J_bkg_norm;
+        double limiter_modified_J_bkg_boundary_norm;
+        double limiter_modified_energy_norm;
+        double low_u_mu_neg_mass_fraction;
+        double low_u_mu_neg_energy_fraction;
+        double low_u_mu_neg_current_fraction;
+        double boundary_force_Cu_max;
+        double boundary_force_Cmu_max;
+        int boundary_force_nsub_max;
+        long long boundary_force_remap_cell_count;
+        double boundary_mu_low_L1_before;
+        double boundary_mu_low_L1_after;
+        double boundary_mu_high_L1_after;
+        double J_bkg_neg_boundary;
+        double delta_E_neg_boundary;
+        double boundary_force_remap_mass_loss;
+        double boundary_force_remap_energy_loss;
+        double alpha_interface_BQ_min;
+        double alpha_interface_QC_min;
+        double interface_BQ_flux;
+        double interface_BQ_high_correction;
+        double interface_QC_flux_into_core;
+        double interface_QC_high_correction_into_core;
+        double boundary_energy_diagnostic_invalid;
         int trial_failure_downgraded;
         int accepted_with_negative_debt;
         double positivity_energy_defect;
@@ -430,6 +524,7 @@ private:
         int u_flux_audit_imu;
         double u_flux_audit_severity;
         double u_flux_audit_f0;
+        double u_flux_audit_f_after_x;
         double u_flux_audit_f_low;
         double u_flux_audit_f_high;
         double u_flux_audit_alpha;
@@ -441,6 +536,17 @@ private:
         double u_flux_audit_final_xl_hi;
         double u_flux_audit_final_xr_lo;
         double u_flux_audit_final_xr_hi;
+        double u_flux_audit_lower_flux;
+        double u_flux_audit_upper_flux;
+        double u_flux_audit_lower_donor_f;
+        double u_flux_audit_upper_donor_f;
+        double u_flux_audit_cfl;
+        double u_flux_audit_line_positive_peak;
+        double u_flux_audit_line_negative_mass;
+        double u_flux_audit_allowed_debt;
+        int u_flux_audit_lower_donor_iv;
+        int u_flux_audit_upper_donor_iv;
+        int u_flux_audit_failure_kind;
         LowOrderFailureAudit u_low_failure_audit;
         LowOrderFailureAudit mu_low_failure_audit;
         int finite_failure_mask;
@@ -504,88 +610,29 @@ private:
         int finite_flux_imu;
         int finite_flux_has_failure;
     };
+#endif
 
     void reset_result(Result& result) const;
     void reset_current_diag(CurrentDiagnostics& diag) const;
-    Result advance_single_step(const Species& bkg_n,
-                               const BeamPIC& beam_n,
-                               const EMFields& fields_n,
-                               const SpatialGrid& sg,
-                               double dt,
-                               double time,
-                               int mpi_rank,
-                               int mpi_size,
-                               int substeps_used) const;
-    Result advance_with_fixed_substeps(const Species& bkg_n,
-                                       const BeamPIC& beam_n,
-                                       const EMFields& fields_n,
-                                       const SpatialGrid& sg,
-                                       double dt,
-                                       double time,
-                                       int mpi_rank,
-                                       int mpi_size,
-                                       int substeps) const;
+    Result advance_cylindrical_single_step(const Species& bkg_n,
+                                           const BeamPIC& beam_n,
+                                           const EMFields& fields_n,
+                                           const SpatialGrid& sg,
+                                           double dt,
+                                           double time,
+                                           int mpi_rank,
+                                           int mpi_size,
+                                           int substeps_used) const;
     void set_midpoint_field(EMFields& fields_mid,
                             const EMFields& fields_n,
                             const std::vector<double>& ex_mid,
                             const SpatialGrid& sg,
                             int mpi_rank,
                             int mpi_size) const;
-    void compute_midpoint_fluxes(const Species& bkg_n,
-                                 const Species& bkg_guess_np1,
-                                 const EMFields& fields_mid,
-                                 const SpatialGrid& sg,
-                                 double dt,
-                                 int mpi_rank,
-                                 int mpi_size,
-                                 Species& bkg_new,
-                                 FluxPack& fluxes,
-                                 const std::vector<double>* alpha_smooth_from,
-                                 double alpha_smooth_beta,
-                                 bool& finite) const;
-    void compute_vlasov_midpoint_residual(const Species& bkg_n,
-                                          const Species& bkg_guess_np1,
-                                          const EMFields& fields_mid,
-                                          const SpatialGrid& sg,
-                                          double dt,
-                                          int mpi_rank,
-                                          int mpi_size,
-                                          Species& bkg_new,
-                                          FluxPack& fluxes,
-                                          const std::vector<double>* alpha_smooth_from,
-                                          double alpha_smooth_beta,
-                                          bool& finite) const;
-    void update_flux_current(const Species& sp,
-                             const SpatialGrid& sg,
-                             FluxPack& fluxes,
-                             Species& bkg_new) const;
-    void conservative_floor_repair(Species& sp,
-                                   const SpatialGrid& sg,
-                                   int mpi_rank,
-                                   int mpi_size,
-                                   FluxPack& fluxes,
-                                   bool& finite) const;
-    void scan_negative_debt_guard(const Species& sp,
-                                  const SpatialGrid& sg,
-                                  const EMFields& fields_mid,
-                                  FluxPack& fluxes) const;
     double integrate_face_work(const std::vector<double>& current_face,
                                const EMFields& fields_mid,
                                const SpatialGrid& sg,
                                double dt) const;
-    void build_current_diagnostics(const std::vector<double>& j_bkg_charge,
-                                   const std::vector<double>& j_bkg_energy,
-                                   const std::vector<double>& j_bkg_ampere,
-                                   const EMFields& fields_mid,
-                                   const SpatialGrid& sg,
-                                   double local_delta_ke_bkg,
-                                   double dt,
-                                   CurrentDiagnostics& diag) const;
-    bool check_finite_state(const Species& bkg,
-                            const BeamPIC& beam,
-                            const EMFields& fields,
-                            const std::vector<double>& ex_mid_next,
-                            const std::vector<double>& current_next) const;
 
     void exchange_ghosts_x_persistent(Species& sp, const SpatialGrid& sg,
                                       int mpi_rank, int mpi_size) const;
@@ -595,6 +642,7 @@ private:
     mutable std::vector<double> ghost_send_right_;
     mutable std::vector<double> ghost_recv_left_;
     mutable std::vector<double> ghost_recv_right_;
+    int core_macro_debt_consecutive_steps_;
 };
 
 #endif

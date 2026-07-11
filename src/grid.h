@@ -181,6 +181,68 @@ struct VelocityGrid {
     double mu_face(int j) const { return mu_faces[j]; }
 };
 
+// Cylindrical momentum grid used by the collisionless background-electron
+// Vlasov--Ampere path.  The two stored indices retain Param::Nv/Param::Nmu
+// extents, but represent (u_parallel, u_perp), not the legacy (u, mu) grid.
+// Values in Species::f are cell-integrated masses M on this grid.
+struct CylindricalVelocityGrid {
+    std::vector<double> upar_faces;
+    std::vector<double> upar_cells;
+    std::vector<double> upar_widths;
+    std::vector<double> uperp_faces;
+    std::vector<double> uperp_cells;
+    std::vector<double> uperp_ring_areas;
+    std::vector<double> kinetic_energy;
+    std::vector<double> vx;
+
+    void init(double umax)
+    {
+        upar_faces.resize(Param::Nv + 1);
+        upar_cells.resize(Param::Nv);
+        upar_widths.resize(Param::Nv);
+        uperp_faces.resize(Param::Nmu + 1);
+        uperp_cells.resize(Param::Nmu);
+        uperp_ring_areas.resize(Param::Nmu);
+        kinetic_energy.resize(Param::Nvmu);
+        vx.resize(Param::Nvmu);
+
+        // A symmetric parallel-momentum grid removes the u=0 directional
+        // degeneracy of the former spherical representation.
+        for (int j = 0; j <= Param::Nv; ++j) {
+            upar_faces[j] = -umax + 2.0 * umax * j / Param::Nv;
+        }
+        for (int k = 0; k <= Param::Nmu; ++k) {
+            uperp_faces[k] = umax * k / Param::Nmu;
+        }
+        for (int j = 0; j < Param::Nv; ++j) {
+            upar_cells[j] = 0.5 * (upar_faces[j] + upar_faces[j + 1]);
+            upar_widths[j] = upar_faces[j + 1] - upar_faces[j];
+        }
+        for (int k = 0; k < Param::Nmu; ++k) {
+            const double lo = uperp_faces[k];
+            const double hi = uperp_faces[k + 1];
+            uperp_cells[k] = 0.5 * (lo + hi);
+            uperp_ring_areas[k] = Const::pi * (hi * hi - lo * lo);
+        }
+        for (int j = 0; j < Param::Nv; ++j) {
+            for (int k = 0; k < Param::Nmu; ++k) {
+                const size_t slot = static_cast<size_t>(j) * Param::Nmu + k;
+                const double gamma = std::sqrt(1.0 +
+                    upar_cells[j] * upar_cells[j] +
+                    uperp_cells[k] * uperp_cells[k]);
+                kinetic_energy[slot] = Const::me * Const::c * Const::c *
+                                       (gamma - 1.0);
+                vx[slot] = Const::c * upar_cells[j] / gamma;
+            }
+        }
+    }
+
+    double cell_phase_volume(int j, int k) const
+    {
+        return upar_widths[j] * uperp_ring_areas[k];
+    }
+};
+
 struct SpatialGrid {
     int nx_global;
     int nx_local;

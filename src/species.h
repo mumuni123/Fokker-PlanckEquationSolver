@@ -24,7 +24,13 @@ public:
     bool relativistic_push;
 
     VelocityGrid vgrid;
+    CylindricalVelocityGrid cgrid;
     const SpatialGrid* sgrid;
+
+    // Background electrons use the phase-1 cylindrical representation.
+    // In that mode f stores the cell-integrated conservative mass M, not a
+    // point value of the legacy spherical distribution.
+    bool cylindrical_mass_representation;
 
     // Axisymmetric distribution f(x, u, mu), with d3u = 2*pi*u^2 du dmu.
     std::vector<double> f;
@@ -60,6 +66,7 @@ public:
     double total_kinetic_energy() const;
     void total_particle_number_and_energy(double& number,
                                           double& kinetic_energy) const;
+    double distribution_value(int ix_with_ghost, int iv, int imu) const;
 
     size_t local_size() const {
         return static_cast<size_t>(sgrid->nx_total) * Param::Nvmu;

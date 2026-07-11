@@ -37,7 +37,8 @@ double discrete_maxwellian_sum(const Species& sp,
 
 Species::Species()
     : charge(0.0), mass(0.0), density0(0.0), temperature(0.0),
-      collisions_enabled(true), relativistic_push(false), sgrid(NULL)
+      collisions_enabled(true), relativistic_push(false), sgrid(NULL),
+      cylindrical_mass_representation(false)
 {}
 
 void Species::init(const std::string& n, SpeciesType t,
@@ -58,6 +59,9 @@ void Species::init(const std::string& n, SpeciesType t,
 
     double umax = Param::momentum_umax;
     vgrid.init(umax);
+    cylindrical_mass_representation =
+        (type == SpeciesType::BACKGROUND_ELECTRON);
+    if (cylindrical_mass_representation) cgrid.init(umax);
 
     f.assign(local_size(), 0.0);
     f_tmp.assign(local_size(), 0.0);
@@ -70,6 +74,40 @@ void Species::init(const std::string& n, SpeciesType t,
 void Species::initialize_maxwellian(double drift_vx)
 {
     if (type == SpeciesType::BEAM) return;
+
+    if (cylindrical_mass_representation) {
+        const double inv2uth2 = mass * Const::c * Const::c /
+                                (2.0 * temperature);
+        const double drift_u = u_from_v(drift_vx);
+        double raw_number = 0.0;
+        for (int iv = 0; iv < Param::Nv; ++iv) {
+            for (int imu = 0; imu < Param::Nmu; ++imu) {
+                const double up = cgrid.upar_cells[iv];
+                const double ut = cgrid.uperp_cells[imu];
+                raw_number += std::exp(-((up - drift_u) * (up - drift_u) +
+                                         ut * ut) * inv2uth2) *
+                              cgrid.cell_phase_volume(iv, imu);
+            }
+        }
+        const double norm = (raw_number > 0.0) ? density0 / raw_number : 0.0;
+        const int nxt = sgrid->nx_total;
+        #pragma omp parallel for collapse(2)
+        for (int ix = 0; ix < nxt; ++ix) {
+            for (int iv = 0; iv < Param::Nv; ++iv) {
+                for (int imu = 0; imu < Param::Nmu; ++imu) {
+                    const double up = cgrid.upar_cells[iv];
+                    const double ut = cgrid.uperp_cells[imu];
+                    const double f3 = norm *
+                        std::exp(-((up - drift_u) * (up - drift_u) +
+                                   ut * ut) * inv2uth2);
+                    f[idx3(ix, iv, imu)] = f3 * sgrid->dx *
+                        cgrid.cell_phase_volume(iv, imu);
+                }
+            }
+        }
+        f_tmp = f;
+        return;
+    }
 
     const double inv2uth2 = mass * Const::c * Const::c / (2.0 * temperature);
     const double raw_sum = discrete_maxwellian_sum(*this, drift_vx, inv2uth2);
@@ -96,6 +134,41 @@ void Species::initialize_maxwellian_profile(const std::vector<double>& density_p
                                             double drift_vx)
 {
     if (type == SpeciesType::BEAM) return;
+
+    if (cylindrical_mass_representation) {
+        const int ng = sgrid->nghost;
+        const int nxl = sgrid->nx_local;
+        if (density_profile.size() < static_cast<size_t>(nxl)) return;
+        const double inv2uth2 = mass * Const::c * Const::c /
+                                (2.0 * temperature);
+        const double drift_u = u_from_v(drift_vx);
+        double raw_number = 0.0;
+        for (int iv = 0; iv < Param::Nv; ++iv)
+            for (int imu = 0; imu < Param::Nmu; ++imu) {
+                const double up = cgrid.upar_cells[iv];
+                const double ut = cgrid.uperp_cells[imu];
+                raw_number += std::exp(-((up - drift_u) * (up - drift_u) +
+                                         ut * ut) * inv2uth2) *
+                              cgrid.cell_phase_volume(iv, imu);
+            }
+        #pragma omp parallel for
+        for (int ix = 0; ix < nxl; ++ix) {
+            const double norm = (raw_number > 0.0)
+                ? std::max(0.0, density_profile[ix]) / raw_number : 0.0;
+            for (int iv = 0; iv < Param::Nv; ++iv) {
+                for (int imu = 0; imu < Param::Nmu; ++imu) {
+                    const double up = cgrid.upar_cells[iv];
+                    const double ut = cgrid.uperp_cells[imu];
+                    f[idx3(ng + ix, iv, imu)] = norm *
+                        std::exp(-((up - drift_u) * (up - drift_u) +
+                                   ut * ut) * inv2uth2) * sgrid->dx *
+                        cgrid.cell_phase_volume(iv, imu);
+                }
+            }
+        }
+        f_tmp = f;
+        return;
+    }
 
     std::fill(f.begin(), f.end(), 0.0);
     const double inv2uth2 = mass * Const::c * Const::c / (2.0 * temperature);
@@ -173,6 +246,26 @@ void Species::compute_moments()
     std::fill(charge_density.begin(), charge_density.end(), 0.0);
     std::fill(current_x.begin(), current_x.end(), 0.0);
 
+    if (cylindrical_mass_representation) {
+        #pragma omp parallel for
+        for (int ix = 0; ix < nxl; ++ix) {
+            const int ix_g = ix + ng;
+            double n = 0.0;
+            double gamma_x = 0.0;
+            for (int iv = 0; iv < Param::Nv; ++iv) {
+                for (int imu = 0; imu < Param::Nmu; ++imu) {
+                    const double m = f[idx3(ix_g, iv, imu)];
+                    n += m;
+                    gamma_x += m * cgrid.vx[idx2(iv, imu)];
+                }
+            }
+            number_density[ix] = n / sgrid->dx;
+            charge_density[ix] = charge * number_density[ix];
+            current_x[ix] = charge * gamma_x / sgrid->dx;
+        }
+        return;
+    }
+
     #pragma omp parallel for
     for (int ix = 0; ix < nxl; ++ix) {
         const int ix_g = ix + ng;
@@ -202,6 +295,17 @@ double Species::total_particle_number() const
     const int nxl = sgrid->nx_local;
     double total = 0.0;
 
+    if (cylindrical_mass_representation) {
+        #pragma omp parallel for reduction(+:total)
+        for (int ix = 0; ix < nxl; ++ix) {
+            const int ix_g = ix + ng;
+            for (int iv = 0; iv < Param::Nv; ++iv)
+                for (int imu = 0; imu < Param::Nmu; ++imu)
+                    total += f[idx3(ix_g, iv, imu)];
+        }
+        return total;
+    }
+
     #pragma omp parallel for reduction(+:total)
     for (int ix = 0; ix < nxl; ++ix) {
         const int ix_g = ix + ng;
@@ -224,6 +328,18 @@ double Species::total_kinetic_energy() const
     const int ng = sgrid->nghost;
     const int nxl = sgrid->nx_local;
     double total = 0.0;
+
+    if (cylindrical_mass_representation) {
+        #pragma omp parallel for reduction(+:total)
+        for (int ix = 0; ix < nxl; ++ix) {
+            const int ix_g = ix + ng;
+            for (int iv = 0; iv < Param::Nv; ++iv)
+                for (int imu = 0; imu < Param::Nmu; ++imu)
+                    total += f[idx3(ix_g, iv, imu)] *
+                             cgrid.kinetic_energy[idx2(iv, imu)];
+        }
+        return total;
+    }
 
     #pragma omp parallel for reduction(+:total)
     for (int ix = 0; ix < nxl; ++ix) {
@@ -252,6 +368,23 @@ void Species::total_particle_number_and_energy(double& number,
     double total_n = 0.0;
     double total_e = 0.0;
 
+    if (cylindrical_mass_representation) {
+        #pragma omp parallel for reduction(+:total_n,total_e)
+        for (int ix = 0; ix < nxl; ++ix) {
+            const int ix_g = ix + ng;
+            for (int iv = 0; iv < Param::Nv; ++iv) {
+                for (int imu = 0; imu < Param::Nmu; ++imu) {
+                    const double m = f[idx3(ix_g, iv, imu)];
+                    total_n += m;
+                    total_e += m * cgrid.kinetic_energy[idx2(iv, imu)];
+                }
+            }
+        }
+        number = total_n;
+        kinetic_energy = total_e;
+        return;
+    }
+
     #pragma omp parallel for reduction(+:total_n,total_e)
     for (int ix = 0; ix < nxl; ++ix) {
         const int ix_g = ix + ng;
@@ -275,4 +408,12 @@ void Species::total_particle_number_and_energy(double& number,
 
     number = total_n;
     kinetic_energy = total_e;
+}
+
+double Species::distribution_value(int ix_with_ghost, int iv, int imu) const
+{
+    const double stored = f[idx3(ix_with_ghost, iv, imu)];
+    if (!cylindrical_mass_representation) return stored;
+    const double volume = sgrid->dx * cgrid.cell_phase_volume(iv, imu);
+    return (volume > 0.0) ? stored / volume : 0.0;
 }
