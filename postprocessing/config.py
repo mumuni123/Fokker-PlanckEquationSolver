@@ -25,7 +25,7 @@ SPACE_COLUMNS = ["Ex[V/m]"]
 # Bounds can also be None individually, e.g. (1.0, None).
 SPACE_X_AXIS_RANGE = [0.1,7.9]
 
-ALL_DENSITY_FILES = "density_00020.dat"
+ALL_DENSITY_FILES = "density_00040.dat"
 
 # Settings for plot_background_density_evolution.py.
 BACKGROUND_DENSITY_FILES = [

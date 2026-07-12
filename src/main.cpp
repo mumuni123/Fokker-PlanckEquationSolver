@@ -615,6 +615,8 @@ int main(int argc, char** argv)
     std::ofstream mu_low_failure_audit;
     std::ofstream negative_debt_guard_monitor;
     std::ofstream trial_boundary_debt_monitor;
+    std::ofstream accepted_transport_monitor;
+    bool first_accepted_negative_seen = false;
     if (mpi_rank == 0) {
         bkg_energy_monitor.open("output/bkg_energy_monitor.dat");
         bkg_energy_monitor
@@ -805,6 +807,18 @@ int main(int argc, char** argv)
             << "coupled_iter residual_E residual_J_bkg failed\n";
         trial_boundary_debt_monitor << std::scientific
                                     << std::setprecision(8);
+
+        accepted_transport_monitor.open(
+            "output/accepted_transport_safety.dat");
+        accepted_transport_monitor
+            << "# step time_fs nonlinear_iteration substep min_M ix iv imu "
+            << "M_low M_candidate M_safe outflow inflow beta "
+            << "alpha_x_left alpha_x_right alpha_u_lower alpha_u_upper "
+            << "A_lim_x_left A_lim_x_right A_lim_u_lower A_lim_u_upper "
+            << "A_safe_x_left A_safe_x_right A_safe_u_lower A_safe_u_upper "
+            << "mpi_interface k_zero next_step_donor soft_unconverged\n";
+        accepted_transport_monitor << std::scientific
+                                   << std::setprecision(16);
 
         std::ofstream f_neg_monitor;
         f_neg_monitor.open("output/f_negativity_monitor.dat");
@@ -1165,7 +1179,101 @@ int main(int argc, char** argv)
             !midpoint_result.failed;
         if ((!midpoint_result.converged && !midpoint_soft_accepted) ||
             midpoint_result.failed) {
+            const char* failure_reason = "NONE";
+            switch (midpoint_result.failure_reason) {
+            case 1: failure_reason = "CFL_LIMIT"; break;
+            case 2: failure_reason = "LOW_ORDER_POSITIVITY"; break;
+            case 3: failure_reason = "FCT_FINAL_POSITIVITY"; break;
+            case 4: failure_reason = "NONFINITE_STATE"; break;
+            case 5: failure_reason = "FCT_HIGH_LOW_IDENTITY"; break;
+            case 6: failure_reason = "FCT_DONOR_CAPACITY"; break;
+            case 7: failure_reason = "FCT_INTERFACE_CHECKSUM"; break;
+            default: break;
+            }
             if (mpi_rank == 0) {
+                if (midpoint_result.failure_reason != 0) {
+                std::fprintf(stderr,
+                             "EARLY_EXIT: step=%d reason=%s iter=%d substep=%d "
+                             "global_cfl=%.16e low_min=%.16e final_min=%.16e "
+                             "worst=(x=%d,j=%d,k=%d); "
+                             "fct_identity=%.16e identity_violation=%.16e "
+                             "donor_violation=%.16e interface_checksum=%.16e "
+                             "interface_violation=%.16e low_tol=%.16e "
+                             "final_tol=%.16e; "
+                             "identity_worst=(x=%d,j=%d,k=%d,R=%.16e,S=%.16e,"
+                             "R_over_S=%.16e,abs_R_over_max1S=%.16e); "
+                             "donor_worst=(x=%d,j=%d,k=%d,m_low=%.16e,"
+                             "A=[%.16e,%.16e,%.16e,%.16e],"
+                             "alpha=[%.16e,%.16e,%.16e,%.16e],"
+                             "outflow=%.16e,S=%.16e,relative=%.16e,"
+                             "roundoff_warning=%d,beta_count=%lld,"
+                             "beta_min=%.16e); "
+                             "low_order=(M_in=%.16e,M_low=%.16e,"
+                             "hPhi=[%.16e,%.16e,%.16e,%.16e],"
+                             "out=[%.16e,%.16e,%.16e,%.16e],"
+                             "in=[%.16e,%.16e,%.16e,%.16e],"
+                             "CFL_x=%.16e,CFL_u=%.16e,"
+                             "work_input_min=%.16e,mpi_interface=%d).\n",
+                             step, failure_reason,
+                             midpoint_result.failure_iteration,
+                             midpoint_result.failure_substep,
+                             midpoint_result.failure_global_cfl,
+                             midpoint_result.failure_low_min,
+                             midpoint_result.failure_final_min,
+                             midpoint_result.failure_worst_ix,
+                             midpoint_result.failure_worst_iv,
+                             midpoint_result.failure_worst_imu,
+                             midpoint_result.fct_high_low_identity_linf,
+                             midpoint_result.fct_high_low_identity_violation,
+                             midpoint_result.fct_donor_capacity_violation,
+                             midpoint_result.fct_interface_checksum_linf,
+                             midpoint_result.fct_interface_checksum_violation,
+                             midpoint_result.fct_low_order_tolerance_linf,
+                             midpoint_result.fct_final_tolerance_linf,
+                             midpoint_result.fct_high_low_identity_worst_ix,
+                             midpoint_result.fct_high_low_identity_worst_iv,
+                             midpoint_result.fct_high_low_identity_worst_imu,
+                             midpoint_result.fct_high_low_identity_worst_residual,
+                             midpoint_result.fct_high_low_identity_worst_scale,
+                             midpoint_result.fct_high_low_identity_worst_relative,
+                             midpoint_result.fct_high_low_identity_ratio_linf,
+                             midpoint_result.fct_donor_worst_ix,
+                             midpoint_result.fct_donor_worst_iv,
+                             midpoint_result.fct_donor_worst_imu,
+                             midpoint_result.fct_donor_worst_m_low,
+                             midpoint_result.fct_donor_worst_ax_left,
+                             midpoint_result.fct_donor_worst_ax_right,
+                             midpoint_result.fct_donor_worst_au_lower,
+                             midpoint_result.fct_donor_worst_au_upper,
+                             midpoint_result.fct_donor_worst_alpha_x_left,
+                             midpoint_result.fct_donor_worst_alpha_x_right,
+                             midpoint_result.fct_donor_worst_alpha_u_lower,
+                             midpoint_result.fct_donor_worst_alpha_u_upper,
+                             midpoint_result.fct_donor_worst_outflow,
+                             midpoint_result.fct_donor_worst_scale,
+                             midpoint_result.fct_donor_worst_relative,
+                             midpoint_result.fct_donor_roundoff_warning,
+                             midpoint_result.fct_donor_beta_applied_count,
+                             midpoint_result.fct_donor_beta_min,
+                             midpoint_result.failure_low_m_in,
+                             midpoint_result.failure_low_m_low,
+                             midpoint_result.failure_low_transfer_x_left,
+                             midpoint_result.failure_low_transfer_x_right,
+                             midpoint_result.failure_low_transfer_u_lower,
+                             midpoint_result.failure_low_transfer_u_upper,
+                             midpoint_result.failure_low_out_x_left,
+                             midpoint_result.failure_low_out_x_right,
+                             midpoint_result.failure_low_out_u_lower,
+                             midpoint_result.failure_low_out_u_upper,
+                             midpoint_result.failure_low_in_x_left,
+                             midpoint_result.failure_low_in_x_right,
+                             midpoint_result.failure_low_in_u_lower,
+                             midpoint_result.failure_low_in_u_upper,
+                             midpoint_result.failure_low_cfl_x,
+                             midpoint_result.failure_low_cfl_u,
+                             midpoint_result.failure_low_work_input_min,
+                             midpoint_result.failure_low_on_mpi_interface);
+                }
                 x_low_monitor << step << "  "
                               << time / Const::femto << "  "
                               << midpoint_result.x_low_input_min_f << "  "
@@ -1366,6 +1474,48 @@ int main(int argc, char** argv)
         beam = midpoint_result.beam_np1;
         fields = midpoint_result.fields_np1;
         if (mpi_rank == 0) {
+            const auto& transport = midpoint_result.accepted_transport;
+            if (transport.valid != 0) {
+                accepted_transport_monitor
+                    << step << " "
+                    << time / Const::femto << " "
+                    << midpoint_result.nonlinear_iterations << " "
+                    << transport.substep << " "
+                    << transport.min_mass << " "
+                    << transport.ix << " "
+                    << transport.iv << " "
+                    << transport.imu << " "
+                    << transport.m_low << " "
+                    << transport.m_candidate << " "
+                    << transport.m_safe << " "
+                    << transport.outflow << " "
+                    << transport.inflow << " "
+                    << transport.beta << " ";
+                for (int f = 0; f < 4; ++f)
+                    accepted_transport_monitor << transport.alpha[f] << " ";
+                for (int f = 0; f < 4; ++f)
+                    accepted_transport_monitor << transport.a_limited[f] << " ";
+                for (int f = 0; f < 4; ++f)
+                    accepted_transport_monitor << transport.a_safe[f] << " ";
+                accepted_transport_monitor
+                    << transport.mpi_interface << " "
+                    << transport.k_zero << " "
+                    << transport.next_step_donor << " "
+                    << midpoint_result.soft_unconverged << "\n";
+                accepted_transport_monitor.flush();
+                if (transport.min_mass < 0.0 &&
+                    !first_accepted_negative_seen) {
+                    std::fprintf(stderr,
+                                 "FIRST_ACCEPTED_NEGATIVE: step=%d t=%.16e "
+                                 "iter=%d substep=%d M=%.16e at "
+                                 "(x=%d,j=%d,k=%d).\n",
+                                 step, time,
+                                 midpoint_result.nonlinear_iterations,
+                                 transport.substep, transport.min_mass,
+                                 transport.ix, transport.iv, transport.imu);
+                    first_accepted_negative_seen = true;
+                }
+            }
             const int long_run_diagnostic =
                 midpoint_result.soft_unconverged ? 1 : 0;
             negative_debt_guard_monitor

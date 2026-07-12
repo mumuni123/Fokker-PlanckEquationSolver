@@ -53,6 +53,31 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
     result.x_low_input_min_f = std::numeric_limits<double>::infinity();
     result.x_low_output_min_f = std::numeric_limits<double>::infinity();
     result.x_final_min_f = std::numeric_limits<double>::infinity();
+    result.failure_low_min = std::numeric_limits<double>::infinity();
+    result.failure_final_min = std::numeric_limits<double>::infinity();
+    result.fct_final_scratch_min = std::numeric_limits<double>::infinity();
+    result.fct_roundoff_zeroed_count = 0;
+    result.fct_roundoff_zeroed_mass = 0.0;
+    result.fct_high_low_identity_worst_ix = -1;
+    result.fct_high_low_identity_worst_iv = -1;
+    result.fct_high_low_identity_worst_imu = -1;
+    result.fct_donor_worst_ix = -1;
+    result.fct_donor_worst_iv = -1;
+    result.fct_donor_worst_imu = -1;
+    result.fct_donor_beta_min = 1.0;
+    result.failure_worst_ix = -1;
+    result.failure_worst_iv = -1;
+    result.failure_worst_imu = -1;
+    result.failure_low_work_input_min =
+        std::numeric_limits<double>::infinity();
+    result.accepted_transport.min_mass =
+        std::numeric_limits<double>::infinity();
+    result.accepted_transport.ix = -1;
+    result.accepted_transport.iv = -1;
+    result.accepted_transport.imu = -1;
+    for (int f = 0; f < 4; ++f) {
+        result.accepted_transport.alpha[f] = 1.0;
+    }
     for (int d = 0; d < 3; ++d) {
         result.flux_pos[d].min_f_before = std::numeric_limits<double>::infinity();
         result.flux_pos[d].min_f_low = std::numeric_limits<double>::infinity();

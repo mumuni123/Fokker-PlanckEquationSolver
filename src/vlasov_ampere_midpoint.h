@@ -89,6 +89,27 @@ public:
         int right_upper_donor_index;
     };
 
+    struct AcceptedTransportSnapshot {
+        int valid;
+        int substep;
+        double min_mass;
+        int ix;
+        int iv;
+        int imu;
+        double m_low;
+        double m_candidate;
+        double m_safe;
+        double outflow;
+        double inflow;
+        double beta;
+        double alpha[4];
+        double a_limited[4];
+        double a_safe[4];
+        int mpi_interface;
+        int k_zero;
+        int next_step_donor;
+    };
+
     struct Result {
         Species species_np1;
         BeamPIC beam_np1;
@@ -97,6 +118,7 @@ public:
         std::vector<double> j_beam_face_mid;
         std::vector<double> j_total_face_mid;
         std::vector<double> j_bkg_energy_debug_face;
+        AcceptedTransportSnapshot accepted_transport;
         CurrentDiagnostics current_diag;
         double delta_ke_bkg;
         double delta_ke_beam;
@@ -112,6 +134,102 @@ public:
         double u_boundary_particle_outflow;
         double u_boundary_momentum_outflow;
         double u_boundary_energy_outflow;
+        // Stage 5: finite-volume and field-current closure are deliberately
+        // separate diagnostics.  No compatibility projection is active yet.
+        double stage5_r_fv;
+        double stage5_r_couple;
+        double stage5_r_total;
+        double stage5_r_physical_balance;
+        double stage5_u_energy_moment;
+        double stage5_u_momentum_moment;
+        double stage5_spatial_energy_boundary;
+        double stage5_spatial_momentum_boundary;
+        double stage5_jn_minus_je_l2;
+        double stage5_jn_minus_je_linf;
+        double stage5_energy_speed_candidate_linf;
+        double stage5_energy_speed_candidate_rel;
+        double stage5_fct_budget_violation;
+        int stage5_compatibility_enabled;
+        int stage5_projection_skipped_zero_field;
+        int stage5_projection_skipped_raw_residual;
+        double stage5_correction_energy_target;
+        double stage5_correction_energy_achieved;
+        double stage5_correction_added_momentum_linf;
+        double stage5_correction_l1;
+        double stage5_correction_linf;
+        double stage5_correction_relative;
+        long long stage5_correction_active_bounds;
+        int stage5_correction_infeasible;
+        int stage5_correction_retry_count;
+        // P1 FCT audit invariants.  These only audit the existing algorithm;
+        // P2--P4 will change transfer units and the MPI owner protocol.
+        double fct_high_low_identity_linf;
+        double fct_high_low_identity_violation;
+        double fct_high_low_identity_worst_residual;
+        double fct_high_low_identity_worst_scale;
+        double fct_high_low_identity_worst_relative;
+        double fct_high_low_identity_ratio_linf;
+        int fct_high_low_identity_worst_ix;
+        int fct_high_low_identity_worst_iv;
+        int fct_high_low_identity_worst_imu;
+        double fct_donor_capacity_violation;
+        double fct_donor_worst_m_low;
+        double fct_donor_worst_ax_left;
+        double fct_donor_worst_ax_right;
+        double fct_donor_worst_au_lower;
+        double fct_donor_worst_au_upper;
+        double fct_donor_worst_alpha_x_left;
+        double fct_donor_worst_alpha_x_right;
+        double fct_donor_worst_alpha_u_lower;
+        double fct_donor_worst_alpha_u_upper;
+        double fct_donor_worst_outflow;
+        double fct_donor_worst_scale;
+        double fct_donor_worst_relative;
+        int fct_donor_worst_ix;
+        int fct_donor_worst_iv;
+        int fct_donor_worst_imu;
+        int fct_donor_roundoff_warning;
+        long long fct_donor_beta_applied_count;
+        double fct_donor_beta_min;
+        double fct_interface_checksum_linf;
+        double fct_interface_checksum_violation;
+        double fct_low_order_tolerance_linf;
+        double fct_final_scratch_min;
+        double fct_final_tolerance_linf;
+        // Final-scratch negative values set to +0.0 solely because they are
+        // within the local floating-point summation bound.
+        long long fct_roundoff_zeroed_count;
+        double fct_roundoff_zeroed_mass;
+        // 0=none, 1=CFL limit, 2=low-order positivity,
+        // 3=FCT final positivity, 4=non-finite state,
+        // 5=high-low identity, 6=donor capacity, 7=interface checksum.
+        int failure_reason;
+        int failure_iteration;
+        int failure_substep;
+        double failure_global_cfl;
+        double failure_low_min;
+        double failure_final_min;
+        int failure_worst_ix;
+        int failure_worst_iv;
+        int failure_worst_imu;
+        double failure_low_m_in;
+        double failure_low_m_low;
+        double failure_low_transfer_x_left;
+        double failure_low_transfer_x_right;
+        double failure_low_transfer_u_lower;
+        double failure_low_transfer_u_upper;
+        double failure_low_out_x_left;
+        double failure_low_out_x_right;
+        double failure_low_out_u_lower;
+        double failure_low_out_u_upper;
+        double failure_low_in_x_left;
+        double failure_low_in_x_right;
+        double failure_low_in_u_lower;
+        double failure_low_in_u_upper;
+        double failure_low_cfl_x;
+        double failure_low_cfl_u;
+        double failure_low_work_input_min;
+        int failure_low_on_mpi_interface;
         double continuity_residual_bkg;
         double beam_continuity_residual;
         double nonlinear_residual;

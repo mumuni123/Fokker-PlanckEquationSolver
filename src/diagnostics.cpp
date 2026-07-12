@@ -192,7 +192,11 @@ void compute_bkg_distribution_stats(const Species& electrons,
         const int ix_g = ix + ng;
         const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
         for (int iv = 0; iv < Param::Nv; ++iv) {
-            const double cell_weight = electrons.vgrid.moment_weight[iv] * sg.dx;
+            // Cylindrical Species::f stores cell-integrated mass M already;
+            // applying the legacy spherical quadrature a second time would
+            // corrupt negative/positive mass diagnostics.
+            const double cell_weight = electrons.cylindrical_mass_representation
+                ? 1.0 : electrons.vgrid.moment_weight[iv] * sg.dx;
             const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
             for (int imu = 0; imu < Param::Nmu; ++imu) {
                 const double fval = electrons.f[row + static_cast<size_t>(imu)];
