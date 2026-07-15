@@ -3,7 +3,6 @@ results/
 output/
 build/
 docs/
-tests/
 noCollision_full_fields/
 noCollision_fields/
 noCollision_Beam_denstiy/

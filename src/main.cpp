@@ -562,6 +562,18 @@ int main(int argc, char** argv)
 
     VlasovAmpereMidpointSolver midpoint_solver;
     midpoint_solver.set_step_diagnostics_enabled(false);
+    midpoint_solver.set_low_order_only(false);
+    midpoint_solver.set_nonuniform_high_order_enabled(true);
+    midpoint_solver.set_fct_enabled(true);
+    midpoint_solver.set_max_midpoint_iterations(40);
+    if (mpi_rank == 0) {
+        printf("Transport configuration: low_order_only=%s, "
+               "nonuniform_high_order=%s, FCT=%s, midpoint_max_iters=%d\n",
+               midpoint_solver.low_order_only() ? "ON" : "OFF",
+               midpoint_solver.nonuniform_high_order_enabled() ? "ON" : "OFF",
+               midpoint_solver.fct_enabled() ? "ON" : "OFF",
+               midpoint_solver.max_midpoint_iterations());
+    }
     CollisionOperator collision;
     Diagnostics diag;
     diag.init("output", mpi_rank, config.enable_debug_diagnostics,
@@ -1188,6 +1200,7 @@ int main(int argc, char** argv)
             case 5: failure_reason = "FCT_HIGH_LOW_IDENTITY"; break;
             case 6: failure_reason = "FCT_DONOR_CAPACITY"; break;
             case 7: failure_reason = "FCT_INTERFACE_CHECKSUM"; break;
+            case 12: failure_reason = "NONUNIFORM_HIGH_ORDER_DISABLED"; break;
             default: break;
             }
             if (mpi_rank == 0) {

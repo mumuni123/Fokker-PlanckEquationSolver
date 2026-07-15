@@ -5,15 +5,43 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace Stage5 {
 
 // DiscreteMomentOperators: all energy and momentum moments use these same
 // cell/face definitions.  The analytic x velocity remains the production
 // transport velocity; energy-consistent cell speed is audit-only in stage 5.
-inline double u_face_width(const CylindricalVelocityGrid& grid, int jf)
+//
+// Cylindrical u-face coefficient contract:
+//   M[j,k] = f_3 * dx * du_parallel[j] * (2*pi*u_perp*du_perp)[k]
+//   C_u[j+1/2,k] = M_donor / du_parallel_donor
+//   Phi_u = a_x * C_u,  a_x = q E_x / (m c).
+//
+// Thus C_u carries dx and the perpendicular ring measure implicitly through
+// M, but it contains neither a_x nor an additional 1/dx factor.  The energy
+// current is J_E = q/(m c dx) sum(delta_K * C_u).  A substep accumulates
+// h*J_E and divides by dt only after all substeps are complete.
+enum CylindricalUFluxContract {
+    CU_DIVIDES_BY_UPAR_DONOR_WIDTH = 1,
+    CU_CONTAINS_DX_VIA_CELL_MASS = 1,
+    CU_CONTAINS_UPERP_RING_VIA_CELL_MASS = 1,
+    CU_CONTAINS_ACCELERATION = 0,
+    JE_REQUIRES_CELL_DX_DIVISION = 1,
+    JE_IS_SUBSTEP_TIME_AVERAGED = 1
+};
+
+// The donor width is selected by the caller from the upwind cell.  Keeping
+// this primitive here prevents production and standalone audits from quietly
+// diverging on nonuniform velocity grids.
+inline double donor_cell_coefficient(double donor_mass, double donor_width)
 {
-    return 0.5 * (grid.upar_widths[jf - 1] + grid.upar_widths[jf]);
+    return donor_mass / donor_width;
+}
+
+inline double upar_center_distance(const CylindricalVelocityGrid& grid, int jf)
+{
+    return grid.upar_cells[jf] - grid.upar_cells[jf - 1];
 }
 
 inline double delta_energy(const CylindricalVelocityGrid& grid, int jf, int k)
@@ -26,7 +54,7 @@ inline double energy_face_speed(const CylindricalVelocityGrid& grid,
                                 double mass, int jf, int k)
 {
     return delta_energy(grid, jf, k) /
-           (mass * Const::c * u_face_width(grid, jf));
+           (mass * Const::c * upar_center_distance(grid, jf));
 }
 
 inline double energy_consistent_cell_speed_candidate(
@@ -51,7 +79,13 @@ inline void shared_budget_alphas(const double contribution[4],
         alpha[f] = 1.0;
         total += std::max(0.0, contribution[f]);
     }
-    if (total <= std::max(0.0, available)) return;
+    // The high-order candidate remains the default.  Limit only when its
+    // antidiffusive outflow exceeds the positive low-order mass budget by
+    // more than the local floating-point summation envelope.
+    const double budget_with_roundoff = std::max(0.0, available) +
+        64.0 * std::numeric_limits<double>::epsilon() *
+        std::max(1.0, std::max(total, std::fabs(available)));
+    if (total <= budget_with_roundoff) return;
 
     const double budget = std::max(0.0, available);
     // With four faces this KKT problem has an exact active-set solution.

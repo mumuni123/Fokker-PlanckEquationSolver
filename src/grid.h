@@ -3,8 +3,10 @@
 
 #include "parameters.h"
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <vector>
 
 struct VelocityGrid {
@@ -189,8 +191,10 @@ struct CylindricalVelocityGrid {
     std::vector<double> upar_faces;
     std::vector<double> upar_cells;
     std::vector<double> upar_widths;
+    std::vector<double> upar_center_distances;
     std::vector<double> uperp_faces;
     std::vector<double> uperp_cells;
+    std::vector<double> uperp_widths;
     std::vector<double> uperp_ring_areas;
     std::vector<double> kinetic_energy;
     std::vector<double> vx;
@@ -200,28 +204,43 @@ struct CylindricalVelocityGrid {
         upar_faces.resize(Param::Nv + 1);
         upar_cells.resize(Param::Nv);
         upar_widths.resize(Param::Nv);
+        upar_center_distances.assign(Param::Nv + 1, 0.0);
         uperp_faces.resize(Param::Nmu + 1);
         uperp_cells.resize(Param::Nmu);
+        uperp_widths.resize(Param::Nmu);
         uperp_ring_areas.resize(Param::Nmu);
         kinetic_energy.resize(Param::Nvmu);
         vx.resize(Param::Nvmu);
 
-        // A symmetric parallel-momentum grid removes the u=0 directional
-        // degeneracy of the former spherical representation.
+        assert(Param::Nv > 0 && Param::Nmu > 0 && Param::Nv % 2 == 0);
+        const double sinh_upar = std::sinh(Param::momentum_upar_stretch);
+        const double sinh_uperp = std::sinh(Param::momentum_uperp_stretch);
         for (int j = 0; j <= Param::Nv; ++j) {
-            upar_faces[j] = -umax + 2.0 * umax * j / Param::Nv;
+            const double xi = -1.0 + 2.0 * static_cast<double>(j) / Param::Nv;
+            upar_faces[j] = umax *
+                std::sinh(Param::momentum_upar_stretch * xi) / sinh_upar;
         }
+        upar_faces.front() = -umax;
+        upar_faces[Param::Nv / 2] = 0.0;
+        upar_faces.back() = umax;
         for (int k = 0; k <= Param::Nmu; ++k) {
-            uperp_faces[k] = umax * k / Param::Nmu;
+            const double eta = static_cast<double>(k) / Param::Nmu;
+            uperp_faces[k] = umax *
+                std::sinh(Param::momentum_uperp_stretch * eta) / sinh_uperp;
         }
+        uperp_faces.front() = 0.0;
+        uperp_faces.back() = umax;
         for (int j = 0; j < Param::Nv; ++j) {
             upar_cells[j] = 0.5 * (upar_faces[j] + upar_faces[j + 1]);
             upar_widths[j] = upar_faces[j + 1] - upar_faces[j];
         }
+        for (int jf = 1; jf < Param::Nv; ++jf)
+            upar_center_distances[jf] = upar_cells[jf] - upar_cells[jf - 1];
         for (int k = 0; k < Param::Nmu; ++k) {
             const double lo = uperp_faces[k];
             const double hi = uperp_faces[k + 1];
             uperp_cells[k] = 0.5 * (lo + hi);
+            uperp_widths[k] = hi - lo;
             uperp_ring_areas[k] = Const::pi * (hi * hi - lo * lo);
         }
         for (int j = 0; j < Param::Nv; ++j) {
@@ -235,11 +254,55 @@ struct CylindricalVelocityGrid {
                 vx[slot] = Const::c * upar_cells[j] / gamma;
             }
         }
+
+#if FP_ENABLE_DEBUG_DIAGNOSTICS
+        for (int j = 0; j < Param::Nv; ++j) {
+            assert(std::isfinite(upar_faces[j]));
+            assert(upar_faces[j + 1] > upar_faces[j]);
+            assert(std::isfinite(upar_widths[j]) && upar_widths[j] > 0.0);
+        }
+        for (int k = 0; k < Param::Nmu; ++k) {
+            assert(std::isfinite(uperp_faces[k]));
+            assert(uperp_faces[k + 1] > uperp_faces[k]);
+            assert(std::isfinite(uperp_widths[k]) && uperp_widths[k] > 0.0);
+        }
+        assert(upar_faces.front() == -umax && upar_faces.back() == umax);
+        assert(uperp_faces.front() == 0.0 && uperp_faces.back() == umax);
+        const double symmetry_tolerance = 64.0 *
+            std::numeric_limits<double>::epsilon() * umax;
+        for (int j = 0; j <= Param::Nv; ++j)
+            assert(std::fabs(upar_faces[j] + upar_faces[Param::Nv - j]) <=
+                   symmetry_tolerance);
+        double ring_sum = 0.0;
+        for (int k = 0; k < Param::Nmu; ++k) ring_sum += uperp_ring_areas[k];
+        assert(std::fabs(ring_sum - Const::pi * umax * umax) /
+               (Const::pi * umax * umax) <= 1.0e-13);
+        if (Param::Nv == 96)
+            assert(*std::min_element(upar_widths.begin(), upar_widths.end()) >= 0.0035 &&
+                   *std::min_element(upar_widths.begin(), upar_widths.end()) <= 0.0070);
+        if (Param::Nmu == 64)
+            assert(*std::min_element(uperp_widths.begin(), uperp_widths.end()) >= 0.0035 &&
+                   *std::min_element(uperp_widths.begin(), uperp_widths.end()) <= 0.0070);
+#endif
     }
 
     double cell_phase_volume(int j, int k) const
     {
         return upar_widths[j] * uperp_ring_areas[k];
+    }
+
+    bool is_uniform() const
+    {
+        const double tolerance = 64.0 * std::numeric_limits<double>::epsilon();
+        const double upar_reference = upar_widths.empty() ? 0.0 : upar_widths[0];
+        const double uperp_reference = uperp_widths.empty() ? 0.0 : uperp_widths[0];
+        for (size_t j = 1; j < upar_widths.size(); ++j)
+            if (std::fabs(upar_widths[j] - upar_reference) >
+                tolerance * std::max(1.0, std::fabs(upar_reference))) return false;
+        for (size_t k = 1; k < uperp_widths.size(); ++k)
+            if (std::fabs(uperp_widths[k] - uperp_reference) >
+                tolerance * std::max(1.0, std::fabs(uperp_reference))) return false;
+        return true;
     }
 };
 

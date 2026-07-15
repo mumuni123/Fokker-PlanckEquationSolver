@@ -1,11 +1,12 @@
 #include "vlasov_ampere_midpoint.h"
-#include "ppm_ctu_reconstruction.h"
+#include "nonuniform_reconstruction.h"
 #include "discrete_moment_operators.h"
 
 #include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <mpi.h>
 #include <omp.h>
@@ -59,6 +60,14 @@ inline bool normalize_roundoff_negative_candidate(double& candidate,
     return true;
 }
 
+const double kFctCoreBoundaryWidth = 0.1 * Const::micro;
+
+inline bool fct_core_x(double x)
+{
+    return x >= kFctCoreBoundaryWidth &&
+           x <= Param::Lx - kFctCoreBoundaryWidth;
+}
+
 void close_periodic_face_blocks(std::vector<double>& faces, int nxl,
                                 int block, int rank, int size, int tag)
 {
@@ -100,6 +109,25 @@ void exchange_neighbor_scalars(const std::vector<double>& local, int rank,
                  MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 }
 
+void exchange_neighbor_triplet(const double first[3], const double last[3],
+                               int rank, int size, double left_value[3],
+                               double right_value[3], int tag)
+{
+    if (size == 1) {
+        std::copy(last, last + 3, left_value);
+        std::copy(first, first + 3, right_value);
+        return;
+    }
+    const int left = (rank + size - 1) % size;
+    const int right = (rank + 1) % size;
+    MPI_Sendrecv(first, 3, MPI_DOUBLE, left, tag,
+                 right_value, 3, MPI_DOUBLE, right, tag,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    MPI_Sendrecv(last, 3, MPI_DOUBLE, right, tag + 1,
+                 left_value, 3, MPI_DOUBLE, left, tag + 1,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+}
+
 bool all_finite(const Species& sp, const EMFields& fields,
                 const std::vector<double>& current)
 {
@@ -112,6 +140,17 @@ bool all_finite(const Species& sp, const EMFields& fields,
     return true;
 }
 
+void low_order_solver_checkpoint(bool enabled, const char* phase, int mpi_rank)
+{
+    if (!enabled) return;
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (mpi_rank == 0) {
+        std::cerr << "production_7_2_solver_checkpoint phase=" << phase
+                  << std::endl;
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+
 }
 
 VlasovAmpereMidpointSolver::Result
@@ -120,12 +159,15 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
     const SpatialGrid& sg, double dt, double time, int mpi_rank,
     int mpi_size, int substeps_used) const
 {
+    low_order_solver_checkpoint(low_order_only_, "entry", mpi_rank);
     Result result;
     reset_result(result);
+    result.transport_low_order_only = low_order_only_ ? 1 : 0;
     result.substeps_used = substeps_used;
     result.species_np1 = bkg_n;
     result.beam_np1 = beam_n;
     result.fields_np1 = fields_n;
+    low_order_solver_checkpoint(low_order_only_, "result_initialized", mpi_rank);
 
     const int ng = sg.nghost;
     const int nxl = sg.nx_local;
@@ -138,36 +180,66 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
         const int velocity_linear = global_linear % Param::Nvmu;
         result.failure_worst_iv = velocity_linear / Param::Nmu;
         result.failure_worst_imu = velocity_linear % Param::Nmu;
+        const double x = sg.x_min +
+            (static_cast<double>(result.failure_worst_ix) + 0.5) * sg.dx;
+        result.failure_worst_is_core = fct_core_x(x) ? 1 : 0;
+        result.failure_worst_is_tail =
+            (result.failure_worst_iv >= 3 * Param::Nv / 4 ||
+             result.failure_worst_imu >= 3 * Param::Nmu / 4) ? 1 : 0;
     };
     // Reused across nonlinear iterations/substeps.  These are the dominant
     // transient allocations in the new FV/FCT kernel.
-    std::vector<double> fx_low(xflux_size, 0.0), fx_high(xflux_size, 0.0);
-    std::vector<double> fu_low(uflux_size, 0.0), fu_high(uflux_size, 0.0);
-    std::vector<double> cu_low(uflux_size, 0.0), cu_high(uflux_size, 0.0);
-    const size_t cell_count = static_cast<size_t>(sg.nx_total) * Param::Nvmu;
-    const size_t local_cell_count = static_cast<size_t>(nxl) * Param::Nvmu;
-    // Full PPM/CTU work storage.  These arrays are reused for every nonlinear
-    // iteration and substep; no per-face temporary allocation is performed.
-    std::vector<PpmCtu::Parabola> ppm_x(cell_count), ppm_u(local_cell_count);
-    std::vector<double> x_left_1d(xflux_size, 0.0), x_right_1d(xflux_size, 0.0);
-    std::vector<double> u_left_1d(uflux_size, 0.0), u_right_1d(uflux_size, 0.0);
-    std::vector<double> fx_provisional(xflux_size, 0.0);
-    std::vector<double> fu_provisional(uflux_size, 0.0);
-    std::vector<double> alpha_x_left(local_cell_count, 1.0);
-    std::vector<double> alpha_x_right(local_cell_count, 1.0);
-    std::vector<double> alpha_u_lower(local_cell_count, 1.0);
-    std::vector<double> alpha_u_upper(local_cell_count, 1.0);
-    std::vector<double> left_alpha_x_right(Param::Nvmu, 1.0);
-    std::vector<double> fx_final(xflux_size, 0.0), fu_final(uflux_size, 0.0);
-    std::vector<double> cu_final(uflux_size, 0.0);
-    std::vector<double> candidate_mass(local_cell_count, 0.0);
-    std::vector<double> donor_beta(local_cell_count, 1.0);
+    std::vector<double> fx_low(xflux_size, 0.0);
+    std::vector<double> fu_low(uflux_size, 0.0);
+    std::vector<double> cu_low(uflux_size, 0.0);
+    const size_t high_local_cell_count = low_order_only_
+        ? 0 : static_cast<size_t>(nxl) * Param::Nvmu;
+    const size_t high_xflux_size = low_order_only_ ? 0 : xflux_size;
+    const size_t high_uflux_size = low_order_only_ ? 0 : uflux_size;
+    std::vector<double> fx_high(high_xflux_size, 0.0);
+    std::vector<double> fu_high(high_uflux_size, 0.0);
+    std::vector<double> cu_high(high_uflux_size, 0.0);
+    // Centered u-force candidate is kept separately from the selected high
+    // flux so the closure audit can isolate boundary/upwind stabilization.
+    std::vector<double> cu_high_center(high_uflux_size, 0.0);
+    std::vector<double> inv_cell_volume(low_order_only_ ? 0 : Param::Nvmu, 0.0);
+    if (!low_order_only_) {
+        for (int j = 0; j < Param::Nv; ++j) {
+            for (int k = 0; k < Param::Nmu; ++k) {
+                inv_cell_volume[idx2(j, k)] = 1.0 /
+                    (sg.dx * bkg_n.cgrid.cell_phase_volume(j, k));
+            }
+        }
+    }
+    std::vector<double> alpha_x_left(high_local_cell_count, 1.0);
+    std::vector<double> alpha_x_right(high_local_cell_count, 1.0);
+    std::vector<double> alpha_u_lower(high_local_cell_count, 1.0);
+    std::vector<double> alpha_u_upper(high_local_cell_count, 1.0);
+    std::vector<double> left_alpha_x_right(
+        low_order_only_ ? 0 : Param::Nvmu, 1.0);
+    std::vector<double> fx_final(high_xflux_size, 0.0),
+        fu_final(high_uflux_size, 0.0);
+    std::vector<double> cu_final(high_uflux_size, 0.0);
+    std::vector<double> candidate_mass(high_local_cell_count, 0.0);
+    std::vector<double> donor_beta(high_local_cell_count, 1.0);
     Species low_state_buffer = bkg_n;
     std::vector<double> e_mid_buffer(static_cast<size_t>(nxl), 0.0);
     std::vector<double> next_e_buffer(static_cast<size_t>(nxl), 0.0);
     std::vector<double> integrated_jn_buffer(nface, 0.0);
     std::vector<double> integrated_je_buffer(static_cast<size_t>(nxl), 0.0);
+    std::vector<double> integrated_je_high_buffer(static_cast<size_t>(nxl), 0.0);
+    std::vector<double> integrated_je_center_buffer(static_cast<size_t>(nxl), 0.0);
     std::vector<double> je_cell_buffer(static_cast<size_t>(nxl), 0.0);
+    std::vector<double> je_high_cell_buffer(static_cast<size_t>(nxl), 0.0);
+    std::vector<double> je_center_cell_buffer(static_cast<size_t>(nxl), 0.0);
+    // Per-substep low/high/final pairing audit storage.  These are diagnostic
+    // views of the already-built fluxes and never feed back into transport.
+    std::vector<double> layered_jn_low(nface, 0.0);
+    std::vector<double> layered_jn_high(nface, 0.0);
+    std::vector<double> layered_jn_final(nface, 0.0);
+    std::vector<double> layered_je_low(static_cast<size_t>(nxl), 0.0);
+    std::vector<double> layered_je_high(static_cast<size_t>(nxl), 0.0);
+    std::vector<double> layered_je_final(static_cast<size_t>(nxl), 0.0);
     std::vector<double> initial_ke_cell(static_cast<size_t>(nxl), 0.0);
     std::vector<double> initial_p_cell(static_cast<size_t>(nxl), 0.0);
     std::vector<double> final_ke_cell(static_cast<size_t>(nxl), 0.0);
@@ -186,6 +258,12 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
     result.j_total_face_mid.assign(nface, 0.0);
     result.j_bkg_energy_debug_face.assign(nface, 0.0);
 
+    // The production low-order Ampere benchmark deliberately omits all
+    // high-order/FCT storage.  Checkpoints are test-only and use the same
+    // collective sequence on every rank.
+    low_order_solver_checkpoint(low_order_only_, "work_arrays_initialized",
+                                mpi_rank);
+
     std::vector<double> e_end(static_cast<size_t>(nxl), 0.0);
     for (int iface = 0; iface < nxl; ++iface) {
         e_end[static_cast<size_t>(iface)] = fields_n.Ex_face[iface];
@@ -200,35 +278,43 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
     // predictor during phases 1--5, and its lag is kept explicit.
     BeamPIC beam_predictor = beam_n;
     EMFields beam_field = fields_n;
-    beam_predictor.begin_step(sg, dt);
-    beam_predictor.inject(sg, beam_field, dt, time, mpi_rank, mpi_size);
-    const double beam_ke_before = beam_predictor.total_kinetic_energy();
-    beam_predictor.push(sg, beam_field, dt, mpi_rank, mpi_size);
-    const double beam_ke_after = beam_predictor.total_kinetic_energy();
-    beam_predictor.deposit_density(sg, mpi_rank, mpi_size);
-    beam_predictor.finalize_charge_conserving_current(sg, dt, mpi_rank,
-                                                      mpi_size);
+    double beam_ke_before = 0.0;
+    double beam_ke_after = 0.0;
+    if (beam_enabled_) {
+        beam_predictor.begin_step(sg, dt);
+        beam_predictor.inject(sg, beam_field, dt, time, mpi_rank, mpi_size);
+        beam_ke_before = beam_predictor.total_kinetic_energy();
+        beam_predictor.push(sg, beam_field, dt, mpi_rank, mpi_size);
+        beam_ke_after = beam_predictor.total_kinetic_energy();
+        beam_predictor.deposit_density(sg, mpi_rank, mpi_size);
+        beam_predictor.finalize_charge_conserving_current(sg, dt, mpi_rank,
+                                                          mpi_size);
+    }
+    low_order_solver_checkpoint(low_order_only_, "beam_predictor_ready",
+                                mpi_rank);
     std::vector<double> jbeam(nface, 0.0);
-    for (size_t i = 0; i < std::min(jbeam.size(),
-                                    beam_predictor.current_face_x.size()); ++i) {
-        jbeam[i] = beam_predictor.current_face_x[i];
+    if (beam_enabled_) {
+        for (size_t i = 0; i < std::min(jbeam.size(),
+                                        beam_predictor.current_face_x.size()); ++i) {
+            jbeam[i] = beam_predictor.current_face_x[i];
+        }
     }
 
-    const int max_iters = 20;
+    const int max_iters = max_midpoint_iterations_;
+    if (midpoint_iteration_trace_for_test_) {
+        result.midpoint_residual_e_history.reserve(
+            static_cast<size_t>(max_iters));
+    }
     const double field_tol = 1.0e-6;
     const double current_tol = 1.0e-5;
     const double omega = 0.55;
-    double initial_number = 0.0;
-    double initial_ke = 0.0;
-    bkg_n.total_particle_number_and_energy(initial_number, initial_ke);
-
     const auto write_stage5_diagnostics = [&](int accepted, int soft_unconverged) {
         static int stage5_write_count = 0;
         const bool flush_now = (++stage5_write_count % 20) == 0;
         if (mpi_rank == 0) {
             static std::ofstream global_file("output/background_closure_diagnostics.dat");
             if (global_file.tellp() == std::streampos(0)) {
-                global_file << "# time_fs accepted soft R_FV R_couple R_total R_physical dK face_work "
+                global_file << "# time_fs accepted soft R_FV R_couple R_couple_centered R_couple_upwind_stabilization R_couple_fct_stabilization R_total R_physical dK face_work "
                             << "u_energy u_momentum u_energy_outflow PsiK_boundary PsiP_boundary "
                             << "JN_minus_JE_L2 JN_minus_JE_Linf vEC_Linf vEC_rel "
                             << "fct_budget_violation correction_enabled skip_zero_field skip_raw "
@@ -253,6 +339,9 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
             }
             global_file << time / Const::femto << " " << accepted << " " << soft_unconverged << " "
                         << result.stage5_r_fv << " " << result.stage5_r_couple << " "
+                        << result.stage5_r_couple_centered << " "
+                        << result.stage5_r_couple_upwind_stabilization << " "
+                        << result.stage5_r_couple_fct_stabilization << " "
                         << result.stage5_r_total << " " << result.stage5_r_physical_balance << " "
                         << result.delta_ke_bkg << " "
                         << result.field_work_bkg << " " << result.stage5_u_energy_moment << " "
@@ -375,12 +464,16 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
     };
 
     for (int iter = 0; iter < max_iters; ++iter) {
+        if (iter == 0)
+            low_order_solver_checkpoint(low_order_only_, "iteration_begin", mpi_rank);
         std::vector<double>& e_mid = e_mid_buffer;
         for (int iface = 0; iface < nxl; ++iface) {
             e_mid[iface] = 0.5 * (fields_n.Ex_face[iface] + e_end[iface]);
         }
         EMFields fields_mid;
         set_midpoint_field(fields_mid, fields_n, e_mid, sg, mpi_rank, mpi_size);
+        if (iter == 0)
+            low_order_solver_checkpoint(low_order_only_, "midpoint_field_ready", mpi_rank);
 
         double local_cfl = 0.0;
         for (int ix = 0; ix < nxl; ++ix) {
@@ -401,6 +494,9 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
         MPI_Allreduce(MPI_IN_PLACE, &global_cfl, 1, MPI_DOUBLE, MPI_MAX,
                       MPI_COMM_WORLD);
         const int nsub = std::max(1, static_cast<int>(std::ceil(global_cfl / 0.8)));
+        // Report the real force-subcycle count rather than only the outer
+        // retry count supplied at entry.
+        result.substeps_used = nsub;
         if (nsub > 8 || !std::isfinite(global_cfl)) {
             result.failed = true;
             result.state_advanced = 0;
@@ -410,12 +506,30 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
             result.x_low_failure_kind = 3; // genuine combined CFL failure
             return result;
         }
+        if (iter == 0)
+            low_order_solver_checkpoint(low_order_only_, "cfl_ready", mpi_rank);
 
+        // Every transport current is evaluated from the same Picard midpoint
+        // state.  The updated work state remains the conservative endpoint
+        // f^(n+1)=f^n-dt L(f^(n+1/2)).
+        Species midpoint_state = bkg_n;
+        #pragma omp parallel for schedule(static)
+        for (long long p = 0;
+             p < static_cast<long long>(midpoint_state.f.size()); ++p) {
+            midpoint_state.f[static_cast<size_t>(p)] = 0.5 * (
+                bkg_n.f[static_cast<size_t>(p)] +
+                guess.f[static_cast<size_t>(p)]);
+        }
+        exchange_ghosts_x_persistent(midpoint_state, sg, mpi_rank, mpi_size);
         Species work = bkg_n;
         std::vector<double>& integrated_jn = integrated_jn_buffer;
         std::vector<double>& integrated_je_cell = integrated_je_buffer;
+        std::vector<double>& integrated_je_high_cell = integrated_je_high_buffer;
+        std::vector<double>& integrated_je_center_cell = integrated_je_center_buffer;
         std::fill(integrated_jn.begin(), integrated_jn.end(), 0.0);
         std::fill(integrated_je_cell.begin(), integrated_je_cell.end(), 0.0);
+        std::fill(integrated_je_high_cell.begin(), integrated_je_high_cell.end(), 0.0);
+        std::fill(integrated_je_center_cell.begin(), integrated_je_center_cell.end(), 0.0);
         std::fill(psi_k_x.begin(), psi_k_x.end(), 0.0);
         std::fill(psi_p_x.begin(), psi_p_x.end(), 0.0);
         std::fill(u_energy_cell.begin(), u_energy_cell.end(), 0.0);
@@ -445,11 +559,28 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
         double limiter_faces = 0.0;
         double limiter_active = 0.0;
         double limiter_min = 1.0;
+        double limiter_faces_core = 0.0;
+        double limiter_faces_boundary = 0.0;
+        double limiter_active_core = 0.0;
+        double limiter_active_boundary = 0.0;
+        double limiter_min_core = 1.0;
+        double limiter_min_boundary = 1.0;
         double fct_budget_violation = 0.0;
 
         const double h = dt / nsub;
         const auto capture_accepted_transport =
             [&](const Species& committed) {
+                // low_order_only_ intentionally leaves high/FCT work arrays
+                // empty.  The accepted-state audit must therefore use the
+                // same low-order layers as both its high and final views.
+                const std::vector<double>& audit_fx_high = low_order_only_
+                    ? fx_low : fx_high;
+                const std::vector<double>& audit_fu_high = low_order_only_
+                    ? fu_low : fu_high;
+                const std::vector<double>& audit_fx_final = low_order_only_
+                    ? fx_low : fx_final;
+                const std::vector<double>& audit_fu_final = low_order_only_
+                    ? fu_low : fu_final;
                 double local_min = std::numeric_limits<double>::infinity();
                 #pragma omp parallel for reduction(min:local_min)
                 for (int ix = 0; ix < nxl; ++ix)
@@ -480,30 +611,30 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                                 const size_t p = static_cast<size_t>(ix) *
                                     Param::Nvmu + idx2(j, k);
                                 const double a_lim[4] = {
-                                    h * (fx_final[xface_index(ix, j, k)] -
+                                    h * (audit_fx_final[xface_index(ix, j, k)] -
                                          fx_low[xface_index(ix, j, k)]),
-                                    h * (fx_final[xface_index(ix + 1, j, k)] -
+                                    h * (audit_fx_final[xface_index(ix + 1, j, k)] -
                                          fx_low[xface_index(ix + 1, j, k)]),
-                                    h * (fu_final[uface_index(ix, j, k)] -
+                                    h * (audit_fu_final[uface_index(ix, j, k)] -
                                          fu_low[uface_index(ix, j, k)]),
-                                    h * (fu_final[uface_index(ix, j + 1, k)] -
+                                    h * (audit_fu_final[uface_index(ix, j + 1, k)] -
                                          fu_low[uface_index(ix, j + 1, k)])
                                 };
                                 const double a_raw[4] = {
-                                    h * (fx_high[xface_index(ix, j, k)] -
+                                    h * (audit_fx_high[xface_index(ix, j, k)] -
                                          fx_low[xface_index(ix, j, k)]),
-                                    h * (fx_high[xface_index(ix + 1, j, k)] -
+                                    h * (audit_fx_high[xface_index(ix + 1, j, k)] -
                                          fx_low[xface_index(ix + 1, j, k)]),
-                                    h * (fu_high[uface_index(ix, j, k)] -
+                                    h * (audit_fu_high[uface_index(ix, j, k)] -
                                          fu_low[uface_index(ix, j, k)]),
-                                    h * (fu_high[uface_index(ix, j + 1, k)] -
+                                    h * (audit_fu_high[uface_index(ix, j + 1, k)] -
                                          fu_low[uface_index(ix, j + 1, k)])
                                 };
                                 record[0] = static_cast<double>(
                                     (sg.ix_start + ix) * Param::Nvmu + idx2(j, k));
                                 record[1] = low_state_buffer.f[
                                     mass_index(ng + ix, j, k)];
-                                record[2] = candidate_mass[p];
+                                record[2] = low_order_only_ ? m_safe : candidate_mass[p];
                                 record[3] = m_safe;
                                 record[4] = std::max(0.0, -a_lim[0]) +
                                     std::max(0.0, a_lim[1]) +
@@ -513,7 +644,7 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                                     std::max(0.0, -a_lim[1]) +
                                     std::max(0.0, a_lim[2]) +
                                     std::max(0.0, -a_lim[3]);
-                                record[6] = donor_beta[p];
+                                record[6] = low_order_only_ ? 1.0 : donor_beta[p];
                                 for (int f = 0; f < 4; ++f) {
                                     record[7 + f] = (a_raw[f] != 0.0)
                                         ? a_lim[f] / a_raw[f] : 1.0;
@@ -567,7 +698,15 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                                              mpi_size);
                 double local_min = std::numeric_limits<double>::infinity();
                 double local_nonfinite = 0.0;
-                #pragma omp parallel for reduction(min:local_min) reduction(max:local_nonfinite)
+                double local_negative_total = 0.0;
+                double local_negative_mass_core = 0.0;
+                double local_positive_mass_core = 0.0;
+                double local_negative_energy_core = 0.0;
+                double local_positive_energy_core = 0.0;
+                double local_negative_current_core = 0.0;
+                double local_positive_current_core = 0.0;
+                long long local_negative_core_cells = 0;
+                #pragma omp parallel for reduction(min:local_min) reduction(max:local_nonfinite) reduction(+:local_negative_total,local_negative_mass_core,local_positive_mass_core,local_negative_energy_core,local_positive_energy_core,local_negative_current_core,local_positive_current_core,local_negative_core_cells)
                 for (int ix = 0; ix < nxl; ++ix)
                     for (int j = 0; j < Param::Nv; ++j)
                         for (int k = 0; k < Param::Nmu; ++k) {
@@ -575,6 +714,24 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                                 mass_index(ng + ix, j, k)];
                             local_min = std::min(local_min, m);
                             if (!std::isfinite(m)) local_nonfinite = 1.0;
+                            const bool core = fct_core_x(sg.x(ng + ix));
+                            const double abs_mass = std::fabs(m);
+                            const double energy = bkg_n.cgrid.kinetic_energy[idx2(j, k)];
+                            const double current_weight = std::fabs(
+                                bkg_n.charge * bkg_n.cgrid.vx[idx2(j, k)]);
+                            if (m < 0.0) {
+                                local_negative_total += -m;
+                                if (core) {
+                                    local_negative_mass_core += -m;
+                                    local_negative_energy_core += energy * abs_mass;
+                                    local_negative_current_core += current_weight * abs_mass;
+                                    local_negative_core_cells += 1;
+                                }
+                            } else if (core) {
+                                local_positive_mass_core += m;
+                                local_positive_energy_core += energy * m;
+                                local_positive_current_core += current_weight * m;
+                            }
                         }
                 struct GateMinLoc {
                     double value;
@@ -586,6 +743,33 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                               MPI_MINLOC, MPI_COMM_WORLD);
                 MPI_Allreduce(MPI_IN_PLACE, &local_nonfinite, 1, MPI_DOUBLE,
                               MPI_MAX, MPI_COMM_WORLD);
+                double debt_sums[7] = {
+                    local_negative_total, local_negative_mass_core,
+                    local_positive_mass_core, local_negative_energy_core,
+                    local_positive_energy_core, local_negative_current_core,
+                    local_positive_current_core};
+                MPI_Allreduce(MPI_IN_PLACE, debt_sums, 7, MPI_DOUBLE, MPI_SUM,
+                              MPI_COMM_WORLD);
+                long long global_negative_core_cells = local_negative_core_cells;
+                MPI_Allreduce(MPI_IN_PLACE, &global_negative_core_cells, 1,
+                              MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
+                result.neg_mass_total_guard = debt_sums[0];
+                result.neg_mass_core = debt_sums[1];
+                result.neg_mass_core_fraction = debt_sums[1] /
+                    std::max(std::numeric_limits<double>::min(), debt_sums[2]);
+                result.neg_energy_core_abs = debt_sums[3];
+                result.neg_energy_core_fraction = debt_sums[3] /
+                    std::max(std::numeric_limits<double>::min(), debt_sums[4]);
+                result.neg_current_core_abs = debt_sums[5];
+                result.neg_current_core_fraction = debt_sums[5] /
+                    std::max(std::numeric_limits<double>::min(), debt_sums[6]);
+                result.neg_cell_core = global_negative_core_cells;
+                const bool core_macro_debt =
+                    result.neg_mass_core_fraction > 1.0e-6 ||
+                    result.neg_energy_core_fraction > 1.0e-6 ||
+                    result.neg_current_core_fraction > 1.0e-6;
+                result.negative_debt_level = core_macro_debt ? NEG_DEBT_ABORT :
+                    (debt_sums[0] > 0.0 ? NEG_DEBT_WARN : NEG_DEBT_OK);
                 if (local_nonfinite == 0.0 && global_owner.value >= 0.0)
                     return true;
 
@@ -604,6 +788,15 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                 }
                 MPI_Bcast(&global_linear, 1, MPI_INT, global_owner.rank,
                           MPI_COMM_WORLD);
+                if (local_nonfinite == 0.0 &&
+                    allow_finite_negative_debt_for_test_ && !core_macro_debt) {
+                    result.trial_failure_downgraded = 1;
+                    result.accepted_with_negative_debt = 1;
+                    result.failure_final_min = global_owner.value;
+                    if (global_linear >= 0)
+                        set_failure_location(global_linear);
+                    return true;
+                }
                 result.failed = true;
                 result.state_advanced = 0;
                 result.failure_reason =
@@ -617,6 +810,8 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                 return false;
             };
         for (int sub = 0; sub < nsub; ++sub) {
+            if (iter == 0 && sub == 0)
+                low_order_solver_checkpoint(low_order_only_, "substep_begin", mpi_rank);
             if (sub == 0)
                 exchange_ghosts_x_persistent(work, sg, mpi_rank, mpi_size);
             std::fill(fx_low.begin(), fx_low.end(), 0.0);
@@ -625,10 +820,16 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
             std::fill(fu_high.begin(), fu_high.end(), 0.0);
             std::fill(cu_low.begin(), cu_low.end(), 0.0);
             std::fill(cu_high.begin(), cu_high.end(), 0.0);
+            std::fill(cu_high_center.begin(), cu_high_center.end(), 0.0);
 
-            // Unsplit donor-cell baseline.  It shares the same start state,
-            // substep, face topology, velocities and accelerations as PPM-CTU.
-            #pragma omp parallel for schedule(static)
+            // Unsplit donor-cell FCT baseline.  Unlike the high-order
+            // midpoint candidate, this is an explicit positive update of the
+            // current substep state `work`; its donor mass and update state
+            // are therefore identical.
+            double layered_jn_low_linf = 0.0;
+            double layered_jn_high_linf = 0.0;
+            double layered_jn_final_linf = 0.0;
+            #pragma omp parallel for schedule(static) reduction(max:layered_jn_low_linf,layered_jn_high_linf,layered_jn_final_linf)
             for (int iface = 0; iface <= nxl; ++iface) {
                 const int il = ng + iface - 1;
                 const int ir = ng + iface;
@@ -648,189 +849,280 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                 const double a = bkg_n.charge * fields_mid.Ex[ng + ix] /
                                  (bkg_n.mass * Const::c);
                 for (int jf = 1; jf < Param::Nv; ++jf) {
-                    const double du = 0.5 * (bkg_n.cgrid.upar_widths[jf - 1] +
-                                             bkg_n.cgrid.upar_widths[jf]);
                     for (int k = 0; k < Param::Nmu; ++k) {
                         const int donor = (a >= 0.0) ? jf - 1 : jf;
-                        const double coefficient =
-                            work.f[mass_index(ng + ix, donor, k)] / du;
+                        const double donor_du = bkg_n.cgrid.upar_widths[donor];
+                        // cu_low stores C_u, not Phi_u.  Since f stores the
+                        // cell mass M, this coefficient retains dx and the
+                        // perpendicular ring measure through M/du_face.
+                        const double coefficient = Stage5::donor_cell_coefficient(
+                            work.f[mass_index(ng + ix, donor, k)], donor_du);
                         const size_t id = uface_index(ix, jf, k);
                         cu_low[id] = coefficient;
                         fu_low[id] = a * coefficient;
                     }
                 }
-            }
-
-            // A--C: reconstruct complete PPM parabolas, then integrate their
-            // swept half-step intervals.  The two directions use the same
-            // substep-start state; neither is reconstructed from an updated
-            // state of the other direction.
-            #pragma omp parallel for schedule(static)
-            for (int i = 2; i <= sg.nx_total - 3; ++i) {
-                for (int j = 0; j < Param::Nv; ++j) {
+                // Open velocity-domain boundaries: only outward donor flux
+                // is present.  The boundary donor uses its own cell width,
+                // and the existing boundary ledger records the resulting
+                // particle, momentum and energy loss.
+                if (a < 0.0) {
                     for (int k = 0; k < Param::Nmu; ++k) {
-                        ppm_x[mass_index(i, j, k)] = PpmCtu::reconstruct(
-                            work.f[mass_index(i - 2, j, k)],
-                            work.f[mass_index(i - 1, j, k)],
-                            work.f[mass_index(i, j, k)],
-                            work.f[mass_index(i + 1, j, k)],
-                            work.f[mass_index(i + 2, j, k)]);
+                        const size_t id = uface_index(ix, 0, k);
+                        cu_low[id] = Stage5::donor_cell_coefficient(
+                            work.f[mass_index(ng + ix, 0, k)],
+                            bkg_n.cgrid.upar_widths[0]);
+                        fu_low[id] = a * cu_low[id];
+                    }
+                } else if (a > 0.0) {
+                    for (int k = 0; k < Param::Nmu; ++k) {
+                        const size_t id = uface_index(ix, Param::Nv, k);
+                        cu_low[id] = Stage5::donor_cell_coefficient(
+                            work.f[mass_index(ng + ix, Param::Nv - 1, k)],
+                            bkg_n.cgrid.upar_widths[Param::Nv - 1]);
+                        fu_low[id] = a * cu_low[id];
                     }
                 }
             }
-            #pragma omp parallel for schedule(static)
-            for (int ix = 0; ix < nxl; ++ix) {
-                for (int j = 0; j < Param::Nv; ++j) {
-                    const int jm2 = std::max(0, j - 2);
-                    const int jm1 = std::max(0, j - 1);
-                    const int jp1 = std::min(Param::Nv - 1, j + 1);
-                    const int jp2 = std::min(Param::Nv - 1, j + 2);
-                    for (int k = 0; k < Param::Nmu; ++k) {
-                        ppm_u[static_cast<size_t>(ix) * Param::Nvmu + idx2(j, k)] =
-                            PpmCtu::reconstruct(work.f[mass_index(ng + ix, jm2, k)],
-                                               work.f[mass_index(ng + ix, jm1, k)],
-                                               work.f[mass_index(ng + ix, j, k)],
-                                               work.f[mass_index(ng + ix, jp1, k)],
-                                               work.f[mass_index(ng + ix, jp2, k)]);
-                    }
-                }
-            }
+            if (iter == 0 && sub == 0)
+                low_order_solver_checkpoint(low_order_only_, "low_fluxes_ready", mpi_rank);
 
-            std::fill(fx_provisional.begin(), fx_provisional.end(), 0.0);
-            std::fill(fu_provisional.begin(), fu_provisional.end(), 0.0);
+            if (low_order_only_) {
+                // Test-only production mode: high-order reconstruction and
+                // CTU are not evaluated.  Shared accounting below aliases
+                // low fluxes as the high/final diagnostic layers.
+            } else {
+            // Reconstruct physical cell-average fbar rather than integrated
+            // mass M.  Both directions read the same substep-start state and
+            // write one MUSCL Riemann flux per shared face.
+            const auto x_center = [&](int storage_ix) {
+                return sg.x_min + (sg.ix_start + storage_ix - ng + 0.5) * sg.dx;
+            };
+            const auto fbar = [&](int storage_ix, int j, int k) {
+                return midpoint_state.f[mass_index(storage_ix, j, k)] *
+                    inv_cell_volume[idx2(j, k)];
+            };
+
             #pragma omp parallel for schedule(static)
             for (int iface = 0; iface <= nxl; ++iface) {
                 const int il = ng + iface - 1;
                 const int ir = ng + iface;
-                for (int j = 0; j < Param::Nv; ++j) for (int k = 0; k < Param::Nmu; ++k) {
-                    const double v = bkg_n.cgrid.vx[idx2(j, k)];
-                    const double sigma = 0.5 * h * std::fabs(v) / sg.dx;
-                    const size_t id = xface_index(iface, j, k);
-                    x_left_1d[id] = PpmCtu::trace_right(ppm_x[mass_index(il, j, k)], sigma);
-                    x_right_1d[id] = PpmCtu::trace_left(ppm_x[mass_index(ir, j, k)], sigma);
-                    fx_provisional[id] = v * PpmCtu::upwind_state(x_left_1d[id],
-                                                           x_right_1d[id], v) / sg.dx;
-                }
-            }
-            close_periodic_face_blocks(fx_provisional, nxl, Param::Nvmu,
-                                       mpi_rank, mpi_size, 902);
-
-            #pragma omp parallel for schedule(static)
-            for (int ix = 0; ix < nxl; ++ix) {
-                const double a = bkg_n.charge * fields_mid.Ex[ng + ix] /
-                                 (bkg_n.mass * Const::c);
-                for (int jf = 1; jf < Param::Nv; ++jf) {
-                    const int jl = jf - 1;
-                    const int jr = jf;
-                    const double du_l = bkg_n.cgrid.upar_widths[jl];
-                    const double du_r = bkg_n.cgrid.upar_widths[jr];
-                    const size_t id_base = static_cast<size_t>(ix) * Param::Nvmu;
+                const double s_face = sg.x_min + (sg.ix_start + iface) * sg.dx;
+                for (int j = 0; j < Param::Nv; ++j) {
                     for (int k = 0; k < Param::Nmu; ++k) {
-                        const size_t id = uface_index(ix, jf, k);
-                        u_left_1d[id] = PpmCtu::trace_right(
-                            ppm_u[id_base + idx2(jl, k)], 0.5 * h * std::fabs(a) / du_l);
-                        u_right_1d[id] = PpmCtu::trace_left(
-                            ppm_u[id_base + idx2(jr, k)], 0.5 * h * std::fabs(a) / du_r);
-                        const double state = PpmCtu::upwind_state(u_left_1d[id], u_right_1d[id], a);
-                        const double du_face = 0.5 * (du_l + du_r);
-                        cu_high[id] = state / du_face;
-                        fu_provisional[id] = a * cu_high[id];
+                        const NonuniformMuscl::FaceStates states =
+                            NonuniformMuscl::reconstruct_face(
+                                fbar(il - 1, j, k), fbar(il, j, k),
+                                fbar(ir, j, k), fbar(ir + 1, j, k),
+                                x_center(il - 1), x_center(il),
+                                x_center(ir), x_center(ir + 1), s_face);
+                        const double state = NonuniformMuscl::upwind_state(
+                            states, bkg_n.cgrid.vx[idx2(j, k)]);
+                        fx_high[xface_index(iface, j, k)] =
+                            bkg_n.cgrid.vx[idx2(j, k)] * state *
+                            bkg_n.cgrid.upar_widths[j] *
+                            bkg_n.cgrid.uperp_ring_areas[k];
                     }
-                }
-            }
-
-            // D--F: Colella transverse corrections use only provisional
-            // normal fluxes.  A second Riemann solve produces the sole PPM-CTU
-            // high-order candidate consumed by the shared two-dimensional FCT.
-            #pragma omp parallel for schedule(static)
-            for (int iface = 0; iface <= nxl; ++iface) {
-                const int ixl = (iface == 0) ? nxl - 1 : iface - 1;
-                const int ixr = (iface == nxl) ? 0 : iface;
-                for (int j = 0; j < Param::Nv; ++j) for (int k = 0; k < Param::Nmu; ++k) {
-                    const size_t id = xface_index(iface, j, k);
-                    const double v = bkg_n.cgrid.vx[idx2(j, k)];
-                    const double left_star = x_left_1d[id] - 0.5 * h *
-                        (fu_provisional[uface_index(ixl, j + 1, k)] -
-                         fu_provisional[uface_index(ixl, j, k)]);
-                    const double right_star = x_right_1d[id] - 0.5 * h *
-                        (fu_provisional[uface_index(ixr, j + 1, k)] -
-                         fu_provisional[uface_index(ixr, j, k)]);
-                    fx_high[id] = v * PpmCtu::upwind_state(left_star, right_star, v) / sg.dx;
                 }
             }
             close_periodic_face_blocks(fx_high, nxl, Param::Nvmu,
                                        mpi_rank, mpi_size, 908);
+
             #pragma omp parallel for schedule(static)
             for (int ix = 0; ix < nxl; ++ix) {
-                const double a = bkg_n.charge * fields_mid.Ex[ng + ix] /
+                const int storage_ix = ng + ix;
+                const double a = bkg_n.charge * fields_mid.Ex[storage_ix] /
                                  (bkg_n.mass * Const::c);
-                for (int jf = 1; jf < Param::Nv; ++jf) for (int k = 0; k < Param::Nmu; ++k) {
-                    const size_t id = uface_index(ix, jf, k);
-                    const double left_star = u_left_1d[id] - 0.5 * h *
-                        (fx_provisional[xface_index(ix + 1, jf - 1, k)] -
-                         fx_provisional[xface_index(ix, jf - 1, k)]);
-                    const double right_star = u_right_1d[id] - 0.5 * h *
-                        (fx_provisional[xface_index(ix + 1, jf, k)] -
-                         fx_provisional[xface_index(ix, jf, k)]);
-                    const double du = 0.5 * (bkg_n.cgrid.upar_widths[jf - 1] +
-                                             bkg_n.cgrid.upar_widths[jf]);
-                    const double state = PpmCtu::upwind_state(left_star, right_star, a);
-                    cu_high[id] = state / du;
-                    fu_high[id] = a * cu_high[id];
+                for (int jf = 1; jf < Param::Nv; ++jf) {
+                    const int jl = jf - 1;
+                    const int jr = jf;
+                    for (int k = 0; k < Param::Nmu; ++k) {
+                        const double area = bkg_n.cgrid.uperp_ring_areas[k];
+                        const int jll = (jl == 0) ? jl : jl - 1;
+                        const int jrr = (jr + 1 == Param::Nv) ? jr : jr + 1;
+                        const double s_jll = (jl == 0)
+                            ? bkg_n.cgrid.upar_cells[jl] - bkg_n.cgrid.upar_widths[jl]
+                            : bkg_n.cgrid.upar_cells[jll];
+                        const double s_jrr = (jr + 1 == Param::Nv)
+                            ? bkg_n.cgrid.upar_cells[jr] + bkg_n.cgrid.upar_widths[jr]
+                            : bkg_n.cgrid.upar_cells[jrr];
+                        const NonuniformMuscl::FaceStates states =
+                            NonuniformMuscl::reconstruct_face(
+                                fbar(storage_ix, jll, k),
+                                fbar(storage_ix, jl, k),
+                                fbar(storage_ix, jr, k),
+                                fbar(storage_ix, jrr, k),
+                                s_jll,
+                                bkg_n.cgrid.upar_cells[jl],
+                                bkg_n.cgrid.upar_cells[jr],
+                                s_jrr,
+                                bkg_n.cgrid.upar_faces[jf]);
+                        const size_t id = uface_index(ix, jf, k);
+                        // Production high order is centered at every x.
+                        // Donor-cell transport exists only in the separate
+                        // FCT low-order base.  The former boundary-upwind
+                        // high candidate is retained behind a test-only A/B
+                        // switch and never selected by normal production.
+                        const double centered =
+                            NonuniformMuscl::centered_state(states);
+                        cu_high_center[id] =
+                            NonuniformMuscl::upar_face_coefficient(
+                                centered, sg.dx, area);
+                        cu_high[id] = cu_high_center[id];
+                        if (legacy_boundary_upwind_high_candidate_for_test_ &&
+                            !fct_core_x(sg.x(storage_ix))) {
+                            const double upwind =
+                                NonuniformMuscl::upwind_state(states, a);
+                            cu_high[id] = NonuniformMuscl::upar_face_coefficient(
+                                upwind, sg.dx, area);
+                        }
+                        fu_high[id] = NonuniformMuscl::upar_face_flux(a, cu_high[id]);
+                    }
+                }
+                // Keep the physical velocity-domain outflow exactly shared
+                // with the donor baseline; no one-sided MUSCL stencil exists
+                // outside the truncated u_parallel domain.
+                for (int k = 0; k < Param::Nmu; ++k) {
+                    const size_t lower = uface_index(ix, 0, k);
+                    const size_t upper = uface_index(ix, Param::Nv, k);
+                    cu_high[lower] = cu_low[lower];
+                    cu_high[upper] = cu_low[upper];
+                    fu_high[lower] = fu_low[lower];
+                    fu_high[upper] = fu_low[upper];
+                    cu_high_center[lower] = cu_low[lower];
+                    cu_high_center[upper] = cu_low[upper];
                 }
             }
+            } // !low_order_only_: nonuniform MUSCL high-order candidate
 
             Species& low_state = low_state_buffer;
             low_state = work;
+            const auto low_roundoff_bound = [](double m_old, double tx_left,
+                                                double tx_right, double tu_lower,
+                                                double tu_upper) {
+                // Covers the old-mass remainder and every incoming/outgoing
+                // transfer in the explicit donor-cell summation.  The
+                // subnormal allowance is needed in empty velocity tails.
+                const double scale = std::fabs(m_old) + std::fabs(tx_left) +
+                    std::fabs(tx_right) + std::fabs(tu_lower) +
+                    std::fabs(tu_upper);
+                return 256.0 * std::numeric_limits<double>::epsilon() * scale +
+                    64.0 * std::numeric_limits<double>::denorm_min();
+            };
             #pragma omp parallel for schedule(static)
             for (int ix = 0; ix < nxl; ++ix) {
                 for (int j = 0; j < Param::Nv; ++j) {
                     for (int k = 0; k < Param::Nmu; ++k) {
-                        low_state.f[mass_index(ng + ix, j, k)] = work.f[
-                            mass_index(ng + ix, j, k)] - h *
-                            (fx_low[xface_index(ix + 1, j, k)] -
-                             fx_low[xface_index(ix, j, k)] +
-                             fu_low[uface_index(ix, j + 1, k)] -
-                             fu_low[uface_index(ix, j, k)]);
+                        const double m_old = work.f[mass_index(ng + ix, j, k)];
+                        const double tx_left = h * fx_low[xface_index(ix, j, k)];
+                        const double tx_right = h * fx_low[xface_index(ix + 1, j, k)];
+                        const double tu_lower = h * fu_low[uface_index(ix, j, k)];
+                        const double tu_upper = h * fu_low[uface_index(ix, j + 1, k)];
+                        // Build the donor-cell state as a sum of nonnegative
+                        // terms, rather than a cancellation of full face
+                        // transfers.  With the enforced combined CFL, this is
+                        // M_old*(1-C_out) plus the four incoming transfers.
+                        const double incoming = std::max(0.0, tx_left) +
+                            std::max(0.0, -tx_right) +
+                            std::max(0.0, tu_lower) +
+                            std::max(0.0, -tu_upper);
+                        // outgoing/M_old is evaluated through the analytic
+                        // donor CFL coefficients, avoiding a division by a
+                        // tiny tail mass.
+                        const double a = bkg_n.charge *
+                            fields_mid.Ex[ng + ix] / (bkg_n.mass * Const::c);
+                        const double c_out = h * (
+                            std::fabs(bkg_n.cgrid.vx[idx2(j, k)]) / sg.dx +
+                            std::fabs(a) / bkg_n.cgrid.upar_widths[j]);
+                        low_state.f[mass_index(ng + ix, j, k)] =
+                            m_old * (1.0 - c_out) + incoming;
                     }
                 }
             }
+            // The low-order state is the FCT positivity base, but only in
+            // FCT/low-order modes.  Normalize locally bounded roundoff debt
+            // before it enters a donor budget; no-FCT keeps this state intact
+            // as a diagnostic-only comparison layer.
+            double low_roundoff_zeroed_count = 0.0;
+            double low_roundoff_zeroed_mass = 0.0;
+            if (fct_enabled_ || low_order_only_) {
+                #pragma omp parallel for schedule(static) reduction(+:low_roundoff_zeroed_count,low_roundoff_zeroed_mass)
+                for (int ix = 0; ix < nxl; ++ix) for (int j = 0; j < Param::Nv; ++j)
+                    for (int k = 0; k < Param::Nmu; ++k) {
+                        const size_t state_id = mass_index(ng + ix, j, k);
+                        double& m = low_state.f[state_id];
+                        const double tolerance = low_roundoff_bound(
+                            work.f[state_id],
+                            h * fx_low[xface_index(ix, j, k)],
+                            h * fx_low[xface_index(ix + 1, j, k)],
+                            h * fu_low[uface_index(ix, j, k)],
+                            h * fu_low[uface_index(ix, j + 1, k)]);
+                        if (std::isfinite(m) && m < 0.0 && m >= -tolerance) {
+                            low_roundoff_zeroed_count += 1.0;
+                            low_roundoff_zeroed_mass += -m;
+                            m = 0.0;
+                        }
+                    }
+                MPI_Allreduce(MPI_IN_PLACE, &low_roundoff_zeroed_count, 1,
+                              MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+                MPI_Allreduce(MPI_IN_PLACE, &low_roundoff_zeroed_mass, 1,
+                              MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+                result.low_order_roundoff_zeroed_count +=
+                    static_cast<long long>(low_roundoff_zeroed_count);
+                result.low_order_roundoff_zeroed_mass += low_roundoff_zeroed_mass;
+            }
             exchange_ghosts_x_persistent(low_state, sg, mpi_rank, mpi_size);
+            if (iter == 0 && sub == 0)
+                low_order_solver_checkpoint(low_order_only_, "low_state_ghosts_ready", mpi_rank);
 
             double low_min = std::numeric_limits<double>::infinity();
             double low_scale = 0.0;
             double low_tolerance_linf = 0.0;
             double low_positivity_violation = 0.0;
             double low_nonfinite = 0.0;
-            #pragma omp parallel for reduction(min:low_min) reduction(max:low_scale,low_tolerance_linf,low_positivity_violation,low_nonfinite)
+            double low_negative_mass = 0.0;
+            long long low_negative_count = 0;
+            #pragma omp parallel for reduction(min:low_min) reduction(max:low_scale,low_tolerance_linf,low_positivity_violation,low_nonfinite) reduction(+:low_negative_mass,low_negative_count)
             for (int ix = 0; ix < nxl; ++ix) for (int j = 0; j < Param::Nv; ++j)
                 for (int k = 0; k < Param::Nmu; ++k) {
                     const double m = low_state.f[mass_index(ng + ix, j, k)];
-                    const double transfer_scale = h * (
-                        std::fabs(fx_low[xface_index(ix, j, k)]) +
-                        std::fabs(fx_low[xface_index(ix + 1, j, k)]) +
-                        std::fabs(fu_low[uface_index(ix, j, k)]) +
-                        std::fabs(fu_low[uface_index(ix, j + 1, k)]));
-                    const double tolerance = 128.0 *
-                        std::numeric_limits<double>::epsilon() *
-                        (std::fabs(work.f[mass_index(ng + ix, j, k)]) +
-                         transfer_scale);
+                    const double tolerance = low_roundoff_bound(
+                        work.f[mass_index(ng + ix, j, k)],
+                        h * fx_low[xface_index(ix, j, k)],
+                        h * fx_low[xface_index(ix + 1, j, k)],
+                        h * fu_low[uface_index(ix, j, k)],
+                        h * fu_low[uface_index(ix, j + 1, k)]);
                     low_min = std::min(low_min, m);
                     low_scale = std::max(low_scale, std::fabs(m));
                     low_tolerance_linf = std::max(low_tolerance_linf, tolerance);
                     low_positivity_violation = std::max(
                         low_positivity_violation, -m - tolerance);
+                    if (m < 0.0) {
+                        low_negative_mass += -m;
+                        low_negative_count += 1;
+                    }
                     if (!std::isfinite(m)) low_nonfinite = 1.0;
                 }
             double low_guard[5] = {low_min, low_scale, low_tolerance_linf,
                                    low_positivity_violation, low_nonfinite};
             MPI_Allreduce(MPI_IN_PLACE, &low_guard[0], 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
             MPI_Allreduce(MPI_IN_PLACE, &low_guard[1], 4, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            MPI_Allreduce(MPI_IN_PLACE, &low_negative_mass, 1, MPI_DOUBLE,
+                          MPI_SUM, MPI_COMM_WORLD);
+            MPI_Allreduce(MPI_IN_PLACE, &low_negative_count, 1,
+                          MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
             const double mass_roundoff = low_guard[2];
             result.fct_low_order_tolerance_linf = std::max(
                 result.fct_low_order_tolerance_linf, mass_roundoff);
+            result.low_order_candidate_min = std::min(
+                result.low_order_candidate_min, low_guard[0]);
+            result.low_order_negative_mass += low_negative_mass;
+            result.low_order_negative_count += low_negative_count;
+            const bool no_fct_diagnostic_only = !low_order_only_ && !fct_enabled_ &&
+                allow_finite_negative_debt_for_test_;
+            const bool low_order_is_final_or_fct_base = !no_fct_diagnostic_only;
             if (low_guard[4] != 0.0 || !std::isfinite(low_guard[0]) ||
-                low_guard[3] > 0.0) {
+                (low_order_is_final_or_fct_base && low_guard[3] > 0.0)) {
                 double work_input_min = std::numeric_limits<double>::infinity();
                 #pragma omp parallel for reduction(min:work_input_min)
                 for (int ix = 0; ix < nxl; ++ix)
@@ -940,6 +1232,72 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                 return result;
             }
 
+            if (controlled_fct_flux_injection_enabled_ && fct_enabled_) {
+                double local_injection_count = 0.0;
+                if (mpi_rank == 0 && nxl >= 3 && h > 0.0) {
+                    // One owned, internal x face is sufficient for this test.
+                    // The same added flux leaves its left cell and enters its
+                    // right cell, so it is conservative before FCT limits it.
+                    const int iface = nxl / 2;
+                    const int donor_ix = iface - 1;
+                    int donor_j = 0;
+                    int donor_k = 0;
+                    double donor_mass = -1.0;
+                    for (int j = 0; j < Param::Nv; ++j)
+                        for (int k = 0; k < Param::Nmu; ++k) {
+                            const double mass = low_state.f[
+                                mass_index(ng + donor_ix, j, k)];
+                            if (mass > donor_mass) {
+                                donor_mass = mass;
+                                donor_j = j;
+                                donor_k = k;
+                            }
+                        }
+                    if (donor_mass > 0.0) {
+                        const size_t face = xface_index(iface, donor_j, donor_k);
+                        fx_high[face] += 1.25 * donor_mass / h;
+                        local_injection_count = 1.0;
+                    }
+                }
+                MPI_Allreduce(MPI_IN_PLACE, &local_injection_count, 1,
+                              MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+                result.fct_controlled_injection_count +=
+                    static_cast<long long>(local_injection_count);
+            }
+
+            if (low_order_only_) {
+                // Do not enter FCT/donor-capacity processing in the low-order
+                // production test.  Commit the already checked low-order
+                // conservative state and retain identical low/high/final
+                // diagnostic layers for the shared accounting below.
+                work = low_state;
+                if (!transport_safe_step_gate(work, sub + 1))
+                    return result;
+                if (iter == 0 && sub == 0)
+                    low_order_solver_checkpoint(low_order_only_, "low_state_committed", mpi_rank);
+            } else if (!fct_enabled_) {
+                // High-order/no-FCT verification path.  The MUSCL face fluxes
+                // are the final conservative fluxes: the same arrays update
+                // M, construct J_N/J_E and supply every closure diagnostic.
+                fx_final = fx_high;
+                fu_final = fu_high;
+                cu_final = cu_high;
+                #pragma omp parallel for schedule(static)
+                for (int ix = 0; ix < nxl; ++ix) {
+                    for (int j = 0; j < Param::Nv; ++j) {
+                        for (int k = 0; k < Param::Nmu; ++k) {
+                            work.f[mass_index(ng + ix, j, k)] -= h *
+                                (fx_final[xface_index(ix + 1, j, k)] -
+                                 fx_final[xface_index(ix, j, k)] +
+                                 fu_final[uface_index(ix, j + 1, k)] -
+                                 fu_final[uface_index(ix, j, k)]);
+                        }
+                    }
+                }
+                exchange_ghosts_x_persistent(work, sg, mpi_rank, mpi_size);
+                if (!transport_safe_step_gate(work, sub + 1))
+                    return result;
+            } else {
             std::fill(alpha_x_left.begin(), alpha_x_left.end(), 1.0);
             std::fill(alpha_x_right.begin(), alpha_x_right.end(), 1.0);
             std::fill(alpha_u_lower.begin(), alpha_u_lower.end(), 1.0);
@@ -1010,8 +1368,11 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
 
             fx_final = fx_low;
             fu_final = fu_low;
+            // The FCT combination preserves the C_u contract exactly:
+            // cu_final is a coefficient, while fu_final is its acceleration-
+            // multiplied mass flux.  No energy-current formula is altered.
             cu_final = cu_low;
-            #pragma omp parallel for schedule(static) reduction(+:limiter_faces,limiter_active) reduction(min:limiter_min)
+            #pragma omp parallel for schedule(static) reduction(+:limiter_faces,limiter_active,limiter_faces_core,limiter_faces_boundary,limiter_active_core,limiter_active_boundary) reduction(min:limiter_min,limiter_min_core,limiter_min_boundary)
             for (int iface = 0; iface < nxl; ++iface) {
                 for (int j = 0; j < Param::Nv; ++j) for (int k = 0; k < Param::Nmu; ++k) {
                     const size_t id = xface_index(iface, j, k);
@@ -1023,8 +1384,19 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                         : alpha_x_left[static_cast<size_t>(iface) * Param::Nvmu + p];
                     fx_final[id] += alpha * anti;
                     limiter_faces += 1.0;
+                    const bool core_face = fct_core_x(
+                        sg.x_min + (sg.ix_start + iface) * sg.dx);
                     if (alpha < 1.0 - 1.0e-14) limiter_active += 1.0;
                     limiter_min = std::min(limiter_min, alpha);
+                    if (core_face) {
+                        limiter_faces_core += 1.0;
+                        if (alpha < 1.0 - 1.0e-14) limiter_active_core += 1.0;
+                        limiter_min_core = std::min(limiter_min_core, alpha);
+                    } else {
+                        limiter_faces_boundary += 1.0;
+                        if (alpha < 1.0 - 1.0e-14) limiter_active_boundary += 1.0;
+                        limiter_min_boundary = std::min(limiter_min_boundary, alpha);
+                    }
                 }
             }
             close_periodic_face_blocks(fx_final, nxl, Param::Nvmu,
@@ -1068,7 +1440,7 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                 interface_checksum_violation = std::max(
                     interface_checksum_violation, difference - tolerance);
             }
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(static) reduction(+:limiter_faces,limiter_active,limiter_faces_core,limiter_faces_boundary,limiter_active_core,limiter_active_boundary) reduction(min:limiter_min,limiter_min_core,limiter_min_boundary)
             for (int ix = 0; ix < nxl; ++ix) for (int jf = 1; jf < Param::Nv; ++jf)
                 for (int k = 0; k < Param::Nmu; ++k) {
                     const size_t id = uface_index(ix, jf, k);
@@ -1079,6 +1451,18 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                         : alpha_u_lower[base + idx2(jf, k)];
                     fu_final[id] += alpha * anti;
                     cu_final[id] += alpha * (cu_high[id] - cu_low[id]);
+                    limiter_faces += 1.0;
+                    if (alpha < 1.0 - 1.0e-14) limiter_active += 1.0;
+                    limiter_min = std::min(limiter_min, alpha);
+                    if (fct_core_x(sg.x(ng + ix))) {
+                        limiter_faces_core += 1.0;
+                        if (alpha < 1.0 - 1.0e-14) limiter_active_core += 1.0;
+                        limiter_min_core = std::min(limiter_min_core, alpha);
+                    } else {
+                        limiter_faces_boundary += 1.0;
+                        if (alpha < 1.0 - 1.0e-14) limiter_active_boundary += 1.0;
+                        limiter_min_boundary = std::min(limiter_min_boundary, alpha);
+                    }
                 }
 
             // P1: construct the final state in scratch from the low-order
@@ -1086,6 +1470,8 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
             // transfer terms below are h * (Phi^H - Phi^L), hence have the
             // same units as the cell-integrated cylindrical mass.
             double candidate_min = std::numeric_limits<double>::infinity();
+            double high_candidate_min = std::numeric_limits<double>::infinity();
+            double high_candidate_donor_excess = 0.0;
             double high_low_identity_linf = 0.0;
             double high_low_identity_violation = 0.0;
             double donor_capacity_violation = 0.0;
@@ -1122,7 +1508,7 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                 double thread_donor_outflow = 0.0;
                 double thread_donor_scale = 1.0;
                 int thread_donor_global_linear = -1;
-            #pragma omp for schedule(static) reduction(min:candidate_min) reduction(max:high_low_identity_linf,high_low_identity_violation,final_tolerance_linf,final_positivity_violation,candidate_nonfinite,donor_roundoff_warning) reduction(+:donor_beta_count,roundoff_normalized_count,roundoff_normalized_mass) reduction(min:donor_beta_min)
+            #pragma omp for schedule(static) reduction(min:candidate_min,high_candidate_min) reduction(max:high_candidate_donor_excess,high_low_identity_linf,high_low_identity_violation,final_tolerance_linf,final_positivity_violation,candidate_nonfinite,donor_roundoff_warning) reduction(+:donor_beta_count,roundoff_normalized_count,roundoff_normalized_mass) reduction(min:donor_beta_min)
             for (int ix = 0; ix < nxl; ++ix) for (int j = 0; j < Param::Nv; ++j)
                 for (int k = 0; k < Param::Nmu; ++k) {
                     const size_t p = static_cast<size_t>(ix) * Param::Nvmu + idx2(j, k);
@@ -1148,6 +1534,15 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                          fx_low[xface_index(ix, j, k)] +
                          fu_low[uface_index(ix, j + 1, k)] -
                          fu_low[uface_index(ix, j, k)]));
+                    if (fct_activation_audit_enabled_) {
+                        const double high_candidate = m_low + high_minus_low;
+                        if (std::isfinite(high_candidate)) {
+                            high_candidate_min = std::min(high_candidate_min,
+                                                          high_candidate);
+                        } else {
+                            candidate_nonfinite = 1.0;
+                        }
+                    }
                     const double transfer_divergence = ax_left_raw - ax_right_raw +
                         au_lower_raw - au_upper_raw;
                     const double identity_residual = high_minus_low -
@@ -1238,6 +1633,17 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                         ax_left, ax_right, au_lower, au_upper};
                     const double face_raw_transfer[4] = {
                         ax_left_raw, ax_right_raw, au_lower_raw, au_upper_raw};
+                    if (fct_activation_audit_enabled_) {
+                        const long double high_outflow_ld =
+                            std::max(0.0L, -static_cast<long double>(ax_left_raw)) +
+                            std::max(0.0L, static_cast<long double>(ax_right_raw)) +
+                            std::max(0.0L, -static_cast<long double>(au_lower_raw)) +
+                            std::max(0.0L, static_cast<long double>(au_upper_raw));
+                        high_candidate_donor_excess = std::max(
+                            high_candidate_donor_excess,
+                            static_cast<double>(std::max(0.0L, high_outflow_ld -
+                                std::max(0.0L, static_cast<long double>(m_low)))));
+                    }
                     double face_alpha[4];
                     for (int f = 0; f < 4; ++f) {
                         face_alpha[f] = (face_raw_transfer[f] != 0.0)
@@ -1659,16 +2065,19 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                 static_cast<long long>(roundoff_normalization[0]);
             result.fct_roundoff_zeroed_mass += roundoff_normalization[1];
 
-            double invariant_max[8] = {
+            double invariant_max[9] = {
                 high_low_identity_linf, high_low_identity_violation,
                 donor_capacity_violation, interface_checksum_linf,
                 interface_checksum_violation, final_tolerance_linf,
-                final_positivity_violation, candidate_nonfinite
+                final_positivity_violation, candidate_nonfinite,
+                high_candidate_donor_excess
             };
-            MPI_Allreduce(MPI_IN_PLACE, invariant_max, 8, MPI_DOUBLE, MPI_MAX,
+            MPI_Allreduce(MPI_IN_PLACE, invariant_max, 9, MPI_DOUBLE, MPI_MAX,
                           MPI_COMM_WORLD);
             MPI_Allreduce(MPI_IN_PLACE, &candidate_min, 1, MPI_DOUBLE, MPI_MIN,
                           MPI_COMM_WORLD);
+            MPI_Allreduce(MPI_IN_PLACE, &high_candidate_min, 1, MPI_DOUBLE,
+                          MPI_MIN, MPI_COMM_WORLD);
             result.fct_high_low_identity_linf = std::max(
                 result.fct_high_low_identity_linf, invariant_max[0]);
             result.fct_high_low_identity_violation = std::max(
@@ -1683,6 +2092,10 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                 result.fct_final_tolerance_linf, invariant_max[5]);
             result.fct_final_scratch_min = std::min(
                 result.fct_final_scratch_min, candidate_min);
+            result.fct_high_candidate_min = std::min(
+                result.fct_high_candidate_min, high_candidate_min);
+            result.fct_high_candidate_donor_excess = std::max(
+                result.fct_high_candidate_donor_excess, invariant_max[8]);
 
             int invariant_failure_reason = 0;
             if (invariant_max[7] != 0.0) invariant_failure_reason = 4;
@@ -1735,8 +2148,7 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                         if (dlim >= 0.0) limiter_energy_positive += dlim;
                         else limiter_energy_negative += dlim;
                         const double x = sg.x(ng + ix);
-                        if (x >= 0.1 * Const::micro &&
-                            x <= Param::Lx - 0.1 * Const::micro)
+                        if (fct_core_x(x))
                             limiter_energy_core += dlim;
                         else
                             limiter_energy_boundary += dlim;
@@ -1750,47 +2162,325 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                                        idx2(j, k)];
             if (!transport_safe_step_gate(work, sub + 1))
                 return result;
+            } // high-order/FCT donor-capacity closure
+
+            const std::vector<double>& fx_high_used = low_order_only_
+                ? fx_low : fx_high;
+            const std::vector<double>& fu_high_used = low_order_only_
+                ? fu_low : fu_high;
+            const std::vector<double>& cu_high_used = low_order_only_
+                ? cu_low : cu_high;
+            const std::vector<double>& cu_high_center_used = low_order_only_
+                ? cu_low : cu_high_center;
+            const std::vector<double>& fx_final_used = low_order_only_
+                ? fx_low : fx_final;
+            const std::vector<double>& fu_final_used = low_order_only_
+                ? fu_low : fu_final;
+            const std::vector<double>& cu_final_used = low_order_only_
+                ? cu_low : cu_final;
 
             #pragma omp parallel for schedule(static)
             for (int iface = 0; iface <= nxl; ++iface) {
-                double gamma = 0.0;
+                double gamma_low = 0.0;
+                double gamma_high = 0.0;
+                double gamma_final = 0.0;
                 double psi_k = 0.0;
                 double psi_p = 0.0;
                 for (int j = 0; j < Param::Nv; ++j) for (int k = 0; k < Param::Nmu; ++k)
                 {
-                    const double flux = fx_final[xface_index(iface, j, k)];
-                    gamma += flux;
-                    psi_k += bkg_n.cgrid.kinetic_energy[idx2(j, k)] * flux;
-                    psi_p += bkg_n.mass * Const::c * bkg_n.cgrid.upar_cells[j] * flux;
+                    const size_t id = xface_index(iface, j, k);
+                    const double flux_final = fx_final_used[id];
+                    gamma_low += fx_low[id];
+                    gamma_high += fx_high_used[id];
+                    gamma_final += flux_final;
+                    psi_k += bkg_n.cgrid.kinetic_energy[idx2(j, k)] *
+                        flux_final;
+                    psi_p += bkg_n.mass * Const::c *
+                        bkg_n.cgrid.upar_cells[j] * flux_final;
                 }
-                integrated_jn[iface] += h * bkg_n.charge * gamma;
+                layered_jn_low[iface] = bkg_n.charge * gamma_low;
+                layered_jn_high[iface] = bkg_n.charge * gamma_high;
+                layered_jn_final[iface] = bkg_n.charge * gamma_final;
+                layered_jn_low_linf = std::max(layered_jn_low_linf,
+                                                std::fabs(layered_jn_low[iface]));
+                layered_jn_high_linf = std::max(layered_jn_high_linf,
+                                                 std::fabs(layered_jn_high[iface]));
+                layered_jn_final_linf = std::max(layered_jn_final_linf,
+                                                  std::fabs(layered_jn_final[iface]));
+                integrated_jn[iface] += h * layered_jn_final[iface];
                 psi_k_x[iface] += h * psi_k;
                 psi_p_x[iface] += h * psi_p;
             }
-            #pragma omp parallel for schedule(static)
+            double layered_pu_low = 0.0;
+            double layered_pu_high = 0.0;
+            double layered_pu_final = 0.0;
+            double layered_cell_work_low = 0.0;
+            double layered_cell_work_high = 0.0;
+            double layered_cell_work_center = 0.0;
+            double layered_cell_work_final = 0.0;
+            double cu_ratio_error_linf = 0.0;
+            double cu_ratio_scale_linf = 0.0;
+            double je_equivalent_difference_linf = 0.0;
+            double je_equivalent_scale_linf = 0.0;
+            double layered_je_low_linf = 0.0;
+            double layered_je_high_linf = 0.0;
+            double layered_je_final_linf = 0.0;
+            #pragma omp parallel for schedule(static) reduction(+:layered_pu_low,layered_pu_high,layered_pu_final,layered_cell_work_low,layered_cell_work_high,layered_cell_work_center,layered_cell_work_final) reduction(max:cu_ratio_error_linf,cu_ratio_scale_linf,je_equivalent_difference_linf,je_equivalent_scale_linf,layered_je_low_linf,layered_je_high_linf,layered_je_final_linf)
             for (int ix = 0; ix < nxl; ++ix) {
-                double je = 0.0;
+                double je_low = 0.0;
+                double je_high = 0.0;
+                double je_center = 0.0;
+                double je_final = 0.0;
+                double je_final_energy_speed = 0.0;
                 double u_energy = 0.0;
                 double u_momentum = 0.0;
                 for (int jf = 1; jf < Param::Nv; ++jf) for (int k = 0; k < Param::Nmu; ++k) {
                     const double dke = Stage5::delta_energy(bkg_n.cgrid, jf, k);
-                    const double flux = fu_final[uface_index(ix, jf, k)];
-                    je += dke * (bkg_n.charge / (bkg_n.mass * Const::c)) *
-                          cu_final[uface_index(ix, jf, k)] / sg.dx;
-                    u_energy += dke * flux;
+                    const double center_distance = Stage5::upar_center_distance(
+                        bkg_n.cgrid, jf);
+                    const size_t id = uface_index(ix, jf, k);
+                    const double coefficient_low = cu_low[id];
+                    const double coefficient_high = cu_high_used[id];
+                    const double coefficient_center = cu_high_center_used[id];
+                    const double coefficient_final = cu_final_used[id];
+                    const double flux_low = fu_low[id];
+                    const double flux_high = fu_high_used[id];
+                    const double flux_final = fu_final_used[id];
+                    // J_E = q/(m c dx) sum(delta_K * C_u).  The dx division
+                    // converts the cell-integrated C_u back to a current
+                    // density; h-weighting and /dt occur outside this loop.
+                    const double current_factor =
+                        bkg_n.charge / (bkg_n.mass * Const::c * sg.dx);
+                    je_low += dke * current_factor * coefficient_low;
+                    je_high += dke * current_factor * coefficient_high;
+                    je_center += dke * current_factor * coefficient_center;
+                    je_final += dke * current_factor * coefficient_final;
+                    const double v_energy = dke /
+                        (bkg_n.mass * Const::c * center_distance);
+                    je_final_energy_speed += bkg_n.charge * v_energy *
+                        center_distance * coefficient_final / sg.dx;
+                    layered_pu_low += dke * flux_low;
+                    layered_pu_high += dke * flux_high;
+                    layered_pu_final += dke * flux_final;
+                    if (coefficient_final != 0.0) {
+                        const double a_cell =
+                            bkg_n.charge * fields_mid.Ex[ng + ix] /
+                            (bkg_n.mass * Const::c);
+                        const double ratio_error = std::fabs(
+                            flux_final / coefficient_final - a_cell);
+                        cu_ratio_error_linf = std::max(
+                            cu_ratio_error_linf, ratio_error);
+                        cu_ratio_scale_linf = std::max(
+                            cu_ratio_scale_linf, std::fabs(a_cell));
+                    } else if (flux_final != 0.0) {
+                        cu_ratio_error_linf = std::numeric_limits<double>::infinity();
+                    }
+                    u_energy += dke * flux_final;
                     u_momentum += bkg_n.mass * Const::c *
-                        Stage5::u_face_width(bkg_n.cgrid, jf) * flux;
+                        center_distance * flux_final;
                 }
-                integrated_je_cell[ix] += h * je;
+                layered_je_low[ix] = je_low;
+                layered_je_high[ix] = je_high;
+                layered_je_final[ix] = je_final;
+                layered_je_low_linf = std::max(layered_je_low_linf,
+                                                std::fabs(je_low));
+                layered_je_high_linf = std::max(layered_je_high_linf,
+                                                 std::fabs(je_high));
+                layered_je_final_linf = std::max(layered_je_final_linf,
+                                                  std::fabs(je_final));
+                je_equivalent_difference_linf = std::max(
+                    je_equivalent_difference_linf,
+                    std::fabs(je_final - je_final_energy_speed));
+                je_equivalent_scale_linf = std::max(
+                    je_equivalent_scale_linf, std::fabs(je_final));
+                layered_cell_work_low += fields_mid.Ex[ng + ix] * je_low *
+                    sg.dx;
+                layered_cell_work_high += fields_mid.Ex[ng + ix] * je_high *
+                    sg.dx;
+                layered_cell_work_center += fields_mid.Ex[ng + ix] * je_center *
+                    sg.dx;
+                layered_cell_work_final += fields_mid.Ex[ng + ix] * je_final *
+                    sg.dx;
+                integrated_je_cell[ix] += h * je_final;
+                integrated_je_high_cell[ix] += h * je_high;
+                integrated_je_center_cell[ix] += h * je_center;
                 u_energy_cell[ix] += h * u_energy;
                 u_momentum_cell[ix] += h * u_momentum;
+            }
+
+            // Section 3/18 diagnostic only: pair each current layer on the
+            // same Yee/cell staggering used by the final closure audit.
+            // Exchange the three cell-energy currents together so face zero
+            // has the left neighbour's value on every MPI rank.
+            double je_first[3] = {0.0, 0.0, 0.0};
+            double je_last[3] = {0.0, 0.0, 0.0};
+            if (nxl > 0) {
+                je_first[0] = layered_je_low.front();
+                je_first[1] = layered_je_high.front();
+                je_first[2] = layered_je_final.front();
+                je_last[0] = layered_je_low.back();
+                je_last[1] = layered_je_high.back();
+                je_last[2] = layered_je_final.back();
+            }
+            double je_left[3] = {0.0, 0.0, 0.0};
+            double je_right[3] = {0.0, 0.0, 0.0};
+            exchange_neighbor_triplet(je_first, je_last, mpi_rank, mpi_size,
+                                      je_left, je_right, 911);
+
+            double layered_face_work[3] = {0.0, 0.0, 0.0};
+            double layered_linf[3] = {0.0, 0.0, 0.0};
+            for (int iface = 0; iface < nxl; ++iface) {
+                const double je_face_low = 0.5 * (
+                    (iface == 0 ? je_left[0] : layered_je_low[iface - 1]) +
+                    layered_je_low[iface]);
+                const double je_face_high = 0.5 * (
+                    (iface == 0 ? je_left[1] : layered_je_high[iface - 1]) +
+                    layered_je_high[iface]);
+                const double je_face_final = 0.5 * (
+                    (iface == 0 ? je_left[2] : layered_je_final[iface - 1]) +
+                    layered_je_final[iface]);
+                const double eface = e_mid[iface];
+                layered_face_work[0] += eface * layered_jn_low[iface] *
+                    sg.dx;
+                layered_face_work[1] += eface * layered_jn_high[iface] *
+                    sg.dx;
+                layered_face_work[2] += eface * layered_jn_final[iface] *
+                    sg.dx;
+                layered_linf[0] = std::max(layered_linf[0], std::fabs(
+                    layered_jn_low[iface] - je_face_low));
+                layered_linf[1] = std::max(layered_linf[1], std::fabs(
+                    layered_jn_high[iface] - je_face_high));
+                layered_linf[2] = std::max(layered_linf[2], std::fabs(
+                    layered_jn_final[iface] - je_face_final));
+            }
+            double layered_sum[9] = {
+                layered_face_work[0], layered_face_work[1],
+                layered_face_work[2],
+                layered_cell_work_low, layered_cell_work_high,
+                layered_cell_work_final,
+                layered_pu_low, layered_pu_high, layered_pu_final};
+            MPI_Allreduce(MPI_IN_PLACE, layered_sum, 9, MPI_DOUBLE, MPI_SUM,
+                          MPI_COMM_WORLD);
+            double layered_max[10] = {
+                layered_linf[0], layered_linf[1], layered_linf[2],
+                cu_ratio_error_linf,
+                layered_jn_low_linf, layered_jn_high_linf,
+                layered_jn_final_linf,
+                layered_je_low_linf, layered_je_high_linf,
+                layered_je_final_linf};
+            MPI_Allreduce(MPI_IN_PLACE, layered_max, 10, MPI_DOUBLE, MPI_MAX,
+                          MPI_COMM_WORLD);
+            double cu_audit_max[2] = {
+                cu_ratio_scale_linf, je_equivalent_difference_linf};
+            MPI_Allreduce(MPI_IN_PLACE, cu_audit_max, 2, MPI_DOUBLE, MPI_MAX,
+                          MPI_COMM_WORLD);
+            MPI_Allreduce(MPI_IN_PLACE, &je_equivalent_scale_linf, 1,
+                          MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            if (iter == 0 && sub == 0)
+                low_order_solver_checkpoint(low_order_only_, "layered_audit_reduced", mpi_rank);
+
+            if (mpi_rank == 0) {
+                static std::ofstream layered_file(
+                    "output/stage5_layered_pairing.dat");
+                static std::ofstream cu_audit_file(
+                    "output/cu_definition_audit.dat");
+                static std::ofstream low_adjoint_file(
+                    "output/low_order_adjoint_audit.dat");
+                static int diagnostic_write_count = 0;
+                const bool flush_now = (++diagnostic_write_count % 20) == 0;
+                if (layered_file.tellp() == std::streampos(0)) {
+                    layered_file
+                        << "# time_fs nonlinear_iteration substep "
+                        << "R_pair_low R_pair_high R_pair_final "
+                        << "JN_GstarJE_low_Linf JN_GstarJE_high_Linf "
+                        << "JN_GstarJE_final_Linf P_u_low P_u_high P_u_final "
+                        << "W_face_low W_face_high W_face_final\n";
+                    layered_file << std::scientific << std::setprecision(10);
+                }
+                layered_file << (time + (sub + 1) * h) / Const::femto << " "
+                             << iter << " " << sub << " "
+                             << (layered_sum[0] - layered_sum[3]) << " "
+                             << (layered_sum[1] - layered_sum[4]) << " "
+                             << (layered_sum[2] - layered_sum[5]) << " "
+                             << layered_max[0] << " " << layered_max[1] << " "
+                             << layered_max[2] << " " << layered_sum[6] << " "
+                             << layered_sum[7] << " " << layered_sum[8] << " "
+                             << layered_sum[0] << " " << layered_sum[1] << " "
+                             << layered_sum[2] << "\n";
+
+                if (cu_audit_file.tellp() == std::streampos(0)) {
+                    cu_audit_file
+                        << "# time_fs nonlinear_iteration substep "
+                        << "cu_divides_dupar cu_contains_dx_via_M "
+                        << "cu_contains_uperp_ring_via_M "
+                        << "cu_contains_acceleration JE_divides_by_dx "
+                        << "JE_time_average_h_over_dt "
+                        << "state_is_cylindrical_cell_mass "
+                        << "fu_over_cu_minus_a_linf fu_over_cu_a_scale_linf "
+                        << "fu_over_cu_minus_a_relative "
+                        << "JE_formula_difference_linf JE_formula_scale_linf "
+                        << "JE_formula_relative\n";
+                    cu_audit_file << std::scientific << std::setprecision(10);
+                }
+                const double cu_ratio_relative = cu_audit_max[0] > 0.0
+                    ? layered_max[3] / cu_audit_max[0] : layered_max[3];
+                const double je_formula_relative =
+                    je_equivalent_scale_linf > 0.0
+                    ? cu_audit_max[1] / je_equivalent_scale_linf
+                    : cu_audit_max[1];
+                cu_audit_file
+                    << (time + (sub + 1) * h) / Const::femto << " "
+                    << iter << " " << sub << " "
+                    << Stage5::CU_DIVIDES_BY_UPAR_DONOR_WIDTH << " "
+                    << Stage5::CU_CONTAINS_DX_VIA_CELL_MASS << " "
+                    << Stage5::CU_CONTAINS_UPERP_RING_VIA_CELL_MASS << " "
+                    << Stage5::CU_CONTAINS_ACCELERATION << " "
+                    << Stage5::JE_REQUIRES_CELL_DX_DIVISION << " "
+                    << Stage5::JE_IS_SUBSTEP_TIME_AVERAGED
+                    << " " << (bkg_n.cylindrical_mass_representation ? 1 : 0)
+                    << " " << layered_max[3] << " " << cu_audit_max[0] << " "
+                    << cu_ratio_relative << " " << cu_audit_max[1] << " "
+                    << je_equivalent_scale_linf << " "
+                    << je_formula_relative << "\n";
+                if (low_adjoint_file.tellp() == std::streampos(0)) {
+                    low_adjoint_file
+                        << "# Bx_low: Phi_x=v_x*M_upwind/dx; "
+                        << "Bu_low: C_u=M_upwind/dupar_donor; "
+                        << "Phi_u=a_x*C_u; Gstar: neighbour cell average\n"
+                        << "# time_fs nonlinear_iteration substep "
+                        << "Bx_is_x_upwind Bu_is_u_upwind "
+                        << "Bx_donor_selector_vx Bu_donor_selector_ax "
+                        << "Gstar_is_spatial_average "
+                        << "same_donor_map low_R_pair low_R_pair_relative "
+                        << "JN_low_Linf JE_low_Linf JN_minus_GstarJE_low_Linf "
+                        << "W_face_low GE_JE_low P_u_low\n";
+                    low_adjoint_file << std::scientific << std::setprecision(10);
+                }
+                const double low_pair = layered_sum[0] - layered_sum[3];
+                const double low_pair_scale = std::max(
+                    std::numeric_limits<double>::min(), std::max(
+                        std::fabs(layered_sum[0]), std::fabs(layered_sum[3])));
+                low_adjoint_file
+                    << (time + (sub + 1) * h) / Const::femto << " "
+                    << iter << " " << sub << " "
+                    << 1 << " " << 1 << " " << 1 << " " << 1 << " " << 1
+                    << " " << 0 << " " << low_pair << " "
+                    << low_pair / low_pair_scale << " " << layered_max[4]
+                    << " " << layered_max[7] << " " << layered_max[0] << " "
+                    << layered_sum[0] << " " << layered_sum[3] << " "
+                    << layered_sum[6] << "\n";
+                if (flush_now) {
+                    layered_file.flush();
+                    cu_audit_file.flush();
+                    low_adjoint_file.flush();
+                }
             }
             for (int k = 0; k < Param::Nmu; ++k) {
                 const double ke_lo = bkg_n.cgrid.kinetic_energy[idx2(0, k)];
                 const double ke_hi = bkg_n.cgrid.kinetic_energy[idx2(Param::Nv - 1, k)];
                 for (int ix = 0; ix < nxl; ++ix) {
-                    const double f_hi = fu_final[uface_index(ix, Param::Nv, k)];
-                    const double f_lo = fu_final[uface_index(ix, 0, k)];
+                    const double f_hi = fu_final_used[uface_index(ix, Param::Nv, k)];
+                    const double f_lo = fu_final_used[uface_index(ix, 0, k)];
                     u_boundary_energy += h * (ke_hi * f_hi - ke_lo * f_lo);
                     u_boundary_particle += h * (f_hi - f_lo);
                     u_boundary_momentum += h * bkg_n.mass * Const::c *
@@ -1830,6 +2520,14 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
         for (size_t i = 0; i < nface; ++i) result.j_bkg_face_mid[i] = integrated_jn[i] / dt;
         std::vector<double>& je_cell = je_cell_buffer;
         for (int ix = 0; ix < nxl; ++ix) je_cell[ix] = integrated_je_cell[ix] / dt;
+        // These are audit-only layers.  They preserve the direct C_u -> J_E
+        // construction and never replace the charge-conserving Ampere J_N.
+        std::vector<double>& je_high_cell = je_high_cell_buffer;
+        std::vector<double>& je_center_cell = je_center_cell_buffer;
+        for (int ix = 0; ix < nxl; ++ix) {
+            je_high_cell[ix] = integrated_je_high_cell[ix] / dt;
+            je_center_cell[ix] = integrated_je_center_cell[ix] / dt;
+        }
         double je_left_neighbor = 0.0;
         double je_right_neighbor = 0.0;
         exchange_neighbor_scalars(je_cell, mpi_rank, mpi_size,
@@ -1845,12 +2543,16 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
             result.j_beam_face_mid[nxl] = jbeam[nxl];
             result.j_total_face_mid[nxl] = result.j_total_face_mid[0];
         }
+        if (iter == 0)
+            low_order_solver_checkpoint(low_order_only_, "currents_ready", mpi_rank);
         close_periodic_face_blocks(result.j_bkg_energy_debug_face, nxl, 1,
                                    mpi_rank, mpi_size, 907);
 
         EMFields fields_new = fields_n;
         fields_new.advance_ampere_face_from_midpoint_current(result.j_total_face_mid,
                                                               dt, mpi_rank, mpi_size);
+        if (iter == 0)
+            low_order_solver_checkpoint(low_order_only_, "ampere_ready", mpi_rank);
         last_fields = fields_new;
         std::vector<double>& next_e = next_e_buffer;
         double local_de = 0.0, local_e = 0.0, local_dj = 0.0, local_j = 0.0;
@@ -1866,6 +2568,8 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
         MPI_Allreduce(MPI_IN_PLACE, norms, 4, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
         result.residual_E = norms[0] / std::max(1.0, norms[1]);
         result.residual_J_bkg = norms[2] / std::max(1.0, std::max(std::fabs(Param::jb), norms[3]));
+        if (midpoint_iteration_trace_for_test_)
+            result.midpoint_residual_e_history.push_back(result.residual_E);
 
         double local_df = 0.0, local_f = 0.0;
         for (int ix = 0; ix < nxl; ++ix) for (int j = 0; j < Param::Nv; ++j)
@@ -1897,26 +2601,35 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                       MPI_COMM_WORLD);
         result.continuity_residual_bkg = local_cont;
 
-        double local_cell_work = 0.0, local_face_work = 0.0;
-        for (int ix = 0; ix < nxl; ++ix)
+        double local_cell_work = 0.0, local_high_cell_work = 0.0;
+        double local_center_cell_work = 0.0, local_face_work = 0.0;
+        for (int ix = 0; ix < nxl; ++ix) {
             local_cell_work += fields_mid.Ex[ng + ix] * je_cell[ix] * sg.dx;
+            local_high_cell_work += fields_mid.Ex[ng + ix] *
+                je_high_cell[ix] * sg.dx;
+            local_center_cell_work += fields_mid.Ex[ng + ix] *
+                je_center_cell[ix] * sg.dx;
+        }
         for (int iface = 0; iface < nxl; ++iface)
             local_face_work += e_mid[iface] * result.j_bkg_face_mid[iface] * sg.dx;
-        double energy_pair[2] = {local_cell_work, local_face_work};
-        MPI_Allreduce(MPI_IN_PLACE, energy_pair, 2, MPI_DOUBLE, MPI_SUM,
+        double energy_pair[4] = {local_cell_work, local_face_work,
+                                 local_high_cell_work,
+                                 local_center_cell_work};
+        MPI_Allreduce(MPI_IN_PLACE, energy_pair, 4, MPI_DOUBLE, MPI_SUM,
                       MPI_COMM_WORLD);
         result.energy_residual_bkg = dt * (energy_pair[0] - energy_pair[1]);
 
-        double local_stage5[6] = {0.0, 0.0, 0.0, 0.0,
+        double local_stage5[7] = {0.0, 0.0, 0.0, 0.0,
                                   psi_k_x[nxl] - psi_k_x[0],
-                                  psi_p_x[nxl] - psi_p_x[0]};
+                                  psi_p_x[nxl] - psi_p_x[0], 0.0};
         for (int ix = 0; ix < nxl; ++ix) {
             local_stage5[0] += local_energy_residual[ix];
             local_stage5[1] += local_momentum_residual[ix];
             local_stage5[2] += u_energy_cell[ix];
             local_stage5[3] += u_momentum_cell[ix];
+            local_stage5[6] += delta_ke_cell[ix];
         }
-        MPI_Allreduce(MPI_IN_PLACE, local_stage5, 6, MPI_DOUBLE, MPI_SUM,
+        MPI_Allreduce(MPI_IN_PLACE, local_stage5, 7, MPI_DOUBLE, MPI_SUM,
                       MPI_COMM_WORLD);
         double u_boundary_global[3] = {u_boundary_particle, u_boundary_momentum,
                                        u_boundary_energy};
@@ -1931,6 +2644,12 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
         // pairing between the face Ampere current and the cell force current.
         result.stage5_r_fv = local_stage5[0];
         result.stage5_r_couple = dt * (energy_pair[1] - energy_pair[0]);
+        result.stage5_r_couple_centered = dt *
+            (energy_pair[1] - energy_pair[3]);
+        result.stage5_r_couple_upwind_stabilization = dt *
+            (energy_pair[3] - energy_pair[2]);
+        result.stage5_r_couple_fct_stabilization = dt *
+            (energy_pair[2] - energy_pair[0]);
         // The documented stage-5 aggregate is the sum of the two independently
         // reported residuals.  Keep the algebraic dK-face-work-Bu balance as a
         // separate audit quantity because its sign convention differs.
@@ -2006,14 +2725,17 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
         result.stage5_correction_active_bounds = 0;
         result.stage5_correction_infeasible = 0;
         result.stage5_correction_retry_count = 0;
-        double limiter_sum[8] = {limiter_energy_change, u_boundary_energy,
-                                 limiter_faces, limiter_active,
-                                 limiter_energy_positive, limiter_energy_negative,
-                                 limiter_energy_core, limiter_energy_boundary};
-        MPI_Allreduce(MPI_IN_PLACE, limiter_sum, 8, MPI_DOUBLE, MPI_SUM,
+        double limiter_sum[12] = {limiter_energy_change, u_boundary_energy,
+                                  limiter_faces, limiter_active,
+                                  limiter_energy_positive, limiter_energy_negative,
+                                  limiter_energy_core, limiter_energy_boundary,
+                                  limiter_faces_core, limiter_faces_boundary,
+                                  limiter_active_core, limiter_active_boundary};
+        MPI_Allreduce(MPI_IN_PLACE, limiter_sum, 12, MPI_DOUBLE, MPI_SUM,
                       MPI_COMM_WORLD);
-        double limiter_alpha_global = limiter_min;
-        MPI_Allreduce(MPI_IN_PLACE, &limiter_alpha_global, 1, MPI_DOUBLE,
+        double limiter_alpha_global[3] = {
+            limiter_min, limiter_min_core, limiter_min_boundary};
+        MPI_Allreduce(MPI_IN_PLACE, limiter_alpha_global, 3, MPI_DOUBLE,
                       MPI_MIN, MPI_COMM_WORLD);
         result.limiter_energy_defect = limiter_sum[0];
         result.limiter_energy_defect_positive = limiter_sum[4];
@@ -2023,15 +2745,19 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
         result.flux_defect[1].boundary_energy_loss = limiter_sum[1];
         result.limiter_active_fraction = (limiter_sum[2] > 0.0)
             ? limiter_sum[3] / limiter_sum[2] : 0.0;
-        result.limiter_min_alpha = limiter_alpha_global;
+        result.limiter_active_fraction_core = (limiter_sum[8] > 0.0)
+            ? limiter_sum[10] / limiter_sum[8] : 0.0;
+        result.limiter_active_fraction_boundary = (limiter_sum[9] > 0.0)
+            ? limiter_sum[11] / limiter_sum[9] : 0.0;
+        result.limiter_min_alpha = limiter_alpha_global[0];
+        result.limiter_min_alpha_core = limiter_alpha_global[1];
+        result.limiter_min_alpha_boundary = limiter_alpha_global[2];
         result.flux_pos[0].alpha_active_fraction = result.limiter_active_fraction;
         result.flux_pos[1].alpha_active_fraction = result.limiter_active_fraction;
-        result.flux_pos[0].alpha_min = limiter_alpha_global;
-        result.flux_pos[1].alpha_min = limiter_alpha_global;
+        result.flux_pos[0].alpha_min = limiter_alpha_global[0];
+        result.flux_pos[1].alpha_min = limiter_alpha_global[0];
 
-        double final_number = 0.0, final_ke = 0.0;
-        work.total_particle_number_and_energy(final_number, final_ke);
-        result.delta_ke_bkg = final_ke - initial_ke;
+        result.delta_ke_bkg = local_stage5[6];
         result.delta_ke_beam = beam_ke_after - beam_ke_before;
         result.field_work_bkg = -dt * energy_pair[1];
         result.field_work_beam = -integrate_face_work(jbeam, beam_field, sg, dt);
@@ -2051,7 +2777,8 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
             result.failure_global_cfl = global_cfl;
             return result;
         }
-        if (result.residual_E < field_tol && result.residual_J_bkg < current_tol &&
+        if (have_previous && result.residual_E < field_tol &&
+            result.residual_J_bkg < current_tol &&
             result.beam_continuity_residual < 1.0e-6) {
             if (!transport_safe_step_gate(work, nsub))
                 return result;

@@ -8,6 +8,32 @@
 #define FP_ENABLE_DEBUG_DIAGNOSTICS 1
 #endif
 
+// Test-only overrides for the production section-7.2 velocity-grid
+// convergence audit.  Normal solver builds do not define these macros and
+// retain the established 96 x 64 momentum grid.
+#ifndef FP_VELOCITY_GRID_NV
+#define FP_VELOCITY_GRID_NV 96
+#endif
+
+#ifndef FP_VELOCITY_GRID_NMU
+#define FP_VELOCITY_GRID_NMU 64
+#endif
+
+// Deprecated compatibility macro.  The cylindrical grid no longer has a
+// piecewise "refined cells" region; all resolutions use one fixed smooth
+// mapping and differ only in cell count.
+#ifndef FP_VELOCITY_GRID_REFINED_CELLS
+#define FP_VELOCITY_GRID_REFINED_CELLS 32
+#endif
+
+#ifndef FP_VELOCITY_GRID_UPAR_STRETCH
+#define FP_VELOCITY_GRID_UPAR_STRETCH 6.2
+#endif
+
+#ifndef FP_VELOCITY_GRID_UPERP_STRETCH
+#define FP_VELOCITY_GRID_UPERP_STRETCH 5.9
+#endif
+
 namespace Const {
     const double me   = 9.10938e-31;
     const double qe   = 1.60218e-19;
@@ -67,14 +93,18 @@ namespace Param {
 
     // Axisymmetric spherical momentum grid: (u, mu), u = p / (m c).
     // The distribution is normalized with d3u = 2*pi*u^2 du dmu.
-    const int Nv  = 96;
-    const int Nmu = 64;
+    const int Nv  = FP_VELOCITY_GRID_NV;
+    const int Nmu = FP_VELOCITY_GRID_NMU;
     const size_t Nvmu = static_cast<size_t>(Nv) * Nmu;
 
     const double Nsigma = 80.0;
     const double momentum_umax = 10.0;
     const double momentum_refined_u = 0.2;
-    const int    momentum_refined_cells = 32;
+    // Deprecated: retained only so external builds that reference the old
+    // name still compile.  It does not control CylindricalVelocityGrid.
+    const int    momentum_refined_cells = FP_VELOCITY_GRID_REFINED_CELLS;
+    const double momentum_upar_stretch = FP_VELOCITY_GRID_UPAR_STRETCH;
+    const double momentum_uperp_stretch = FP_VELOCITY_GRID_UPERP_STRETCH;
     const double diagnostic_tail_u_min = 8.0;
     const double vmax_fraction_c = 0.995;
     const int Nghost = 3;

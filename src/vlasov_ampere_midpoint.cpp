@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <mpi.h>
 
@@ -26,7 +27,14 @@ void fill_periodic_ghosts(Species& sp, const SpatialGrid& sg)
 }
 
 VlasovAmpereMidpointSolver::VlasovAmpereMidpointSolver()
-    : step_diagnostics_enabled_(false), core_macro_debt_consecutive_steps_(0)
+    : step_diagnostics_enabled_(false), beam_enabled_(true),
+      low_order_only_(false), nonuniform_high_order_enabled_(false),
+      fct_enabled_(true), legacy_boundary_upwind_high_candidate_for_test_(false),
+      max_midpoint_iterations_(20), midpoint_iteration_trace_for_test_(false),
+      fct_activation_audit_enabled_(false),
+      controlled_fct_flux_injection_enabled_(false),
+      allow_finite_negative_debt_for_test_(false),
+      core_macro_debt_consecutive_steps_(0)
 {}
 
 void VlasovAmpereMidpointSolver::reset_current_diag(CurrentDiagnostics& diag) const
@@ -55,9 +63,18 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
     result.x_final_min_f = std::numeric_limits<double>::infinity();
     result.failure_low_min = std::numeric_limits<double>::infinity();
     result.failure_final_min = std::numeric_limits<double>::infinity();
+    result.fct_high_candidate_min = std::numeric_limits<double>::infinity();
     result.fct_final_scratch_min = std::numeric_limits<double>::infinity();
+    result.low_order_candidate_min = std::numeric_limits<double>::infinity();
+    result.low_order_negative_count = 0;
+    result.low_order_negative_mass = 0.0;
+    result.low_order_roundoff_zeroed_count = 0;
+    result.low_order_roundoff_zeroed_mass = 0.0;
     result.fct_roundoff_zeroed_count = 0;
     result.fct_roundoff_zeroed_mass = 0.0;
+    result.stage5_r_couple_centered = 0.0;
+    result.stage5_r_couple_upwind_stabilization = 0.0;
+    result.stage5_r_couple_fct_stabilization = 0.0;
     result.fct_high_low_identity_worst_ix = -1;
     result.fct_high_low_identity_worst_iv = -1;
     result.fct_high_low_identity_worst_imu = -1;
@@ -68,6 +85,8 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
     result.failure_worst_ix = -1;
     result.failure_worst_iv = -1;
     result.failure_worst_imu = -1;
+    result.failure_worst_is_core = -1;
+    result.failure_worst_is_tail = -1;
     result.failure_low_work_input_min =
         std::numeric_limits<double>::infinity();
     result.accepted_transport.min_mass =
@@ -163,6 +182,21 @@ VlasovAmpereMidpointSolver::advance_background_and_fields(
         Result failed;
         reset_result(failed);
         failed.failed = true;
+        return failed;
+    }
+    if (!low_order_only_ && !bkg_n.cgrid.is_uniform() &&
+        !nonuniform_high_order_enabled_) {
+        Result failed;
+        reset_result(failed);
+        failed.failed = true;
+        failed.state_advanced = 0;
+        failed.failure_reason = 12;
+        if (mpi_rank == 0) {
+            std::cerr << "VlasovAmpereMidpointSolver configuration error: "
+                      << "nonuniform cylindrical velocity grid requires "
+                      << "set_nonuniform_high_order_enabled(true) when "
+                      << "low_order_only=false\n";
+        }
         return failed;
     }
     Result result = advance_cylindrical_single_step(

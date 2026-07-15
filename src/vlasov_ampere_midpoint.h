@@ -138,6 +138,12 @@ public:
         // separate diagnostics.  No compatibility projection is active yet.
         double stage5_r_fv;
         double stage5_r_couple;
+        // R_couple decomposition.  The centered term is the physical
+        // high-order u-force candidate; the other two terms expose the
+        // boundary upwind and FCT safety contributions without changing J_N.
+        double stage5_r_couple_centered;
+        double stage5_r_couple_upwind_stabilization;
+        double stage5_r_couple_fct_stabilization;
         double stage5_r_total;
         double stage5_r_physical_balance;
         double stage5_u_energy_moment;
@@ -194,6 +200,15 @@ public:
         double fct_interface_checksum_linf;
         double fct_interface_checksum_violation;
         double fct_low_order_tolerance_linf;
+        double low_order_candidate_min;
+        long long low_order_negative_count;
+        double low_order_negative_mass;
+        long long low_order_roundoff_zeroed_count;
+        double low_order_roundoff_zeroed_mass;
+        // Raw high-order candidate before FCT alpha/beta correction.
+        double fct_high_candidate_min;
+        double fct_high_candidate_donor_excess;
+        long long fct_controlled_injection_count;
         double fct_final_scratch_min;
         double fct_final_tolerance_linf;
         // Final-scratch negative values set to +0.0 solely because they are
@@ -202,7 +217,8 @@ public:
         double fct_roundoff_zeroed_mass;
         // 0=none, 1=CFL limit, 2=low-order positivity,
         // 3=FCT final positivity, 4=non-finite state,
-        // 5=high-low identity, 6=donor capacity, 7=interface checksum.
+        // 5=high-low identity, 6=donor capacity, 7=interface checksum,
+        // 12=nonuniform high-order transport disabled by configuration.
         int failure_reason;
         int failure_iteration;
         int failure_substep;
@@ -212,6 +228,8 @@ public:
         int failure_worst_ix;
         int failure_worst_iv;
         int failure_worst_imu;
+        int failure_worst_is_core;
+        int failure_worst_is_tail;
         double failure_low_m_in;
         double failure_low_m_low;
         double failure_low_transfer_x_left;
@@ -452,11 +470,13 @@ public:
         int f_neg_iv;
         int f_neg_imu;
         int nonlinear_iterations;
+        std::vector<double> midpoint_residual_e_history;
         bool converged;
         bool failed;
         bool soft_accepted;
         bool soft_unconverged;
         bool protected_converged;
+        int transport_low_order_only;
         int substeps_used;
     };
 
@@ -464,6 +484,56 @@ public:
 
     void set_step_diagnostics_enabled(bool enabled) {
         step_diagnostics_enabled_ = enabled;
+    }
+
+    // Test harnesses can disable the open PIC source while retaining the
+    // production background/Vlasov/Ampere implementation.  Normal runs keep
+    // this enabled by default.
+    void set_beam_enabled(bool enabled) { beam_enabled_ = enabled; }
+    void set_low_order_only(bool enabled) { low_order_only_ = enabled; }
+    // Explicit production configuration for MUSCL/CTU transport on a
+    // nonuniform cylindrical velocity grid.
+    void set_nonuniform_high_order_enabled(bool enabled) {
+        nonuniform_high_order_enabled_ = enabled;
+    }
+    void set_fct_enabled(bool enabled) { fct_enabled_ = enabled; }
+    void set_max_midpoint_iterations(int iterations) {
+        max_midpoint_iterations_ = iterations > 0 ? iterations : 1;
+    }
+    bool low_order_only() const { return low_order_only_; }
+    bool nonuniform_high_order_enabled() const {
+        return nonuniform_high_order_enabled_;
+    }
+    bool fct_enabled() const { return fct_enabled_; }
+    int max_midpoint_iterations() const { return max_midpoint_iterations_; }
+    // Test-only A/B control.  Production always uses the centered high-order
+    // candidate at every x; enabling this restores the former boundary
+    // upwind branch solely for comparison.
+    void set_legacy_boundary_upwind_high_candidate_for_test(bool enabled) {
+        legacy_boundary_upwind_high_candidate_for_test_ = enabled;
+    }
+    // Test-only convergence tracing does not alter the midpoint equation,
+    // relaxation, fluxes, or production acceptance rules.
+    void set_midpoint_iteration_trace_for_test(bool enabled) {
+        midpoint_iteration_trace_for_test_ = enabled;
+    }
+    // Raw high-candidate accounting is needed by the controlled FCT test,
+    // but is intentionally off in production runs to avoid extra per-cell
+    // long-double audit work.
+    void set_fct_activation_audit_enabled(bool enabled) {
+        fct_activation_audit_enabled_ = enabled;
+    }
+    // Test-only: inject one conservative anti-diffusive x-face correction
+    // after the low-order state passes its transport gate.  Never enabled by
+    // the production executable.
+    void set_controlled_fct_flux_injection_enabled(bool enabled) {
+        controlled_fct_flux_injection_enabled_ = enabled;
+    }
+    // Section-7.3 no-FCT verification may retain finite, non-macroscopic
+    // negative debt so the raw high-order dynamics can be audited.  This is
+    // disabled for the production solver and never relaxes NaN/Inf checks.
+    void set_allow_finite_negative_debt_for_test(bool enabled) {
+        allow_finite_negative_debt_for_test_ = enabled;
     }
 
     Result advance_background_and_fields(const Species& bkg_n,
@@ -756,6 +826,16 @@ private:
                                       int mpi_rank, int mpi_size) const;
 
     bool step_diagnostics_enabled_;
+    bool beam_enabled_;
+    bool low_order_only_;
+    bool nonuniform_high_order_enabled_;
+    bool fct_enabled_;
+    bool legacy_boundary_upwind_high_candidate_for_test_;
+    int max_midpoint_iterations_;
+    bool midpoint_iteration_trace_for_test_;
+    bool fct_activation_audit_enabled_;
+    bool controlled_fct_flux_injection_enabled_;
+    bool allow_finite_negative_debt_for_test_;
     mutable std::vector<double> ghost_send_left_;
     mutable std::vector<double> ghost_send_right_;
     mutable std::vector<double> ghost_recv_left_;
