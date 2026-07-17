@@ -1,4 +1,5 @@
 #include "maxwell.h"
+#include "periodic_staggered_operators.h"
 #include "species.h"
 #include <algorithm>
 #include <cstddef>
@@ -137,23 +138,8 @@ void close_periodic_right_face(std::vector<double>& face,
                                int mpi_size,
                                int tag)
 {
-    if (nxl <= 0 || face.size() < static_cast<size_t>(nxl + 1)) return;
-    if (mpi_size == 1) {
-        face[static_cast<size_t>(nxl)] = face[0];
-        return;
-    }
-
-    const int left_peer = (mpi_rank + mpi_size - 1) % mpi_size;
-    const int right_peer = (mpi_rank + 1) % mpi_size;
-    const double send_left_face = face[0];
-    double recv_right_face = 0.0;
-    MPI_Request reqs[2];
-    MPI_Isend(&send_left_face, 1, MPI_DOUBLE, left_peer, tag,
-              MPI_COMM_WORLD, &reqs[0]);
-    MPI_Irecv(&recv_right_face, 1, MPI_DOUBLE, right_peer, tag,
-              MPI_COMM_WORLD, &reqs[1]);
-    MPI_Waitall(2, reqs, MPI_STATUSES_IGNORE);
-    face[static_cast<size_t>(nxl)] = recv_right_face;
+    PeriodicStaggered::close_right_face_alias(face, nxl, 1,
+                                              mpi_rank, mpi_size, tag);
 }
 
 void update_cell_ex_from_faces(EMFields& fields,
@@ -165,11 +151,8 @@ void update_cell_ex_from_faces(EMFields& fields,
     if (fields.Ex_face.size() != static_cast<size_t>(nxl + 1)) {
         fields.Ex_face.assign(static_cast<size_t>(nxl + 1), 0.0);
     }
-    for (int ix = 0; ix < nxl; ++ix) {
-        fields.Ex[ng + ix] =
-            0.5 * (fields.Ex_face[static_cast<size_t>(ix)]
-                 + fields.Ex_face[static_cast<size_t>(ix + 1)]);
-    }
+    PeriodicStaggered::apply_face_to_cell_G(fields.Ex_face,
+                                            fields.Ex.data() + ng, nxl);
     exchange_scalar_ghosts(fields, fields.Ex, 201, mpi_rank, mpi_size);
 }
 

@@ -175,40 +175,6 @@ void gather_max_loss_u_high_location(double local_max_loss,
     }
 }
 
-void compute_bkg_distribution_stats(const Species& electrons,
-                                    const SpatialGrid& sg,
-                                    double& min_f,
-                                    double& negative_mass,
-                                    double& positive_mass,
-                                    double& total_mass_raw)
-{
-    min_f = std::numeric_limits<double>::infinity();
-    negative_mass = 0.0;
-    positive_mass = 0.0;
-    total_mass_raw = 0.0;
-
-    const int ng = sg.nghost;
-    for (int ix = 0; ix < sg.nx_local; ++ix) {
-        const int ix_g = ix + ng;
-        const size_t xbase = static_cast<size_t>(ix_g) * Param::Nvmu;
-        for (int iv = 0; iv < Param::Nv; ++iv) {
-            // Cylindrical Species::f stores cell-integrated mass M already;
-            // applying the legacy spherical quadrature a second time would
-            // corrupt negative/positive mass diagnostics.
-            const double cell_weight = electrons.cylindrical_mass_representation
-                ? 1.0 : electrons.vgrid.moment_weight[iv] * sg.dx;
-            const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
-            for (int imu = 0; imu < Param::Nmu; ++imu) {
-                const double fval = electrons.f[row + static_cast<size_t>(imu)];
-                min_f = std::min(min_f, fval);
-                negative_mass += std::min(fval, 0.0) * cell_weight;
-                positive_mass += std::max(fval, 0.0) * cell_weight;
-                total_mass_raw += fval * cell_weight;
-            }
-        }
-    }
-
-}
 }
 
 void Diagnostics::init(const std::string& dir, int mpi_rank,
@@ -275,18 +241,18 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                       << "net_Nb_change[m^-2]  "
                       << "KE_bkg_e[J/m2]  KE_beam[J/m2]  E_field[J/m2]  "
                       << "E_total[J/m2]  dKE_bkg[J/m2]  dKE_beam[J/m2]  "
-                      << "dE_field[J/m2]  W_bkg_E[J/m2]  W_beam_E[J/m2]  "
-                      << "bkg_energy_residual_step[J/m2]  "
-                      << "max_abs_J_bkg_charge[A/m2]  "
-                      << "max_abs_J_bkg_energy_diagnostic[A/m2]  "
-                      << "max_abs_J_bkg_ampere[A/m2]  "
-                      << "max_abs_J_bkg_charge_minus_ampere[A/m2]  "
-                      << "max_abs_J_bkg_energy_minus_ampere[A/m2]  "
-                      << "E_dot_J_bkg_charge[W/m2]  "
-                      << "E_dot_J_bkg_energy_diagnostic[W/m2]  "
-                      << "E_dot_J_bkg_ampere[W/m2]  "
-                      << "residual_if_charge_current[J/m2]  "
-                      << "residual_if_ampere_current[J/m2]  "
+                       << "dE_field[J/m2]  W_bkg_E_global[J/m2]  W_beam_E[J/m2]  "
+                       << "bkg_energy_residual_global[J/m2]  "
+                       << "max_abs_J_bkg_charge_global[A/m2]  "
+                       << "max_abs_J_bkg_energy_diagnostic_global[A/m2]  "
+                       << "max_abs_J_bkg_ampere_global[A/m2]  "
+                       << "max_abs_J_bkg_charge_minus_ampere_global[A/m2]  "
+                       << "max_abs_J_bkg_energy_minus_ampere_global[A/m2]  "
+                       << "E_dot_J_bkg_charge_global[W/m2]  "
+                       << "E_dot_J_bkg_energy_diagnostic_global[W/m2]  "
+                       << "E_dot_J_bkg_ampere_global[W/m2]  "
+                       << "residual_if_charge_current_global[J/m2]  "
+                       << "residual_if_ampere_current_global[J/m2]  "
                       << "boundary_force_Cu_max  boundary_force_Cmu_max  "
                       << "boundary_force_nsub_max  "
                       << "boundary_force_remap_cell_count  "
@@ -303,9 +269,11 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                       << "interface_QC_flux_into_core  "
                       << "interface_QC_high_correction_into_core  "
                       << "boundary_energy_diagnostic_invalid  "
-                      << "coupled_iter  coupled_residual_E  "
-                      << "coupled_residual_J_bkg  coupled_residual_J_beam  "
-                      << "x_limiter_active_fraction  x_limiter_min_alpha  "
+                       << "coupled_iter_global  coupled_residual_E_global  "
+                       << "coupled_residual_J_bkg_global  coupled_residual_J_beam_global  "
+                       << "JN_minus_GstarJE_linf_global[A/m2]  "
+                       << "stage5_R_FV_global[J/m2]  stage5_R_couple_global[J/m2]  "
+                       << "x_limiter_active_fraction  x_limiter_min_alpha  "
                       << "u_mass_error  mu_mass_error  "
                       << "u_px_delta[kg/m/s/m2]  mu_px_delta[kg/m/s/m2]  "
                       << "u_energy_delta[J/m2]  mu_energy_delta[J/m2]  "
@@ -320,38 +288,6 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                       << "integral_f_u_gt_8_x[m^-3]\n";
             step_file << std::scientific << std::setprecision(8);
 
-            bkg_stage_file.open(
-                (output_dir + "/bkg_stage_diagnostics.dat").c_str());
-            bkg_stage_file
-                << "# step  time[fs]  accepted  state_advanced  "
-                << "soft_unconverged  coupled_iter  stage  "
-                << "min_f  negative_mass[m^-2]  positive_mass[m^-2]  "
-                << "total_mass_raw[m^-2]  total_mass_clipped[m^-2]  "
-                << "N_bkg_change[m^-2]  "
-                << "neg_cell_count  low_u_neg_mass[m^-2]  "
-                << "core_low_u_min_f\n";
-            bkg_stage_file << std::scientific << std::setprecision(8);
-
-            bkg_stage_by_u_file.open(
-                (output_dir + "/bkg_stage_by_u_diagnostics.dat").c_str());
-            bkg_stage_by_u_file
-                << "# step  time[fs]  accepted  state_advanced  "
-                << "soft_unconverged  coupled_iter  stage  u_index  "
-                << "min_f_core_by_u  neg_mass_core_by_u[m^-2]  "
-                << "neg_cell_count_core_by_u  "
-                << "min_f_boundary_by_u  neg_mass_boundary_by_u[m^-2]  "
-                << "neg_cell_count_boundary_by_u\n";
-            bkg_stage_by_u_file << std::scientific << std::setprecision(8);
-
-            bkg_low_u_divergence_file.open(
-                (output_dir + "/bkg_low_u_divergence_diagnostics.dat").c_str());
-            bkg_low_u_divergence_file
-                << "# step  time[fs]  coupled_iter  "
-                << "low_u_dx_div_neg_added[m^-2]  "
-                << "low_u_du_div_neg_added[m^-2]  "
-                << "low_u_dmu_div_neg_added[m^-2]\n";
-            bkg_low_u_divergence_file
-                << std::scientific << std::setprecision(8);
         }
     }
     MPI_Barrier(MPI_COMM_WORLD);
@@ -594,7 +530,7 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                                          double dke_bkg_step,
                                          double dke_beam_push,
                                          double dE_field_step,
-                                         double W_bkg_E,
+                                          double global_W_bkg_E,
                                          double W_beam_E,
                                          double v_mass_error_step,
                                          double mu_mass_error_step,
@@ -607,17 +543,17 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                                          double E_balance_step,
                                          double x_limiter_active_fraction,
                                          double x_limiter_min_alpha,
-                                         double bkg_energy_residual_step,
-                                         double bkg_current_max_abs_charge,
-                                         double bkg_current_max_abs_energy,
-                                         double bkg_current_max_abs_ampere,
-                                         double bkg_current_max_abs_charge_minus_ampere,
-                                         double bkg_current_max_abs_energy_minus_ampere,
-                                         double bkg_current_e_dot_charge,
-                                         double bkg_current_e_dot_energy,
-                                         double bkg_current_e_dot_ampere,
-                                    double bkg_residual_if_charge_current,
-                                    double bkg_residual_if_ampere_current,
+                                          double global_bkg_energy_residual_step,
+                                          double global_bkg_current_max_abs_charge,
+                                          double global_bkg_current_max_abs_energy,
+                                          double global_bkg_current_max_abs_ampere,
+                                          double global_bkg_current_max_abs_charge_minus_ampere,
+                                          double global_bkg_current_max_abs_energy_minus_ampere,
+                                          double global_bkg_current_e_dot_charge,
+                                          double global_bkg_current_e_dot_energy,
+                                          double global_bkg_current_e_dot_ampere,
+                                     double global_bkg_residual_if_charge_current,
+                                     double global_bkg_residual_if_ampere_current,
                                     double boundary_force_Cu_max,
                                     double boundary_force_Cmu_max,
                                     int boundary_force_nsub_max,
@@ -636,11 +572,14 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                                     double interface_QC_flux_into_core,
                                     double interface_QC_high_correction_into_core,
                                     double boundary_energy_diagnostic_invalid,
-                                    int coupled_iter,
-                                    double coupled_residual_E,
-                                    double coupled_residual_J_bkg,
-                                         double coupled_residual_J_beam,
-                                         double local_max_loss_u_high,
+                                      int global_coupled_iter,
+                                      double global_coupled_residual_E,
+                                      double global_coupled_residual_J_bkg,
+                                      double global_coupled_residual_J_beam,
+                                      double global_jn_minus_gstar_je_linf,
+                                      double global_stage5_r_fv,
+                                      double global_stage5_r_couple,
+                                      double local_max_loss_u_high,
                                          double local_x_at_max_loss_u_high,
                                          double local_f_u_max_x,
                                          double local_integral_f_u_gt_8_x)
@@ -695,6 +634,9 @@ void Diagnostics::write_step_diagnostics(int step, double time,
     const double local_field_energy = fields.total_energy();
     const double local_total_energy =
         local_bkg_ke + local_beam_ke + local_field_energy;
+    // Entries sourced from Species/Beam/EMFields are rank-local and need one
+    // SUM reduction.  Solver closure diagnostics are already global and are
+    // deliberately kept out of this array.
     double local_energy[28] = {
         local_bkg_ke,
         local_beam_ke,
@@ -703,7 +645,7 @@ void Diagnostics::write_step_diagnostics(int step, double time,
         dke_bkg_step,
         dke_beam_push,
         dE_field_step,
-        W_bkg_E,
+        0.0,
         W_beam_E,
         v_mass_error_step,
         mu_mass_error_step,
@@ -715,12 +657,12 @@ void Diagnostics::write_step_diagnostics(int step, double time,
         E_src_out_step,
         collision_energy_step,
         E_balance_step,
-        bkg_energy_residual_step,
-        bkg_current_e_dot_charge,
-        bkg_current_e_dot_energy,
-        bkg_current_e_dot_ampere,
-        bkg_residual_if_charge_current,
-        bkg_residual_if_ampere_current,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
         beam.cumulative_injected_energy(),
         beam.cumulative_outflow_energy(),
         cumulative_collision_energy_delta
@@ -731,6 +673,30 @@ void Diagnostics::write_step_diagnostics(int step, double time,
         0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
         0.0, 0.0, 0.0, 0.0
     };
+    // One collective for all rank-local SUM quantities.  The layout is kept
+    // contiguous to reduce synchronization overhead without mixing in any
+    // solver-global diagnostics.
+    double local_sum_values[43] = {0.0};
+    double global_sum_values[43] = {0.0};
+    local_sum_values[0] = local_charge_residual_int;
+    local_sum_values[1] = local_N_bkg_e;
+    local_sum_values[2] = local_N_beam_macro;
+    local_sum_values[3] = local_N_beam_weighted;
+    local_sum_values[4] = local_beam_continuity_sum[0];
+    local_sum_values[5] = local_beam_continuity_sum[1];
+    for (int i = 0; i < 9; ++i)
+        local_sum_values[6 + i] = local_losses[i];
+    for (int i = 0; i < 28; ++i)
+        local_sum_values[15 + i] = local_energy[i];
+    const double global_solver_energy[7] = {
+        global_W_bkg_E,
+        global_bkg_energy_residual_step,
+        global_bkg_current_e_dot_charge,
+        global_bkg_current_e_dot_energy,
+        global_bkg_current_e_dot_ampere,
+        global_bkg_residual_if_charge_current,
+        global_bkg_residual_if_ampere_current
+    };
     double global_max_abs_Ex = 0.0;
     double global_x_at_max_abs_Ex = 0.0;
     double global_charge_residual_int = 0.0;
@@ -738,16 +704,13 @@ void Diagnostics::write_step_diagnostics(int step, double time,
     double global_N_bkg_e = 0.0;
     double global_N_beam_macro = 0.0;
     double global_N_beam_weighted = 0.0;
-    double global_bkg_current_max_values[5] = {
-        0.0, 0.0, 0.0, 0.0, 0.0
+    const double global_bkg_current_max_values[5] = {
+        global_bkg_current_max_abs_charge,
+        global_bkg_current_max_abs_energy,
+        global_bkg_current_max_abs_ampere,
+        global_bkg_current_max_abs_charge_minus_ampere,
+        global_bkg_current_max_abs_energy_minus_ampere
     };
-    double local_coupled_values[4] = {
-        static_cast<double>(coupled_iter),
-        coupled_residual_E,
-        coupled_residual_J_bkg,
-        coupled_residual_J_beam
-    };
-    double global_coupled_values[4] = {0.0, 0.0, 0.0, 0.0};
     double global_x_at_max_loss_u_high = 0.0;
     double global_f_u_max_x = 0.0;
     double global_integral_f_u_gt_8_x = 0.0;
@@ -765,37 +728,25 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                                     global_x_at_max_loss_u_high,
                                     global_f_u_max_x,
                                     global_integral_f_u_gt_8_x);
-    MPI_Reduce(&local_charge_residual_int, &global_charge_residual_int, 1,
-               MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_charge_residual_abs_max,
                &global_charge_residual_abs_max, 1,
                MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&local_N_bkg_e, &global_N_bkg_e, 1,
-               MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&local_N_beam_macro, &global_N_beam_macro, 1,
-               MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&local_N_beam_weighted, &global_N_beam_weighted, 1,
-               MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(local_beam_continuity_sum, global_beam_continuity_sum,
-               2, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(local_beam_continuity_max, global_beam_continuity_max,
                4, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(local_nsub, global_nsub, 4, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(local_losses, global_losses, 9, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(local_energy, global_energy, 28, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    double local_bkg_current_max_values[5] = {
-        bkg_current_max_abs_charge,
-        bkg_current_max_abs_energy,
-        bkg_current_max_abs_ampere,
-        bkg_current_max_abs_charge_minus_ampere,
-        bkg_current_max_abs_energy_minus_ampere
-    };
-    MPI_Reduce(local_bkg_current_max_values, global_bkg_current_max_values,
-               5, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(local_coupled_values, global_coupled_values,
-               4, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-
+    MPI_Reduce(local_sum_values, global_sum_values, 43, MPI_DOUBLE, MPI_SUM,
+               0, MPI_COMM_WORLD);
     if (mpi_rank == 0) {
+        global_charge_residual_int = global_sum_values[0];
+        global_N_bkg_e = global_sum_values[1];
+        global_N_beam_macro = global_sum_values[2];
+        global_N_beam_weighted = global_sum_values[3];
+        global_beam_continuity_sum[0] = global_sum_values[4];
+        global_beam_continuity_sum[1] = global_sum_values[5];
+        for (int i = 0; i < 9; ++i)
+            global_losses[i] = global_sum_values[6 + i];
+        for (int i = 0; i < 28; ++i)
+            global_energy[i] = global_sum_values[15 + i];
         const double current_ke_per_particle_eV =
             (global_N_bkg_e > 0.0)
             ? global_energy[0] / global_N_bkg_e / Const::eV
@@ -842,19 +793,19 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << global_energy[4] << "  "
                   << global_energy[5] << "  "
                   << global_energy[6] << "  "
-                  << global_energy[7] << "  "
+                   << global_solver_energy[0] << "  "
                   << global_energy[8] << "  "
-                  << global_energy[19] << "  "
+                   << global_solver_energy[1] << "  "
                   << global_bkg_current_max_values[0] << "  "
                   << global_bkg_current_max_values[1] << "  "
                   << global_bkg_current_max_values[2] << "  "
                   << global_bkg_current_max_values[3] << "  "
                   << global_bkg_current_max_values[4] << "  "
-                  << global_energy[20] << "  "
-                  << global_energy[21] << "  "
-                  << global_energy[22] << "  "
-                  << global_energy[23] << "  "
-                  << global_energy[24] << "  "
+                   << global_solver_energy[2] << "  "
+                   << global_solver_energy[3] << "  "
+                   << global_solver_energy[4] << "  "
+                   << global_solver_energy[5] << "  "
+                   << global_solver_energy[6] << "  "
                   << boundary_force_Cu_max << "  "
                   << boundary_force_Cmu_max << "  "
                   << boundary_force_nsub_max << "  "
@@ -873,11 +824,14 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << interface_QC_flux_into_core << "  "
                   << interface_QC_high_correction_into_core << "  "
                   << boundary_energy_diagnostic_invalid << "  "
-                  << static_cast<int>(global_coupled_values[0]) << "  "
-                  << global_coupled_values[1] << "  "
-                  << global_coupled_values[2] << "  "
-                  << global_coupled_values[3] << "  "
-                  << x_limiter_active_fraction << "  "
+                   << global_coupled_iter << "  "
+                   << global_coupled_residual_E << "  "
+                   << global_coupled_residual_J_bkg << "  "
+                   << global_coupled_residual_J_beam << "  "
+                   << global_jn_minus_gstar_je_linf << "  "
+                   << global_stage5_r_fv << "  "
+                   << global_stage5_r_couple << "  "
+                   << x_limiter_active_fraction << "  "
                   << x_limiter_min_alpha << "  "
                   << global_energy[9] << "  "
                   << global_energy[10] << "  "
@@ -899,197 +853,6 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << global_integral_f_u_gt_8_x << "\n";
         step_file.flush();
     }
-}
-
-void Diagnostics::write_bkg_stage_diagnostics(
-    int step, double time,
-    int coupled_iter,
-    const std::string& stage,
-    const Species& electrons,
-    const SpatialGrid& sg,
-    int mpi_rank, int mpi_size,
-    double reference_total_mass_raw)
-{
-    (void)mpi_size;
-    if (!step_enabled) {
-        (void)step;
-        (void)time;
-        (void)coupled_iter;
-        (void)stage;
-        (void)electrons;
-        (void)sg;
-        (void)mpi_rank;
-        (void)reference_total_mass_raw;
-        return;
-    }
-
-    double local_min_f = 0.0;
-    double local_negative_mass = 0.0;
-    double local_positive_mass = 0.0;
-    double local_total_mass_raw = 0.0;
-    compute_bkg_distribution_stats(electrons, sg,
-                                   local_min_f,
-                                   local_negative_mass,
-                                   local_positive_mass,
-                                   local_total_mass_raw);
-
-    double global_min_f = 0.0;
-    double local_sums[3] = {
-        local_negative_mass,
-        local_positive_mass,
-        local_total_mass_raw
-    };
-    double global_sums[3] = { 0.0, 0.0, 0.0 };
-    MPI_Reduce(&local_min_f, &global_min_f, 1, MPI_DOUBLE, MPI_MIN,
-               0, MPI_COMM_WORLD);
-    MPI_Reduce(local_sums, global_sums, 3, MPI_DOUBLE, MPI_SUM,
-               0, MPI_COMM_WORLD);
-
-    if (mpi_rank == 0) {
-        if (global_min_f == std::numeric_limits<double>::infinity()) {
-            global_min_f = 0.0;
-        }
-        const double total_mass_clipped = global_sums[1];
-        const double N_bkg_change = global_sums[2] - reference_total_mass_raw;
-        bkg_stage_file << step << "  "
-                       << time / Const::femto << "  "
-                       << coupled_iter << "  "
-                       << stage << "  "
-                       << global_min_f << "  "
-                       << global_sums[0] << "  "
-                       << global_sums[1] << "  "
-                       << global_sums[2] << "  "
-                       << total_mass_clipped << "  "
-                       << N_bkg_change << "  "
-                       << 0 << "  "
-                       << 0.0 << "  "
-                       << 0.0 << "\n";
-        bkg_stage_file.flush();
-    }
-}
-
-void Diagnostics::write_bkg_stage_negativity(
-    int step, double time, int coupled_iter,
-    bool soft_unconverged,
-    const std::vector<double>& min_f,
-    const std::vector<double>& neg_mass,
-    const std::vector<long long>& neg_cell_count,
-    const std::vector<double>& low_u_neg_mass,
-    const std::vector<double>& core_low_u_min_f,
-    int mpi_rank)
-{
-    if (!step_enabled || mpi_rank != 0) return;
-    static const char* stages[3] = {"after_x", "after_u", "after_mu"};
-    const size_t nstage = 3;
-    for (size_t istage = 0; istage < nstage; ++istage) {
-        const double min_value =
-            (istage < min_f.size()) ? min_f[istage] : 0.0;
-        const double neg_mass_value =
-            (istage < neg_mass.size()) ? neg_mass[istage] : 0.0;
-        const long long neg_count_value =
-            (istage < neg_cell_count.size()) ? neg_cell_count[istage] : 0;
-        const double low_u_value =
-            (istage < low_u_neg_mass.size()) ? low_u_neg_mass[istage] : 0.0;
-        const double core_low_u_min =
-            (istage < core_low_u_min_f.size())
-            ? core_low_u_min_f[istage] : 0.0;
-        bkg_stage_file << step << "  "
-                       << time / Const::femto << "  "
-                       << 1 << "  "
-                       << 1 << "  "
-                       << (soft_unconverged ? 1 : 0) << "  "
-                       << coupled_iter << "  "
-                       << stages[istage] << "  "
-                       << min_value << "  "
-                       << neg_mass_value << "  "
-                       << 0.0 << "  "
-                       << 0.0 << "  "
-                       << 0.0 << "  "
-                       << 0.0 << "  "
-                       << neg_count_value << "  "
-                       << low_u_value << "  "
-                       << core_low_u_min << "\n";
-    }
-    bkg_stage_file.flush();
-}
-
-void Diagnostics::write_bkg_stage_by_u_diagnostics(
-    int step, double time, int coupled_iter,
-    bool soft_unconverged,
-    const std::vector<double>& min_f_core_by_u,
-    const std::vector<double>& neg_mass_core_by_u,
-    const std::vector<long long>& neg_cell_count_core_by_u,
-    const std::vector<double>& min_f_boundary_by_u,
-    const std::vector<double>& neg_mass_boundary_by_u,
-    const std::vector<long long>& neg_cell_count_boundary_by_u,
-    int mpi_rank)
-{
-    if (!step_enabled || mpi_rank != 0) return;
-    static const char* stages[3] = {"after_x", "after_u", "after_mu"};
-    const size_t stride = Param::Nv;
-    for (size_t istage = 0; istage < 3; ++istage) {
-        const size_t base = istage * stride;
-        for (int iv = 0; iv < Param::Nv; ++iv) {
-            const size_t slot = base + static_cast<size_t>(iv);
-            const double min_core =
-                (slot < min_f_core_by_u.size())
-                ? min_f_core_by_u[slot] : 0.0;
-            const double neg_core =
-                (slot < neg_mass_core_by_u.size())
-                ? neg_mass_core_by_u[slot] : 0.0;
-            const long long count_core =
-                (slot < neg_cell_count_core_by_u.size())
-                ? neg_cell_count_core_by_u[slot] : 0;
-            const double min_boundary =
-                (slot < min_f_boundary_by_u.size())
-                ? min_f_boundary_by_u[slot] : 0.0;
-            const double neg_boundary =
-                (slot < neg_mass_boundary_by_u.size())
-                ? neg_mass_boundary_by_u[slot] : 0.0;
-            const long long count_boundary =
-                (slot < neg_cell_count_boundary_by_u.size())
-                ? neg_cell_count_boundary_by_u[slot] : 0;
-            bkg_stage_by_u_file << step << "  "
-                                << time / Const::femto << "  "
-                                << 1 << "  "
-                                << 1 << "  "
-                                << (soft_unconverged ? 1 : 0) << "  "
-                                << coupled_iter << "  "
-                                << stages[istage] << "  "
-                                << iv << "  "
-                                << min_core << "  "
-                                << neg_core << "  "
-                                << count_core << "  "
-                                << min_boundary << "  "
-                                << neg_boundary << "  "
-                                << count_boundary << "\n";
-        }
-    }
-    bkg_stage_by_u_file.flush();
-}
-
-void Diagnostics::write_bkg_low_u_divergence_diagnostics(
-    int step, double time, int coupled_iter,
-    const std::vector<double>& low_u_neg_added_by_div,
-    int mpi_rank)
-{
-    if (!step_enabled || mpi_rank != 0) return;
-    const double dx_added =
-        (low_u_neg_added_by_div.size() > 0)
-        ? low_u_neg_added_by_div[0] : 0.0;
-    const double du_added =
-        (low_u_neg_added_by_div.size() > 1)
-        ? low_u_neg_added_by_div[1] : 0.0;
-    const double dmu_added =
-        (low_u_neg_added_by_div.size() > 2)
-        ? low_u_neg_added_by_div[2] : 0.0;
-    bkg_low_u_divergence_file << step << "  "
-                              << time / Const::femto << "  "
-                              << coupled_iter << "  "
-                              << dx_added << "  "
-                              << du_added << "  "
-                              << dmu_added << "\n";
-    bkg_low_u_divergence_file.flush();
 }
 
 void Diagnostics::write_fields(double time,
@@ -1373,86 +1136,6 @@ void Diagnostics::write_electron_distribution(double time,
             }
         }
     }
-}
-
-// 7.1.6: per-direction flux-positivity diagnostics
-void Diagnostics::write_flux_positivity_diagnostics(
-    int step, double time,
-    const double min_f_before[3],
-    const double min_f_low[3],
-    const double min_f_final[3],
-    const double low_order_failed[3],
-    const double alpha_active[3],
-    const double alpha_min[3],
-    const double alpha_core[3],
-    const double alpha_boundary[3],
-    const double neg_mass_prevented[3],
-    int mpi_rank)
-{
-    if (mpi_rank != 0) return;
-    static std::ofstream flux_pos_file;
-    if (!flux_pos_file.is_open()) {
-        flux_pos_file.open("output/flux_positivity_diagnostics.dat");
-        flux_pos_file << std::scientific << std::setprecision(6);
-        flux_pos_file
-            << "step time[fs] direction "
-            << "min_f_before min_f_low min_f_final "
-            << "low_order_failed_count "
-            << "alpha_active_fraction alpha_min "
-            << "alpha_core_fraction alpha_boundary_fraction "
-            << "negative_mass_prevented[m^-2]\n";
-    }
-    const double time_fs = time / Const::femto;
-    const char* dir_names[3] = {"x", "u", "mu"};
-    for (int d = 0; d < 3; ++d) {
-        flux_pos_file
-            << step << " " << time_fs << " " << dir_names[d] << " "
-            << min_f_before[d] << " "
-            << min_f_low[d] << " "
-            << min_f_final[d] << " "
-            << low_order_failed[d] << " "
-            << alpha_active[d] << " "
-            << alpha_min[d] << " "
-            << alpha_core[d] << " "
-            << alpha_boundary[d] << " "
-            << neg_mass_prevented[d] << "\n";
-    }
-    flux_pos_file.flush();
-}
-
-// 7.1.6: per-direction flux-defect diagnostics
-void Diagnostics::write_stage_flux_defect_diagnostics(
-    int step, double time,
-    const double mass_defect[3],
-    const double momentum_defect[3],
-    const double energy_defect[3],
-    const double boundary_mass[3],
-    const double boundary_energy[3],
-    int mpi_rank)
-{
-    if (mpi_rank != 0) return;
-    static std::ofstream defect_file;
-    if (!defect_file.is_open()) {
-        defect_file.open("output/stage_flux_defect_diagnostics.dat");
-        defect_file << std::scientific << std::setprecision(6);
-        defect_file
-            << "step time[fs] direction "
-            << "mass_defect[m^-2] momentum_defect[kg*m/s/m^2] "
-            << "energy_defect[J/m^2] "
-            << "boundary_mass_loss[m^-2] boundary_energy_loss[J/m^2]\n";
-    }
-    const double time_fs = time / Const::femto;
-    const char* dir_names[3] = {"x", "u", "mu"};
-    for (int d = 0; d < 3; ++d) {
-        defect_file
-            << step << " " << time_fs << " " << dir_names[d] << " "
-            << mass_defect[d] << " "
-            << momentum_defect[d] << " "
-            << energy_defect[d] << " "
-            << boundary_mass[d] << " "
-            << boundary_energy[d] << "\n";
-    }
-    defect_file.flush();
 }
 
 void Diagnostics::advance_snapshot()

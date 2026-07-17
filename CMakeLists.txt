@@ -13,6 +13,10 @@ option(FP_BUILD_PRODUCTION_AMPERE_TEST
        "Build the section-7.2 MPI production-solver Ampere audit" OFF)
 option(FP_BUILD_LANGMUIR_WAVE_TEST
        "Build the section-7.3 MPI production Langmuir-wave tests" OFF)
+option(FP_BUILD_CHECKPOINT_TESTS
+       "Build checkpoint/restart infrastructure tests" OFF)
+option(FP_BUILD_PERIODIC_STAGGERED_TESTS
+       "Build periodic G/G* adjoint and x-face topology tests" OFF)
 set(FP_VELOCITY_GRID_UPAR_STRETCH "6.2" CACHE STRING
     "Smooth cylindrical u_parallel sinh mapping parameter")
 set(FP_VELOCITY_GRID_UPERP_STRETCH "5.9" CACHE STRING
@@ -37,6 +41,51 @@ if(MPI_CXX_FOUND)
     include_directories(${MPI_CXX_INCLUDE_PATH})
 endif()
 
+if(FP_BUILD_CHECKPOINT_TESTS)
+    if(NOT MPI_CXX_FOUND)
+        message(FATAL_ERROR "FP_BUILD_CHECKPOINT_TESTS requires MPI")
+    endif()
+    add_executable(checkpoint_roundtrip_test
+        tests/checkpoint_roundtrip_test.cpp src/checkpoint.cpp src/species.cpp
+        src/maxwell.cpp src/periodic_staggered_operators.cpp src/beam_pic.cpp)
+    target_include_directories(checkpoint_roundtrip_test PRIVATE src)
+    target_link_libraries(checkpoint_roundtrip_test ${MPI_CXX_LIBRARIES})
+
+    add_executable(restart_one_step_equivalence_test
+        tests/restart_one_step_equivalence_test.cpp
+        src/checkpoint.cpp src/species.cpp src/maxwell.cpp src/periodic_staggered_operators.cpp src/beam_pic.cpp
+        src/vlasov_ampere_midpoint.cpp src/cylindrical_vlasov_midpoint.cpp
+        src/nonuniform_reconstruction.cpp)
+    target_include_directories(restart_one_step_equivalence_test PRIVATE src)
+    target_link_libraries(restart_one_step_equivalence_test ${MPI_CXX_LIBRARIES})
+
+    add_executable(beam_rng_injection_continuity_test
+        tests/beam_rng_injection_continuity_test.cpp
+        src/checkpoint.cpp src/species.cpp src/maxwell.cpp src/periodic_staggered_operators.cpp src/beam_pic.cpp)
+    target_include_directories(beam_rng_injection_continuity_test PRIVATE src)
+    target_link_libraries(beam_rng_injection_continuity_test ${MPI_CXX_LIBRARIES})
+
+    add_executable(checkpoint_failure_safety_test
+        tests/checkpoint_failure_safety_test.cpp
+        src/checkpoint.cpp src/species.cpp src/maxwell.cpp src/periodic_staggered_operators.cpp src/beam_pic.cpp)
+    target_include_directories(checkpoint_failure_safety_test PRIVATE src)
+    target_link_libraries(checkpoint_failure_safety_test ${MPI_CXX_LIBRARIES})
+
+    add_executable(beam_dt_half_time_consistency_test
+        tests/beam_dt_half_time_consistency_test.cpp
+        src/species.cpp src/maxwell.cpp src/periodic_staggered_operators.cpp src/beam_pic.cpp)
+    target_include_directories(beam_dt_half_time_consistency_test PRIVATE src)
+    target_link_libraries(beam_dt_half_time_consistency_test ${MPI_CXX_LIBRARIES})
+
+    add_executable(fixed_midpoint_operator_audit_test
+        tests/fixed_midpoint_operator_audit_test.cpp
+        src/checkpoint.cpp src/species.cpp src/maxwell.cpp src/periodic_staggered_operators.cpp src/beam_pic.cpp
+        src/vlasov_ampere_midpoint.cpp src/cylindrical_vlasov_midpoint.cpp
+        src/nonuniform_reconstruction.cpp)
+    target_include_directories(fixed_midpoint_operator_audit_test PRIVATE src)
+    target_link_libraries(fixed_midpoint_operator_audit_test ${MPI_CXX_LIBRARIES})
+endif()
+
 if(FP_BUILD_LANGMUIR_WAVE_TEST)
     if(NOT MPI_CXX_FOUND)
         message(FATAL_ERROR "FP_BUILD_LANGMUIR_WAVE_TEST requires MPI")
@@ -48,6 +97,7 @@ if(FP_BUILD_LANGMUIR_WAVE_TEST)
         src/cylindrical_vlasov_midpoint.cpp
         src/nonuniform_reconstruction.cpp
         src/maxwell.cpp
+        src/periodic_staggered_operators.cpp
         src/beam_pic.cpp)
     target_include_directories(production_langmuir_wave_test PRIVATE src)
     target_compile_definitions(production_langmuir_wave_test PRIVATE
@@ -73,6 +123,23 @@ if(FP_BUILD_LANGMUIR_WAVE_TEST)
     add_executable(production_langmuir_wave_audit
         tests/production_langmuir_wave_audit.cpp)
     target_include_directories(production_langmuir_wave_audit PRIVATE src)
+endif()
+
+if(FP_BUILD_PERIODIC_STAGGERED_TESTS)
+    if(NOT MPI_CXX_FOUND)
+        message(FATAL_ERROR "FP_BUILD_PERIODIC_STAGGERED_TESTS requires MPI")
+    endif()
+    add_executable(periodic_staggered_adjoint_test
+        tests/periodic_staggered_adjoint_test.cpp
+        src/periodic_staggered_operators.cpp)
+    target_include_directories(periodic_staggered_adjoint_test PRIVATE src)
+    target_link_libraries(periodic_staggered_adjoint_test ${MPI_CXX_LIBRARIES})
+
+    add_executable(periodic_x_flux_topology_test
+        tests/periodic_x_flux_topology_test.cpp
+        src/species.cpp src/maxwell.cpp src/periodic_staggered_operators.cpp)
+    target_include_directories(periodic_x_flux_topology_test PRIVATE src)
+    target_link_libraries(periodic_x_flux_topology_test ${MPI_CXX_LIBRARIES})
 endif()
 
 if(FP_BUILD_PPM_CTU_TESTS)
@@ -122,6 +189,7 @@ if(FP_BUILD_PRODUCTION_AMPERE_TEST)
             src/cylindrical_vlasov_midpoint.cpp
             src/nonuniform_reconstruction.cpp
             src/maxwell.cpp
+            src/periodic_staggered_operators.cpp
             src/beam_pic.cpp)
         target_include_directories(${target_name} PRIVATE src)
         target_compile_definitions(${target_name} PRIVATE
@@ -173,6 +241,7 @@ if(FP_BUILD_PRODUCTION_AMPERE_TEST)
         src/cylindrical_vlasov_midpoint.cpp
         src/nonuniform_reconstruction.cpp
         src/maxwell.cpp
+        src/periodic_staggered_operators.cpp
         src/beam_pic.cpp)
     target_include_directories(production_energy_current_scaling_test PRIVATE src)
     target_compile_definitions(production_energy_current_scaling_test PRIVATE
@@ -233,11 +302,14 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 set(SOURCES
     src/main.cpp
     src/config.cpp
+    src/runtime_options.cpp
+    src/checkpoint.cpp
     src/species.cpp
     src/vlasov_ampere_midpoint.cpp
     src/cylindrical_vlasov_midpoint.cpp
     src/nonuniform_reconstruction.cpp
     src/maxwell.cpp
+    src/periodic_staggered_operators.cpp
     src/collision.cpp
     src/diagnostics.cpp
     src/beam_pic.cpp

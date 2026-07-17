@@ -33,6 +33,73 @@ BeamPIC::BeamPIC()
       injected_begin_(0)
 {}
 
+BeamPersistentState BeamPIC::export_persistent_state() const
+{
+    // Checkpoint serialization and restart hashes include this POD object.
+    // Zero its padding so equivalent Beam states have byte-identical images.
+    BeamPersistentState s = {};
+    s.injection_remainder = injection_remainder_;
+    s.cumulative_injected_energy = cumulative_injected_energy_;
+    s.cumulative_outflow_energy = cumulative_outflow_energy_;
+    s.last_injected_energy = last_injected_energy_;
+    s.last_outflow_energy = last_outflow_energy_;
+    s.last_injected_number = last_injected_number_;
+    s.last_outflow_number = last_outflow_number_;
+    s.last_injected_current = last_injected_current_;
+    s.last_outflow_current = last_outflow_current_;
+    s.last_field_work = last_field_work_;
+    s.step_dt = step_dt_;
+    s.step_signed_outflow_number = step_signed_outflow_number_;
+    s.interval_injected_number = interval_injected_number_;
+    s.interval_left_outflow_signed_number = interval_left_outflow_signed_number_;
+    s.interval_right_outflow_number = interval_right_outflow_number_;
+    s.interval_left_guard_path_number = interval_left_guard_path_number_;
+    s.interval_right_guard_path_number = interval_right_guard_path_number_;
+    s.last_continuity_abs_l1_residual = last_continuity_abs_l1_residual_;
+    s.last_continuity_abs_linf_residual = last_continuity_abs_linf_residual_;
+    s.last_continuity_l1_error = last_continuity_l1_error_;
+    s.last_continuity_linf_error = last_continuity_linf_error_;
+    s.last_boundary_flux_error = last_boundary_flux_error_;
+    s.last_trajectory_reconstruction_error = last_trajectory_reconstruction_error_;
+    s.rng_state = rng_state_;
+    return s;
+}
+
+void BeamPIC::import_persistent_state(const BeamPersistentState& s,
+                                      const SpatialGrid& sg)
+{
+    injection_remainder_ = s.injection_remainder;
+    cumulative_injected_energy_ = s.cumulative_injected_energy;
+    cumulative_outflow_energy_ = s.cumulative_outflow_energy;
+    last_injected_energy_ = s.last_injected_energy;
+    last_outflow_energy_ = s.last_outflow_energy;
+    last_injected_number_ = s.last_injected_number;
+    last_outflow_number_ = s.last_outflow_number;
+    last_injected_current_ = s.last_injected_current;
+    last_outflow_current_ = s.last_outflow_current;
+    last_field_work_ = s.last_field_work;
+    step_dt_ = s.step_dt;
+    step_signed_outflow_number_ = s.step_signed_outflow_number;
+    interval_injected_number_ = s.interval_injected_number;
+    interval_left_outflow_signed_number_ = s.interval_left_outflow_signed_number;
+    interval_right_outflow_number_ = s.interval_right_outflow_number;
+    interval_left_guard_path_number_ = s.interval_left_guard_path_number;
+    interval_right_guard_path_number_ = s.interval_right_guard_path_number;
+    last_continuity_abs_l1_residual_ = s.last_continuity_abs_l1_residual;
+    last_continuity_abs_linf_residual_ = s.last_continuity_abs_linf_residual;
+    last_continuity_l1_error_ = s.last_continuity_l1_error;
+    last_continuity_linf_error_ = s.last_continuity_linf_error;
+    last_boundary_flux_error_ = s.last_boundary_flux_error;
+    last_trajectory_reconstruction_error_ = s.last_trajectory_reconstruction_error;
+    rng_state_ = s.rng_state;
+    injected_begin_ = particles.size();
+    injected_push_dt_.clear(); send_left_.clear(); send_right_.clear(); keep_.clear();
+    recv_left_.clear(); recv_right_.clear(); thread_keep_.clear();
+    thread_send_left_.clear(); thread_send_right_.clear();
+    trajectory_density_delta_.assign(static_cast<size_t>(sg.nx_local), 0.0);
+    boundary_source_density_delta_.assign(static_cast<size_t>(sg.nx_local), 0.0);
+}
+
 namespace {
 size_t initial_particle_capacity(const SpatialGrid& sg)
 {

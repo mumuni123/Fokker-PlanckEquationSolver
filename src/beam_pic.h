@@ -12,6 +12,33 @@ struct BeamParticle {
     double weight;
 };
 
+struct BeamPersistentState {
+    double injection_remainder;
+    double cumulative_injected_energy;
+    double cumulative_outflow_energy;
+    double last_injected_energy;
+    double last_outflow_energy;
+    double last_injected_number;
+    double last_outflow_number;
+    double last_injected_current;
+    double last_outflow_current;
+    double last_field_work;
+    double step_dt;
+    double step_signed_outflow_number;
+    double interval_injected_number;
+    double interval_left_outflow_signed_number;
+    double interval_right_outflow_number;
+    double interval_left_guard_path_number;
+    double interval_right_guard_path_number;
+    double last_continuity_abs_l1_residual;
+    double last_continuity_abs_linf_residual;
+    double last_continuity_l1_error;
+    double last_continuity_linf_error;
+    double last_boundary_flux_error;
+    double last_trajectory_reconstruction_error;
+    unsigned long long rng_state;
+};
+
 class BeamPIC {
 public:
     std::vector<BeamParticle> particles;
@@ -57,6 +84,9 @@ public:
     double last_trajectory_reconstruction_error() const {
         return last_trajectory_reconstruction_error_;
     }
+    BeamPersistentState export_persistent_state() const;
+    void import_persistent_state(const BeamPersistentState& state,
+                                 const SpatialGrid& sg);
 
 private:
     double injection_remainder_;

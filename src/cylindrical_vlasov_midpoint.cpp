@@ -1,11 +1,10 @@
 #include "vlasov_ampere_midpoint.h"
 #include "nonuniform_reconstruction.h"
 #include "discrete_moment_operators.h"
+#include "periodic_staggered_operators.h"
 
 #include <algorithm>
 #include <cmath>
-#include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <mpi.h>
@@ -71,61 +70,8 @@ inline bool fct_core_x(double x)
 void close_periodic_face_blocks(std::vector<double>& faces, int nxl,
                                 int block, int rank, int size, int tag)
 {
-    if (nxl <= 0 || block <= 0) return;
-    const size_t first = 0;
-    const size_t last = static_cast<size_t>(nxl) * block;
-    if (size == 1) {
-        std::copy(faces.begin() + first, faces.begin() + first + block,
-                  faces.begin() + last);
-        return;
-    }
-    const int left = (rank + size - 1) % size;
-    const int right = (rank + 1) % size;
-    MPI_Sendrecv(faces.data() + first, block, MPI_DOUBLE, left, tag,
-                 faces.data() + last, block, MPI_DOUBLE, right, tag,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-}
-
-void exchange_neighbor_scalars(const std::vector<double>& local, int rank,
-                               int size, double& left_value,
-                               double& right_value, int tag)
-{
-    if (local.empty()) {
-        left_value = right_value = 1.0;
-        return;
-    }
-    if (size == 1) {
-        left_value = local.back();
-        right_value = local.front();
-        return;
-    }
-    const int left = (rank + size - 1) % size;
-    const int right = (rank + 1) % size;
-    MPI_Sendrecv(&local.front(), 1, MPI_DOUBLE, left, tag,
-                 &right_value, 1, MPI_DOUBLE, right, tag,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    MPI_Sendrecv(&local.back(), 1, MPI_DOUBLE, right, tag + 1,
-                 &left_value, 1, MPI_DOUBLE, left, tag + 1,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-}
-
-void exchange_neighbor_triplet(const double first[3], const double last[3],
-                               int rank, int size, double left_value[3],
-                               double right_value[3], int tag)
-{
-    if (size == 1) {
-        std::copy(last, last + 3, left_value);
-        std::copy(first, first + 3, right_value);
-        return;
-    }
-    const int left = (rank + size - 1) % size;
-    const int right = (rank + 1) % size;
-    MPI_Sendrecv(first, 3, MPI_DOUBLE, left, tag,
-                 right_value, 3, MPI_DOUBLE, right, tag,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    MPI_Sendrecv(last, 3, MPI_DOUBLE, right, tag + 1,
-                 left_value, 3, MPI_DOUBLE, left, tag + 1,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    PeriodicStaggered::close_right_face_alias(faces, nxl, block,
+                                              rank, size, tag);
 }
 
 bool all_finite(const Species& sp, const EMFields& fields,
@@ -154,10 +100,14 @@ void low_order_solver_checkpoint(bool enabled, const char* phase, int mpi_rank)
 }
 
 VlasovAmpereMidpointSolver::Result
-VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
+VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
     const Species& bkg_n, const BeamPIC& beam_n, const EMFields& fields_n,
     const SpatialGrid& sg, double dt, double time, int mpi_rank,
-    int mpi_size, int substeps_used) const
+    int mpi_size, int substeps_used, const Species* fixed_guess_np1,
+    const EMFields* fixed_fields_end,
+    const std::vector<double>* fixed_j_beam_face_mid,
+    const CouplingRegionLayout* fixed_coupling_layout,
+    bool fixed_candidate) const
 {
     low_order_solver_checkpoint(low_order_only_, "entry", mpi_rank);
     Result result;
@@ -167,6 +117,7 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
     result.species_np1 = bkg_n;
     result.beam_np1 = beam_n;
     result.fields_np1 = fields_n;
+    result.operator_input_fields_end_guess = fields_n;
     low_order_solver_checkpoint(low_order_only_, "result_initialized", mpi_rank);
 
     const int ng = sg.nghost;
@@ -226,20 +177,16 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
     std::vector<double> e_mid_buffer(static_cast<size_t>(nxl), 0.0);
     std::vector<double> next_e_buffer(static_cast<size_t>(nxl), 0.0);
     std::vector<double> integrated_jn_buffer(nface, 0.0);
+    std::vector<double> integrated_jn_low_buffer(nface, 0.0);
+    std::vector<double> integrated_jn_high_buffer(nface, 0.0);
     std::vector<double> integrated_je_buffer(static_cast<size_t>(nxl), 0.0);
+    std::vector<double> integrated_je_low_buffer(static_cast<size_t>(nxl), 0.0);
     std::vector<double> integrated_je_high_buffer(static_cast<size_t>(nxl), 0.0);
     std::vector<double> integrated_je_center_buffer(static_cast<size_t>(nxl), 0.0);
     std::vector<double> je_cell_buffer(static_cast<size_t>(nxl), 0.0);
+    std::vector<double> je_low_cell_buffer(static_cast<size_t>(nxl), 0.0);
     std::vector<double> je_high_cell_buffer(static_cast<size_t>(nxl), 0.0);
     std::vector<double> je_center_cell_buffer(static_cast<size_t>(nxl), 0.0);
-    // Per-substep low/high/final pairing audit storage.  These are diagnostic
-    // views of the already-built fluxes and never feed back into transport.
-    std::vector<double> layered_jn_low(nface, 0.0);
-    std::vector<double> layered_jn_high(nface, 0.0);
-    std::vector<double> layered_jn_final(nface, 0.0);
-    std::vector<double> layered_je_low(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> layered_je_high(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> layered_je_final(static_cast<size_t>(nxl), 0.0);
     std::vector<double> initial_ke_cell(static_cast<size_t>(nxl), 0.0);
     std::vector<double> initial_p_cell(static_cast<size_t>(nxl), 0.0);
     std::vector<double> final_ke_cell(static_cast<size_t>(nxl), 0.0);
@@ -254,9 +201,16 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
     std::vector<double> u_boundary_energy_cell(static_cast<size_t>(nxl), 0.0);
     std::vector<double> u_boundary_momentum_cell(static_cast<size_t>(nxl), 0.0);
     result.j_bkg_face_mid.assign(nface, 0.0);
+    result.j_bkg_face_low_mid.assign(nface, 0.0);
+    result.j_bkg_face_center_mid.assign(nface, 0.0);
+    result.j_bkg_face_high_mid.assign(nface, 0.0);
     result.j_beam_face_mid.assign(nface, 0.0);
     result.j_total_face_mid.assign(nface, 0.0);
     result.j_bkg_energy_debug_face.assign(nface, 0.0);
+    result.j_bkg_energy_low_debug_face.assign(nface, 0.0);
+    result.j_bkg_energy_center_debug_face.assign(nface, 0.0);
+    result.j_bkg_energy_high_debug_face.assign(nface, 0.0);
+    result.j_bkg_energy_cell_mid.assign(static_cast<size_t>(nxl), 0.0);
 
     // The production low-order Ampere benchmark deliberately omits all
     // high-order/FCT storage.  Checkpoints are test-only and use the same
@@ -266,9 +220,10 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
 
     std::vector<double> e_end(static_cast<size_t>(nxl), 0.0);
     for (int iface = 0; iface < nxl; ++iface) {
-        e_end[static_cast<size_t>(iface)] = fields_n.Ex_face[iface];
+        e_end[static_cast<size_t>(iface)] = fixed_fields_end
+            ? fixed_fields_end->Ex_face[iface] : fields_n.Ex_face[iface];
     }
-    Species guess = bkg_n;
+    Species guess = fixed_guess_np1 ? *fixed_guess_np1 : bkg_n;
     Species last_work = bkg_n;
     EMFields last_fields = fields_n;
     std::vector<double> previous_j(static_cast<size_t>(nxl), 0.0);
@@ -280,7 +235,7 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
     EMFields beam_field = fields_n;
     double beam_ke_before = 0.0;
     double beam_ke_after = 0.0;
-    if (beam_enabled_) {
+    if (beam_enabled_ && !fixed_j_beam_face_mid) {
         beam_predictor.begin_step(sg, dt);
         beam_predictor.inject(sg, beam_field, dt, time, mpi_rank, mpi_size);
         beam_ke_before = beam_predictor.total_kinetic_energy();
@@ -293,179 +248,47 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
     low_order_solver_checkpoint(low_order_only_, "beam_predictor_ready",
                                 mpi_rank);
     std::vector<double> jbeam(nface, 0.0);
-    if (beam_enabled_) {
+    if (fixed_j_beam_face_mid) {
+        for (size_t i = 0; i < std::min(jbeam.size(),
+                                        fixed_j_beam_face_mid->size()); ++i) {
+            jbeam[i] = (*fixed_j_beam_face_mid)[i];
+        }
+    } else if (beam_enabled_) {
         for (size_t i = 0; i < std::min(jbeam.size(),
                                         beam_predictor.current_face_x.size()); ++i) {
             jbeam[i] = beam_predictor.current_face_x[i];
         }
     }
 
-    const int max_iters = max_midpoint_iterations_;
+    const int max_iters = fixed_candidate ? 1 : max_midpoint_iterations_;
     if (midpoint_iteration_trace_for_test_) {
         result.midpoint_residual_e_history.reserve(
+            static_cast<size_t>(max_iters));
+        result.midpoint_residual_j_bkg_history.reserve(
+            static_cast<size_t>(max_iters));
+        result.midpoint_residual_j_beam_history.reserve(
+            static_cast<size_t>(max_iters));
+        result.midpoint_residual_f_history.reserve(
             static_cast<size_t>(max_iters));
     }
     const double field_tol = 1.0e-6;
     const double current_tol = 1.0e-5;
     const double omega = 0.55;
-    const auto write_stage5_diagnostics = [&](int accepted, int soft_unconverged) {
-        static int stage5_write_count = 0;
-        const bool flush_now = (++stage5_write_count % 20) == 0;
-        if (mpi_rank == 0) {
-            static std::ofstream global_file("output/background_closure_diagnostics.dat");
-            if (global_file.tellp() == std::streampos(0)) {
-                global_file << "# time_fs accepted soft R_FV R_couple R_couple_centered R_couple_upwind_stabilization R_couple_fct_stabilization R_total R_physical dK face_work "
-                            << "u_energy u_momentum u_energy_outflow PsiK_boundary PsiP_boundary "
-                            << "JN_minus_JE_L2 JN_minus_JE_Linf vEC_Linf vEC_rel "
-                            << "fct_budget_violation correction_enabled skip_zero_field skip_raw "
-                            << "correction_target correction_achieved correction_added_momentum_linf "
-                            << "correction_l1 correction_linf correction_relative active_bounds infeasible retry_count "
-                            << "fct_high_low_linf fct_high_low_violation "
-                            << "fct_donor_capacity_violation fct_interface_checksum_linf "
-                            << "fct_interface_checksum_violation fct_low_tolerance_linf "
-                            << "fct_final_scratch_min fct_final_tolerance_linf "
-                            << "fct_roundoff_zeroed_count fct_roundoff_zeroed_mass "
-                            << "fct_id_R_worst fct_id_S_worst fct_id_R_over_S "
-                            << "fct_id_abs_R_over_max1S "
-                            << "fct_id_worst_ix fct_id_worst_iv fct_id_worst_imu "
-                            << "donor_m_low donor_Ax_left donor_Ax_right "
-                            << "donor_Au_lower donor_Au_upper "
-                            << "donor_alpha_x_left donor_alpha_x_right "
-                            << "donor_alpha_u_lower donor_alpha_u_upper "
-                            << "donor_outflow donor_scale donor_relative "
-                            << "donor_ix donor_iv donor_imu donor_roundoff_warning "
-                            << "donor_beta_count donor_beta_min\n";
-                global_file << std::scientific << std::setprecision(10);
-            }
-            global_file << time / Const::femto << " " << accepted << " " << soft_unconverged << " "
-                        << result.stage5_r_fv << " " << result.stage5_r_couple << " "
-                        << result.stage5_r_couple_centered << " "
-                        << result.stage5_r_couple_upwind_stabilization << " "
-                        << result.stage5_r_couple_fct_stabilization << " "
-                        << result.stage5_r_total << " " << result.stage5_r_physical_balance << " "
-                        << result.delta_ke_bkg << " "
-                        << result.field_work_bkg << " " << result.stage5_u_energy_moment << " "
-                        << result.stage5_u_momentum_moment << " "
-                        << result.u_boundary_energy_outflow << " "
-                        << result.stage5_spatial_energy_boundary << " "
-                        << result.stage5_spatial_momentum_boundary << " "
-                        << result.stage5_jn_minus_je_l2 << " "
-                        << result.stage5_jn_minus_je_linf << " "
-                        << result.stage5_energy_speed_candidate_linf << " "
-                        << result.stage5_energy_speed_candidate_rel << " "
-                        << result.stage5_fct_budget_violation << " "
-                        << result.stage5_compatibility_enabled << " "
-                        << result.stage5_projection_skipped_zero_field << " "
-                        << result.stage5_projection_skipped_raw_residual << " "
-                        << result.stage5_correction_energy_target << " "
-                        << result.stage5_correction_energy_achieved << " "
-                        << result.stage5_correction_added_momentum_linf << " "
-                        << result.stage5_correction_l1 << " "
-                        << result.stage5_correction_linf << " "
-                        << result.stage5_correction_relative << " "
-                        << result.stage5_correction_active_bounds << " "
-                        << result.stage5_correction_infeasible << " "
-                        << result.stage5_correction_retry_count << " "
-                        << result.fct_high_low_identity_linf << " "
-                        << result.fct_high_low_identity_violation << " "
-                        << result.fct_donor_capacity_violation << " "
-                        << result.fct_interface_checksum_linf << " "
-                        << result.fct_interface_checksum_violation << " "
-                        << result.fct_low_order_tolerance_linf << " "
-                        << result.fct_final_scratch_min << " "
-                        << result.fct_final_tolerance_linf << " "
-                        << result.fct_roundoff_zeroed_count << " "
-                        << result.fct_roundoff_zeroed_mass << " "
-                        << result.fct_high_low_identity_worst_residual << " "
-                        << result.fct_high_low_identity_worst_scale << " "
-                        << result.fct_high_low_identity_worst_relative << " "
-                        << result.fct_high_low_identity_ratio_linf << " "
-                        << result.fct_high_low_identity_worst_ix << " "
-                        << result.fct_high_low_identity_worst_iv << " "
-                        << result.fct_high_low_identity_worst_imu << " "
-                        << result.fct_donor_worst_m_low << " "
-                        << result.fct_donor_worst_ax_left << " "
-                        << result.fct_donor_worst_ax_right << " "
-                        << result.fct_donor_worst_au_lower << " "
-                        << result.fct_donor_worst_au_upper << " "
-                        << result.fct_donor_worst_alpha_x_left << " "
-                        << result.fct_donor_worst_alpha_x_right << " "
-                        << result.fct_donor_worst_alpha_u_lower << " "
-                        << result.fct_donor_worst_alpha_u_upper << " "
-                        << result.fct_donor_worst_outflow << " "
-                        << result.fct_donor_worst_scale << " "
-                        << result.fct_donor_worst_relative << " "
-                        << result.fct_donor_worst_ix << " "
-                        << result.fct_donor_worst_iv << " "
-                        << result.fct_donor_worst_imu << " "
-                        << result.fct_donor_roundoff_warning << " "
-                        << result.fct_donor_beta_applied_count << " "
-                        << result.fct_donor_beta_min << "\n";
-            if (flush_now) global_file.flush();
-        }
-
-        // Keep the detailed closure ledger compact during long production
-        // runs.  The global closure record remains per accepted step, while
-        // this rank summary is sampled every 50 accepted states.
-        const int local_summary_interval = 50;
-        if (stage5_write_count % local_summary_interval != 0) return;
-
-        int worst_energy_ix = -1;
-        int worst_momentum_ix = -1;
-        double worst_energy_abs = -1.0;
-        double worst_momentum_abs = -1.0;
-        double local_energy_l1 = 0.0;
-        double local_momentum_l1 = 0.0;
-        for (int ix = 0; ix < nxl; ++ix) {
-            const double energy_abs = std::fabs(local_energy_residual[ix]);
-            const double momentum_abs = std::fabs(local_momentum_residual[ix]);
-            local_energy_l1 += energy_abs;
-            local_momentum_l1 += momentum_abs;
-            if (energy_abs > worst_energy_abs) {
-                worst_energy_abs = energy_abs;
-                worst_energy_ix = sg.ix_start + ix;
-            }
-            if (momentum_abs > worst_momentum_abs) {
-                worst_momentum_abs = momentum_abs;
-                worst_momentum_ix = sg.ix_start + ix;
-            }
-        }
-        const int values_per_rank = 7;
-        const double local_summary[values_per_rank] = {
-            static_cast<double>(mpi_rank),
-            static_cast<double>(worst_energy_ix), worst_energy_abs,
-            static_cast<double>(worst_momentum_ix), worst_momentum_abs,
-            local_energy_l1, local_momentum_l1
-        };
-        std::vector<double> gathered_rows;
-        if (mpi_rank == 0) {
-            gathered_rows.resize(static_cast<size_t>(mpi_size) * values_per_rank);
-        }
-        MPI_Gather(local_summary, values_per_rank, MPI_DOUBLE,
-                   mpi_rank == 0 ? gathered_rows.data() : 0,
-                   values_per_rank, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-        if (mpi_rank == 0) {
-            static std::ofstream local_file("output/background_closure_rank_summary.dat");
-            if (local_file.tellp() == std::streampos(0)) {
-                local_file << "# time_fs accepted soft rank worst_energy_ix "
-                           << "max_abs_local_energy worst_momentum_ix "
-                           << "max_abs_local_momentum local_energy_L1 "
-                           << "local_momentum_L1\n";
-                local_file << std::scientific << std::setprecision(10);
-            }
-            for (size_t offset = 0; offset < gathered_rows.size(); offset += values_per_rank) {
-                const double* row = gathered_rows.data() + offset;
-                local_file << time / Const::femto << " " << accepted << " " << soft_unconverged << " ";
-                for (int col = 0; col < values_per_rank; ++col)
-                    local_file << row[col] << (col + 1 == values_per_rank ? '\n' : ' ');
-            }
-            if (flush_now) local_file.flush();
-        }
-    };
-
     for (int iter = 0; iter < max_iters; ++iter) {
         if (iter == 0)
             low_order_solver_checkpoint(low_order_only_, "iteration_begin", mpi_rank);
+        // Preserve the exact endpoint guess used by this kernel call.  The
+        // accepted field is an Ampere output and is not a valid replacement
+        // for fixed-state operator replay.
+        if (capture_midpoint_input_) {
+            result.operator_input_guess = guess;
+            result.operator_input_fields_end_guess = fields_n;
+            for (int iface = 0; iface < nxl; ++iface) {
+                result.operator_input_fields_end_guess.Ex_face[iface] = e_end[iface];
+            }
+            result.operator_input_fields_end_guess.sync_cell_ex_from_faces(
+                mpi_rank, mpi_size);
+        }
         std::vector<double>& e_mid = e_mid_buffer;
         for (int iface = 0; iface < nxl; ++iface) {
             e_mid[iface] = 0.5 * (fields_n.Ex_face[iface] + e_end[iface]);
@@ -523,11 +346,17 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
         exchange_ghosts_x_persistent(midpoint_state, sg, mpi_rank, mpi_size);
         Species work = bkg_n;
         std::vector<double>& integrated_jn = integrated_jn_buffer;
+        std::vector<double>& integrated_jn_low = integrated_jn_low_buffer;
+        std::vector<double>& integrated_jn_high = integrated_jn_high_buffer;
         std::vector<double>& integrated_je_cell = integrated_je_buffer;
+        std::vector<double>& integrated_je_low_cell = integrated_je_low_buffer;
         std::vector<double>& integrated_je_high_cell = integrated_je_high_buffer;
         std::vector<double>& integrated_je_center_cell = integrated_je_center_buffer;
         std::fill(integrated_jn.begin(), integrated_jn.end(), 0.0);
+        std::fill(integrated_jn_low.begin(), integrated_jn_low.end(), 0.0);
+        std::fill(integrated_jn_high.begin(), integrated_jn_high.end(), 0.0);
         std::fill(integrated_je_cell.begin(), integrated_je_cell.end(), 0.0);
+        std::fill(integrated_je_low_cell.begin(), integrated_je_low_cell.end(), 0.0);
         std::fill(integrated_je_high_cell.begin(), integrated_je_high_cell.end(), 0.0);
         std::fill(integrated_je_center_cell.begin(), integrated_je_center_cell.end(), 0.0);
         std::fill(psi_k_x.begin(), psi_k_x.end(), 0.0);
@@ -826,10 +655,6 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
             // midpoint candidate, this is an explicit positive update of the
             // current substep state `work`; its donor mass and update state
             // are therefore identical.
-            double layered_jn_low_linf = 0.0;
-            double layered_jn_high_linf = 0.0;
-            double layered_jn_final_linf = 0.0;
-            #pragma omp parallel for schedule(static) reduction(max:layered_jn_low_linf,layered_jn_high_linf,layered_jn_final_linf)
             for (int iface = 0; iface <= nxl; ++iface) {
                 const int il = ng + iface - 1;
                 const int ir = ng + iface;
@@ -2164,14 +1989,13 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                 return result;
             } // high-order/FCT donor-capacity closure
 
-            const std::vector<double>& fx_high_used = low_order_only_
-                ? fx_low : fx_high;
-            const std::vector<double>& fu_high_used = low_order_only_
-                ? fu_low : fu_high;
             const std::vector<double>& cu_high_used = low_order_only_
                 ? cu_low : cu_high;
             const std::vector<double>& cu_high_center_used = low_order_only_
                 ? cu_low : cu_high_center;
+            const std::vector<double>& fx_low_used = fx_low;
+            const std::vector<double>& fx_high_used = low_order_only_
+                ? fx_low : fx_high;
             const std::vector<double>& fx_final_used = low_order_only_
                 ? fx_low : fx_final;
             const std::vector<double>& fu_final_used = low_order_only_
@@ -2189,49 +2013,27 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                 for (int j = 0; j < Param::Nv; ++j) for (int k = 0; k < Param::Nmu; ++k)
                 {
                     const size_t id = xface_index(iface, j, k);
-                    const double flux_final = fx_final_used[id];
-                    gamma_low += fx_low[id];
+                    gamma_low += fx_low_used[id];
                     gamma_high += fx_high_used[id];
+                    const double flux_final = fx_final_used[id];
                     gamma_final += flux_final;
                     psi_k += bkg_n.cgrid.kinetic_energy[idx2(j, k)] *
                         flux_final;
                     psi_p += bkg_n.mass * Const::c *
                         bkg_n.cgrid.upar_cells[j] * flux_final;
                 }
-                layered_jn_low[iface] = bkg_n.charge * gamma_low;
-                layered_jn_high[iface] = bkg_n.charge * gamma_high;
-                layered_jn_final[iface] = bkg_n.charge * gamma_final;
-                layered_jn_low_linf = std::max(layered_jn_low_linf,
-                                                std::fabs(layered_jn_low[iface]));
-                layered_jn_high_linf = std::max(layered_jn_high_linf,
-                                                 std::fabs(layered_jn_high[iface]));
-                layered_jn_final_linf = std::max(layered_jn_final_linf,
-                                                  std::fabs(layered_jn_final[iface]));
-                integrated_jn[iface] += h * layered_jn_final[iface];
+                integrated_jn_low[iface] += h * bkg_n.charge * gamma_low;
+                integrated_jn_high[iface] += h * bkg_n.charge * gamma_high;
+                integrated_jn[iface] += h * bkg_n.charge * gamma_final;
                 psi_k_x[iface] += h * psi_k;
                 psi_p_x[iface] += h * psi_p;
             }
-            double layered_pu_low = 0.0;
-            double layered_pu_high = 0.0;
-            double layered_pu_final = 0.0;
-            double layered_cell_work_low = 0.0;
-            double layered_cell_work_high = 0.0;
-            double layered_cell_work_center = 0.0;
-            double layered_cell_work_final = 0.0;
-            double cu_ratio_error_linf = 0.0;
-            double cu_ratio_scale_linf = 0.0;
-            double je_equivalent_difference_linf = 0.0;
-            double je_equivalent_scale_linf = 0.0;
-            double layered_je_low_linf = 0.0;
-            double layered_je_high_linf = 0.0;
-            double layered_je_final_linf = 0.0;
-            #pragma omp parallel for schedule(static) reduction(+:layered_pu_low,layered_pu_high,layered_pu_final,layered_cell_work_low,layered_cell_work_high,layered_cell_work_center,layered_cell_work_final) reduction(max:cu_ratio_error_linf,cu_ratio_scale_linf,je_equivalent_difference_linf,je_equivalent_scale_linf,layered_je_low_linf,layered_je_high_linf,layered_je_final_linf)
+            #pragma omp parallel for schedule(static)
             for (int ix = 0; ix < nxl; ++ix) {
                 double je_low = 0.0;
                 double je_high = 0.0;
                 double je_center = 0.0;
                 double je_final = 0.0;
-                double je_final_energy_speed = 0.0;
                 double u_energy = 0.0;
                 double u_momentum = 0.0;
                 for (int jf = 1; jf < Param::Nv; ++jf) for (int k = 0; k < Param::Nmu; ++k) {
@@ -2239,12 +2041,10 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                     const double center_distance = Stage5::upar_center_distance(
                         bkg_n.cgrid, jf);
                     const size_t id = uface_index(ix, jf, k);
-                    const double coefficient_low = cu_low[id];
                     const double coefficient_high = cu_high_used[id];
                     const double coefficient_center = cu_high_center_used[id];
                     const double coefficient_final = cu_final_used[id];
-                    const double flux_low = fu_low[id];
-                    const double flux_high = fu_high_used[id];
+                    const double coefficient_low = cu_low[id];
                     const double flux_final = fu_final_used[id];
                     // J_E = q/(m c dx) sum(delta_K * C_u).  The dx division
                     // converts the cell-integrated C_u back to a current
@@ -2255,52 +2055,11 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                     je_high += dke * current_factor * coefficient_high;
                     je_center += dke * current_factor * coefficient_center;
                     je_final += dke * current_factor * coefficient_final;
-                    const double v_energy = dke /
-                        (bkg_n.mass * Const::c * center_distance);
-                    je_final_energy_speed += bkg_n.charge * v_energy *
-                        center_distance * coefficient_final / sg.dx;
-                    layered_pu_low += dke * flux_low;
-                    layered_pu_high += dke * flux_high;
-                    layered_pu_final += dke * flux_final;
-                    if (coefficient_final != 0.0) {
-                        const double a_cell =
-                            bkg_n.charge * fields_mid.Ex[ng + ix] /
-                            (bkg_n.mass * Const::c);
-                        const double ratio_error = std::fabs(
-                            flux_final / coefficient_final - a_cell);
-                        cu_ratio_error_linf = std::max(
-                            cu_ratio_error_linf, ratio_error);
-                        cu_ratio_scale_linf = std::max(
-                            cu_ratio_scale_linf, std::fabs(a_cell));
-                    } else if (flux_final != 0.0) {
-                        cu_ratio_error_linf = std::numeric_limits<double>::infinity();
-                    }
                     u_energy += dke * flux_final;
                     u_momentum += bkg_n.mass * Const::c *
                         center_distance * flux_final;
                 }
-                layered_je_low[ix] = je_low;
-                layered_je_high[ix] = je_high;
-                layered_je_final[ix] = je_final;
-                layered_je_low_linf = std::max(layered_je_low_linf,
-                                                std::fabs(je_low));
-                layered_je_high_linf = std::max(layered_je_high_linf,
-                                                 std::fabs(je_high));
-                layered_je_final_linf = std::max(layered_je_final_linf,
-                                                  std::fabs(je_final));
-                je_equivalent_difference_linf = std::max(
-                    je_equivalent_difference_linf,
-                    std::fabs(je_final - je_final_energy_speed));
-                je_equivalent_scale_linf = std::max(
-                    je_equivalent_scale_linf, std::fabs(je_final));
-                layered_cell_work_low += fields_mid.Ex[ng + ix] * je_low *
-                    sg.dx;
-                layered_cell_work_high += fields_mid.Ex[ng + ix] * je_high *
-                    sg.dx;
-                layered_cell_work_center += fields_mid.Ex[ng + ix] * je_center *
-                    sg.dx;
-                layered_cell_work_final += fields_mid.Ex[ng + ix] * je_final *
-                    sg.dx;
+                integrated_je_low_cell[ix] += h * je_low;
                 integrated_je_cell[ix] += h * je_final;
                 integrated_je_high_cell[ix] += h * je_high;
                 integrated_je_center_cell[ix] += h * je_center;
@@ -2308,173 +2067,6 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                 u_momentum_cell[ix] += h * u_momentum;
             }
 
-            // Section 3/18 diagnostic only: pair each current layer on the
-            // same Yee/cell staggering used by the final closure audit.
-            // Exchange the three cell-energy currents together so face zero
-            // has the left neighbour's value on every MPI rank.
-            double je_first[3] = {0.0, 0.0, 0.0};
-            double je_last[3] = {0.0, 0.0, 0.0};
-            if (nxl > 0) {
-                je_first[0] = layered_je_low.front();
-                je_first[1] = layered_je_high.front();
-                je_first[2] = layered_je_final.front();
-                je_last[0] = layered_je_low.back();
-                je_last[1] = layered_je_high.back();
-                je_last[2] = layered_je_final.back();
-            }
-            double je_left[3] = {0.0, 0.0, 0.0};
-            double je_right[3] = {0.0, 0.0, 0.0};
-            exchange_neighbor_triplet(je_first, je_last, mpi_rank, mpi_size,
-                                      je_left, je_right, 911);
-
-            double layered_face_work[3] = {0.0, 0.0, 0.0};
-            double layered_linf[3] = {0.0, 0.0, 0.0};
-            for (int iface = 0; iface < nxl; ++iface) {
-                const double je_face_low = 0.5 * (
-                    (iface == 0 ? je_left[0] : layered_je_low[iface - 1]) +
-                    layered_je_low[iface]);
-                const double je_face_high = 0.5 * (
-                    (iface == 0 ? je_left[1] : layered_je_high[iface - 1]) +
-                    layered_je_high[iface]);
-                const double je_face_final = 0.5 * (
-                    (iface == 0 ? je_left[2] : layered_je_final[iface - 1]) +
-                    layered_je_final[iface]);
-                const double eface = e_mid[iface];
-                layered_face_work[0] += eface * layered_jn_low[iface] *
-                    sg.dx;
-                layered_face_work[1] += eface * layered_jn_high[iface] *
-                    sg.dx;
-                layered_face_work[2] += eface * layered_jn_final[iface] *
-                    sg.dx;
-                layered_linf[0] = std::max(layered_linf[0], std::fabs(
-                    layered_jn_low[iface] - je_face_low));
-                layered_linf[1] = std::max(layered_linf[1], std::fabs(
-                    layered_jn_high[iface] - je_face_high));
-                layered_linf[2] = std::max(layered_linf[2], std::fabs(
-                    layered_jn_final[iface] - je_face_final));
-            }
-            double layered_sum[9] = {
-                layered_face_work[0], layered_face_work[1],
-                layered_face_work[2],
-                layered_cell_work_low, layered_cell_work_high,
-                layered_cell_work_final,
-                layered_pu_low, layered_pu_high, layered_pu_final};
-            MPI_Allreduce(MPI_IN_PLACE, layered_sum, 9, MPI_DOUBLE, MPI_SUM,
-                          MPI_COMM_WORLD);
-            double layered_max[10] = {
-                layered_linf[0], layered_linf[1], layered_linf[2],
-                cu_ratio_error_linf,
-                layered_jn_low_linf, layered_jn_high_linf,
-                layered_jn_final_linf,
-                layered_je_low_linf, layered_je_high_linf,
-                layered_je_final_linf};
-            MPI_Allreduce(MPI_IN_PLACE, layered_max, 10, MPI_DOUBLE, MPI_MAX,
-                          MPI_COMM_WORLD);
-            double cu_audit_max[2] = {
-                cu_ratio_scale_linf, je_equivalent_difference_linf};
-            MPI_Allreduce(MPI_IN_PLACE, cu_audit_max, 2, MPI_DOUBLE, MPI_MAX,
-                          MPI_COMM_WORLD);
-            MPI_Allreduce(MPI_IN_PLACE, &je_equivalent_scale_linf, 1,
-                          MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-            if (iter == 0 && sub == 0)
-                low_order_solver_checkpoint(low_order_only_, "layered_audit_reduced", mpi_rank);
-
-            if (mpi_rank == 0) {
-                static std::ofstream layered_file(
-                    "output/stage5_layered_pairing.dat");
-                static std::ofstream cu_audit_file(
-                    "output/cu_definition_audit.dat");
-                static std::ofstream low_adjoint_file(
-                    "output/low_order_adjoint_audit.dat");
-                static int diagnostic_write_count = 0;
-                const bool flush_now = (++diagnostic_write_count % 20) == 0;
-                if (layered_file.tellp() == std::streampos(0)) {
-                    layered_file
-                        << "# time_fs nonlinear_iteration substep "
-                        << "R_pair_low R_pair_high R_pair_final "
-                        << "JN_GstarJE_low_Linf JN_GstarJE_high_Linf "
-                        << "JN_GstarJE_final_Linf P_u_low P_u_high P_u_final "
-                        << "W_face_low W_face_high W_face_final\n";
-                    layered_file << std::scientific << std::setprecision(10);
-                }
-                layered_file << (time + (sub + 1) * h) / Const::femto << " "
-                             << iter << " " << sub << " "
-                             << (layered_sum[0] - layered_sum[3]) << " "
-                             << (layered_sum[1] - layered_sum[4]) << " "
-                             << (layered_sum[2] - layered_sum[5]) << " "
-                             << layered_max[0] << " " << layered_max[1] << " "
-                             << layered_max[2] << " " << layered_sum[6] << " "
-                             << layered_sum[7] << " " << layered_sum[8] << " "
-                             << layered_sum[0] << " " << layered_sum[1] << " "
-                             << layered_sum[2] << "\n";
-
-                if (cu_audit_file.tellp() == std::streampos(0)) {
-                    cu_audit_file
-                        << "# time_fs nonlinear_iteration substep "
-                        << "cu_divides_dupar cu_contains_dx_via_M "
-                        << "cu_contains_uperp_ring_via_M "
-                        << "cu_contains_acceleration JE_divides_by_dx "
-                        << "JE_time_average_h_over_dt "
-                        << "state_is_cylindrical_cell_mass "
-                        << "fu_over_cu_minus_a_linf fu_over_cu_a_scale_linf "
-                        << "fu_over_cu_minus_a_relative "
-                        << "JE_formula_difference_linf JE_formula_scale_linf "
-                        << "JE_formula_relative\n";
-                    cu_audit_file << std::scientific << std::setprecision(10);
-                }
-                const double cu_ratio_relative = cu_audit_max[0] > 0.0
-                    ? layered_max[3] / cu_audit_max[0] : layered_max[3];
-                const double je_formula_relative =
-                    je_equivalent_scale_linf > 0.0
-                    ? cu_audit_max[1] / je_equivalent_scale_linf
-                    : cu_audit_max[1];
-                cu_audit_file
-                    << (time + (sub + 1) * h) / Const::femto << " "
-                    << iter << " " << sub << " "
-                    << Stage5::CU_DIVIDES_BY_UPAR_DONOR_WIDTH << " "
-                    << Stage5::CU_CONTAINS_DX_VIA_CELL_MASS << " "
-                    << Stage5::CU_CONTAINS_UPERP_RING_VIA_CELL_MASS << " "
-                    << Stage5::CU_CONTAINS_ACCELERATION << " "
-                    << Stage5::JE_REQUIRES_CELL_DX_DIVISION << " "
-                    << Stage5::JE_IS_SUBSTEP_TIME_AVERAGED
-                    << " " << (bkg_n.cylindrical_mass_representation ? 1 : 0)
-                    << " " << layered_max[3] << " " << cu_audit_max[0] << " "
-                    << cu_ratio_relative << " " << cu_audit_max[1] << " "
-                    << je_equivalent_scale_linf << " "
-                    << je_formula_relative << "\n";
-                if (low_adjoint_file.tellp() == std::streampos(0)) {
-                    low_adjoint_file
-                        << "# Bx_low: Phi_x=v_x*M_upwind/dx; "
-                        << "Bu_low: C_u=M_upwind/dupar_donor; "
-                        << "Phi_u=a_x*C_u; Gstar: neighbour cell average\n"
-                        << "# time_fs nonlinear_iteration substep "
-                        << "Bx_is_x_upwind Bu_is_u_upwind "
-                        << "Bx_donor_selector_vx Bu_donor_selector_ax "
-                        << "Gstar_is_spatial_average "
-                        << "same_donor_map low_R_pair low_R_pair_relative "
-                        << "JN_low_Linf JE_low_Linf JN_minus_GstarJE_low_Linf "
-                        << "W_face_low GE_JE_low P_u_low\n";
-                    low_adjoint_file << std::scientific << std::setprecision(10);
-                }
-                const double low_pair = layered_sum[0] - layered_sum[3];
-                const double low_pair_scale = std::max(
-                    std::numeric_limits<double>::min(), std::max(
-                        std::fabs(layered_sum[0]), std::fabs(layered_sum[3])));
-                low_adjoint_file
-                    << (time + (sub + 1) * h) / Const::femto << " "
-                    << iter << " " << sub << " "
-                    << 1 << " " << 1 << " " << 1 << " " << 1 << " " << 1
-                    << " " << 0 << " " << low_pair << " "
-                    << low_pair / low_pair_scale << " " << layered_max[4]
-                    << " " << layered_max[7] << " " << layered_max[0] << " "
-                    << layered_sum[0] << " " << layered_sum[3] << " "
-                    << layered_sum[6] << "\n";
-                if (flush_now) {
-                    layered_file.flush();
-                    cu_audit_file.flush();
-                    low_adjoint_file.flush();
-                }
-            }
             for (int k = 0; k < Param::Nmu; ++k) {
                 const double ke_lo = bkg_n.cgrid.kinetic_energy[idx2(0, k)];
                 const double ke_hi = bkg_n.cgrid.kinetic_energy[idx2(Param::Nv - 1, k)];
@@ -2517,9 +2109,21 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
                 u_boundary_momentum_cell[ix];
         }
 
-        for (size_t i = 0; i < nface; ++i) result.j_bkg_face_mid[i] = integrated_jn[i] / dt;
+        for (size_t i = 0; i < nface; ++i) {
+            result.j_bkg_face_low_mid[i] = integrated_jn_low[i] / dt;
+            result.j_bkg_face_high_mid[i] = integrated_jn_high[i] / dt;
+            // x transport has one production high-order layer.  Its explicit
+            // centered audit view is therefore the same flux, rather than a
+            // separately reconstructed current with different ownership.
+            result.j_bkg_face_center_mid[i] = result.j_bkg_face_high_mid[i];
+            result.j_bkg_face_mid[i] = integrated_jn[i] / dt;
+        }
         std::vector<double>& je_cell = je_cell_buffer;
-        for (int ix = 0; ix < nxl; ++ix) je_cell[ix] = integrated_je_cell[ix] / dt;
+        std::vector<double>& je_low_cell = je_low_cell_buffer;
+        for (int ix = 0; ix < nxl; ++ix) {
+            je_cell[ix] = integrated_je_cell[ix] / dt;
+            je_low_cell[ix] = integrated_je_low_cell[ix] / dt;
+        }
         // These are audit-only layers.  They preserve the direct C_u -> J_E
         // construction and never replace the charge-conserving Ampere J_N.
         std::vector<double>& je_high_cell = je_high_cell_buffer;
@@ -2528,14 +2132,18 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
             je_high_cell[ix] = integrated_je_high_cell[ix] / dt;
             je_center_cell[ix] = integrated_je_center_cell[ix] / dt;
         }
-        double je_left_neighbor = 0.0;
-        double je_right_neighbor = 0.0;
-        exchange_neighbor_scalars(je_cell, mpi_rank, mpi_size,
-                                  je_left_neighbor, je_right_neighbor, 906);
-        (void)je_right_neighbor;
+        result.j_bkg_energy_cell_mid = je_cell;
+        const auto assemble_gstar_face = [&](const std::vector<double>& cell,
+                                             std::vector<double>& face,
+                                             int message_tag) {
+            PeriodicStaggered::apply_cell_to_face_Gstar(
+                cell, face, nxl, mpi_rank, mpi_size, message_tag);
+        };
+        assemble_gstar_face(je_low_cell, result.j_bkg_energy_low_debug_face, 906);
+        assemble_gstar_face(je_center_cell, result.j_bkg_energy_center_debug_face, 908);
+        assemble_gstar_face(je_high_cell, result.j_bkg_energy_high_debug_face, 910);
+        assemble_gstar_face(je_cell, result.j_bkg_energy_debug_face, 912);
         for (int iface = 0; iface < nxl; ++iface) {
-            const double je_left = (iface == 0) ? je_left_neighbor : je_cell[iface - 1];
-            result.j_bkg_energy_debug_face[iface] = 0.5 * (je_left + je_cell[iface]);
             result.j_beam_face_mid[iface] = jbeam[iface];
             result.j_total_face_mid[iface] = result.j_bkg_face_mid[iface] + jbeam[iface];
         }
@@ -2545,12 +2153,38 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
         }
         if (iter == 0)
             low_order_solver_checkpoint(low_order_only_, "currents_ready", mpi_rank);
-        close_periodic_face_blocks(result.j_bkg_energy_debug_face, nxl, 1,
-                                   mpi_rank, mpi_size, 907);
+        // Keep the two representations of the global periodic seam separate
+        // for fixed-state replay.  Face 0 is owned by rank 0; face nxl on the
+        // final rank is its periodic alias at x = L.  This is audit-only: it
+        // neither closes nor modifies either current.
+        double seam_local[4] = {0.0, 0.0, 0.0, 0.0};
+        if (nxl > 0 && mpi_rank == 0) {
+            seam_local[0] = result.j_bkg_face_mid[0];
+            seam_local[2] = result.j_bkg_energy_debug_face[0];
+        }
+        if (nxl > 0 && mpi_rank == mpi_size - 1) {
+            seam_local[1] = result.j_bkg_face_mid[nxl];
+            seam_local[3] = result.j_bkg_energy_debug_face[nxl];
+        }
+        double seam_global[4] = {0.0, 0.0, 0.0, 0.0};
+        MPI_Allreduce(seam_local, seam_global, 4, MPI_DOUBLE, MPI_SUM,
+                      MPI_COMM_WORLD);
+        result.periodic_seam_face_audit[0] = seam_global[0];
+        result.periodic_seam_face_audit[1] = seam_global[1];
+        result.periodic_seam_face_audit[2] = seam_global[2];
+        result.periodic_seam_face_audit[3] = seam_global[3];
+        result.periodic_seam_face_audit[4] = seam_global[0] - seam_global[2];
+        result.periodic_seam_face_audit[5] = seam_global[1] - seam_global[3];
 
-        EMFields fields_new = fields_n;
-        fields_new.advance_ampere_face_from_midpoint_current(result.j_total_face_mid,
-                                                              dt, mpi_rank, mpi_size);
+        // A fixed operator audit evaluates the FV/current operator at an
+        // externally supplied endpoint. It must not perform a second Ampere
+        // update or advance/reinject Beam particles.
+        EMFields fields_new = (fixed_candidate && fixed_fields_end)
+            ? *fixed_fields_end : fields_n;
+        if (!fixed_candidate) {
+            fields_new.advance_ampere_face_from_midpoint_current(
+                result.j_total_face_mid, dt, mpi_rank, mpi_size);
+        }
         if (iter == 0)
             low_order_solver_checkpoint(low_order_only_, "ampere_ready", mpi_rank);
         last_fields = fields_new;
@@ -2568,8 +2202,11 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
         MPI_Allreduce(MPI_IN_PLACE, norms, 4, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
         result.residual_E = norms[0] / std::max(1.0, norms[1]);
         result.residual_J_bkg = norms[2] / std::max(1.0, std::max(std::fabs(Param::jb), norms[3]));
-        if (midpoint_iteration_trace_for_test_)
+        if (midpoint_iteration_trace_for_test_) {
             result.midpoint_residual_e_history.push_back(result.residual_E);
+            result.midpoint_residual_j_bkg_history.push_back(result.residual_J_bkg);
+            result.midpoint_residual_j_beam_history.push_back(result.residual_J_beam);
+        }
 
         double local_df = 0.0, local_f = 0.0;
         for (int ix = 0; ix < nxl; ++ix) for (int j = 0; j < Param::Nv; ++j)
@@ -2581,6 +2218,8 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
         double f_norms[2] = {local_df, local_f};
         MPI_Allreduce(MPI_IN_PLACE, f_norms, 2, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
         result.residual_f = f_norms[0] / std::max(1.0, f_norms[1]);
+        if (midpoint_iteration_trace_for_test_)
+            result.midpoint_residual_f_history.push_back(result.residual_f);
         result.nonlinear_residual = std::max(result.residual_E / field_tol,
             result.residual_J_bkg / current_tol);
 
@@ -2613,8 +2252,8 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
         for (int iface = 0; iface < nxl; ++iface)
             local_face_work += e_mid[iface] * result.j_bkg_face_mid[iface] * sg.dx;
         double energy_pair[4] = {local_cell_work, local_face_work,
-                                 local_high_cell_work,
-                                 local_center_cell_work};
+                                  local_high_cell_work,
+                                  local_center_cell_work};
         MPI_Allreduce(MPI_IN_PLACE, energy_pair, 4, MPI_DOUBLE, MPI_SUM,
                       MPI_COMM_WORLD);
         result.energy_residual_bkg = dt * (energy_pair[0] - energy_pair[1]);
@@ -2777,6 +2416,184 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
             result.failure_global_cfl = global_cfl;
             return result;
         }
+        const auto finalize_coupling_regions = [&]() {
+            if (fixed_coupling_layout) {
+                result.coupling_beam_front_ix =
+                    fixed_coupling_layout->beam_front_ix;
+                result.coupling_wave_core_end_m =
+                    fixed_coupling_layout->wave_core_end_m;
+            } else {
+                const double beam_threshold = 1.0e-6 * Param::densb;
+                int local_beam_front = -1;
+                for (int ix = 0; ix < nxl; ++ix) {
+                    if (ix < static_cast<int>(beam_predictor.density.size()) &&
+                        beam_predictor.density[ix] > beam_threshold) {
+                        local_beam_front = std::max(local_beam_front,
+                            sg.ix_start + ix);
+                    }
+                }
+                MPI_Allreduce(&local_beam_front, &result.coupling_beam_front_ix, 1,
+                              MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+                const double front_x = result.coupling_beam_front_ix >= 0
+                    ? (static_cast<double>(result.coupling_beam_front_ix) + 0.5) * sg.dx
+                    : 0.8 * Const::micro;
+                result.coupling_wave_core_end_m = std::max(0.8 * Const::micro,
+                    std::min(7.2 * Const::micro, front_x + 0.2 * Const::micro));
+            }
+            const auto region_for_x = [&](double x) {
+                if (x < 0.2 * Const::micro) return 0;       // B_left
+                if (x < 0.8 * Const::micro) return 1;       // Q_left
+                if (x <= result.coupling_wave_core_end_m) return 2; // wave_core
+                if (x < 7.2 * Const::micro) return 3;       // quiet_right
+                if (x < 7.8 * Const::micro) return 4;       // Q_right
+                return 5;                                    // B_right
+            };
+            // Every entry below is accumulated from rank-local cells/faces,
+            // then reduced exactly once after the loops.  Do not use any
+            // Result field here: those fields are already global.
+            const int values_per_region = 14;
+            std::array<double, 6 * values_per_region> sums = {};
+            std::array<double, 6> linf_rj = {};
+            std::array<double, 6> linf_rk = {};
+            std::array<double, 6> max_j_difference = {};
+            std::array<int, 6> local_max_face;
+            local_max_face.fill(std::numeric_limits<int>::max());
+            for (int ix = 0; ix < nxl; ++ix) {
+                const int region = region_for_x(sg.x(ng + ix));
+                const size_t base = static_cast<size_t>(region * values_per_region);
+                // This is the local finite-volume energy residual used to
+                // form stage5_r_fv, including spatial and velocity-face
+                // boundary bookkeeping.  Reusing it makes the regional sum
+                // an exact decomposition of the stage-5 residual.
+                const double rk = local_energy_residual[ix];
+                sums[base + 3] += rk;
+                sums[base + 4] += std::fabs(rk);
+                sums[base + 5] += rk * rk;
+                sums[base + 7] += delta_ke_cell[ix];
+                sums[base + 8] += dt * fields_mid.Ex[ng + ix] *
+                    (je_high_cell[ix] - je_cell[ix]) * sg.dx;
+                sums[base + 10] += 1.0;
+                linf_rk[region] = std::max(linf_rk[region], std::fabs(rk));
+            }
+            for (int iface = 0; iface < nxl; ++iface) {
+                const double xface = sg.x_min +
+                    static_cast<double>(sg.ix_start + iface) * sg.dx;
+                const int region = region_for_x(xface);
+                const size_t base = static_cast<size_t>(region * values_per_region);
+                const double j_difference = result.j_bkg_face_mid[iface] -
+                    result.j_bkg_energy_debug_face[iface];
+                const double rj = dt * e_mid[iface] * j_difference * sg.dx;
+                const double rj_centered = dt * e_mid[iface] *
+                    (result.j_bkg_face_mid[iface] -
+                     result.j_bkg_energy_center_debug_face[iface]) * sg.dx;
+                const double rj_upwind = dt * e_mid[iface] *
+                    (result.j_bkg_energy_center_debug_face[iface] -
+                     result.j_bkg_energy_high_debug_face[iface]) * sg.dx;
+                const double rj_fct = dt * e_mid[iface] *
+                    (result.j_bkg_energy_high_debug_face[iface] -
+                     result.j_bkg_energy_debug_face[iface]) * sg.dx;
+                sums[base] += rj;
+                sums[base + 1] += std::fabs(rj);
+                sums[base + 2] += rj * rj;
+                sums[base + 6] += e_mid[iface] *
+                    result.j_bkg_face_mid[iface] * sg.dx;
+                sums[base + 9] += 1.0;
+                sums[base + 11] += rj_centered;
+                sums[base + 12] += rj_upwind;
+                sums[base + 13] += rj_fct;
+                linf_rj[region] = std::max(linf_rj[region], std::fabs(rj));
+                const double abs_j_difference = std::fabs(j_difference);
+                if (abs_j_difference > max_j_difference[region]) {
+                    max_j_difference[region] = abs_j_difference;
+                    local_max_face[region] = sg.ix_start + iface;
+                }
+            }
+            std::array<double, 6 * 3> maxima = {};
+            for (int region = 0; region < 6; ++region) {
+                maxima[3 * region] = linf_rj[region];
+                maxima[3 * region + 1] = linf_rk[region];
+                maxima[3 * region + 2] = max_j_difference[region];
+            }
+            MPI_Allreduce(MPI_IN_PLACE, sums.data(), static_cast<int>(sums.size()),
+                          MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+            MPI_Allreduce(MPI_IN_PLACE, maxima.data(), static_cast<int>(maxima.size()),
+                          MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            std::array<int, 6> max_face;
+            for (int region = 0; region < 6; ++region) {
+                if (max_j_difference[region] < maxima[3 * region + 2])
+                    local_max_face[region] = std::numeric_limits<int>::max();
+                max_face[region] = local_max_face[region];
+            }
+            MPI_Allreduce(MPI_IN_PLACE, max_face.data(), static_cast<int>(max_face.size()),
+                          MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+            result.coupling_rj_global_sum = 0.0;
+            result.coupling_rk_global_sum = 0.0;
+            result.coupling_face_work_jn_global_sum = 0.0;
+            result.coupling_rj_centered_global_sum = 0.0;
+            result.coupling_rj_upwind_global_sum = 0.0;
+            result.coupling_rj_fct_global_sum = 0.0;
+            for (int region = 0; region < 6; ++region) {
+                const size_t base = static_cast<size_t>(region * values_per_region);
+                CouplingRegionDiagnostics& output = result.coupling_regions[region];
+                output.sum_rj = sums[base];
+                output.sum_abs_rj = sums[base + 1];
+                output.sum_sq_rj = sums[base + 2];
+                output.linf_rj = maxima[3 * region];
+                output.sum_rk = sums[base + 3];
+                output.sum_abs_rk = sums[base + 4];
+                output.sum_sq_rk = sums[base + 5];
+                output.linf_rk = maxima[3 * region + 1];
+                output.max_abs_jn_minus_gstar_je = maxima[3 * region + 2];
+                output.max_abs_jn_minus_gstar_je_face =
+                    max_face[region] == std::numeric_limits<int>::max() ? -1 : max_face[region];
+                output.face_work_jn = sums[base + 6];
+                output.delta_ke_bkg = sums[base + 7];
+                output.fct_work = sums[base + 8];
+                output.r_couple_centered = sums[base + 11];
+                output.r_couple_upwind_stabilization = sums[base + 12];
+                output.r_couple_fct_stabilization = sums[base + 13];
+                output.face_count = static_cast<long long>(sums[base + 9]);
+                output.cell_count = static_cast<long long>(sums[base + 10]);
+                result.coupling_rj_global_sum += output.sum_rj;
+                result.coupling_rk_global_sum += output.sum_rk;
+                result.coupling_face_work_jn_global_sum += output.face_work_jn;
+                result.coupling_rj_centered_global_sum += output.r_couple_centered;
+                result.coupling_rj_upwind_global_sum +=
+                    output.r_couple_upwind_stabilization;
+                result.coupling_rj_fct_global_sum +=
+                    output.r_couple_fct_stabilization;
+            }
+            // Automatic regional reconstruction identities.  stage5_r_* and
+            // energy_pair[1] are already global; do not reduce them again.
+            result.coupling_rj_reconstruction_error =
+                result.coupling_rj_global_sum - result.stage5_r_couple;
+            result.coupling_rk_reconstruction_error =
+                result.coupling_rk_global_sum - result.stage5_r_fv;
+            result.coupling_face_work_jn_reconstruction_error =
+                result.coupling_face_work_jn_global_sum - energy_pair[1];
+            result.coupling_rj_centered_reconstruction_error =
+                result.coupling_rj_centered_global_sum -
+                result.stage5_r_couple_centered;
+            result.coupling_rj_upwind_reconstruction_error =
+                result.coupling_rj_upwind_global_sum -
+                result.stage5_r_couple_upwind_stabilization;
+            result.coupling_rj_fct_reconstruction_error =
+                result.coupling_rj_fct_global_sum -
+                result.stage5_r_couple_fct_stabilization;
+        };
+        if (fixed_candidate) {
+            capture_accepted_transport(work);
+            result.species_np1 = work;
+            result.beam_np1 = beam_n;
+            result.fields_np1 = fields_new;
+            result.converged = true;
+            result.state_advanced = 1;
+            result.final_x_flux = low_order_only_ ? fx_low : fx_final;
+            result.final_u_flux = low_order_only_ ? fu_low : fu_final;
+            if (step_diagnostics_enabled_ || fixed_candidate)
+                finalize_coupling_regions();
+            return result;
+        }
         if (have_previous && result.residual_E < field_tol &&
             result.residual_J_bkg < current_tol &&
             result.beam_continuity_residual < 1.0e-6) {
@@ -2788,7 +2605,8 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
             result.fields_np1 = fields_new;
             result.converged = true;
             result.state_advanced = 1;
-            write_stage5_diagnostics(1, 0);
+            if (step_diagnostics_enabled_ || fixed_candidate)
+                finalize_coupling_regions();
             return result;
         }
 
@@ -2802,6 +2620,8 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
             if (!transport_safe_step_gate(last_work, nsub))
                 return result;
             capture_accepted_transport(last_work);
+        if (step_diagnostics_enabled_ || fixed_candidate)
+            finalize_coupling_regions();
         }
     }
 
@@ -2811,6 +2631,5 @@ VlasovAmpereMidpointSolver::advance_cylindrical_single_step(
     result.soft_unconverged = true;
     result.soft_accepted = true;
     result.state_advanced = 1;
-    write_stage5_diagnostics(1, 1);
     return result;
 }

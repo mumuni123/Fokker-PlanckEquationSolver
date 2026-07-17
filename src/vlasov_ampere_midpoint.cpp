@@ -29,7 +29,8 @@ void fill_periodic_ghosts(Species& sp, const SpatialGrid& sg)
 VlasovAmpereMidpointSolver::VlasovAmpereMidpointSolver()
     : step_diagnostics_enabled_(false), beam_enabled_(true),
       low_order_only_(false), nonuniform_high_order_enabled_(false),
-      fct_enabled_(true), legacy_boundary_upwind_high_candidate_for_test_(false),
+      fct_enabled_(true), capture_midpoint_input_(false),
+      legacy_boundary_upwind_high_candidate_for_test_(false),
       max_midpoint_iterations_(20), midpoint_iteration_trace_for_test_(false),
       fct_activation_audit_enabled_(false),
       controlled_fct_flux_injection_enabled_(false),
@@ -75,6 +76,16 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
     result.stage5_r_couple_centered = 0.0;
     result.stage5_r_couple_upwind_stabilization = 0.0;
     result.stage5_r_couple_fct_stabilization = 0.0;
+    result.coupling_rj_global_sum = 0.0;
+    result.coupling_rk_global_sum = 0.0;
+    result.coupling_face_work_jn_global_sum = 0.0;
+    result.coupling_rj_reconstruction_error = 0.0;
+    result.coupling_rk_reconstruction_error = 0.0;
+    result.coupling_face_work_jn_reconstruction_error = 0.0;
+    result.coupling_beam_front_ix = -1;
+    for (size_t region = 0; region < result.coupling_regions.size(); ++region) {
+        result.coupling_regions[region].max_abs_jn_minus_gstar_je_face = -1;
+    }
     result.fct_high_low_identity_worst_ix = -1;
     result.fct_high_low_identity_worst_iv = -1;
     result.fct_high_low_identity_worst_imu = -1;
@@ -199,7 +210,7 @@ VlasovAmpereMidpointSolver::advance_background_and_fields(
         }
         return failed;
     }
-    Result result = advance_cylindrical_single_step(
+    Result result = evaluate_production_midpoint_operator(
         bkg_n, beam_n, fields_n, sg, dt, time, mpi_rank, mpi_size, 1);
     if (result.state_advanced && !result.failed) {
         const bool core_macro_debt =
@@ -214,4 +225,19 @@ VlasovAmpereMidpointSolver::advance_background_and_fields(
         }
     }
     return result;
+}
+
+VlasovAmpereMidpointSolver::MidpointOperatorEvaluation
+VlasovAmpereMidpointSolver::evaluate_fixed_midpoint_operator(
+    const Species& bkg_n, const BeamPIC& beam_n, const EMFields& fields_n,
+    const Species& guess_np1, const EMFields& fields_end_guess,
+    const std::vector<double>& fixed_j_beam_face_mid,
+    const CouplingRegionLayout& coupling_layout,
+    const SpatialGrid& sg, double dt, double time, int mpi_rank,
+    int mpi_size) const
+{
+    return evaluate_production_midpoint_operator(
+        bkg_n, beam_n, fields_n, sg, dt, time, mpi_rank, mpi_size, 1,
+        &guess_np1, &fields_end_guess, &fixed_j_beam_face_mid,
+        &coupling_layout, true);
 }

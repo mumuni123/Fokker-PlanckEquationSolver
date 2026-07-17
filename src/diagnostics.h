@@ -65,7 +65,7 @@ public:
                                 double dke_bkg_step,
                                 double dke_beam_push,
                                 double dE_field_step,
-                                double W_bkg_E,
+                                 double global_W_bkg_E,
                                 double W_beam_E,
                                 double v_mass_error_step,
                                 double mu_mass_error_step,
@@ -78,17 +78,17 @@ public:
                                 double E_balance_step,
                                 double x_limiter_active_fraction,
                                 double x_limiter_min_alpha,
-                                double bkg_energy_residual_step,
-                                double bkg_current_max_abs_charge,
-                                double bkg_current_max_abs_energy,
-                                double bkg_current_max_abs_ampere,
-                                double bkg_current_max_abs_charge_minus_ampere,
-                                double bkg_current_max_abs_energy_minus_ampere,
-                                double bkg_current_e_dot_charge,
-                                double bkg_current_e_dot_energy,
-                                double bkg_current_e_dot_ampere,
-                                double bkg_residual_if_charge_current,
-                                double bkg_residual_if_ampere_current,
+                                 double global_bkg_energy_residual_step,
+                                 double global_bkg_current_max_abs_charge,
+                                 double global_bkg_current_max_abs_energy,
+                                 double global_bkg_current_max_abs_ampere,
+                                 double global_bkg_current_max_abs_charge_minus_ampere,
+                                 double global_bkg_current_max_abs_energy_minus_ampere,
+                                 double global_bkg_current_e_dot_charge,
+                                 double global_bkg_current_e_dot_energy,
+                                 double global_bkg_current_e_dot_ampere,
+                                 double global_bkg_residual_if_charge_current,
+                                 double global_bkg_residual_if_ampere_current,
                                 double boundary_force_Cu_max,
                                 double boundary_force_Cmu_max,
                                 int boundary_force_nsub_max,
@@ -107,71 +107,17 @@ public:
                                 double interface_QC_flux_into_core,
                                 double interface_QC_high_correction_into_core,
                                 double boundary_energy_diagnostic_invalid,
-                                int coupled_iter,
-                                double coupled_residual_E,
-                                double coupled_residual_J_bkg,
-                                double coupled_residual_J_beam,
-                                double local_max_loss_u_high,
+                                 int global_coupled_iter,
+                                 double global_coupled_residual_E,
+                                 double global_coupled_residual_J_bkg,
+                                 double global_coupled_residual_J_beam,
+                                 double global_jn_minus_gstar_je_linf,
+                                 double global_stage5_r_fv,
+                                 double global_stage5_r_couple,
+                                 double local_max_loss_u_high,
                                 double local_x_at_max_loss_u_high,
                                 double local_f_u_max_x,
                                 double local_integral_f_u_gt_8_x);
-
-    void write_bkg_stage_diagnostics(int step, double time,
-                                     int coupled_iter,
-                                     const std::string& stage,
-                                     const Species& electrons,
-                                     const SpatialGrid& sg,
-                                     int mpi_rank, int mpi_size,
-                                     double reference_total_mass_raw);
-
-    void write_bkg_stage_negativity(
-        int step, double time, int coupled_iter,
-        bool soft_unconverged,
-        const std::vector<double>& min_f,
-        const std::vector<double>& neg_mass,
-        const std::vector<long long>& neg_cell_count,
-        const std::vector<double>& low_u_neg_mass,
-        const std::vector<double>& core_low_u_min_f,
-        int mpi_rank);
-
-    void write_bkg_stage_by_u_diagnostics(
-        int step, double time, int coupled_iter,
-        bool soft_unconverged,
-        const std::vector<double>& min_f_core_by_u,
-        const std::vector<double>& neg_mass_core_by_u,
-        const std::vector<long long>& neg_cell_count_core_by_u,
-        const std::vector<double>& min_f_boundary_by_u,
-        const std::vector<double>& neg_mass_boundary_by_u,
-        const std::vector<long long>& neg_cell_count_boundary_by_u,
-        int mpi_rank);
-
-    void write_bkg_low_u_divergence_diagnostics(
-        int step, double time, int coupled_iter,
-        const std::vector<double>& low_u_neg_added_by_div,
-        int mpi_rank);
-
-    // 7.1.6: write per-direction flux-positivity and defect diagnostics
-    void write_flux_positivity_diagnostics(
-        int step, double time,
-        const double flux_pos_min_f_before[3],
-        const double flux_pos_min_f_low[3],
-        const double flux_pos_min_f_final[3],
-        const double flux_pos_low_order_failed[3],
-        const double flux_pos_alpha_active[3],
-        const double flux_pos_alpha_min[3],
-        const double flux_pos_alpha_core[3],
-        const double flux_pos_alpha_boundary[3],
-        const double flux_pos_neg_mass_prevented[3],
-        int mpi_rank);
-
-    void write_stage_flux_defect_diagnostics(
-        int step, double time,
-        const double defect_mass[3],
-        const double defect_momentum[3],
-        const double defect_energy[3],
-        const double defect_boundary_mass[3],
-        const double defect_boundary_energy[3],
-        int mpi_rank);
 
     void write_fields(double time,
                       const EMFields& fields,
@@ -210,9 +156,6 @@ private:
     std::ofstream debug_file;
 #endif
     std::ofstream step_file;
-    std::ofstream bkg_stage_file;
-    std::ofstream bkg_stage_by_u_file;
-    std::ofstream bkg_low_u_divergence_file;
     bool debug_enabled;
     bool step_enabled;
     bool has_energy_reference;

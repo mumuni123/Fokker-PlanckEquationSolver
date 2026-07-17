@@ -6,10 +6,49 @@
 #include "maxwell.h"
 #include "species.h"
 
+#include <array>
+#include <string>
 #include <vector>
 
 class VlasovAmpereMidpointSolver {
 public:
+    // Dynamic part of the accepted regional closure partition.  A fixed
+    // operator audit reuses this layout rather than inferring it from a
+    // frozen Beam state/current.
+    struct CouplingRegionLayout {
+        int beam_front_ix;
+        double wave_core_end_m;
+    };
+
+    // Serialized only for diagnostic-level=2 fixed-state audits.  It owns
+    // complete endpoint objects; no solver scratch arrays are persisted.
+    struct MidpointAuditState {
+        long long step;
+        double time_s;
+        double dt_s;
+        int substeps_used;
+        int nonlinear_iterations;
+        bool low_order_only;
+        bool high_order_enabled;
+        bool fct_enabled;
+        std::string acceptance_type;
+        Species bkg_n;
+        Species guess_np1;
+        Species operator_input_guess;
+        EMFields fields_n;
+        EMFields fields_end_guess;
+        std::vector<double> j_beam_face_mid;
+        std::vector<double> reference_jn_face;
+        std::vector<double> reference_je_cell;
+        std::vector<double> reference_gstar_je_face;
+        // [JN(0), JN(L), G*JE(0), G*JE(L), pair(0), pair(L)].
+        std::array<double, 6> periodic_seam_face_audit;
+        CouplingRegionLayout coupling_layout;
+        // The two global closure residuals belong to the same fixed-operator
+        // reference as JN/JE/G*JE and must be reproduced independently.
+        double reference_stage5_r_fv;
+        double reference_stage5_r_couple;
+    };
     enum NegativeDebtLevel {
         NEG_DEBT_OK = 0,
         NEG_DEBT_WARN = 1,
@@ -50,6 +89,29 @@ public:
         double energy_defect;
         double boundary_mass_loss;
         double boundary_energy_loss;
+    };
+
+    struct CouplingRegionDiagnostics {
+        double sum_rj;
+        double sum_abs_rj;
+        double sum_sq_rj;
+        double linf_rj;
+        double sum_rk;
+        double sum_abs_rk;
+        double sum_sq_rk;
+        double linf_rk;
+        double max_abs_jn_minus_gstar_je;
+        int max_abs_jn_minus_gstar_je_face;
+        double face_work_jn;
+        double delta_ke_bkg;
+        double fct_work;
+        // Additive partition of sum_rj.  These are diagnostic layers only:
+        // J_N remains the charge-conserving current used by Ampere.
+        double r_couple_centered;
+        double r_couple_upwind_stabilization;
+        double r_couple_fct_stabilization;
+        long long face_count;
+        long long cell_count;
     };
 
     struct LowOrderFailureAudit {
@@ -115,9 +177,31 @@ public:
         BeamPIC beam_np1;
         EMFields fields_np1;
         std::vector<double> j_bkg_face_mid;
+        // Fixed-state face-pairing layers.  The x high-order transport has no
+        // separate centered variant, so j_bkg_face_center_mid aliases its
+        // high-order layer; keeping it explicit makes the audit contract
+        // complete without inventing a second transport formula.
+        std::vector<double> j_bkg_face_low_mid;
+        std::vector<double> j_bkg_face_center_mid;
+        std::vector<double> j_bkg_face_high_mid;
         std::vector<double> j_beam_face_mid;
         std::vector<double> j_total_face_mid;
         std::vector<double> j_bkg_energy_debug_face;
+        std::vector<double> j_bkg_energy_low_debug_face;
+        std::vector<double> j_bkg_energy_center_debug_face;
+        std::vector<double> j_bkg_energy_high_debug_face;
+        // Cell-centered J_E assembled directly from final u-face energy
+        // fluxes. It is never formed by dividing power by E.
+        std::vector<double> j_bkg_energy_cell_mid;
+        // Present for fixed midpoint-operator audits only.  These are the
+        // exact final FV fluxes used to form the returned candidate state.
+        std::vector<double> final_x_flux;
+        std::vector<double> final_u_flux;
+        Species operator_input_guess;
+        // Exact endpoint field guess supplied to the final production-kernel
+        // evaluation.  This is distinct from fields_np1, which is the result
+        // of Ampere's update for that evaluation.
+        EMFields operator_input_fields_end_guess;
         AcceptedTransportSnapshot accepted_transport;
         CurrentDiagnostics current_diag;
         double delta_ke_bkg;
@@ -138,6 +222,26 @@ public:
         // separate diagnostics.  No compatibility projection is active yet.
         double stage5_r_fv;
         double stage5_r_couple;
+        std::array<CouplingRegionDiagnostics, 6> coupling_regions;
+        // All three are global values formed by exactly one reduction of the
+        // corresponding local regional terms.  Their reconstruction errors
+        // audit the accepted finite-volume/Ampere state.
+        double coupling_rj_global_sum;
+        double coupling_rk_global_sum;
+        double coupling_face_work_jn_global_sum;
+        double coupling_rj_reconstruction_error;
+        double coupling_rk_reconstruction_error;
+        double coupling_face_work_jn_reconstruction_error;
+        double coupling_rj_centered_global_sum;
+        double coupling_rj_upwind_global_sum;
+        double coupling_rj_fct_global_sum;
+        double coupling_rj_centered_reconstruction_error;
+        double coupling_rj_upwind_reconstruction_error;
+        double coupling_rj_fct_reconstruction_error;
+        int coupling_beam_front_ix;
+        double coupling_wave_core_end_m;
+        // [JN(0), JN(L), G*JE(0), G*JE(L), pair(0), pair(L)].
+        std::array<double, 6> periodic_seam_face_audit;
         // R_couple decomposition.  The centered term is the physical
         // high-order u-force candidate; the other two terms expose the
         // boundary upwind and FCT safety contributions without changing J_N.
@@ -471,6 +575,9 @@ public:
         int f_neg_imu;
         int nonlinear_iterations;
         std::vector<double> midpoint_residual_e_history;
+        std::vector<double> midpoint_residual_j_bkg_history;
+        std::vector<double> midpoint_residual_j_beam_history;
+        std::vector<double> midpoint_residual_f_history;
         bool converged;
         bool failed;
         bool soft_accepted;
@@ -479,6 +586,8 @@ public:
         int transport_low_order_only;
         int substeps_used;
     };
+
+    typedef Result MidpointOperatorEvaluation;
 
     VlasovAmpereMidpointSolver();
 
@@ -500,6 +609,9 @@ public:
     void set_max_midpoint_iterations(int iterations) {
         max_midpoint_iterations_ = iterations > 0 ? iterations : 1;
     }
+    void set_capture_midpoint_input(bool enabled) {
+        capture_midpoint_input_ = enabled;
+    }
     bool low_order_only() const { return low_order_only_; }
     bool nonuniform_high_order_enabled() const {
         return nonuniform_high_order_enabled_;
@@ -515,6 +627,9 @@ public:
     // Test-only convergence tracing does not alter the midpoint equation,
     // relaxation, fluxes, or production acceptance rules.
     void set_midpoint_iteration_trace_for_test(bool enabled) {
+        midpoint_iteration_trace_for_test_ = enabled;
+    }
+    void set_midpoint_iteration_trace(bool enabled) {
         midpoint_iteration_trace_for_test_ = enabled;
     }
     // Raw high-candidate accounting is needed by the controlled FCT test,
@@ -535,6 +650,11 @@ public:
     void set_allow_finite_negative_debt_for_test(bool enabled) {
         allow_finite_negative_debt_for_test_ = enabled;
     }
+    // Restart uses the exact production periodic background exchange.
+    void synchronize_background_ghosts(Species& sp, const SpatialGrid& sg,
+                                       int mpi_rank, int mpi_size) const {
+        exchange_ghosts_x_persistent(sp, sg, mpi_rank, mpi_size);
+    }
 
     Result advance_background_and_fields(const Species& bkg_n,
                                          const BeamPIC& beam_n,
@@ -544,6 +664,16 @@ public:
                                          double time,
                                          int mpi_rank,
                                          int mpi_size);
+    // One production-kernel evaluation at an externally supplied Picard
+    // endpoint.  It is intentionally side-effect free: callers receive a
+    // Result and decide whether to advance physical state.
+    MidpointOperatorEvaluation evaluate_fixed_midpoint_operator(
+        const Species& bkg_n, const BeamPIC& beam_n, const EMFields& fields_n,
+        const Species& guess_np1, const EMFields& fields_end_guess,
+        const std::vector<double>& fixed_j_beam_face_mid,
+        const CouplingRegionLayout& coupling_layout,
+        const SpatialGrid& sg, double dt, double time, int mpi_rank,
+        int mpi_size) const;
 
 private:
     /*
@@ -802,15 +932,23 @@ private:
 
     void reset_result(Result& result) const;
     void reset_current_diag(CurrentDiagnostics& diag) const;
-    Result advance_cylindrical_single_step(const Species& bkg_n,
-                                           const BeamPIC& beam_n,
-                                           const EMFields& fields_n,
-                                           const SpatialGrid& sg,
-                                           double dt,
-                                           double time,
-                                           int mpi_rank,
-                                           int mpi_size,
-                                           int substeps_used) const;
+    // Shared production operator kernel.  The production step and later
+    // fixed-midpoint audit both enter through this boundary; keeping the
+    // original loop order here avoids a second implementation of FCT/JN/JE.
+    Result evaluate_production_midpoint_operator(const Species& bkg_n,
+                                                 const BeamPIC& beam_n,
+                                                 const EMFields& fields_n,
+                                                 const SpatialGrid& sg,
+                                                 double dt,
+                                                 double time,
+                                                 int mpi_rank,
+                                                 int mpi_size,
+                                                 int substeps_used,
+                                                 const Species* fixed_guess_np1 = 0,
+                                                 const EMFields* fixed_fields_end = 0,
+                                                 const std::vector<double>* fixed_j_beam_face_mid = 0,
+                                                 const CouplingRegionLayout* fixed_coupling_layout = 0,
+                                                 bool fixed_candidate = false) const;
     void set_midpoint_field(EMFields& fields_mid,
                             const EMFields& fields_n,
                             const std::vector<double>& ex_mid,
@@ -830,6 +968,7 @@ private:
     bool low_order_only_;
     bool nonuniform_high_order_enabled_;
     bool fct_enabled_;
+    bool capture_midpoint_input_;
     bool legacy_boundary_upwind_high_candidate_for_test_;
     int max_midpoint_iterations_;
     bool midpoint_iteration_trace_for_test_;

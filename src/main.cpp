@@ -7,8 +7,11 @@
 #include "beam_pic.h"
 #include "vlasov_ampere_midpoint.h"
 #include "config.h"
+#include "runtime_options.h"
+#include "checkpoint.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -60,6 +63,27 @@ void sync_moments_and_charge(Species& electrons,
     fields.set_charge_density(electrons, beam.density, ion_density_profile);
 }
 
+bool read_beam_ledger_total(const std::string& filename, double& n_in_total,
+                            double& current_impulse_total)
+{
+    std::ifstream input(filename.c_str());
+    std::string key;
+    double value = 0.0;
+    bool have_n_in = false;
+    bool have_impulse = false;
+    while (input >> key >> value) {
+        if (key == "N_in_total") {
+            n_in_total = value;
+            have_n_in = true;
+        } else if (key == "injected_current_impulse_total") {
+            current_impulse_total = value;
+            have_impulse = true;
+        }
+    }
+    return have_n_in && have_impulse && std::isfinite(n_in_total) &&
+        std::isfinite(current_impulse_total);
+}
+
 struct BackgroundCurrentDiagnostics {
     double residual_if_charge;
     double residual_if_ampere;
@@ -71,30 +95,6 @@ struct BackgroundCurrentDiagnostics {
     double max_abs_j_ampere;
     double max_abs_j_charge_minus_ampere;
     double max_abs_j_energy_minus_ampere;
-};
-
-struct BoundaryCoreDiagnostics {
-    double boundary_width;
-    double neg_mass_boundary;
-    double neg_mass_core;
-    long long neg_cell_count_boundary;
-    long long neg_cell_count_core;
-    double min_f_boundary;
-    double min_f_core;
-    double max_abs_J_bkg_boundary;
-    double max_abs_J_bkg_core;
-    double rms_J_bkg_boundary;
-    double rms_J_bkg_core;
-    double mean_abs_J_bkg_boundary;
-    double mean_abs_J_bkg_core;
-    double max_abs_Ex_boundary;
-    double max_abs_Ex_core;
-    double W_bkg_E_boundary;
-    double W_bkg_E_core;
-    double anomaly_inward_E;
-    double anomaly_inward_J;
-    double anomaly_inward_n;
-    double anomaly_inward_Mneg;
 };
 
 struct FNegativitySnapshotDiagnostics {
@@ -119,32 +119,6 @@ void reset_background_current_diagnostics(BackgroundCurrentDiagnostics& diag)
     diag.max_abs_j_ampere = 0.0;
     diag.max_abs_j_charge_minus_ampere = 0.0;
     diag.max_abs_j_energy_minus_ampere = 0.0;
-}
-
-void reset_boundary_core_diagnostics(BoundaryCoreDiagnostics& diag,
-                                     double boundary_width)
-{
-    diag.boundary_width = boundary_width;
-    diag.neg_mass_boundary = 0.0;
-    diag.neg_mass_core = 0.0;
-    diag.neg_cell_count_boundary = 0;
-    diag.neg_cell_count_core = 0;
-    diag.min_f_boundary = 0.0;
-    diag.min_f_core = 0.0;
-    diag.max_abs_J_bkg_boundary = 0.0;
-    diag.max_abs_J_bkg_core = 0.0;
-    diag.rms_J_bkg_boundary = 0.0;
-    diag.rms_J_bkg_core = 0.0;
-    diag.mean_abs_J_bkg_boundary = 0.0;
-    diag.mean_abs_J_bkg_core = 0.0;
-    diag.max_abs_Ex_boundary = 0.0;
-    diag.max_abs_Ex_core = 0.0;
-    diag.W_bkg_E_boundary = 0.0;
-    diag.W_bkg_E_core = 0.0;
-    diag.anomaly_inward_E = 0.0;
-    diag.anomaly_inward_J = 0.0;
-    diag.anomaly_inward_n = 0.0;
-    diag.anomaly_inward_Mneg = 0.0;
 }
 
 void reset_f_negativity_snapshot_diagnostics(
@@ -235,220 +209,6 @@ void compute_f_negativity_snapshot_diagnostics(
     diag.mu_worst = (diag.min_f < 0.0) ? local_min_indices[2] : -1;
 }
 
-void compute_boundary_core_diagnostics(
-    const Species& electrons,
-    const EMFields& fields,
-    const SpatialGrid& sg,
-    double dt,
-    double boundary_width,
-    int mpi_rank,
-    int mpi_size,
-    BoundaryCoreDiagnostics& diag)
-{
-    reset_boundary_core_diagnostics(diag, boundary_width);
-    const int ng = sg.nghost;
-    const int nxl = sg.nx_local;
-    double local_neg_mass_boundary = 0.0;
-    double local_neg_mass_core = 0.0;
-    long long local_neg_count_boundary = 0;
-    long long local_neg_count_core = 0;
-    double local_min_f_boundary = std::numeric_limits<double>::infinity();
-    double local_min_f_core = std::numeric_limits<double>::infinity();
-
-    for (int ix = 0; ix < nxl; ++ix) {
-        const double x_cell =
-            (static_cast<double>(sg.ix_start + ix) + 0.5) * sg.dx;
-        const bool boundary =
-            (x_cell < boundary_width) || (x_cell > Param::Lx - boundary_width);
-        const size_t xbase =
-            static_cast<size_t>(ng + ix) * Param::Nvmu;
-        for (int iv = 0; iv < Param::Nv; ++iv) {
-            const double shell = electrons.vgrid.moment_weight[iv];
-            const size_t row = xbase + static_cast<size_t>(iv) * Param::Nmu;
-            for (int imu = 0; imu < Param::Nmu; ++imu) {
-                const double f = electrons.f[row + static_cast<size_t>(imu)];
-                if (boundary) {
-                    local_min_f_boundary =
-                        std::min(local_min_f_boundary, f);
-                } else {
-                    local_min_f_core = std::min(local_min_f_core, f);
-                }
-                if (f < 0.0) {
-                    const double neg_mass = -f * shell * sg.dx;
-                    if (boundary) {
-                        local_neg_mass_boundary += neg_mass;
-                        ++local_neg_count_boundary;
-                    } else {
-                        local_neg_mass_core += neg_mass;
-                        ++local_neg_count_core;
-                    }
-                }
-            }
-        }
-    }
-
-    double local_max_j_boundary = 0.0;
-    double local_max_j_core = 0.0;
-    double local_sum_abs_j_boundary = 0.0;
-    double local_sum_abs_j_core = 0.0;
-    double local_sum_j2_boundary = 0.0;
-    double local_sum_j2_core = 0.0;
-    double local_max_ex_boundary = 0.0;
-    double local_max_ex_core = 0.0;
-    double local_work_boundary = 0.0;
-    double local_work_core = 0.0;
-    long long local_face_count_boundary = 0;
-    long long local_face_count_core = 0;
-
-    const int face_count =
-        std::min(nxl, static_cast<int>(std::min(electrons.current_face_x.size(),
-                                                fields.Ex_face.size())));
-    for (int iface = 0; iface < face_count; ++iface) {
-        const double x_face =
-            static_cast<double>(sg.ix_start + iface) * sg.dx;
-        const bool boundary =
-            (x_face < boundary_width) || (x_face > Param::Lx - boundary_width);
-        const double j = electrons.current_face_x[static_cast<size_t>(iface)];
-        const double ex = fields.Ex_face[static_cast<size_t>(iface)];
-        const double abs_j = std::fabs(j);
-        const double abs_ex = std::fabs(ex);
-        const double work = -j * ex * sg.dx * dt;
-        if (boundary) {
-            local_max_j_boundary = std::max(local_max_j_boundary, abs_j);
-            local_sum_abs_j_boundary += abs_j;
-            local_sum_j2_boundary += j * j;
-            local_max_ex_boundary = std::max(local_max_ex_boundary, abs_ex);
-            local_work_boundary += work;
-            ++local_face_count_boundary;
-        } else {
-            local_max_j_core = std::max(local_max_j_core, abs_j);
-            local_sum_abs_j_core += abs_j;
-            local_sum_j2_core += j * j;
-            local_max_ex_core = std::max(local_max_ex_core, abs_ex);
-            local_work_core += work;
-            ++local_face_count_core;
-        }
-    }
-
-    double sums[10] = {
-        local_neg_mass_boundary,
-        local_neg_mass_core,
-        local_sum_abs_j_boundary,
-        local_sum_abs_j_core,
-        local_sum_j2_boundary,
-        local_sum_j2_core,
-        local_work_boundary,
-        local_work_core,
-        0.0,
-        0.0
-    };
-    MPI_Allreduce(MPI_IN_PLACE, sums, 10, MPI_DOUBLE, MPI_SUM,
-                  MPI_COMM_WORLD);
-
-    double mins[2] = { local_min_f_boundary, local_min_f_core };
-    MPI_Allreduce(MPI_IN_PLACE, mins, 2, MPI_DOUBLE, MPI_MIN,
-                  MPI_COMM_WORLD);
-
-    double maxes[4] = {
-        local_max_j_boundary,
-        local_max_j_core,
-        local_max_ex_boundary,
-        local_max_ex_core
-    };
-    MPI_Allreduce(MPI_IN_PLACE, maxes, 4, MPI_DOUBLE, MPI_MAX,
-                  MPI_COMM_WORLD);
-
-    long long counts[4] = {
-        local_neg_count_boundary,
-        local_neg_count_core,
-        local_face_count_boundary,
-        local_face_count_core
-    };
-    MPI_Allreduce(MPI_IN_PLACE, counts, 4, MPI_LONG_LONG_INT, MPI_SUM,
-                  MPI_COMM_WORLD);
-
-    // Dynamic inward-propagation diagnostic.  Thresholds are tied to the
-    // current core envelope, so the 0.2 um belt remains a test isolation
-    // width rather than becoming a moving physical boundary.
-    double local_extent[4] = {0.0,0.0,0.0,0.0};
-    const double e_trigger=1.25*std::max(1.0,maxes[3]);
-    const double j_trigger=1.25*std::max(std::fabs(Param::jb),maxes[1]);
-    for (int ix=0;ix<nxl;++ix) {
-        const double x=(static_cast<double>(sg.ix_start+ix)+0.5)*sg.dx;
-        const double inward=std::min(x,Param::Lx-x);
-        const size_t xb=static_cast<size_t>(ng+ix)*Param::Nvmu;
-        double n=0.0,nneg=0.0;
-        for (int iv=0;iv<Param::Nv;++iv) {
-            const double w=electrons.vgrid.moment_weight[iv];
-            for (int imu=0;imu<Param::Nmu;++imu) {
-                const double f=electrons.f[xb+static_cast<size_t>(iv)*Param::Nmu+imu];
-                n += f*w;
-                if (f<0.0) nneg += (-f)*w;
-            }
-        }
-        const double ex=(static_cast<size_t>(ix)<fields.Ex.size())
-            ? std::fabs(fields.Ex[static_cast<size_t>(ix)]) : 0.0;
-        const double j=(static_cast<size_t>(ix)<electrons.current_x.size())
-            ? std::fabs(electrons.current_x[static_cast<size_t>(ix)]) : 0.0;
-        if (ex>e_trigger) local_extent[0]=std::max(local_extent[0],inward);
-        if (j>j_trigger) local_extent[1]=std::max(local_extent[1],inward);
-        if (std::fabs(n-Param::dens)>1.0e-5*Param::dens)
-            local_extent[2]=std::max(local_extent[2],inward);
-        if (nneg>1.0e-8*std::max(1.0,std::fabs(n)))
-            local_extent[3]=std::max(local_extent[3],inward);
-    }
-    MPI_Allreduce(MPI_IN_PLACE,local_extent,4,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
-
-    (void)mpi_rank;
-    (void)mpi_size;
-    diag.neg_mass_boundary = sums[0];
-    diag.neg_mass_core = sums[1];
-    diag.neg_cell_count_boundary = counts[0];
-    diag.neg_cell_count_core = counts[1];
-    diag.min_f_boundary =
-        std::isfinite(mins[0]) ? mins[0] : 0.0;
-    diag.min_f_core =
-        std::isfinite(mins[1]) ? mins[1] : 0.0;
-    diag.max_abs_J_bkg_boundary = maxes[0];
-    diag.max_abs_J_bkg_core = maxes[1];
-    diag.mean_abs_J_bkg_boundary =
-        (counts[2] > 0) ? sums[2] / static_cast<double>(counts[2]) : 0.0;
-    diag.mean_abs_J_bkg_core =
-        (counts[3] > 0) ? sums[3] / static_cast<double>(counts[3]) : 0.0;
-    diag.rms_J_bkg_boundary =
-        (counts[2] > 0) ? std::sqrt(sums[4] / static_cast<double>(counts[2]))
-                        : 0.0;
-    diag.rms_J_bkg_core =
-        (counts[3] > 0) ? std::sqrt(sums[5] / static_cast<double>(counts[3]))
-                        : 0.0;
-    diag.max_abs_Ex_boundary = maxes[2];
-    diag.max_abs_Ex_core = maxes[3];
-    diag.W_bkg_E_boundary = sums[6];
-    diag.W_bkg_E_core = sums[7];
-    diag.anomaly_inward_E=local_extent[0];
-    diag.anomaly_inward_J=local_extent[1];
-    diag.anomaly_inward_n=local_extent[2];
-    diag.anomaly_inward_Mneg=local_extent[3];
-}
-
-const char* classify_boundary_core_state(double neg_mass_core_fraction,
-                                         double neg_cell_core_fraction,
-                                         double limiter_core_fraction,
-                                         double j_core_to_boundary_ratio)
-{
-    if (neg_mass_core_fraction > 0.2 ||
-        limiter_core_fraction > 0.2 ||
-        j_core_to_boundary_ratio > 0.5) {
-        return "core_contaminated";
-    }
-    if (neg_mass_core_fraction < 0.05 &&
-        limiter_core_fraction < 0.05 &&
-        j_core_to_boundary_ratio < 0.2) {
-        return "boundary_only";
-    }
-    return "transition";
-}
-
 void write_snapshot(Diagnostics& diag,
                     double time,
                     const Species& bkg_e,
@@ -481,6 +241,296 @@ void write_snapshot(Diagnostics& diag,
     diag.advance_snapshot();
 }
 
+enum FixedPairTerm {
+    FIXED_PAIR_LOW = 0,
+    FIXED_PAIR_X_HIGH = 1,
+    FIXED_PAIR_U_CENTER = 2,
+    FIXED_PAIR_U_UPWIND = 3,
+    FIXED_PAIR_X_FCT = 4,
+    FIXED_PAIR_U_FCT = 5,
+    FIXED_PAIR_RECONSTRUCTED_FINAL = 6,
+    FIXED_PAIR_FINAL = 7,
+    FIXED_PAIR_RECONSTRUCTION_ERROR = 8,
+    FIXED_PAIR_TERM_COUNT = 9
+};
+
+struct FixedPairTermSummary {
+    double signed_sum;
+    double absolute_sum;
+    double linf;
+    int max_global_face;
+};
+
+// Gather only owned periodic faces (global 0..nx-1) and write the fixed-state
+// pairing ledger. The x=L alias is intentionally excluded: it is audited in
+// fixed_midpoint_operator_audit.result, but is not a second physical face.
+struct FixedMidpointFacePairingAudit {
+    int row_count;
+    int expected_row_count;
+    int unique_face_count;
+    int complete_unique_coverage;
+    int ledger_match;
+    double r_couple_from_unique_faces;
+    double reconstruction_error;
+    std::array<FixedPairTermSummary, FIXED_PAIR_TERM_COUNT> global_terms;
+    std::array<std::array<FixedPairTermSummary, FIXED_PAIR_TERM_COUNT>, 6>
+        region_terms;
+};
+
+FixedMidpointFacePairingAudit write_fixed_midpoint_face_pairing(
+    const std::string& filename, long long step, double time_s, double dt_s,
+    const VlasovAmpereMidpointSolver::Result& result,
+    const EMFields& fields_start, const EMFields& fields_end_guess,
+    const SpatialGrid& sg, int mpi_rank, int mpi_size, bool append)
+{
+    FixedMidpointFacePairingAudit audit = {};
+    audit.expected_row_count = sg.nx_global;
+    const int nxl = sg.nx_local;
+    // E_mid, JN_low/high/final, G*JE_low/center/high/final.  There is no
+    // JN_center column: x transport has no independently constructed center
+    // current, so exposing its high-order alias would be misleading.
+    const int columns = 8;
+    std::vector<int> local_faces(static_cast<size_t>(nxl), 0);
+    std::vector<double> local_face_values(static_cast<size_t>(nxl * columns), 0.0);
+    for (int iface = 0; iface < nxl; ++iface) {
+        local_faces[static_cast<size_t>(iface)] = sg.ix_start + iface;
+        const size_t base = static_cast<size_t>(iface * columns);
+        local_face_values[base] = 0.5 * (fields_start.Ex_face[iface] +
+                                         fields_end_guess.Ex_face[iface]);
+        local_face_values[base + 1] = result.j_bkg_face_low_mid[iface];
+        local_face_values[base + 2] = result.j_bkg_face_high_mid[iface];
+        local_face_values[base + 3] = result.j_bkg_face_mid[iface];
+        local_face_values[base + 4] = result.j_bkg_energy_low_debug_face[iface];
+        local_face_values[base + 5] = result.j_bkg_energy_center_debug_face[iface];
+        local_face_values[base + 6] = result.j_bkg_energy_high_debug_face[iface];
+        local_face_values[base + 7] = result.j_bkg_energy_debug_face[iface];
+    }
+
+    std::vector<int> counts;
+    if (mpi_rank == 0) counts.assign(static_cast<size_t>(mpi_size), 0);
+    MPI_Gather(&nxl, 1, MPI_INT, mpi_rank == 0 ? counts.data() : 0, 1,
+               MPI_INT, 0, MPI_COMM_WORLD);
+
+    std::vector<int> displacements;
+    std::vector<int> value_counts;
+    std::vector<int> value_displacements;
+    std::vector<int> gathered_faces;
+    std::vector<double> gathered_face_values;
+    if (mpi_rank == 0) {
+        displacements.assign(static_cast<size_t>(mpi_size), 0);
+        value_counts.assign(static_cast<size_t>(mpi_size), 0);
+        value_displacements.assign(static_cast<size_t>(mpi_size), 0);
+        int total = 0;
+        for (int rank = 0; rank < mpi_size; ++rank) {
+            displacements[static_cast<size_t>(rank)] = total;
+            value_displacements[static_cast<size_t>(rank)] = total * columns;
+            value_counts[static_cast<size_t>(rank)] = counts[static_cast<size_t>(rank)] * columns;
+            total += counts[static_cast<size_t>(rank)];
+        }
+        gathered_faces.assign(static_cast<size_t>(total), -1);
+        gathered_face_values.assign(static_cast<size_t>(total * columns), 0.0);
+    }
+    MPI_Gatherv(local_faces.data(), nxl, MPI_INT,
+                mpi_rank == 0 ? gathered_faces.data() : 0,
+                mpi_rank == 0 ? counts.data() : 0,
+                mpi_rank == 0 ? displacements.data() : 0,
+                MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Gatherv(local_face_values.data(), nxl * columns, MPI_DOUBLE,
+                mpi_rank == 0 ? gathered_face_values.data() : 0,
+                mpi_rank == 0 ? value_counts.data() : 0,
+                mpi_rank == 0 ? value_displacements.data() : 0,
+                MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    if (mpi_rank != 0) {
+        double values[2] = {0.0, 0.0};
+        int flags[5] = {0, 0, 0, 0, 0};
+        MPI_Bcast(values, 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        MPI_Bcast(flags, 5, MPI_INT, 0, MPI_COMM_WORLD);
+        audit.r_couple_from_unique_faces = values[0];
+        audit.reconstruction_error = values[1];
+        audit.row_count = flags[0];
+        audit.expected_row_count = flags[1];
+        audit.unique_face_count = flags[2];
+        audit.complete_unique_coverage = flags[3] != 0;
+        audit.ledger_match = flags[4] != 0;
+        return audit;
+    }
+
+    const int nx_global = sg.nx_global;
+    std::vector<double> face_values(static_cast<size_t>(nx_global * columns), 0.0);
+    std::vector<int> owner(static_cast<size_t>(nx_global), -1);
+    std::vector<int> local_face(static_cast<size_t>(nx_global), -1);
+    std::vector<int> seen(static_cast<size_t>(nx_global), 0);
+    for (int rank = 0; rank < mpi_size; ++rank) {
+        const int begin = displacements[static_cast<size_t>(rank)];
+        const int count = counts[static_cast<size_t>(rank)];
+        for (int local = 0; local < count; ++local) {
+            const int packed = begin + local;
+            const int global_face = gathered_faces[static_cast<size_t>(packed)];
+            if (global_face < 0 || global_face >= nx_global) continue;
+            const size_t destination = static_cast<size_t>(global_face * columns);
+            const size_t source = static_cast<size_t>(packed * columns);
+            for (int column = 0; column < columns; ++column)
+                face_values[destination + static_cast<size_t>(column)] =
+                    gathered_face_values[source + static_cast<size_t>(column)];
+            owner[static_cast<size_t>(global_face)] = rank;
+            local_face[static_cast<size_t>(global_face)] = local;
+            ++seen[static_cast<size_t>(global_face)];
+        }
+    }
+
+    std::ofstream out(filename.c_str(), append ? std::ios::app : std::ios::out);
+    if (!append) {
+        out << "# unique periodic face ledger; x has no independently "
+            << "constructed JN_center layer.\n";
+        out << "# step time_fs global_face x_face E_mid JN_low JN_high JN_final "
+            << "GstarJE_low GstarJE_center GstarJE_high GstarJE_final "
+            << "r_low delta_r_x_high delta_r_u_center delta_r_u_upwind "
+            << "delta_r_x_FCT delta_r_u_FCT r_reconstructed_final r_final "
+            << "reconstruction_error owner_rank local_face is_global_seam "
+            << "is_periodic_alias\n";
+    }
+    out << std::scientific << std::setprecision(17);
+    const char* const term_names[FIXED_PAIR_TERM_COUNT] = {
+        "R_pair_low", "delta_R_x_high", "delta_R_u_center",
+        "delta_R_u_upwind", "delta_R_x_FCT", "delta_R_u_FCT",
+        "R_pair_reconstructed_final", "R_pair_final",
+        "R_pair_reconstruction_error"};
+    const auto region_for_face = [&](double x_face) {
+        if (x_face < 0.2 * Const::micro) return 0;
+        if (x_face < 0.8 * Const::micro) return 1;
+        if (x_face <= result.coupling_wave_core_end_m) return 2;
+        if (x_face < 7.2 * Const::micro) return 3;
+        if (x_face < 7.8 * Const::micro) return 4;
+        return 5;
+    };
+    const auto accumulate_term = [](FixedPairTermSummary& summary,
+                                    double value, int global_face) {
+        summary.signed_sum += value;
+        summary.absolute_sum += std::fabs(value);
+        if (std::fabs(value) > summary.linf) {
+            summary.linf = std::fabs(value);
+            summary.max_global_face = global_face;
+        }
+    };
+    for (int term = 0; term < FIXED_PAIR_TERM_COUNT; ++term) {
+        audit.global_terms[static_cast<size_t>(term)].max_global_face = -1;
+        for (int region = 0; region < 6; ++region)
+            audit.region_terms[static_cast<size_t>(region)]
+                [static_cast<size_t>(term)].max_global_face = -1;
+    }
+    for (int global_face = 0; global_face < nx_global; ++global_face) {
+        const size_t base = static_cast<size_t>(global_face * columns);
+        const double e_mid = face_values[base];
+        const double jn_low = face_values[base + 1];
+        const double jn_high = face_values[base + 2];
+        const double jn_final = face_values[base + 3];
+        const double gstar_low = face_values[base + 4];
+        const double gstar_center = face_values[base + 5];
+        const double gstar_high = face_values[base + 6];
+        const double gstar_final = face_values[base + 7];
+        const double factor = dt_s * sg.dx * e_mid;
+        std::array<double, FIXED_PAIR_TERM_COUNT> terms = {};
+        terms[FIXED_PAIR_LOW] = factor * (jn_low - gstar_low);
+        terms[FIXED_PAIR_X_HIGH] = factor * (jn_high - jn_low);
+        terms[FIXED_PAIR_U_CENTER] = -factor * (gstar_center - gstar_low);
+        terms[FIXED_PAIR_U_UPWIND] = -factor * (gstar_high - gstar_center);
+        terms[FIXED_PAIR_X_FCT] = factor * (jn_final - jn_high);
+        terms[FIXED_PAIR_U_FCT] = -factor * (gstar_final - gstar_high);
+        terms[FIXED_PAIR_RECONSTRUCTED_FINAL] = terms[FIXED_PAIR_LOW] +
+            terms[FIXED_PAIR_X_HIGH] + terms[FIXED_PAIR_U_CENTER] +
+            terms[FIXED_PAIR_U_UPWIND] + terms[FIXED_PAIR_X_FCT] +
+            terms[FIXED_PAIR_U_FCT];
+        terms[FIXED_PAIR_FINAL] = factor * (jn_final - gstar_final);
+        terms[FIXED_PAIR_RECONSTRUCTION_ERROR] =
+            terms[FIXED_PAIR_RECONSTRUCTED_FINAL] - terms[FIXED_PAIR_FINAL];
+        const double x_face = sg.x_min + static_cast<double>(global_face) * sg.dx;
+        const int region = region_for_face(x_face);
+        for (int term = 0; term < FIXED_PAIR_TERM_COUNT; ++term) {
+            accumulate_term(audit.global_terms[static_cast<size_t>(term)],
+                            terms[static_cast<size_t>(term)], global_face);
+            accumulate_term(audit.region_terms[static_cast<size_t>(region)]
+                            [static_cast<size_t>(term)],
+                            terms[static_cast<size_t>(term)], global_face);
+        }
+        out << step << " " << time_s / Const::femto << " " << global_face << " "
+            << x_face << " " << e_mid << " "
+            << jn_low << " " << jn_high << " " << jn_final << " "
+            << gstar_low << " " << gstar_center << " " << gstar_high << " "
+            << gstar_final << " " << terms[FIXED_PAIR_LOW] << " "
+            << terms[FIXED_PAIR_X_HIGH] << " "
+            << terms[FIXED_PAIR_U_CENTER] << " "
+            << terms[FIXED_PAIR_U_UPWIND] << " "
+            << terms[FIXED_PAIR_X_FCT] << " "
+            << terms[FIXED_PAIR_U_FCT] << " "
+            << terms[FIXED_PAIR_RECONSTRUCTED_FINAL] << " "
+            << terms[FIXED_PAIR_FINAL] << " "
+            << terms[FIXED_PAIR_RECONSTRUCTION_ERROR] << " "
+            << owner[static_cast<size_t>(global_face)] << " "
+            << local_face[static_cast<size_t>(global_face)] << " "
+            << (global_face == 0 ? 1 : 0) << " 0\n";
+    }
+    const double r_couple_from_unique_faces =
+        audit.global_terms[FIXED_PAIR_FINAL].signed_sum;
+    out << "# R_couple_from_unique_faces " << r_couple_from_unique_faces
+        << " stage5_R_couple " << result.stage5_r_couple
+        << " reconstruction_error "
+        << (r_couple_from_unique_faces - result.stage5_r_couple) << "\n";
+    for (int term = 0; term < FIXED_PAIR_TERM_COUNT; ++term) {
+        const FixedPairTermSummary& summary =
+            audit.global_terms[static_cast<size_t>(term)];
+        out << "# global " << term_names[term]
+            << " signed_sum " << summary.signed_sum
+            << " absolute_sum " << summary.absolute_sum
+            << " Linf " << summary.linf
+            << " max_global_face " << summary.max_global_face << "\n";
+    }
+    for (int region = 0; region < 6; ++region) {
+        for (int term = 0; term < FIXED_PAIR_TERM_COUNT; ++term) {
+            const FixedPairTermSummary& summary =
+                audit.region_terms[static_cast<size_t>(region)]
+                    [static_cast<size_t>(term)];
+            out << "# region " << region << " " << term_names[term]
+                << " signed_sum " << summary.signed_sum
+                << " absolute_sum " << summary.absolute_sum
+                << " Linf " << summary.linf
+                << " max_global_face " << summary.max_global_face << "\n";
+        }
+    }
+    audit.row_count = nx_global;
+    audit.unique_face_count = 0;
+    audit.complete_unique_coverage = 1;
+    for (int global_face = 0; global_face < nx_global; ++global_face) {
+        if (seen[static_cast<size_t>(global_face)] == 1) ++audit.unique_face_count;
+        else audit.complete_unique_coverage = 0;
+    }
+    audit.r_couple_from_unique_faces = r_couple_from_unique_faces;
+    audit.reconstruction_error = r_couple_from_unique_faces - result.stage5_r_couple;
+    const double tolerance = 8192.0 * std::numeric_limits<double>::epsilon() *
+        std::max(1.0, std::fabs(result.stage5_r_couple));
+    audit.ledger_match = audit.complete_unique_coverage &&
+        audit.row_count == audit.expected_row_count &&
+        std::isfinite(audit.reconstruction_error) &&
+        std::fabs(audit.reconstruction_error) <= tolerance &&
+        std::isfinite(audit.global_terms[FIXED_PAIR_RECONSTRUCTION_ERROR]
+                      .signed_sum) &&
+        std::fabs(audit.global_terms[FIXED_PAIR_RECONSTRUCTION_ERROR]
+                  .signed_sum) <= tolerance;
+    out << "# face_row_count " << audit.row_count
+        << " expected_row_count " << audit.expected_row_count
+        << " unique_face_count " << audit.unique_face_count
+        << " complete_unique_coverage " << audit.complete_unique_coverage
+        << " ledger_match " << audit.ledger_match << "\n";
+    double values[2] = {audit.r_couple_from_unique_faces,
+                        audit.reconstruction_error};
+    int flags[5] = {audit.row_count, audit.expected_row_count,
+                    audit.unique_face_count,
+                    audit.complete_unique_coverage ? 1 : 0,
+                    audit.ledger_match ? 1 : 0};
+    MPI_Bcast(values, 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Bcast(flags, 5, MPI_INT, 0, MPI_COMM_WORLD);
+    return audit;
+}
+
 int main(int argc, char** argv)
 {
     MPI_Init(&argc, &argv);
@@ -490,6 +540,13 @@ int main(int argc, char** argv)
     MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
 
     RuntimeConfig config = load_runtime_config();
+    RuntimeOptions runtime = parse_runtime_options(argc, argv, mpi_rank, mpi_size);
+    std::string runtime_error;
+    if (!prepare_output_directory(runtime, mpi_rank, mpi_size, runtime_error)) {
+        if (mpi_rank == 0) std::fprintf(stderr, "Runtime setup error: %s\n", runtime_error.c_str());
+        MPI_Finalize();
+        return 2;
+    }
 
     if (mpi_rank == 0) {
         printf("============================================================\n");
@@ -551,11 +608,8 @@ int main(int argc, char** argv)
     bkg_e.init("bkg_e", SpeciesType::BACKGROUND_ELECTRON,
                -Const::qe, Const::me,
                Param::dens, Param::temperature_e, false, sgrid);
-    bkg_e.initialize_maxwellian();
-
     BeamPIC beam;
     beam.init(sgrid);
-    beam.deposit_density(sgrid, mpi_rank, mpi_size);
 
     EMFields fields;
     fields.init(sgrid);
@@ -565,7 +619,9 @@ int main(int argc, char** argv)
     midpoint_solver.set_low_order_only(false);
     midpoint_solver.set_nonuniform_high_order_enabled(true);
     midpoint_solver.set_fct_enabled(true);
-    midpoint_solver.set_max_midpoint_iterations(40);
+    midpoint_solver.set_max_midpoint_iterations(runtime.midpoint_max_iters);
+    midpoint_solver.set_capture_midpoint_input(runtime.diagnostic_level >= 2);
+    midpoint_solver.set_midpoint_iteration_trace(runtime.diagnostic_level >= 2);
     if (mpi_rank == 0) {
         printf("Transport configuration: low_order_only=%s, "
                "nonuniform_high_order=%s, FCT=%s, midpoint_max_iters=%d\n",
@@ -574,14 +630,331 @@ int main(int argc, char** argv)
                midpoint_solver.fct_enabled() ? "ON" : "OFF",
                midpoint_solver.max_midpoint_iterations());
     }
+
+    if (runtime.operator_audit_mode) {
+        VlasovAmpereMidpointSolver::MidpointAuditState audit_state;
+        if (!read_midpoint_audit_state(runtime.operator_audit_dir, audit_state,
+                                       bkg_e, fields, sgrid, mpi_rank, mpi_size,
+                                       runtime_error)) {
+            if (mpi_rank == 0) {
+                std::fprintf(stderr, "Operator-audit input error: %s\n",
+                             runtime_error.c_str());
+            }
+            MPI_Finalize();
+            return 3;
+        }
+        midpoint_solver.set_low_order_only(audit_state.low_order_only);
+        midpoint_solver.set_nonuniform_high_order_enabled(
+            audit_state.high_order_enabled);
+        midpoint_solver.set_fct_enabled(audit_state.fct_enabled);
+        const VlasovAmpereMidpointSolver::MidpointOperatorEvaluation evaluated =
+            midpoint_solver.evaluate_fixed_midpoint_operator(
+                audit_state.bkg_n, beam, audit_state.fields_n,
+                audit_state.operator_input_guess, audit_state.fields_end_guess,
+                audit_state.j_beam_face_mid, audit_state.coupling_layout,
+                sgrid, audit_state.dt_s,
+                audit_state.time_s, mpi_rank, mpi_size);
+        const auto max_difference = [](const std::vector<double>& a,
+                                       const std::vector<double>& b) {
+            if (a.size() != b.size()) return std::numeric_limits<double>::infinity();
+            double value = 0.0;
+            for (size_t i = 0; i < a.size(); ++i)
+                value = std::max(value, std::fabs(a[i] - b[i]));
+            return value;
+        };
+        const auto max_magnitude = [](const std::vector<double>& values) {
+            double value = 0.0;
+            for (size_t i = 0; i < values.size(); ++i)
+                value = std::max(value, std::fabs(values[i]));
+            return value;
+        };
+        double differences[6] = {
+            max_difference(evaluated.j_bkg_face_mid, audit_state.reference_jn_face),
+            max_difference(evaluated.j_bkg_energy_cell_mid, audit_state.reference_je_cell),
+            max_difference(evaluated.j_bkg_energy_debug_face,
+                           audit_state.reference_gstar_je_face),
+            max_difference(evaluated.j_beam_face_mid, audit_state.j_beam_face_mid),
+            std::fabs(evaluated.stage5_r_fv - audit_state.reference_stage5_r_fv),
+            std::fabs(evaluated.stage5_r_couple - audit_state.reference_stage5_r_couple)
+        };
+        MPI_Allreduce(MPI_IN_PLACE, differences, 6, MPI_DOUBLE, MPI_MAX,
+                      MPI_COMM_WORLD);
+        double reference_scales[6] = {
+            max_magnitude(audit_state.reference_jn_face),
+            max_magnitude(audit_state.reference_je_cell),
+            max_magnitude(audit_state.reference_gstar_je_face),
+            max_magnitude(audit_state.j_beam_face_mid),
+            std::fabs(audit_state.reference_stage5_r_fv),
+            std::fabs(audit_state.reference_stage5_r_couple)
+        };
+        MPI_Allreduce(MPI_IN_PLACE, reference_scales, 6, MPI_DOUBLE, MPI_MAX,
+                      MPI_COMM_WORLD);
+        double relative_differences[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        bool reference_match = true;
+        for (int i = 0; i < 6; ++i) {
+            relative_differences[i] = differences[i] /
+                std::max(1.0, reference_scales[i]);
+            reference_match = reference_match &&
+                relative_differences[i] <= 4096.0 * std::numeric_limits<double>::epsilon();
+        }
+        double periodic_seam_difference = 0.0;
+        double periodic_seam_scale = 0.0;
+        for (size_t i = 0; i < evaluated.periodic_seam_face_audit.size(); ++i) {
+            periodic_seam_difference = std::max(periodic_seam_difference,
+                std::fabs(evaluated.periodic_seam_face_audit[i] -
+                          audit_state.periodic_seam_face_audit[i]));
+            periodic_seam_scale = std::max(periodic_seam_scale,
+                std::max(std::fabs(evaluated.periodic_seam_face_audit[i]),
+                         std::fabs(audit_state.periodic_seam_face_audit[i])));
+        }
+        const double periodic_seam_relative_difference = periodic_seam_difference /
+            std::max(1.0, periodic_seam_scale);
+        const bool periodic_seam_match = std::isfinite(periodic_seam_difference) &&
+            periodic_seam_relative_difference <=
+                4096.0 * std::numeric_limits<double>::epsilon();
+        const bool layout_match =
+            evaluated.coupling_beam_front_ix == audit_state.coupling_layout.beam_front_ix &&
+            std::fabs(evaluated.coupling_wave_core_end_m -
+                      audit_state.coupling_layout.wave_core_end_m) <=
+                64.0 * std::numeric_limits<double>::epsilon() *
+                std::max(1.0, std::fabs(audit_state.coupling_layout.wave_core_end_m));
+        const FixedMidpointFacePairingAudit face_pairing_audit =
+            write_fixed_midpoint_face_pairing(
+                output_path(runtime, "fixed_midpoint_face_pairing.dat"),
+                audit_state.step, audit_state.time_s, audit_state.dt_s, evaluated,
+                audit_state.fields_n, audit_state.fields_end_guess,
+                sgrid, mpi_rank, mpi_size, false);
+        const bool audit_ok = evaluated.state_advanced && !evaluated.failed &&
+            std::isfinite(differences[0]) && std::isfinite(differences[1]) &&
+            std::isfinite(differences[2]) && std::isfinite(differences[3]) &&
+            std::isfinite(differences[4]) && std::isfinite(differences[5]) &&
+            reference_match && layout_match && periodic_seam_match &&
+            face_pairing_audit.ledger_match;
+        if (mpi_rank == 0) {
+            std::ofstream out(output_path(runtime, "fixed_midpoint_operator_audit.result").c_str());
+            out << std::setprecision(17)
+                << "audit_input " << runtime.operator_audit_dir << "\n"
+                << "step " << audit_state.step << "\n"
+                << "time_s " << audit_state.time_s << "\n"
+                << "dt_s " << audit_state.dt_s << "\n"
+                << "state_advanced " << evaluated.state_advanced << "\n"
+                << "failed " << evaluated.failed << "\n"
+                << "j_n_max_abs_difference " << differences[0] << "\n"
+                << "j_e_max_abs_difference " << differences[1] << "\n"
+                << "gstar_j_e_max_abs_difference " << differences[2] << "\n"
+                << "beam_current_max_abs_difference " << differences[3] << "\n"
+                << "max_abs_recomputed_JN " << max_magnitude(evaluated.j_bkg_face_mid) << "\n"
+                << "max_abs_recomputed_JE " << max_magnitude(evaluated.j_bkg_energy_cell_mid) << "\n"
+                << "max_abs_recomputed_GstarJE " << max_magnitude(evaluated.j_bkg_energy_debug_face) << "\n"
+                << "j_n_relative_difference " << relative_differences[0] << "\n"
+                << "j_e_relative_difference " << relative_differences[1] << "\n"
+                << "gstar_j_e_relative_difference " << relative_differences[2] << "\n"
+                << "beam_current_relative_difference " << relative_differences[3] << "\n"
+                << "stage5_R_FV_reference " << audit_state.reference_stage5_r_fv << "\n"
+                << "stage5_R_FV_max_abs_difference " << differences[4] << "\n"
+                << "stage5_R_FV_relative_difference " << relative_differences[4] << "\n"
+                << "stage5_R_couple_reference " << audit_state.reference_stage5_r_couple << "\n"
+                << "stage5_R_couple_max_abs_difference " << differences[5] << "\n"
+                << "stage5_R_couple_relative_difference " << relative_differences[5] << "\n"
+                << "face_pairing_row_count " << face_pairing_audit.row_count << "\n"
+                << "face_pairing_expected_row_count "
+                << face_pairing_audit.expected_row_count << "\n"
+                << "face_pairing_unique_face_count "
+                << face_pairing_audit.unique_face_count << "\n"
+                << "face_pairing_complete_unique_coverage "
+                << face_pairing_audit.complete_unique_coverage << "\n"
+                << "face_pairing_R_couple_from_unique_faces "
+                << face_pairing_audit.r_couple_from_unique_faces << "\n"
+                << "face_pairing_R_couple_reconstruction_error "
+                << face_pairing_audit.reconstruction_error << "\n"
+                << "face_pairing_ledger_match "
+                << face_pairing_audit.ledger_match << "\n"
+                << "unique_face_count " << face_pairing_audit.unique_face_count << "\n"
+                << "sum_of_face_rows "
+                << face_pairing_audit.r_couple_from_unique_faces << "\n"
+                << "global_reconstruction_error "
+                << face_pairing_audit.reconstruction_error << "\n";
+            const char* const pair_term_names[FIXED_PAIR_TERM_COUNT] = {
+                "R_pair_low", "delta_R_x_high", "delta_R_u_center",
+                "delta_R_u_upwind", "delta_R_x_FCT", "delta_R_u_FCT",
+                "R_pair_reconstructed_final", "R_pair_final",
+                "R_pair_reconstruction_error"};
+            const double pair_final_signed =
+                face_pairing_audit.global_terms[FIXED_PAIR_FINAL].signed_sum;
+            const double pair_final_signed_scale =
+                std::fabs(pair_final_signed) > std::numeric_limits<double>::min()
+                ? pair_final_signed
+                : std::numeric_limits<double>::min();
+            const double pair_final_absolute_scale = std::max(
+                std::fabs(pair_final_signed), std::numeric_limits<double>::min());
+            for (int term = 0; term < FIXED_PAIR_TERM_COUNT; ++term) {
+                const FixedPairTermSummary& summary =
+                    face_pairing_audit.global_terms[static_cast<size_t>(term)];
+                out << pair_term_names[term] << " " << summary.signed_sum << "\n"
+                    << pair_term_names[term] << "_absolute_sum "
+                    << summary.absolute_sum << "\n"
+                    << pair_term_names[term] << "_Linf " << summary.linf << "\n"
+                    << pair_term_names[term] << "_max_global_face "
+                    << summary.max_global_face << "\n"
+                    << pair_term_names[term] << "_fraction_of_final "
+                    << summary.signed_sum / pair_final_signed_scale << "\n"
+                    << pair_term_names[term] << "_absolute_fraction_of_final "
+                    << summary.absolute_sum / pair_final_absolute_scale << "\n";
+            }
+            for (int region = 0; region < 6; ++region) {
+                for (int term = 0; term < FIXED_PAIR_TERM_COUNT; ++term) {
+                    const FixedPairTermSummary& summary =
+                        face_pairing_audit.region_terms[static_cast<size_t>(region)]
+                            [static_cast<size_t>(term)];
+                    out << "pair_region " << region << " " << pair_term_names[term]
+                        << " signed_sum " << summary.signed_sum
+                        << " absolute_sum " << summary.absolute_sum
+                        << " Linf " << summary.linf
+                        << " max_global_face " << summary.max_global_face << "\n";
+                }
+            }
+            out
+                << "periodic_seam_JN_face0_reference "
+                << audit_state.periodic_seam_face_audit[0] << "\n"
+                << "periodic_seam_JN_face0_recomputed "
+                << evaluated.periodic_seam_face_audit[0] << "\n"
+                << "periodic_seam_JN_faceL_reference "
+                << audit_state.periodic_seam_face_audit[1] << "\n"
+                << "periodic_seam_JN_faceL_recomputed "
+                << evaluated.periodic_seam_face_audit[1] << "\n"
+                << "periodic_seam_GstarJE_face0_reference "
+                << audit_state.periodic_seam_face_audit[2] << "\n"
+                << "periodic_seam_GstarJE_face0_recomputed "
+                << evaluated.periodic_seam_face_audit[2] << "\n"
+                << "periodic_seam_GstarJE_faceL_reference "
+                << audit_state.periodic_seam_face_audit[3] << "\n"
+                << "periodic_seam_GstarJE_faceL_recomputed "
+                << evaluated.periodic_seam_face_audit[3] << "\n"
+                << "periodic_seam_JN_minus_GstarJE_face0_reference "
+                << audit_state.periodic_seam_face_audit[4] << "\n"
+                << "periodic_seam_JN_minus_GstarJE_face0_recomputed "
+                << evaluated.periodic_seam_face_audit[4] << "\n"
+                << "periodic_seam_JN_minus_GstarJE_faceL_reference "
+                << audit_state.periodic_seam_face_audit[5] << "\n"
+                << "periodic_seam_JN_minus_GstarJE_faceL_recomputed "
+                << evaluated.periodic_seam_face_audit[5] << "\n"
+                << "periodic_seam_JN_alias_error_reference "
+                << (audit_state.periodic_seam_face_audit[1] -
+                    audit_state.periodic_seam_face_audit[0]) << "\n"
+                << "periodic_seam_JN_alias_error_recomputed "
+                << (evaluated.periodic_seam_face_audit[1] -
+                    evaluated.periodic_seam_face_audit[0]) << "\n"
+                << "periodic_seam_GstarJE_alias_error_reference "
+                << (audit_state.periodic_seam_face_audit[3] -
+                    audit_state.periodic_seam_face_audit[2]) << "\n"
+                << "periodic_seam_GstarJE_alias_error_recomputed "
+                << (evaluated.periodic_seam_face_audit[3] -
+                    evaluated.periodic_seam_face_audit[2]) << "\n"
+                << "seam_JN_face0 " << evaluated.periodic_seam_face_audit[0] << "\n"
+                << "seam_JN_aliasN " << evaluated.periodic_seam_face_audit[1] << "\n"
+                << "seam_GstarJE_face0 " << evaluated.periodic_seam_face_audit[2] << "\n"
+                << "seam_GstarJE_aliasN " << evaluated.periodic_seam_face_audit[3] << "\n"
+                << "seam_deltaJ_face0 " << evaluated.periodic_seam_face_audit[4] << "\n"
+                << "seam_deltaJ_aliasN " << evaluated.periodic_seam_face_audit[5] << "\n"
+                << "seam_JN_alias_error "
+                << (evaluated.periodic_seam_face_audit[1] -
+                    evaluated.periodic_seam_face_audit[0]) << "\n"
+                << "seam_GstarJE_alias_error "
+                << (evaluated.periodic_seam_face_audit[3] -
+                    evaluated.periodic_seam_face_audit[2]) << "\n"
+                << "alias_error "
+                << std::max(std::fabs(evaluated.periodic_seam_face_audit[1] -
+                                      evaluated.periodic_seam_face_audit[0]),
+                            std::fabs(evaluated.periodic_seam_face_audit[3] -
+                                      evaluated.periodic_seam_face_audit[2])) << "\n"
+                << "periodic_seam_max_abs_difference "
+                << periodic_seam_difference << "\n"
+                << "periodic_seam_relative_difference "
+                << periodic_seam_relative_difference << "\n"
+                << "periodic_seam_match " << (periodic_seam_match ? 1 : 0) << "\n"
+                << "coupling_beam_front_ix_reference "
+                << audit_state.coupling_layout.beam_front_ix << "\n"
+                << "coupling_beam_front_ix_recomputed "
+                << evaluated.coupling_beam_front_ix << "\n"
+                << "coupling_beam_front_ix_replayed_from_B_dump 1\n"
+                << "coupling_wave_core_end_m_reference "
+                << audit_state.coupling_layout.wave_core_end_m << "\n"
+                << "coupling_wave_core_end_m_recomputed "
+                << evaluated.coupling_wave_core_end_m << "\n"
+                << "coupling_layout_match " << (layout_match ? 1 : 0) << "\n"
+                << "final_x_flux_count " << evaluated.final_x_flux.size() << "\n"
+                << "final_u_flux_count " << evaluated.final_u_flux.size() << "\n"
+                << "stage5_R_FV " << evaluated.stage5_r_fv << "\n"
+                << "stage5_R_couple " << evaluated.stage5_r_couple << "\n"
+                << "stage5_R_couple_centered "
+                << evaluated.stage5_r_couple_centered << "\n"
+                << "stage5_R_couple_upwind_stabilization "
+                << evaluated.stage5_r_couple_upwind_stabilization << "\n"
+                << "stage5_R_couple_fct_stabilization "
+                << evaluated.stage5_r_couple_fct_stabilization << "\n"
+                << "R_couple_decomposition_error "
+                << (evaluated.stage5_r_couple -
+                    (evaluated.stage5_r_couple_centered +
+                     evaluated.stage5_r_couple_upwind_stabilization +
+                     evaluated.stage5_r_couple_fct_stabilization)) << "\n"
+                << "coupling_rJ_sum " << evaluated.coupling_rj_global_sum << "\n"
+                << "coupling_rK_sum " << evaluated.coupling_rk_global_sum << "\n"
+                << "coupling_face_work_sum "
+                << evaluated.coupling_face_work_jn_global_sum << "\n"
+                << "coupling_rJ_identity_error "
+                << evaluated.coupling_rj_reconstruction_error << "\n"
+                << "coupling_rK_identity_error "
+                << evaluated.coupling_rk_reconstruction_error << "\n"
+                << "coupling_face_work_identity_error "
+                << evaluated.coupling_face_work_jn_reconstruction_error << "\n"
+                << "coupling_R_couple_centered_sum "
+                << evaluated.coupling_rj_centered_global_sum << "\n"
+                << "coupling_R_couple_centered_identity_error "
+                << evaluated.coupling_rj_centered_reconstruction_error << "\n"
+                << "coupling_R_couple_upwind_sum "
+                << evaluated.coupling_rj_upwind_global_sum << "\n"
+                << "coupling_R_couple_upwind_identity_error "
+                << evaluated.coupling_rj_upwind_reconstruction_error << "\n"
+                << "coupling_R_couple_fct_sum "
+                << evaluated.coupling_rj_fct_global_sum << "\n"
+                << "coupling_R_couple_fct_identity_error "
+                << evaluated.coupling_rj_fct_reconstruction_error << "\n"
+                << "audit_finite " << (audit_ok ? 1 : 0) << "\n";
+            for (size_t region = 0; region < evaluated.coupling_regions.size(); ++region) {
+                const VlasovAmpereMidpointSolver::CouplingRegionDiagnostics& r =
+                    evaluated.coupling_regions[region];
+                out << "region " << region
+                    << " sum_rJ " << r.sum_rj
+                    << " sum_abs_rJ " << r.sum_abs_rj
+                    << " Linf_rJ " << r.linf_rj
+                    << " sum_rK " << r.sum_rk
+                    << " sum_abs_rK " << r.sum_abs_rk
+                    << " Linf_rK " << r.linf_rk
+                    << " face_work_JN " << r.face_work_jn
+                    << " delta_K_bkg " << r.delta_ke_bkg
+                    << " fct_work " << r.fct_work
+                    << " R_couple_centered " << r.r_couple_centered
+                    << " R_couple_upwind_stabilization "
+                    << r.r_couple_upwind_stabilization
+                    << " R_couple_fct_stabilization "
+                    << r.r_couple_fct_stabilization
+                    << "\n";
+            }
+            std::printf("Fixed midpoint audit: JN=%e JE=%e GstarJE=%e Beam=%e\n",
+                        differences[0], differences[1], differences[2], differences[3]);
+        }
+        MPI_Finalize();
+        return audit_ok ? 0 : 4;
+    }
     CollisionOperator collision;
     Diagnostics diag;
-    diag.init("output", mpi_rank, config.enable_debug_diagnostics,
-              config.enable_step_diagnostics);
+    diag.init(runtime.output_dir, mpi_rank, config.enable_debug_diagnostics,
+              config.enable_step_diagnostics || runtime.diagnostic_level >= 2);
 
     double dt = compute_dt(bkg_e, sgrid);
     MPI_Allreduce(MPI_IN_PLACE, &dt, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
-    int nsteps = static_cast<int>(std::ceil(Param::t_end / dt));
+    dt *= runtime.dt_scale;
+    int nsteps = static_cast<int>(std::ceil(runtime.stop_time_fs * Const::femto / dt));
 
     if (mpi_rank == 0) {
         printf("Time step: dt = %.4e s (%.4f fs)\n", dt, dt / Const::femto);
@@ -590,250 +963,161 @@ int main(int argc, char** argv)
     }
 
     double cumulative_collision_energy_delta = 0.0;
+    double current_time = 0.0;
+    long long restored_step = 0;
+    double next_snapshot = Param::dt_snapshot;
+    int last_snapshot_step = 0;
+    if (runtime.restart_enabled) {
+        CheckpointControlState checkpoint_control;
+        if (!read_checkpoint(runtime.restart_dir, checkpoint_control, bkg_e, beam,
+                             fields, sgrid, mpi_rank, mpi_size, runtime_error,
+                             midpoint_solver.low_order_only(),
+                             midpoint_solver.nonuniform_high_order_enabled(),
+                             midpoint_solver.fct_enabled())) {
+            if (mpi_rank == 0) std::fprintf(stderr, "Restart error: %s\n", runtime_error.c_str());
+            MPI_Abort(MPI_COMM_WORLD, 11);
+            return 11;
+        }
+        current_time = checkpoint_control.time_s;
+        restored_step = checkpoint_control.step;
+        dt = checkpoint_control.dt_s * runtime.dt_scale;
+        next_snapshot = checkpoint_control.next_snapshot_s;
+        last_snapshot_step = checkpoint_control.last_snapshot_step;
+        cumulative_collision_energy_delta = checkpoint_control.cumulative_collision_energy_delta;
+        midpoint_solver.synchronize_background_ghosts(bkg_e, sgrid, mpi_rank, mpi_size);
+        bkg_e.compute_moments();
+        beam.deposit_density(sgrid, mpi_rank, mpi_size);
+        fields.sync_cell_ex_from_faces(mpi_rank, mpi_size);
+        fields.set_charge_density(bkg_e, beam.density, ion_density_profile);
+        const CheckpointStateHashes restored_hashes = checkpoint_state_hashes(
+            bkg_e, beam, fields, sgrid, mpi_rank, mpi_size);
+        CheckpointStateHashes reference_hashes = {0ULL, 0ULL, 0ULL};
+        const bool have_reference_hashes = read_checkpoint_reference_hashes(
+            runtime.restart_dir, reference_hashes, mpi_rank, mpi_size);
+        double restart_n = 0.0, restart_ke = 0.0;
+        bkg_e.total_particle_number_and_energy(restart_n, restart_ke);
+        double restart_values[4] = {restart_n, restart_ke,
+                                    beam.total_particle_number(sgrid),
+                                    beam.total_kinetic_energy()};
+        MPI_Allreduce(MPI_IN_PLACE, restart_values, 4, MPI_DOUBLE, MPI_SUM,
+                      MPI_COMM_WORLD);
+        double restart_ex = 0.0;
+        for (size_t iface = 0; iface < fields.Ex_face.size(); ++iface)
+            restart_ex = std::max(restart_ex, std::fabs(fields.Ex_face[iface]));
+        MPI_Allreduce(MPI_IN_PLACE, &restart_ex, 1, MPI_DOUBLE, MPI_MAX,
+                      MPI_COMM_WORLD);
+        if (mpi_rank == 0) {
+            std::ofstream restart_audit(output_path(runtime, "restart_audit.dat").c_str());
+            restart_audit << "# step time_s dt_s N_bkg KE_bkg beam_weight KE_beam field_energy max_abs_Ex "
+                          << "hash_bkg hash_field hash_beam ref_hash_bkg ref_hash_field ref_hash_beam hashes_match\n";
+            restart_audit << std::setprecision(17) << restored_step << " "
+                          << current_time << " " << dt << " " << restart_values[0]
+                          << " " << restart_values[1] << " " << restart_values[2]
+                          << " " << restart_values[3] << " " << fields.total_energy()
+                          << " " << restart_ex << " " << restored_hashes.background
+                          << " " << restored_hashes.field_faces << " " << restored_hashes.beam
+                          << " " << reference_hashes.background << " "
+                          << reference_hashes.field_faces << " " << reference_hashes.beam
+                          << " " << (have_reference_hashes &&
+                              restored_hashes.background == reference_hashes.background &&
+                              restored_hashes.field_faces == reference_hashes.field_faces &&
+                              restored_hashes.beam == reference_hashes.beam ? 1 : 0) << "\n";
+        }
+        if (mpi_rank == 0) std::printf("Restarted checkpoint: step=%lld t=%.6f fs\n", restored_step, current_time / Const::femto);
+    } else {
+        bkg_e.initialize_maxwellian();
+        beam.deposit_density(sgrid, mpi_rank, mpi_size);
+    }
     bool moments_current = false;
     sync_moments_and_charge(bkg_e, beam, fields, ion_density_profile,
                             moments_current);
-    fields.solve_poisson(mpi_rank, mpi_size);
+    if (!runtime.restart_enabled) fields.solve_poisson(mpi_rank, mpi_size);
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
     if (config.enable_debug_diagnostics) {
         diag.write_debug_state(0, 0.0, "initial", bkg_e, beam, fields,
                                sgrid, mpi_rank, mpi_size);
     }
 #endif
-    diag.write_scalars(0.0, 0, bkg_e, beam, fields,
+    diag.write_scalars(current_time, static_cast<int>(restored_step), bkg_e, beam, fields,
                        cumulative_collision_energy_delta,
                        mpi_rank, mpi_size);
     std::vector<double> latest_bkg_energy_current_face(
         static_cast<size_t>(sgrid.nx_local + 1), 0.0);
     std::vector<double> latest_bkg_ampere_current_face(
         static_cast<size_t>(sgrid.nx_local + 1), 0.0);
-    write_snapshot(diag, 0.0, bkg_e, beam, fields, ion_density_profile,
+    write_snapshot(diag, current_time, bkg_e, beam, fields, ion_density_profile,
                    sgrid, mpi_rank, mpi_size, config.enable_full_fe_output,
                    &latest_bkg_energy_current_face,
                    &latest_bkg_ampere_current_face);
 
-    double next_snapshot = Param::dt_snapshot;
     int stdout_freq = 1000;
-    int last_snapshot_step = 0;
     double cumulative_bkg_energy_residual = 0.0;
-    std::ofstream bkg_energy_monitor;
-    std::ofstream boundary_core_monitor;
-    std::ofstream x_low_monitor;
-    std::ofstream x_final_monitor;
-    std::ofstream mu_final_monitor;
-    std::ofstream u_flux_audit;
-    std::ofstream u_origin_audit;
-    std::ofstream u_low_failure_audit;
-    std::ofstream mu_low_failure_audit;
-    std::ofstream negative_debt_guard_monitor;
-    std::ofstream trial_boundary_debt_monitor;
-    std::ofstream accepted_transport_monitor;
-    bool first_accepted_negative_seen = false;
+    std::ofstream accepted_coupling_region_monitor;
+    std::ofstream midpoint_iteration_residual_monitor;
+    std::ofstream beam_half_step_ledger;
+    double beam_ledger_n_in_total = 0.0;
+    double beam_ledger_n_out_total = 0.0;
+    double beam_ledger_injected_energy_total = 0.0;
+    double beam_ledger_outflow_energy_total = 0.0;
+    double beam_ledger_injected_current_impulse_total = 0.0;
+    double beam_ledger_outflow_current_impulse_total = 0.0;
+    int beam_ledger_step_count = 0;
+    std::vector<double> beam_ledger_rows;
+    const bool write_beam_ledger = runtime.diagnostic_level >= 2 ||
+        runtime.beam_ledger_reference_enabled ||
+        std::fabs(runtime.dt_scale - 0.5) <=
+            16.0 * std::numeric_limits<double>::epsilon();
     if (mpi_rank == 0) {
-        bkg_energy_monitor.open("output/bkg_energy_monitor.dat");
-        bkg_energy_monitor
-            << "# step  time[fs]  x_limiter_active_fraction  "
-            << "x_limiter_min_alpha  dKE_bkg_plus_W_bkg_E[J/m2]  "
-            << "relative_residual_step  cumulative_relative_residual  "
-            << "x_limiter_active_fraction_core  "
-            << "x_limiter_active_fraction_boundary  "
-            << "x_limiter_min_alpha_core  "
-            << "x_limiter_min_alpha_boundary  "
-            << "x_negative_mass_before_repair[m^-2]  "
-            << "x_mass_added_by_positivity_repair[m^-2]  "
-            << "floor_repair_mass[m^-2]  "
-            << "floor_repair_energy[J/m2]  "
-            << "floor_repair_core_fraction  "
-            << "max_abs_J_bkg_charge[A/m2]  "
-            << "max_abs_J_bkg_energy_diagnostic[A/m2]  "
-            << "max_abs_J_bkg_ampere[A/m2]  "
-            << "max_abs_J_bkg_charge_minus_ampere[A/m2]  "
-            << "max_abs_J_bkg_energy_minus_ampere[A/m2]  "
-            << "E_dot_J_bkg_charge[W/m2]  "
-            << "E_dot_J_bkg_energy_diagnostic[W/m2]  "
-            << "E_dot_J_bkg_ampere[W/m2]  "
-            << "residual_if_charge_current[J/m2]  "
-            << "residual_if_ampere_current[J/m2]  "
-            << "positivity_mass_defect[m^-2]  "
-            << "positivity_energy_defect[J/m2]  "
-            << "u_limiter_mass_delta[m^-2]  "
-            << "u_limiter_px_delta[kg/m/s/m2]  "
-            << "u_limiter_energy_delta[J/m2]  "
-            << "x_limiter_mass_delta[m^-2]  "
-            << "x_limiter_energy_delta[J/m2]  "
-            << "mu_low_u_alpha_min  "
-            << "mu_low_u_limiter_active_fraction  "
-            << "mu_low_u_energy_delta[J/m2]  "
-            << "mu_low_u_alpha_min_boundary  "
-            << "mu_low_u_alpha_min_core  "
-            << "mu_low_u_limiter_active_fraction_boundary  "
-            << "mu_low_u_limiter_active_fraction_core  "
-            << "mu_low_u_energy_delta_boundary[J/m2]  "
-            << "mu_low_u_energy_delta_core[J/m2]  "
-            << "mu_low_u_u_eff0  "
-            << "mu_low_u_moment_weight0  "
-            << "mu_low_u_mu_flux_scale0  "
-            << "mu_low_u_half_dt_inv_shell0  "
-            << "mu_low_u_dimless_scale0  "
-            << "mu_low_u_endpoint_flux_max  "
-            << "remap_active_fraction  "
-            << "remap_cell_count  "
-            << "low_u_subcycle_active_fraction  "
-            << "low_u_average_subcycles  "
-            << "low_u_max_subcycles  "
-            << "u_force_alpha_min  u_force_alpha_active_frac  "
-            << "coupled_iter  coupled_residual_E  "
-            << "coupled_residual_J_bkg  coupled_residual_J_beam  "
-            << "coupled_residual_bkg_mass  "
-            << "coupled_residual_beam_continuity\n";
-        bkg_energy_monitor << std::scientific;
+        accepted_coupling_region_monitor.open(
+            output_path(runtime, "accepted_coupling_residual_by_region.dat").c_str());
+        accepted_coupling_region_monitor
+            << "# step time_fs region beam_front_ix wave_core_end_m "
+            << "sum_rJ sum_abs_rJ L2_rJ Linf_rJ "
+            << "sum_rK sum_abs_rK L2_rK Linf_rK "
+            << "max_abs_JN_minus_GstarJE max_difference_face "
+            << "face_work_JN_global delta_K_bkg_global fct_work_global "
+            << "face_count_global cell_count_global "
+            << "stage5_R_couple_global region_sum_rJ_global "
+            << "rJ_identity_error_global stage5_R_FV_global "
+            << "region_sum_rK_global rK_identity_error_global "
+            << "energy_pair_face_work_JN_global "
+            << "region_sum_face_work_JN_global "
+            << "face_work_JN_identity_error_global "
+            << "R_couple_centered_region R_couple_upwind_region R_couple_fct_region "
+            << "stage5_R_couple_centered_global region_R_couple_centered_sum "
+            << "R_couple_centered_identity_error_global "
+            << "stage5_R_couple_upwind_global region_R_couple_upwind_sum "
+            << "R_couple_upwind_identity_error_global "
+            << "stage5_R_couple_fct_global region_R_couple_fct_sum "
+            << "R_couple_fct_identity_error_global "
+            << "accepted state_advanced soft_unconverged\n";
+        accepted_coupling_region_monitor << std::scientific
+                                         << std::setprecision(10);
 
-        u_flux_audit.open("output/u_flux_audit.dat");
-        u_flux_audit
-            << "# step  time[fs]  valid  rank  ix_global  iv  imu  "
-            << "severity  f0  f_low  f_high  alpha  "
-            << "du_div_low  du_div_high  du_div_final  updated  "
-            << "u_final_xleft_lower  u_final_xleft_upper  "
-            << "u_final_xright_lower  u_final_xright_upper\n";
-        u_flux_audit << std::scientific << std::setprecision(8);
+        if (runtime.diagnostic_level >= 2) {
+            midpoint_iteration_residual_monitor.open(
+                output_path(runtime, "midpoint_iteration_residuals.dat").c_str());
+            midpoint_iteration_residual_monitor
+                << "# step time_fs iteration residual_E residual_J_bkg "
+                << "residual_E_contraction residual_J_bkg_contraction "
+                << "record_interval residual_J_beam residual_f accepted state_advanced "
+                << "converged soft_unconverged\n";
+            midpoint_iteration_residual_monitor << std::scientific
+                                                << std::setprecision(17);
+        }
 
-        u_origin_audit.open("output/u_origin_audit.dat");
-        u_origin_audit
-            << "# step time[fs] rank ix_global iv imu region "
-            << "f_raw f_after_x f_u_low f_u_high f_u_final "
-            << "u_lower_flux u_upper_flux "
-            << "u_lower_donor_iv u_upper_donor_iv "
-            << "u_lower_donor_f u_upper_donor_f "
-            << "C_u alpha_cell alpha_face "
-            << "line_positive_peak line_negative_mass allowed_debt "
-            << "failure_kind\n";
-        u_origin_audit << std::scientific << std::setprecision(8);
-
-        u_low_failure_audit.open("output/u_low_failure_audit.dat");
-        u_low_failure_audit
-            << "# step  time[fs]  rank  ix_global  iv  imu  region  "
-            << "severity  f_input  f_after_x  dx_div  dmu_div_used  "
-            << "du_div_low  f_low  "
-            << "left_lower_u_low  left_upper_u_low  "
-            << "right_lower_u_low  right_upper_u_low  "
-            << "left_lower_scale  left_upper_scale  "
-            << "right_lower_scale  right_upper_scale  "
-            << "left_lower_donor_iv  left_upper_donor_iv  "
-            << "right_lower_donor_iv  right_upper_donor_iv  "
-            << "left_lower_donor_f  left_upper_donor_f  "
-            << "right_lower_donor_f  right_upper_donor_f  "
-            << "lower_characteristic  upper_characteristic  "
-            << "moment_weight  cell_budget  "
-            << "low_order_failed_count\n";
-        u_low_failure_audit << std::scientific << std::setprecision(8);
-
-        mu_low_failure_audit.open("output/mu_low_failure_audit.dat");
-        mu_low_failure_audit
-            << "# step  time[fs]  rank  ix_global  iv  imu  region  "
-            << "severity  f_before_mu  f_after_x  dx_div  dmu_div_low  "
-            << "du_div_used  f_mu_low  "
-            << "left_lower_mu_low  left_upper_mu_low  "
-            << "right_lower_mu_low  right_upper_mu_low  "
-            << "left_lower_mu_dot  left_upper_mu_dot  "
-            << "right_lower_mu_dot  right_upper_mu_dot  "
-            << "left_lower_donor_imu  left_upper_donor_imu  "
-            << "right_lower_donor_imu  right_upper_donor_imu  "
-            << "left_lower_donor_f  left_upper_donor_f  "
-            << "right_lower_donor_f  right_upper_donor_f  "
-            << "lower_mu_dot_avg  upper_mu_dot_avg  "
-            << "moment_weight  cell_budget  "
-            << "low_order_failed_count\n";
-        mu_low_failure_audit << std::scientific << std::setprecision(8);
-
-        negative_debt_guard_monitor.open("output/negative_debt_guard.dat");
-        negative_debt_guard_monitor
-            << "# step time[fs] accepted long_run_diagnostic level "
-            << "neg_mass_boundary neg_mass_core neg_mass_tail "
-            << "neg_mass_core_fraction "
-            << "neg_mass_boundary_fraction neg_mass_tail_fraction "
-            << "neg_energy_core_abs neg_energy_core_fraction "
-            << "neg_energy_boundary_abs neg_energy_boundary_fraction "
-            << "neg_current_core_abs neg_current_core_fraction "
-            << "min_f_boundary min_f_core min_f_tail "
-            << "neg_cell_boundary neg_cell_core neg_cell_tail "
-            << "debt_action limiter_reason "
-            << "alpha_core_min alpha_boundary_min alpha_tail_min "
-            << "limiter_modified_J_bkg_norm "
-            << "limiter_modified_J_bkg_boundary_norm "
-            << "limiter_modified_energy_norm "
-            << "low_u_mu_neg_mass_fraction "
-            << "low_u_mu_neg_energy_fraction "
-            << "low_u_mu_neg_current_fraction "
-            << "boundary_force_Cu_max boundary_force_Cmu_max "
-            << "boundary_force_nsub_max "
-            << "boundary_force_remap_cell_count "
-            << "boundary_mu_low_L1_before boundary_mu_low_L1_after "
-            << "boundary_mu_high_L1_after "
-            << "J_bkg_neg_boundary delta_E_neg_boundary "
-            << "boundary_force_remap_mass_loss "
-            << "boundary_force_remap_energy_loss "
-            << "alpha_interface_BQ_min alpha_interface_QC_min "
-            << "interface_BQ_flux interface_BQ_high_correction "
-            << "interface_QC_flux_into_core "
-            << "interface_QC_high_correction_into_core "
-            << "boundary_energy_diagnostic_invalid "
-            << "trial_failure_downgraded accepted_with_negative_debt "
-            << "state_advanced soft_unconverged converged failed "
-            << "coupled_iter residual_E residual_J_bkg\n";
-        negative_debt_guard_monitor << std::scientific
-                                    << std::setprecision(8);
-
-        trial_boundary_debt_monitor.open("output/trial_boundary_debt.dat");
-        trial_boundary_debt_monitor
-            << "# step time[fs] accepted state_advanced soft_unconverged "
-            << "level neg_mass_boundary neg_mass_core neg_mass_tail "
-            << "neg_mass_core_fraction "
-            << "neg_mass_boundary_fraction neg_mass_tail_fraction "
-            << "neg_energy_core_abs neg_energy_core_fraction "
-            << "neg_energy_boundary_abs neg_energy_boundary_fraction "
-            << "neg_current_core_abs neg_current_core_fraction "
-            << "min_f_boundary min_f_core min_f_tail "
-            << "neg_cell_boundary neg_cell_core neg_cell_tail "
-            << "debt_action limiter_reason "
-            << "alpha_core_min alpha_boundary_min alpha_tail_min "
-            << "limiter_modified_J_bkg_norm "
-            << "limiter_modified_J_bkg_boundary_norm "
-            << "limiter_modified_energy_norm "
-            << "low_u_mu_neg_mass_fraction "
-            << "low_u_mu_neg_energy_fraction "
-            << "low_u_mu_neg_current_fraction "
-            << "boundary_force_Cu_max boundary_force_Cmu_max "
-            << "boundary_force_nsub_max "
-            << "boundary_force_remap_cell_count "
-            << "boundary_mu_low_L1_before boundary_mu_low_L1_after "
-            << "boundary_mu_high_L1_after "
-            << "J_bkg_neg_boundary delta_E_neg_boundary "
-            << "boundary_force_remap_mass_loss "
-            << "boundary_force_remap_energy_loss "
-            << "alpha_interface_BQ_min alpha_interface_QC_min "
-            << "interface_BQ_flux interface_BQ_high_correction "
-            << "interface_QC_flux_into_core "
-            << "interface_QC_high_correction_into_core "
-            << "boundary_energy_diagnostic_invalid "
-            << "trial_failure_downgraded limiter_reason_repeat "
-            << "coupled_iter residual_E residual_J_bkg failed\n";
-        trial_boundary_debt_monitor << std::scientific
-                                    << std::setprecision(8);
-
-        accepted_transport_monitor.open(
-            "output/accepted_transport_safety.dat");
-        accepted_transport_monitor
-            << "# step time_fs nonlinear_iteration substep min_M ix iv imu "
-            << "M_low M_candidate M_safe outflow inflow beta "
-            << "alpha_x_left alpha_x_right alpha_u_lower alpha_u_upper "
-            << "A_lim_x_left A_lim_x_right A_lim_u_lower A_lim_u_upper "
-            << "A_safe_x_left A_safe_x_right A_safe_u_lower A_safe_u_upper "
-            << "mpi_interface k_zero next_step_donor soft_unconverged\n";
-        accepted_transport_monitor << std::scientific
-                                   << std::setprecision(16);
+        if (write_beam_ledger) {
+            beam_half_step_ledger.open(
+                output_path(runtime, "beam_half_step_ledger.dat").c_str());
+            beam_half_step_ledger
+                << "# accepted_step time_fs dt_s N_in N_out injected_energy "
+                << "outflow_energy injected_current boundary_current_out "
+                << "injected_current_impulse outflow_current_impulse\n";
+            beam_half_step_ledger << std::scientific << std::setprecision(17);
+        }
 
         std::ofstream f_neg_monitor;
-        f_neg_monitor.open("output/f_negativity_monitor.dat");
+        f_neg_monitor.open(output_path(runtime, "f_negativity_monitor.dat").c_str());
         f_neg_monitor
             << "# accepted_snapshot: statistics scan final accepted bkg_e.f; "
             << "neg_ratio_max uses max positive f as scale\n"
@@ -844,76 +1128,14 @@ int main(int argc, char** argv)
         f_neg_monitor << std::scientific << std::setprecision(8);
         f_neg_monitor.close();
 
-        boundary_core_monitor.open("output/boundary_core_diagnostics.dat");
-        boundary_core_monitor
-            << "# step  time[fs]  accepted  state_advanced  "
-            << "soft_unconverged  boundary_width[um]  "
-            << "neg_mass_boundary[m^-2]  neg_mass_core[m^-2]  "
-            << "neg_mass_core_fraction  "
-            << "neg_cell_count_boundary  neg_cell_count_core  "
-            << "neg_cell_count_core_fraction  "
-            << "min_f_boundary  min_f_core  "
-            << "u_limiter_energy_delta_boundary[J/m2]  "
-            << "u_limiter_energy_delta_core[J/m2]  "
-            << "abs_u_limiter_energy_delta_boundary[J/m2]  "
-            << "abs_u_limiter_energy_delta_core[J/m2]  "
-            << "u_limiter_energy_delta_core_fraction  "
-            << "core_limiter_energy_relative_to_core_work  "
-            << "x_limiter_active_fraction_boundary  "
-            << "x_limiter_active_fraction_core  "
-            << "x_limiter_min_alpha_boundary  "
-            << "x_limiter_min_alpha_core  "
-            << "max_abs_J_bkg_boundary[A/m2]  "
-            << "max_abs_J_bkg_core[A/m2]  "
-            << "J_bkg_core_to_boundary_ratio  "
-            << "rms_J_bkg_boundary[A/m2]  rms_J_bkg_core[A/m2]  "
-            << "mean_abs_J_bkg_boundary[A/m2]  "
-            << "mean_abs_J_bkg_core[A/m2]  "
-            << "max_abs_Ex_boundary[V/m]  max_abs_Ex_core[V/m]  "
-            << "W_bkg_E_boundary[J/m2]  W_bkg_E_core[J/m2]  "
-            << "anomaly_inward_E[um]  anomaly_inward_J[um]  "
-            << "anomaly_inward_n[um]  anomaly_inward_Mneg[um]  "
-            << "conclusion\n";
-        boundary_core_monitor << std::scientific << std::setprecision(8);
-
-        x_low_monitor.open("output/x_low_diagnostics.dat");
-        x_low_monitor
-            << "# step  time[fs]  x_low_input_min_f  x_low_max_cfl  "
-            << "x_low_output_min_f  x_low_failed_count\n";
-        x_low_monitor << std::scientific << std::setprecision(8);
-
-        x_final_monitor.open("output/x_final_diagnostics.dat");
-        x_final_monitor
-            << "# step  time[fs]  x_final_min_f  "
-            << "x_final_failed_count  x_final_failed_max_debt  "
-            << "x_final_worst_ix  x_final_worst_iv  "
-            << "x_final_worst_imu  x_final_failure_region  "
-            << "x_final_core_failed_count  "
-            << "x_final_boundary_failed_count\n";
-        x_final_monitor << std::scientific << std::setprecision(8);
-
-        mu_final_monitor.open("output/mu_final_diagnostics.dat");
-        mu_final_monitor
-            << "# step  time[fs]  mu_final_min_f  "
-            << "mu_final_failed_count  mu_final_failed_max_debt  "
-            << "mu_final_worst_ix  mu_final_worst_iv  "
-            << "mu_final_worst_imu  mu_final_failure_region  "
-            << "mu_final_core_failed_count  "
-            << "mu_final_boundary_failed_count  "
-            << "mu_alpha_active_fraction  mu_alpha_min  "
-            << "mu_alpha_core_fraction  mu_alpha_boundary_fraction  "
-            << "mu_alpha_core_min  mu_alpha_boundary_min  "
-            << "mu_limiter_energy_delta[J/m2]  "
-            << "mu_limiter_mass_delta[m^-2]\n";
-        mu_final_monitor << std::scientific << std::setprecision(8);
-
     }
-    bool last_accepted_stage_valid = false;
-    double last_accepted_stage_min_f[3] = {0.0, 0.0, 0.0};
-    double last_accepted_stage_neg_mass[3] = {0.0, 0.0, 0.0};
-    long long last_accepted_stage_neg_cell_count[3] = {0, 0, 0};
+    long long accepted_after_restart = 0;
+    size_t next_checkpoint = 0;
+    while (next_checkpoint < runtime.checkpoint_times_fs.size() &&
+           current_time / Const::femto >= runtime.checkpoint_times_fs[next_checkpoint]) ++next_checkpoint;
     for (int step = 1; step <= nsteps; ++step) {
-        double time = step * dt;
+        const long long physical_step = restored_step + step;
+        double time = current_time + dt;
         int nsub_v1 = 0;
         int nsub_mu1 = 0;
         int nsub_v2 = 0;
@@ -928,7 +1150,9 @@ int main(int argc, char** argv)
         double loss_mu2 = 0.0;
         double net_nb_change_step = 0.0;
         double collision_energy_step = 0.0;
-        const bool collect_step_diagnostics =
+        // Probe/audit runs need every accepted step, independent of the
+        // production cadence, so their field/current closure can be replayed.
+        const bool collect_step_diagnostics = runtime.diagnostic_level >= 2 ||
             should_write_step_diagnostics(config, step);
         double dke_bkg_step = 0.0;
         double dke_beam_push = 0.0;
@@ -955,72 +1179,6 @@ int main(int argc, char** argv)
         double field_energy_step_start = 0.0;
         double x_limiter_active_fraction_step = 0.0;
         double x_limiter_min_alpha_step = 1.0;
-        double x_limiter_active_fraction_core_step = 0.0;
-        double x_limiter_active_fraction_boundary_step = 0.0;
-        double x_limiter_min_alpha_core_step = 1.0;
-        double x_limiter_min_alpha_boundary_step = 1.0;
-        double x_negative_mass_before_repair_step = 0.0;
-        double x_mass_added_by_positivity_repair_step = 0.0;
-        double floor_repair_mass_step = 0.0;
-        double floor_repair_energy_step = 0.0;
-        double floor_repair_core_fraction_step = 0.0;
-        double positivity_energy_defect_step = 0.0;
-        double positivity_mass_defect_step = 0.0;
-        double u_limiter_mass_delta_step = 0.0;
-        double u_limiter_momentum_delta_step = 0.0;
-        double u_limiter_energy_delta_step = 0.0;
-        double x_limiter_mass_delta_step = 0.0;
-        double x_limiter_energy_delta_step = 0.0;
-        double x_low_input_min_f_step = 0.0;
-        double x_low_max_cfl_step = 0.0;
-        double x_low_output_min_f_step = 0.0;
-        double x_low_failed_count_step = 0.0;
-        double x_low_input_neg_mass_step = 0.0;
-        double x_low_input_rel_neg_step = 0.0;
-        double x_low_output_rel_neg_step = 0.0;
-        double x_low_input_core_failed_count_step = 0.0;
-        double x_low_input_debt_accepted_step = 0.0;
-        int x_low_failure_kind_step = 0;
-        double x_final_min_f_step = 0.0;
-        double x_final_failed_count_step = 0.0;
-        double x_final_failed_max_debt_step = 0.0;
-        int x_final_worst_ix_step = -1;
-        int x_final_worst_iv_step = -1;
-        int x_final_worst_imu_step = -1;
-        int x_final_failure_region_step = -1;
-        double x_final_core_failed_count_step = 0.0;
-        double x_final_boundary_failed_count_step = 0.0;
-        double mu_final_min_f_step = 0.0;
-        double mu_final_failed_count_step = 0.0;
-        double mu_final_failed_max_debt_step = 0.0;
-        int mu_final_worst_ix_step = -1;
-        int mu_final_worst_iv_step = -1;
-        int mu_final_worst_imu_step = -1;
-        int mu_final_failure_region_step = -1;
-        double mu_final_core_failed_count_step = 0.0;
-        double mu_final_boundary_failed_count_step = 0.0;
-        double mu_low_u_alpha_min_step = 1.0;
-        double mu_low_u_limiter_active_fraction_step = 0.0;
-        double mu_low_u_energy_delta_step = 0.0;
-        double mu_low_u_alpha_min_boundary_step = 1.0;
-        double mu_low_u_alpha_min_core_step = 1.0;
-        double mu_low_u_limiter_active_fraction_boundary_step = 0.0;
-        double mu_low_u_limiter_active_fraction_core_step = 0.0;
-        double mu_low_u_energy_delta_boundary_step = 0.0;
-        double mu_low_u_energy_delta_core_step = 0.0;
-        double mu_low_u_u_eff0_step = 0.0;
-        double mu_low_u_moment_weight0_step = 0.0;
-        double mu_low_u_mu_flux_scale0_step = 0.0;
-        double mu_low_u_half_dt_inv_shell0_step = 0.0;
-        double mu_low_u_dimless_scale0_step = 0.0;
-        double mu_low_u_endpoint_flux_max_step = 0.0;
-        double remap_active_fraction_step = 0.0;
-        long long remap_cell_count_step = 0;
-        double low_u_subcycle_active_fraction_step = 0.0;
-        double low_u_average_subcycles_step = 1.0;
-        int low_u_max_subcycles_step = 1;
-        double u_force_alpha_min_step = 1.0;
-        double u_force_alpha_active_frac_step = 0.0;
         double local_bkg_energy_residual_step = 0.0;
         double bkg_energy_residual_step = 0.0;
         double bkg_energy_relative_residual_step = 0.0;
@@ -1028,25 +1186,21 @@ int main(int argc, char** argv)
         double coupled_residual_E_step = 0.0;
         double coupled_residual_J_bkg_step = 0.0;
         double coupled_residual_J_beam_step = 0.0;
-        double coupled_residual_bkg_mass_step = 0.0;
-        double coupled_residual_beam_continuity_step = 0.0;
         BackgroundCurrentDiagnostics local_bkg_current_diag_step;
         reset_background_current_diagnostics(local_bkg_current_diag_step);
-        BackgroundCurrentDiagnostics global_bkg_current_diag_step;
-        reset_background_current_diagnostics(global_bkg_current_diag_step);
         const Species bkg_step_start = bkg_e;
         const BeamPIC beam_step_start = beam;
         const EMFields fields_step_start = fields;
-        bkg_e.total_particle_number_and_energy(bkg_number_step_start,
-                                               bkg_ke_step_start);
-        double global_bkg_start_values[2] = {
-            bkg_number_step_start,
-            bkg_ke_step_start
-        };
-        MPI_Allreduce(MPI_IN_PLACE, global_bkg_start_values, 2,
-                      MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        global_bkg_ke_step_start = global_bkg_start_values[1];
         if (collect_step_diagnostics) {
+            bkg_e.total_particle_number_and_energy(bkg_number_step_start,
+                                                   bkg_ke_step_start);
+            double global_bkg_start_values[2] = {
+                bkg_number_step_start,
+                bkg_ke_step_start
+            };
+            MPI_Allreduce(MPI_IN_PLACE, global_bkg_start_values, 2,
+                          MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+            global_bkg_ke_step_start = global_bkg_start_values[1];
             beam_ke_step_start = beam.total_kinetic_energy();
             field_energy_step_start = fields.total_energy();
         }
@@ -1058,131 +1212,61 @@ int main(int argc, char** argv)
             midpoint_solver.advance_background_and_fields(
                 bkg_step_start, beam_step_start, fields_step_start, sgrid,
                 dt, time, mpi_rank, mpi_size);
-        const bool negative_debt_attention =
-            midpoint_result.negative_debt_level >=
-            VlasovAmpereMidpointSolver::NEG_DEBT_WARN ||
-            midpoint_result.accepted_with_negative_debt != 0 ||
-            midpoint_result.trial_failure_downgraded != 0;
-        const bool abnormal_midpoint =
-            !midpoint_result.converged || midpoint_result.failed ||
-            negative_debt_attention;
         trace_progress(config, mpi_rank, step,
                        "after coupled midpoint FV solve");
-
-        auto write_low_order_failure_audit =
-            [&](std::ofstream& out,
-                const VlasovAmpereMidpointSolver::LowOrderFailureAudit&
-                    audit) {
-                if (!audit.valid) return;
-                const char* region =
-                    (audit.region != 0) ? "boundary" : "core";
-                out << step << "  "
-                    << time / Const::femto << "  "
-                    << audit.rank << "  "
-                    << audit.ix << "  "
-                    << audit.iv << "  "
-                    << audit.imu << "  "
-                    << region << "  "
-                    << audit.severity << "  "
-                    << audit.f_input << "  "
-                    << audit.f_after_x << "  "
-                    << audit.dx_div << "  "
-                    << audit.dmu_div_used << "  "
-                    << audit.du_div_low << "  "
-                    << audit.f_low << "  "
-                    << audit.left_lower_flux << "  "
-                    << audit.left_upper_flux << "  "
-                    << audit.right_lower_flux << "  "
-                    << audit.right_upper_flux << "  "
-                    << audit.left_lower_scale << "  "
-                    << audit.left_upper_scale << "  "
-                    << audit.right_lower_scale << "  "
-                    << audit.right_upper_scale << "  "
-                    << audit.left_lower_donor_index << "  "
-                    << audit.left_upper_donor_index << "  "
-                    << audit.right_lower_donor_index << "  "
-                    << audit.right_upper_donor_index << "  "
-                    << audit.left_lower_donor_f << "  "
-                    << audit.left_upper_donor_f << "  "
-                    << audit.right_lower_donor_f << "  "
-                    << audit.right_upper_donor_f << "  "
-                    << audit.lower_characteristic << "  "
-                    << audit.upper_characteristic << "  "
-                    << audit.moment_weight << "  "
-                    << audit.cell_budget << "  "
-                    << audit.low_order_failed_count << "\n";
-                out.flush();
-            };
-
-        if (mpi_rank == 0) {
-            trial_boundary_debt_monitor
-                << step << " "
-                << time / Const::femto << " "
-                << 0 << " "
-                << midpoint_result.state_advanced << " "
-                << midpoint_result.soft_unconverged << " "
-                << midpoint_result.negative_debt_level << " "
-                << midpoint_result.neg_mass_boundary << " "
-                << midpoint_result.neg_mass_core << " "
-                << midpoint_result.neg_mass_tail << " "
-                << midpoint_result.neg_mass_core_fraction << " "
-                << midpoint_result.neg_mass_boundary_fraction << " "
-                << midpoint_result.neg_mass_tail_fraction << " "
-                << midpoint_result.neg_energy_core_abs << " "
-                << midpoint_result.neg_energy_core_fraction << " "
-                << midpoint_result.neg_energy_boundary_abs << " "
-                << midpoint_result.neg_energy_boundary_fraction << " "
-                << midpoint_result.neg_current_core_abs << " "
-                << midpoint_result.neg_current_core_fraction << " "
-                << midpoint_result.neg_debt_min_f_boundary << " "
-                << midpoint_result.neg_debt_min_f_core << " "
-                << midpoint_result.neg_debt_min_f_tail << " "
-                << midpoint_result.neg_cell_boundary << " "
-                << midpoint_result.neg_cell_core << " "
-                << midpoint_result.neg_cell_tail << " "
-                << midpoint_result.debt_action << " "
-                << midpoint_result.limiter_reason << " "
-                << midpoint_result.alpha_core_min << " "
-                << midpoint_result.alpha_boundary_min << " "
-                << midpoint_result.alpha_tail_min << " "
-                << midpoint_result.limiter_modified_J_bkg_norm << " "
-                << midpoint_result.limiter_modified_J_bkg_boundary_norm << " "
-                << midpoint_result.limiter_modified_energy_norm << " "
-                << midpoint_result.low_u_mu_neg_mass_fraction << " "
-                << midpoint_result.low_u_mu_neg_energy_fraction << " "
-                << midpoint_result.low_u_mu_neg_current_fraction << " "
-                << midpoint_result.boundary_force_Cu_max << " "
-                << midpoint_result.boundary_force_Cmu_max << " "
-                << midpoint_result.boundary_force_nsub_max << " "
-                << midpoint_result.boundary_force_remap_cell_count << " "
-                << midpoint_result.boundary_mu_low_L1_before << " "
-                << midpoint_result.boundary_mu_low_L1_after << " "
-                << midpoint_result.boundary_mu_high_L1_after << " "
-                << midpoint_result.J_bkg_neg_boundary << " "
-                << midpoint_result.delta_E_neg_boundary << " "
-                << midpoint_result.boundary_force_remap_mass_loss << " "
-                << midpoint_result.boundary_force_remap_energy_loss << " "
-                << midpoint_result.alpha_interface_BQ_min << " "
-                << midpoint_result.alpha_interface_QC_min << " "
-                << midpoint_result.interface_BQ_flux << " "
-                << midpoint_result.interface_BQ_high_correction << " "
-                << midpoint_result.interface_QC_flux_into_core << " "
-                << midpoint_result.interface_QC_high_correction_into_core << " "
-                << midpoint_result.boundary_energy_diagnostic_invalid << " "
-                << midpoint_result.trial_failure_downgraded << " "
-                << midpoint_result.limiter_reason << " "
-                << midpoint_result.nonlinear_iterations << " "
-                << midpoint_result.residual_E << " "
-                << midpoint_result.residual_J_bkg << " "
-                << midpoint_result.failed << " "
-                << "\n";
-            if (abnormal_midpoint ||
-                step + 1 == nsteps ||
-                (config.enable_step_diagnostics &&
-                 config.step_diagnostics_interval > 0 &&
-                 step % config.step_diagnostics_interval == 0)) {
-                trial_boundary_debt_monitor.flush();
+        if (mpi_rank == 0 && runtime.diagnostic_level >= 2) {
+            const size_t count = midpoint_result.midpoint_residual_e_history.size();
+            double previous_record_e = 0.0;
+            double previous_record_j_bkg = 0.0;
+            size_t previous_record_iteration = 0;
+            bool have_previous_record = false;
+            for (size_t iter = 0; iter < count; ++iter) {
+                const bool record_iteration = iter == 0 ||
+                    ((iter + 1) % 10 == 0) || iter + 1 == count;
+                if (!record_iteration) continue;
+                const double residual_e = midpoint_result.midpoint_residual_e_history[iter];
+                const double residual_j_bkg =
+                    midpoint_result.midpoint_residual_j_bkg_history[iter];
+                const double residual_e_contraction = have_previous_record
+                    ? (previous_record_e != 0.0
+                        ? residual_e / previous_record_e
+                        : (residual_e == 0.0 ? 1.0
+                                             : std::numeric_limits<double>::infinity()))
+                    : 1.0;
+                const double residual_j_bkg_contraction = have_previous_record
+                    ? (previous_record_j_bkg != 0.0
+                        ? residual_j_bkg / previous_record_j_bkg
+                        : (residual_j_bkg == 0.0 ? 1.0
+                                                 : std::numeric_limits<double>::infinity()))
+                    : 1.0;
+                const size_t record_interval = have_previous_record
+                    ? iter + 1 - previous_record_iteration : 0;
+                const double residual_j_beam =
+                    iter < midpoint_result.midpoint_residual_j_beam_history.size()
+                    ? midpoint_result.midpoint_residual_j_beam_history[iter]
+                    : std::numeric_limits<double>::quiet_NaN();
+                const double residual_f =
+                    iter < midpoint_result.midpoint_residual_f_history.size()
+                    ? midpoint_result.midpoint_residual_f_history[iter]
+                    : std::numeric_limits<double>::quiet_NaN();
+                midpoint_iteration_residual_monitor
+                    << physical_step << " " << time / Const::femto << " "
+                    << (iter + 1) << " "
+                    << residual_e << " " << residual_j_bkg << " "
+                    << residual_e_contraction << " "
+                    << residual_j_bkg_contraction << " "
+                    << record_interval << " " << residual_j_beam << " "
+                    << residual_f << " "
+                    << (midpoint_result.state_advanced && !midpoint_result.failed ? 1 : 0)
+                    << " " << midpoint_result.state_advanced << " "
+                    << midpoint_result.converged << " "
+                    << midpoint_result.soft_unconverged << "\n";
+                previous_record_e = residual_e;
+                previous_record_j_bkg = residual_j_bkg;
+                previous_record_iteration = iter + 1;
+                have_previous_record = true;
             }
+            midpoint_iteration_residual_monitor.flush();
         }
 
         const bool midpoint_soft_accepted =
@@ -1287,51 +1371,6 @@ int main(int argc, char** argv)
                              midpoint_result.failure_low_work_input_min,
                              midpoint_result.failure_low_on_mpi_interface);
                 }
-                x_low_monitor << step << "  "
-                              << time / Const::femto << "  "
-                              << midpoint_result.x_low_input_min_f << "  "
-                              << midpoint_result.x_low_max_cfl << "  "
-                              << midpoint_result.x_low_output_min_f << "  "
-                              << midpoint_result.x_low_failed_count << "\n";
-                x_low_monitor.flush();
-                x_final_monitor << step << "  "
-                                << time / Const::femto << "  "
-                                << midpoint_result.x_final_min_f << "  "
-                                << midpoint_result.x_final_failed_count << "  "
-                                << midpoint_result.x_final_failed_max_debt << "  "
-                                << midpoint_result.x_final_worst_ix << "  "
-                                << midpoint_result.x_final_worst_iv << "  "
-                                << midpoint_result.x_final_worst_imu << "  "
-                                << midpoint_result.x_final_failure_region << "  "
-                                << midpoint_result.x_final_core_failed_count << "  "
-                                << midpoint_result.x_final_boundary_failed_count << "\n";
-                x_final_monitor.flush();
-                mu_final_monitor << step << "  "
-                                 << time / Const::femto << "  "
-                                 << midpoint_result.flux_pos[2].min_f_final << "  "
-                                 << midpoint_result.mu_final_negative_hard_count << "  "
-                                 << midpoint_result.mu_final_failed_max_debt << "  "
-                                 << midpoint_result.mu_final_worst_ix << "  "
-                                 << midpoint_result.mu_final_worst_iv << "  "
-                                 << midpoint_result.mu_final_worst_imu << "  "
-                                 << midpoint_result.mu_final_failure_region << "  "
-                                 << midpoint_result.mu_final_core_failed_count << "  "
-                                 << midpoint_result.mu_final_boundary_failed_count << "  "
-                                 << midpoint_result.flux_pos[2].alpha_active_fraction << "  "
-                                 << midpoint_result.flux_pos[2].alpha_min << "  "
-                                 << midpoint_result.flux_pos[2].alpha_core_fraction << "  "
-                                 << midpoint_result.flux_pos[2].alpha_boundary_fraction << "  "
-                                 << midpoint_result.mu_low_u_alpha_min_core << "  "
-                                 << midpoint_result.mu_low_u_alpha_min_boundary << "  "
-                                 << midpoint_result.flux_defect[2].energy_defect << "  "
-                                 << midpoint_result.flux_defect[2].mass_defect << "\n";
-                mu_final_monitor.flush();
-                write_low_order_failure_audit(
-                    u_low_failure_audit,
-                    midpoint_result.u_low_failure_audit);
-                write_low_order_failure_audit(
-                    mu_low_failure_audit,
-                    midpoint_result.mu_low_failure_audit);
                 std::fprintf(stderr,
                              "WARNING: coupled midpoint FV solve failed at "
                              "step %d, t = %.6e s; residual %.6e, "
@@ -1362,14 +1401,7 @@ int main(int argc, char** argv)
                              "ix %d, iv %d, imu %d, severity %.6e, "
                              "f_base %.6e, f_low %.6e, f_high %.6e, "
                              "f_final %.6e, dx_div %.6e, du_div %.6e, "
-                             "dmu_div %.6e). "
-                             "previous accepted stage valid %d; "
-                             "prev after_x(min %.6e, neg_mass %.6e, "
-                             "neg_count %lld), "
-                             "after_u(min %.6e, neg_mass %.6e, "
-                             "neg_count %lld), "
-                             "after_mu(min %.6e, neg_mass %.6e, "
-                             "neg_count %lld). "
+                              "dmu_div %.6e). "
                              "Soft negative-debt failures are accepted only "
                              "when state_advanced=1; frozen states remain "
                              "hard failures.\n",
@@ -1426,17 +1458,7 @@ int main(int argc, char** argv)
                              midpoint_result.finite_stage_failure_f_final,
                              midpoint_result.finite_stage_failure_dx_div,
                              midpoint_result.finite_stage_failure_du_div,
-                             midpoint_result.finite_stage_failure_dmu_div,
-                             last_accepted_stage_valid ? 1 : 0,
-                             last_accepted_stage_min_f[0],
-                             last_accepted_stage_neg_mass[0],
-                             last_accepted_stage_neg_cell_count[0],
-                             last_accepted_stage_min_f[1],
-                             last_accepted_stage_neg_mass[1],
-                             last_accepted_stage_neg_cell_count[1],
-                             last_accepted_stage_min_f[2],
-                             last_accepted_stage_neg_mass[2],
-                             last_accepted_stage_neg_cell_count[2]);
+                              midpoint_result.finite_stage_failure_dmu_div);
             }
             const bool hard_negative_debt =
                 midpoint_result.negative_debt_level >=
@@ -1486,125 +1508,109 @@ int main(int argc, char** argv)
         bkg_e = midpoint_result.species_np1;
         beam = midpoint_result.beam_np1;
         fields = midpoint_result.fields_np1;
-        if (mpi_rank == 0) {
-            const auto& transport = midpoint_result.accepted_transport;
-            if (transport.valid != 0) {
-                accepted_transport_monitor
-                    << step << " "
-                    << time / Const::femto << " "
-                    << midpoint_result.nonlinear_iterations << " "
-                    << transport.substep << " "
-                    << transport.min_mass << " "
-                    << transport.ix << " "
-                    << transport.iv << " "
-                    << transport.imu << " "
-                    << transport.m_low << " "
-                    << transport.m_candidate << " "
-                    << transport.m_safe << " "
-                    << transport.outflow << " "
-                    << transport.inflow << " "
-                    << transport.beta << " ";
-                for (int f = 0; f < 4; ++f)
-                    accepted_transport_monitor << transport.alpha[f] << " ";
-                for (int f = 0; f < 4; ++f)
-                    accepted_transport_monitor << transport.a_limited[f] << " ";
-                for (int f = 0; f < 4; ++f)
-                    accepted_transport_monitor << transport.a_safe[f] << " ";
-                accepted_transport_monitor
-                    << transport.mpi_interface << " "
-                    << transport.k_zero << " "
-                    << transport.next_step_donor << " "
+        if (runtime.diagnostic_level >= 2 && !midpoint_result.failed) {
+            write_fixed_midpoint_face_pairing(
+                output_path(runtime, "fixed_midpoint_face_pairing.dat"),
+                physical_step, time, dt, midpoint_result, fields_step_start,
+                midpoint_result.operator_input_fields_end_guess, sgrid,
+                mpi_rank, mpi_size, true);
+        }
+        if (runtime.diagnostic_level >= 2 && runtime.dump_final_midpoint) {
+            VlasovAmpereMidpointSolver::MidpointAuditState audit_state;
+            audit_state.step = physical_step;
+            audit_state.time_s = time;
+            audit_state.dt_s = dt;
+            audit_state.substeps_used = midpoint_result.substeps_used;
+            audit_state.nonlinear_iterations = midpoint_result.nonlinear_iterations;
+            audit_state.low_order_only = midpoint_solver.low_order_only();
+            audit_state.high_order_enabled = midpoint_solver.nonuniform_high_order_enabled();
+            audit_state.fct_enabled = midpoint_solver.fct_enabled();
+            audit_state.acceptance_type = midpoint_result.converged
+                ? "strict_converged"
+                : (midpoint_result.soft_unconverged ? "soft_accepted" : "unconverged_best_trial");
+            audit_state.bkg_n = bkg_step_start;
+            audit_state.guess_np1 = bkg_e;
+            audit_state.operator_input_guess = midpoint_result.operator_input_guess;
+            audit_state.fields_n = fields_step_start;
+            audit_state.fields_end_guess =
+                midpoint_result.operator_input_fields_end_guess;
+            audit_state.coupling_layout.beam_front_ix =
+                midpoint_result.coupling_beam_front_ix;
+            audit_state.coupling_layout.wave_core_end_m =
+                midpoint_result.coupling_wave_core_end_m;
+            audit_state.j_beam_face_mid = midpoint_result.j_beam_face_mid;
+            audit_state.reference_jn_face = midpoint_result.j_bkg_face_mid;
+            // The existing energy-debug face quantity is the production
+            // G*J_E reference. J_E cell storage is introduced with 10.1.
+            audit_state.reference_je_cell = midpoint_result.j_bkg_energy_cell_mid;
+            audit_state.reference_gstar_je_face = midpoint_result.j_bkg_energy_debug_face;
+            audit_state.periodic_seam_face_audit =
+                midpoint_result.periodic_seam_face_audit;
+            audit_state.reference_stage5_r_fv = midpoint_result.stage5_r_fv;
+            audit_state.reference_stage5_r_couple = midpoint_result.stage5_r_couple;
+            if (!write_midpoint_audit_state(output_path(runtime, "final_midpoint"),
+                                            audit_state, sgrid, mpi_rank,
+                                            mpi_size, runtime_error)) {
+                if (mpi_rank == 0) std::fprintf(stderr, "Midpoint audit error: %s\n", runtime_error.c_str());
+                MPI_Abort(MPI_COMM_WORLD, 13);
+                return 13;
+            }
+        }
+        if (mpi_rank == 0 && collect_step_diagnostics &&
+            midpoint_result.state_advanced != 0 && !midpoint_result.failed) {
+            static const char* const region_names[6] = {
+                "B_left", "Q_left", "wave_core", "quiet_right",
+                "Q_right", "B_right"};
+            for (int region = 0; region < 6; ++region) {
+                const VlasovAmpereMidpointSolver::CouplingRegionDiagnostics& stats =
+                    midpoint_result.coupling_regions[region];
+                accepted_coupling_region_monitor
+                    << step << " " << time / Const::femto << " "
+                    << region_names[region] << " "
+                    << midpoint_result.coupling_beam_front_ix << " "
+                    << midpoint_result.coupling_wave_core_end_m << " "
+                    << stats.sum_rj << " " << stats.sum_abs_rj << " "
+                    << std::sqrt(stats.sum_sq_rj) << " " << stats.linf_rj << " "
+                    << stats.sum_rk << " " << stats.sum_abs_rk << " "
+                    << std::sqrt(stats.sum_sq_rk) << " " << stats.linf_rk << " "
+                    << stats.max_abs_jn_minus_gstar_je << " "
+                    << stats.max_abs_jn_minus_gstar_je_face << " "
+                    << stats.face_work_jn << " " << stats.delta_ke_bkg << " "
+                    << stats.fct_work << " " << stats.face_count << " "
+                    << stats.cell_count << " "
+                    << midpoint_result.stage5_r_couple << " "
+                    << midpoint_result.coupling_rj_global_sum << " "
+                    << midpoint_result.coupling_rj_reconstruction_error << " "
+                    << midpoint_result.stage5_r_fv << " "
+                    << midpoint_result.coupling_rk_global_sum << " "
+                    << midpoint_result.coupling_rk_reconstruction_error << " "
+                    << midpoint_result.current_diag.e_dot_j_charge << " "
+                    << midpoint_result.coupling_face_work_jn_global_sum << " "
+                    << midpoint_result
+                           .coupling_face_work_jn_reconstruction_error << " "
+                    << stats.r_couple_centered << " "
+                    << stats.r_couple_upwind_stabilization << " "
+                    << stats.r_couple_fct_stabilization << " "
+                    << midpoint_result.stage5_r_couple_centered << " "
+                    << midpoint_result.coupling_rj_centered_global_sum << " "
+                    << midpoint_result.coupling_rj_centered_reconstruction_error << " "
+                    << midpoint_result.stage5_r_couple_upwind_stabilization << " "
+                    << midpoint_result.coupling_rj_upwind_global_sum << " "
+                    << midpoint_result.coupling_rj_upwind_reconstruction_error << " "
+                    << midpoint_result.stage5_r_couple_fct_stabilization << " "
+                    << midpoint_result.coupling_rj_fct_global_sum << " "
+                    << midpoint_result.coupling_rj_fct_reconstruction_error << " "
+                    << 1 << " " << midpoint_result.state_advanced << " "
                     << midpoint_result.soft_unconverged << "\n";
-                accepted_transport_monitor.flush();
-                if (transport.min_mass < 0.0 &&
-                    !first_accepted_negative_seen) {
-                    std::fprintf(stderr,
-                                 "FIRST_ACCEPTED_NEGATIVE: step=%d t=%.16e "
-                                 "iter=%d substep=%d M=%.16e at "
-                                 "(x=%d,j=%d,k=%d).\n",
-                                 step, time,
-                                 midpoint_result.nonlinear_iterations,
-                                 transport.substep, transport.min_mass,
-                                 transport.ix, transport.iv, transport.imu);
-                    first_accepted_negative_seen = true;
-                }
             }
-            const int long_run_diagnostic =
-                midpoint_result.soft_unconverged ? 1 : 0;
-            negative_debt_guard_monitor
-                << step << " "
-                << time / Const::femto << " "
-                << 1 << " "
-                << long_run_diagnostic << " "
-                << midpoint_result.negative_debt_level << " "
-                << midpoint_result.neg_mass_boundary << " "
-                << midpoint_result.neg_mass_core << " "
-                << midpoint_result.neg_mass_tail << " "
-                << midpoint_result.neg_mass_core_fraction << " "
-                << midpoint_result.neg_mass_boundary_fraction << " "
-                << midpoint_result.neg_mass_tail_fraction << " "
-                << midpoint_result.neg_energy_core_abs << " "
-                << midpoint_result.neg_energy_core_fraction << " "
-                << midpoint_result.neg_energy_boundary_abs << " "
-                << midpoint_result.neg_energy_boundary_fraction << " "
-                << midpoint_result.neg_current_core_abs << " "
-                << midpoint_result.neg_current_core_fraction << " "
-                << midpoint_result.neg_debt_min_f_boundary << " "
-                << midpoint_result.neg_debt_min_f_core << " "
-                << midpoint_result.neg_debt_min_f_tail << " "
-                << midpoint_result.neg_cell_boundary << " "
-                << midpoint_result.neg_cell_core << " "
-                << midpoint_result.neg_cell_tail << " "
-                << midpoint_result.debt_action << " "
-                << midpoint_result.limiter_reason << " "
-                << midpoint_result.alpha_core_min << " "
-                << midpoint_result.alpha_boundary_min << " "
-                << midpoint_result.alpha_tail_min << " "
-                << midpoint_result.limiter_modified_J_bkg_norm << " "
-                << midpoint_result.limiter_modified_J_bkg_boundary_norm << " "
-                << midpoint_result.limiter_modified_energy_norm << " "
-                << midpoint_result.low_u_mu_neg_mass_fraction << " "
-                << midpoint_result.low_u_mu_neg_energy_fraction << " "
-                << midpoint_result.low_u_mu_neg_current_fraction << " "
-                << midpoint_result.boundary_force_Cu_max << " "
-                << midpoint_result.boundary_force_Cmu_max << " "
-                << midpoint_result.boundary_force_nsub_max << " "
-                << midpoint_result.boundary_force_remap_cell_count << " "
-                << midpoint_result.boundary_mu_low_L1_before << " "
-                << midpoint_result.boundary_mu_low_L1_after << " "
-                << midpoint_result.boundary_mu_high_L1_after << " "
-                << midpoint_result.J_bkg_neg_boundary << " "
-                << midpoint_result.delta_E_neg_boundary << " "
-                << midpoint_result.boundary_force_remap_mass_loss << " "
-                << midpoint_result.boundary_force_remap_energy_loss << " "
-                << midpoint_result.alpha_interface_BQ_min << " "
-                << midpoint_result.alpha_interface_QC_min << " "
-                << midpoint_result.interface_BQ_flux << " "
-                << midpoint_result.interface_BQ_high_correction << " "
-                << midpoint_result.interface_QC_flux_into_core << " "
-                << midpoint_result.interface_QC_high_correction_into_core << " "
-                << midpoint_result.boundary_energy_diagnostic_invalid << " "
-                << midpoint_result.trial_failure_downgraded << " "
-                << midpoint_result.accepted_with_negative_debt << " "
-                << midpoint_result.state_advanced << " "
-                << midpoint_result.soft_unconverged << " "
-                << midpoint_result.converged << " "
-                << midpoint_result.failed << " "
-                << midpoint_result.nonlinear_iterations << " "
-                << midpoint_result.residual_E << " "
-                << midpoint_result.residual_J_bkg << "\n";
-            if (abnormal_midpoint ||
-                step + 1 == nsteps ||
-                (config.enable_step_diagnostics &&
-                 config.step_diagnostics_interval > 0 &&
-                 step % config.step_diagnostics_interval == 0)) {
-                negative_debt_guard_monitor.flush();
-            }
+            accepted_coupling_region_monitor.flush();
         }
         latest_bkg_energy_current_face =
             midpoint_result.j_bkg_energy_debug_face;
         moments_current = true;
         latest_bkg_ampere_current_face = midpoint_result.j_bkg_face_mid;
+        // All current diagnostics returned by the midpoint solver are global
+        // MPI values despite this legacy per-step storage name.
         local_bkg_current_diag_step.residual_if_charge =
             midpoint_result.current_diag.residual_if_charge;
         local_bkg_current_diag_step.residual_if_ampere =
@@ -1631,295 +1637,20 @@ int main(int argc, char** argv)
         x_limiter_active_fraction_step =
             midpoint_result.limiter_active_fraction;
         x_limiter_min_alpha_step = midpoint_result.limiter_min_alpha;
-        x_limiter_active_fraction_core_step =
-            midpoint_result.limiter_active_fraction_core;
-        x_limiter_active_fraction_boundary_step =
-            midpoint_result.limiter_active_fraction_boundary;
-        x_limiter_min_alpha_core_step =
-            midpoint_result.limiter_min_alpha_core;
-        x_limiter_min_alpha_boundary_step =
-            midpoint_result.limiter_min_alpha_boundary;
-        x_negative_mass_before_repair_step =
-            midpoint_result.x_negative_mass_before_repair;
-        x_mass_added_by_positivity_repair_step =
-            midpoint_result.x_mass_added_by_positivity_repair;
-        floor_repair_mass_step = midpoint_result.floor_repair_mass;
-        floor_repair_energy_step = midpoint_result.floor_repair_energy;
-        floor_repair_core_fraction_step =
-            midpoint_result.floor_repair_core_fraction;
-        positivity_energy_defect_step =
-            midpoint_result.positivity_energy_defect;
-        positivity_mass_defect_step =
-            midpoint_result.positivity_mass_defect;
-        u_limiter_mass_delta_step =
-            midpoint_result.limiter_mass_defect;
-        u_limiter_momentum_delta_step =
-            midpoint_result.limiter_momentum_defect;
-        u_limiter_energy_delta_step =
-            midpoint_result.limiter_energy_defect;
-        x_limiter_mass_delta_step =
-            midpoint_result.x_limiter_mass_defect;
-        x_limiter_energy_delta_step =
-            midpoint_result.x_limiter_energy_defect;
-        x_low_input_min_f_step = midpoint_result.x_low_input_min_f;
-        x_low_max_cfl_step = midpoint_result.x_low_max_cfl;
-        x_low_output_min_f_step = midpoint_result.x_low_output_min_f;
-        x_low_failed_count_step = midpoint_result.x_low_failed_count;
-        x_low_input_neg_mass_step = midpoint_result.x_low_input_neg_mass;
-        x_low_input_rel_neg_step = midpoint_result.x_low_input_rel_neg;
-        x_low_output_rel_neg_step = midpoint_result.x_low_output_rel_neg;
-        x_low_input_core_failed_count_step =
-            midpoint_result.x_low_input_core_failed_count;
-        x_low_input_debt_accepted_step =
-            midpoint_result.x_low_input_debt_accepted;
-        x_low_failure_kind_step = midpoint_result.x_low_failure_kind;
-        (void)x_low_failure_kind_step;
-        x_final_min_f_step = midpoint_result.x_final_min_f;
-        x_final_failed_count_step = midpoint_result.x_final_failed_count;
-        x_final_failed_max_debt_step =
-            midpoint_result.x_final_failed_max_debt;
-        x_final_worst_ix_step = midpoint_result.x_final_worst_ix;
-        x_final_worst_iv_step = midpoint_result.x_final_worst_iv;
-        x_final_worst_imu_step = midpoint_result.x_final_worst_imu;
-        x_final_failure_region_step =
-            midpoint_result.x_final_failure_region;
-        x_final_core_failed_count_step =
-            midpoint_result.x_final_core_failed_count;
-        x_final_boundary_failed_count_step =
-            midpoint_result.x_final_boundary_failed_count;
-        mu_final_min_f_step = midpoint_result.flux_pos[2].min_f_final;
-        mu_final_failed_count_step =
-            static_cast<double>(midpoint_result.mu_final_negative_hard_count);
-        mu_final_failed_max_debt_step =
-            midpoint_result.mu_final_failed_max_debt;
-        mu_final_worst_ix_step = midpoint_result.mu_final_worst_ix;
-        mu_final_worst_iv_step = midpoint_result.mu_final_worst_iv;
-        mu_final_worst_imu_step = midpoint_result.mu_final_worst_imu;
-        mu_final_failure_region_step =
-            midpoint_result.mu_final_failure_region;
-        mu_final_core_failed_count_step =
-            midpoint_result.mu_final_core_failed_count;
-        mu_final_boundary_failed_count_step =
-            midpoint_result.mu_final_boundary_failed_count;
-        if (mpi_rank == 0 && x_low_input_debt_accepted_step > 0.0) {
-            std::fprintf(
-                stderr,
-                "WARNING: accepted x_low input negative debt at step %d, "
-                "t = %.6e s; failed_cell_count %.0f, input_min_f %.6e, "
-                "input_neg_mass %.6e, input_rel_neg %.6e, "
-                "output_min_f %.6e, output_rel_neg %.6e, "
-                "core_failed_count %.0f. Previous accepted stage valid %d: "
-                "after_x(min %.6e, neg_mass %.6e, neg_count %lld), "
-                "after_u(min %.6e, neg_mass %.6e, neg_count %lld), "
-                "after_mu(min %.6e, neg_mass %.6e, neg_count %lld).\n",
-                step, time, x_low_failed_count_step,
-                x_low_input_min_f_step,
-                x_low_input_neg_mass_step,
-                x_low_input_rel_neg_step,
-                x_low_output_min_f_step,
-                x_low_output_rel_neg_step,
-                x_low_input_core_failed_count_step,
-                last_accepted_stage_valid ? 1 : 0,
-                last_accepted_stage_min_f[0],
-                last_accepted_stage_neg_mass[0],
-                last_accepted_stage_neg_cell_count[0],
-                last_accepted_stage_min_f[1],
-                last_accepted_stage_neg_mass[1],
-                last_accepted_stage_neg_cell_count[1],
-                last_accepted_stage_min_f[2],
-                last_accepted_stage_neg_mass[2],
-                last_accepted_stage_neg_cell_count[2]);
-        }
-        mu_low_u_alpha_min_step =
-            midpoint_result.mu_low_u_alpha_min;
-        mu_low_u_limiter_active_fraction_step =
-            midpoint_result.mu_low_u_limiter_active_fraction;
-        mu_low_u_energy_delta_step =
-            midpoint_result.mu_low_u_energy_delta;
-        mu_low_u_alpha_min_boundary_step =
-            midpoint_result.mu_low_u_alpha_min_boundary;
-        mu_low_u_alpha_min_core_step =
-            midpoint_result.mu_low_u_alpha_min_core;
-        mu_low_u_limiter_active_fraction_boundary_step =
-            midpoint_result.mu_low_u_limiter_active_fraction_boundary;
-        mu_low_u_limiter_active_fraction_core_step =
-            midpoint_result.mu_low_u_limiter_active_fraction_core;
-        mu_low_u_energy_delta_boundary_step =
-            midpoint_result.mu_low_u_energy_delta_boundary;
-        mu_low_u_energy_delta_core_step =
-            midpoint_result.mu_low_u_energy_delta_core;
-        mu_low_u_u_eff0_step = midpoint_result.mu_low_u_u_eff0;
-        mu_low_u_moment_weight0_step =
-            midpoint_result.mu_low_u_moment_weight0;
-        mu_low_u_mu_flux_scale0_step =
-            midpoint_result.mu_low_u_mu_flux_scale0;
-        mu_low_u_half_dt_inv_shell0_step =
-            midpoint_result.mu_low_u_half_dt_inv_shell0;
-        mu_low_u_dimless_scale0_step =
-            midpoint_result.mu_low_u_dimless_scale0;
-        mu_low_u_endpoint_flux_max_step =
-            midpoint_result.mu_low_u_endpoint_flux_max;
-        remap_active_fraction_step =
-            midpoint_result.remap_active_fraction;
-        remap_cell_count_step = midpoint_result.remap_cell_count;
-        low_u_subcycle_active_fraction_step =
-            midpoint_result.low_u_subcycle_active_fraction;
-        low_u_average_subcycles_step =
-            midpoint_result.low_u_average_subcycles;
-        low_u_max_subcycles_step = midpoint_result.low_u_max_subcycles;
-        u_force_alpha_min_step =
-            midpoint_result.u_force_alpha_min;
-        u_force_alpha_active_frac_step =
-            midpoint_result.u_force_alpha_active_frac;
         coupled_iter_step = midpoint_result.nonlinear_iterations;
         coupled_residual_E_step = midpoint_result.residual_E;
         coupled_residual_J_bkg_step = midpoint_result.residual_J_bkg;
         coupled_residual_J_beam_step = midpoint_result.residual_J_beam;
-        coupled_residual_bkg_mass_step =
-            midpoint_result.continuity_residual_bkg;
-        coupled_residual_beam_continuity_step =
-            midpoint_result.beam_continuity_residual;
 
-        const bool write_flux_audit =
-            collect_step_diagnostics || abnormal_midpoint;
-        if (mpi_rank == 0 && write_flux_audit &&
-            midpoint_result.u_flux_audit_valid) {
-            u_flux_audit << step << "  "
-                         << time / Const::femto << "  "
-                         << midpoint_result.u_flux_audit_valid << "  "
-                         << midpoint_result.u_flux_audit_rank << "  "
-                         << midpoint_result.u_flux_audit_ix << "  "
-                         << midpoint_result.u_flux_audit_iv << "  "
-                         << midpoint_result.u_flux_audit_imu << "  "
-                         << midpoint_result.u_flux_audit_severity << "  "
-                         << midpoint_result.u_flux_audit_f0 << "  "
-                         << midpoint_result.u_flux_audit_f_low << "  "
-                         << midpoint_result.u_flux_audit_f_high << "  "
-                         << midpoint_result.u_flux_audit_alpha << "  "
-                         << midpoint_result.u_flux_audit_du_div_low << "  "
-                         << midpoint_result.u_flux_audit_du_div_high << "  "
-                         << midpoint_result.u_flux_audit_du_div_final << "  "
-                         << midpoint_result.u_flux_audit_updated << "  "
-                         << midpoint_result.u_flux_audit_final_xl_lo << "  "
-                         << midpoint_result.u_flux_audit_final_xl_hi << "  "
-                         << midpoint_result.u_flux_audit_final_xr_lo << "  "
-                         << midpoint_result.u_flux_audit_final_xr_hi << "\n";
-            u_flux_audit.flush();
-        }
-        if (mpi_rank == 0 && midpoint_result.u_flux_audit_valid) {
-            const double x_cell =
-                (static_cast<double>(midpoint_result.u_flux_audit_ix) + 0.5) *
-                sgrid.dx;
-            const int region =
-                (x_cell < 0.1 * Const::micro ||
-                 x_cell > Param::Lx - 0.1 * Const::micro) ? 1 : 0;
-            u_origin_audit << step << "  "
-                           << time / Const::femto << "  "
-                           << midpoint_result.u_flux_audit_rank << "  "
-                           << midpoint_result.u_flux_audit_ix << "  "
-                           << midpoint_result.u_flux_audit_iv << "  "
-                           << midpoint_result.u_flux_audit_imu << "  "
-                           << region << "  "
-                           << midpoint_result.u_flux_audit_f0 << "  "
-                           << midpoint_result.u_flux_audit_f_after_x << "  "
-                           << midpoint_result.u_flux_audit_f_low << "  "
-                           << midpoint_result.u_flux_audit_f_high << "  "
-                           << midpoint_result.u_flux_audit_updated << "  "
-                           << midpoint_result.u_flux_audit_lower_flux << "  "
-                           << midpoint_result.u_flux_audit_upper_flux << "  "
-                           << midpoint_result.u_flux_audit_lower_donor_iv
-                           << "  "
-                           << midpoint_result.u_flux_audit_upper_donor_iv
-                           << "  "
-                           << midpoint_result.u_flux_audit_lower_donor_f
-                           << "  "
-                           << midpoint_result.u_flux_audit_upper_donor_f
-                           << "  "
-                           << midpoint_result.u_flux_audit_cfl << "  "
-                           << midpoint_result.u_flux_audit_alpha << "  "
-                           << midpoint_result.u_flux_audit_alpha << "  "
-                           << midpoint_result
-                                  .u_flux_audit_line_positive_peak << "  "
-                           << midpoint_result
-                                  .u_flux_audit_line_negative_mass << "  "
-                           << midpoint_result.u_flux_audit_allowed_debt
-                           << "  "
-                           << midpoint_result.u_flux_audit_failure_kind
-                           << "\n";
-            if (abnormal_midpoint) {
-                u_origin_audit.flush();
-            }
-        }
-        if (mpi_rank == 0 && abnormal_midpoint) {
-            write_low_order_failure_audit(
-                u_low_failure_audit,
-                midpoint_result.u_low_failure_audit);
-            write_low_order_failure_audit(
-                mu_low_failure_audit,
-                midpoint_result.mu_low_failure_audit);
-        }
-
-        const bool write_periodic_monitors =
-            collect_step_diagnostics || abnormal_midpoint ||
-            (x_low_input_debt_accepted_step > 0.0) ||
-            (x_final_failed_count_step > 0.0) ||
-            (mu_final_failed_count_step > 0.0);
-        if (write_periodic_monitors) {
-            const double bkg_ke_step_end_for_residual =
-                bkg_ke_step_start + midpoint_result.delta_ke_bkg;
+        if (collect_step_diagnostics) {
+            // The midpoint solver already returns globally reduced current,
+            // work, and kinetic-energy diagnostics.  Re-reducing these here
+            // would multiply sums by the number of MPI ranks.
+            const double global_dke_bkg_step = midpoint_result.delta_ke_bkg;
+            const double global_W_bkg_E = midpoint_result.field_work_bkg;
             local_bkg_energy_residual_step =
-                (bkg_ke_step_end_for_residual - bkg_ke_step_start) + W_bkg_E;
-            const double local_bkg_energy_values[8] = {
-                bkg_ke_step_end_for_residual,
-                W_bkg_E,
-                local_bkg_energy_residual_step,
-                local_bkg_current_diag_step.residual_if_charge,
-                local_bkg_current_diag_step.residual_if_ampere,
-                local_bkg_current_diag_step.e_dot_j_charge,
-                local_bkg_current_diag_step.e_dot_j_energy,
-                local_bkg_current_diag_step.e_dot_j_ampere
-            };
-            double global_bkg_energy_values[8] = {
-                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-            };
-            MPI_Allreduce(local_bkg_energy_values, global_bkg_energy_values, 8,
-                          MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-            const double local_current_max_values[5] = {
-                local_bkg_current_diag_step.max_abs_j_charge,
-                local_bkg_current_diag_step.max_abs_j_energy,
-                local_bkg_current_diag_step.max_abs_j_ampere,
-                local_bkg_current_diag_step.max_abs_j_charge_minus_ampere,
-                local_bkg_current_diag_step.max_abs_j_energy_minus_ampere
-            };
-            double global_current_max_values[5] = {
-                0.0, 0.0, 0.0, 0.0, 0.0
-            };
-            MPI_Allreduce(local_current_max_values, global_current_max_values,
-                          5, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-            global_bkg_current_diag_step.residual_if_charge =
-                global_bkg_energy_values[3];
-            global_bkg_current_diag_step.residual_if_ampere =
-                global_bkg_energy_values[4];
-            global_bkg_current_diag_step.e_dot_j_charge =
-                global_bkg_energy_values[5];
-            global_bkg_current_diag_step.e_dot_j_energy =
-                global_bkg_energy_values[6];
-            global_bkg_current_diag_step.e_dot_j_ampere =
-                global_bkg_energy_values[7];
-            global_bkg_current_diag_step.max_abs_j_charge =
-                global_current_max_values[0];
-            global_bkg_current_diag_step.max_abs_j_energy =
-                global_current_max_values[1];
-            global_bkg_current_diag_step.max_abs_j_ampere =
-                global_current_max_values[2];
-            global_bkg_current_diag_step.max_abs_j_charge_minus_ampere =
-                global_current_max_values[3];
-            global_bkg_current_diag_step.max_abs_j_energy_minus_ampere =
-                global_current_max_values[4];
-            const double global_dke_bkg_step =
-                global_bkg_energy_values[0] - global_bkg_ke_step_start;
-            const double global_W_bkg_E = global_bkg_energy_values[1];
-            bkg_energy_residual_step = global_bkg_energy_values[2];
+                global_dke_bkg_step + global_W_bkg_E;
+            bkg_energy_residual_step = local_bkg_energy_residual_step;
             const double bkg_energy_residual_den =
                 std::max(std::max(std::fabs(global_dke_bkg_step),
                                   std::fabs(global_W_bkg_E)),
@@ -1932,173 +1663,7 @@ int main(int argc, char** argv)
             cumulative_bkg_energy_residual +=
                 bkg_energy_relative_residual_step;
         }
-        if (mpi_rank == 0 && write_periodic_monitors) {
-            bkg_energy_monitor << step << "  "
-                               << time / Const::femto << "  "
-                               << x_limiter_active_fraction_step << "  "
-                               << x_limiter_min_alpha_step << "  "
-                               << bkg_energy_residual_step << "  "
-                               << bkg_energy_relative_residual_step << "  "
-                               << cumulative_bkg_energy_residual << "  "
-                               << x_limiter_active_fraction_core_step << "  "
-                               << x_limiter_active_fraction_boundary_step << "  "
-                               << x_limiter_min_alpha_core_step << "  "
-                               << x_limiter_min_alpha_boundary_step << "  "
-                               << x_negative_mass_before_repair_step << "  "
-                               << x_mass_added_by_positivity_repair_step << "  "
-                               << floor_repair_mass_step << "  "
-                               << floor_repair_energy_step << "  "
-                               << floor_repair_core_fraction_step << "  "
-                               << global_bkg_current_diag_step.max_abs_j_charge << "  "
-                               << global_bkg_current_diag_step.max_abs_j_energy << "  "
-                               << global_bkg_current_diag_step.max_abs_j_ampere << "  "
-                               << global_bkg_current_diag_step.max_abs_j_charge_minus_ampere << "  "
-                               << global_bkg_current_diag_step.max_abs_j_energy_minus_ampere << "  "
-                               << global_bkg_current_diag_step.e_dot_j_charge << "  "
-                               << global_bkg_current_diag_step.e_dot_j_energy << "  "
-                               << global_bkg_current_diag_step.e_dot_j_ampere << "  "
-                               << global_bkg_current_diag_step.residual_if_charge << "  "
-                               << global_bkg_current_diag_step.residual_if_ampere << "  "
-                               << positivity_mass_defect_step << "  "
-                               << positivity_energy_defect_step << "  "
-                               << u_limiter_mass_delta_step << "  "
-                               << u_limiter_momentum_delta_step << "  "
-                               << u_limiter_energy_delta_step << "  "
-                               << x_limiter_mass_delta_step << "  "
-                               << x_limiter_energy_delta_step << "  "
-                               << mu_low_u_alpha_min_step << "  "
-                               << mu_low_u_limiter_active_fraction_step << "  "
-                               << mu_low_u_energy_delta_step << "  "
-                               << mu_low_u_alpha_min_boundary_step << "  "
-                               << mu_low_u_alpha_min_core_step << "  "
-                               << mu_low_u_limiter_active_fraction_boundary_step << "  "
-                               << mu_low_u_limiter_active_fraction_core_step << "  "
-                               << mu_low_u_energy_delta_boundary_step << "  "
-                               << mu_low_u_energy_delta_core_step << "  "
-                               << mu_low_u_u_eff0_step << "  "
-                               << mu_low_u_moment_weight0_step << "  "
-                               << mu_low_u_mu_flux_scale0_step << "  "
-                               << mu_low_u_half_dt_inv_shell0_step << "  "
-                               << mu_low_u_dimless_scale0_step << "  "
-                               << mu_low_u_endpoint_flux_max_step << "  "
-                               << remap_active_fraction_step << "  "
-                               << remap_cell_count_step << "  "
-                               << low_u_subcycle_active_fraction_step << "  "
-                               << low_u_average_subcycles_step << "  "
-                               << low_u_max_subcycles_step << "  "
-                               << u_force_alpha_min_step << "  "
-                               << u_force_alpha_active_frac_step << "  "
-                               << coupled_iter_step << "  "
-                               << coupled_residual_E_step << "  "
-                               << coupled_residual_J_bkg_step << "  "
-                               << coupled_residual_J_beam_step << "  "
-                               << coupled_residual_bkg_mass_step << "  "
-                               << coupled_residual_beam_continuity_step << "\n";
-            bkg_energy_monitor.flush();
-            x_low_monitor << step << "  "
-                          << time / Const::femto << "  "
-                          << x_low_input_min_f_step << "  "
-                          << x_low_max_cfl_step << "  "
-                          << x_low_output_min_f_step << "  "
-                          << x_low_failed_count_step << "\n";
-            x_low_monitor.flush();
-            x_final_monitor << step << "  "
-                            << time / Const::femto << "  "
-                            << x_final_min_f_step << "  "
-                            << x_final_failed_count_step << "  "
-                            << x_final_failed_max_debt_step << "  "
-                            << x_final_worst_ix_step << "  "
-                            << x_final_worst_iv_step << "  "
-                            << x_final_worst_imu_step << "  "
-                            << x_final_failure_region_step << "  "
-                            << x_final_core_failed_count_step << "  "
-                            << x_final_boundary_failed_count_step << "\n";
-            x_final_monitor.flush();
-            mu_final_monitor << step << "  "
-                             << time / Const::femto << "  "
-                             << mu_final_min_f_step << "  "
-                             << mu_final_failed_count_step << "  "
-                             << mu_final_failed_max_debt_step << "  "
-                             << mu_final_worst_ix_step << "  "
-                             << mu_final_worst_iv_step << "  "
-                             << mu_final_worst_imu_step << "  "
-                             << mu_final_failure_region_step << "  "
-                             << mu_final_core_failed_count_step << "  "
-                             << mu_final_boundary_failed_count_step << "  "
-                             << midpoint_result.flux_pos[2].alpha_active_fraction << "  "
-                             << midpoint_result.flux_pos[2].alpha_min << "  "
-                             << midpoint_result.flux_pos[2].alpha_core_fraction << "  "
-                             << midpoint_result.flux_pos[2].alpha_boundary_fraction << "  "
-                             << mu_low_u_alpha_min_core_step << "  "
-                             << mu_low_u_alpha_min_boundary_step << "  "
-                             << midpoint_result.flux_defect[2].energy_defect << "  "
-                             << midpoint_result.flux_defect[2].mass_defect << "\n";
-            mu_final_monitor.flush();
-        }
         if (collect_step_diagnostics) {
-            diag.write_bkg_stage_negativity(
-                step, time, coupled_iter_step,
-                midpoint_result.soft_unconverged,
-                midpoint_result.stage_min_f,
-                midpoint_result.stage_neg_mass,
-                midpoint_result.stage_neg_cell_count,
-                midpoint_result.stage_low_u_neg_mass,
-                midpoint_result.stage_core_low_u_min_f,
-                mpi_rank);
-            diag.write_bkg_stage_by_u_diagnostics(
-                step, time, coupled_iter_step,
-                midpoint_result.soft_unconverged,
-                midpoint_result.stage_min_f_core_by_u,
-                midpoint_result.stage_neg_mass_core_by_u,
-                midpoint_result.stage_neg_cell_count_core_by_u,
-                midpoint_result.stage_min_f_boundary_by_u,
-                midpoint_result.stage_neg_mass_boundary_by_u,
-                midpoint_result.stage_neg_cell_count_boundary_by_u,
-                mpi_rank);
-            diag.write_bkg_low_u_divergence_diagnostics(
-                step, time, coupled_iter_step,
-                midpoint_result.low_u_neg_added_by_div,
-                mpi_rank);
-
-            // 7.1.6: per-direction flux diagnostics
-            {
-                double fp_min_before[3], fp_min_low[3], fp_min_final[3];
-                double fp_low_failed[3], fp_alpha_active[3], fp_alpha_min[3];
-                double fp_alpha_core[3], fp_alpha_boundary[3];
-                double fp_neg_mass_prev[3];
-                double fd_mass[3], fd_momentum[3], fd_energy[3];
-                double fd_bound_mass[3], fd_bound_energy[3];
-                for (int d = 0; d < 3; ++d) {
-                    const auto& fp = midpoint_result.flux_pos[d];
-                    fp_min_before[d]   = fp.min_f_before;
-                    fp_min_low[d]      = fp.min_f_low;
-                    fp_min_final[d]    = fp.min_f_final;
-                    fp_low_failed[d]   = fp.low_order_failed_count;
-                    fp_alpha_active[d] = fp.alpha_active_fraction;
-                    fp_alpha_min[d]    = fp.alpha_min;
-                    fp_alpha_core[d]   = fp.alpha_core_fraction;
-                    fp_alpha_boundary[d] = fp.alpha_boundary_fraction;
-                    fp_neg_mass_prev[d]  = fp.negative_mass_prevented;
-                    const auto& fd = midpoint_result.flux_defect[d];
-                    fd_mass[d]      = fd.mass_defect;
-                    fd_momentum[d]  = fd.momentum_defect;
-                    fd_energy[d]    = fd.energy_defect;
-                    fd_bound_mass[d]  = fd.boundary_mass_loss;
-                    fd_bound_energy[d] = fd.boundary_energy_loss;
-                }
-                diag.write_flux_positivity_diagnostics(
-                    step, time,
-                    fp_min_before, fp_min_low, fp_min_final,
-                    fp_low_failed, fp_alpha_active, fp_alpha_min,
-                    fp_alpha_core, fp_alpha_boundary, fp_neg_mass_prev,
-                    mpi_rank);
-                diag.write_stage_flux_defect_diagnostics(
-                    step, time,
-                    fd_mass, fd_momentum, fd_energy,
-                    fd_bound_mass, fd_bound_energy,
-                    mpi_rank);
-            }
-
             FNegativitySnapshotDiagnostics f_neg_snapshot;
             compute_f_negativity_snapshot_diagnostics(
                 bkg_e, sgrid, f_neg_snapshot);
@@ -2107,7 +1672,7 @@ int main(int argc, char** argv)
                 // f-negativity monitor: final accepted snapshot at the
                 // configured step-diagnostics cadence.
                 std::ofstream f_neg_monitor;
-                f_neg_monitor.open("output/f_negativity_monitor.dat",
+                f_neg_monitor.open(output_path(runtime, "f_negativity_monitor.dat").c_str(),
                                    std::ios::app);
                 f_neg_monitor << step << "  "
                               << time / Const::femto << "  "
@@ -2123,130 +1688,6 @@ int main(int argc, char** argv)
                               << f_neg_snapshot.mu_worst << "\n";
                 f_neg_monitor.close();
             }
-        }
-        if (collect_step_diagnostics || abnormal_midpoint) {
-            const double region_widths[2] = {
-                0.1 * Const::micro,
-                0.2 * Const::micro
-            };
-            for (int ir = 0; ir < 2; ++ir) {
-                BoundaryCoreDiagnostics region_diag;
-                compute_boundary_core_diagnostics(
-                    bkg_e, fields, sgrid, dt, region_widths[ir],
-                    mpi_rank, mpi_size, region_diag);
-                const double neg_mass_total_region =
-                    region_diag.neg_mass_boundary + region_diag.neg_mass_core;
-                const double neg_mass_core_fraction =
-                    (neg_mass_total_region > 0.0)
-                    ? region_diag.neg_mass_core / neg_mass_total_region
-                    : 0.0;
-                const long long neg_cell_total_region =
-                    region_diag.neg_cell_count_boundary
-                  + region_diag.neg_cell_count_core;
-                const double neg_cell_core_fraction =
-                    (neg_cell_total_region > 0)
-                    ? static_cast<double>(region_diag.neg_cell_count_core) /
-                      static_cast<double>(neg_cell_total_region)
-                    : 0.0;
-                const double abs_limiter_boundary =
-                    midpoint_result
-                        .region_abs_u_limiter_energy_boundary[ir];
-                const double abs_limiter_core =
-                    midpoint_result
-                        .region_abs_u_limiter_energy_core[ir];
-                const double abs_limiter_total =
-                    abs_limiter_boundary + abs_limiter_core;
-                const double limiter_core_fraction =
-                    (abs_limiter_total > 0.0)
-                    ? abs_limiter_core / abs_limiter_total
-                    : 0.0;
-                const double j_core_to_boundary_ratio =
-                    (region_diag.max_abs_J_bkg_boundary > 0.0)
-                    ? region_diag.max_abs_J_bkg_core /
-                      region_diag.max_abs_J_bkg_boundary
-                    : 0.0;
-                const double core_limiter_relative_to_work =
-                    abs_limiter_core /
-                    std::max(std::fabs(region_diag.W_bkg_E_core), 1.0);
-                const char* conclusion =
-                    classify_boundary_core_state(
-                        neg_mass_core_fraction,
-                        neg_cell_core_fraction,
-                        limiter_core_fraction,
-                        j_core_to_boundary_ratio);
-                if (mpi_rank == 0) {
-                    boundary_core_monitor
-                        << step << "  "
-                        << time / Const::femto << "  "
-                        << 1 << "  "
-                        << midpoint_result.state_advanced << "  "
-                        << midpoint_result.soft_unconverged << "  "
-                        << region_widths[ir] / Const::micro << "  "
-                        << region_diag.neg_mass_boundary << "  "
-                        << region_diag.neg_mass_core << "  "
-                        << neg_mass_core_fraction << "  "
-                        << region_diag.neg_cell_count_boundary << "  "
-                        << region_diag.neg_cell_count_core << "  "
-                        << neg_cell_core_fraction << "  "
-                        << region_diag.min_f_boundary << "  "
-                        << region_diag.min_f_core << "  "
-                        << midpoint_result
-                               .region_u_limiter_energy_boundary[ir] << "  "
-                        << midpoint_result
-                               .region_u_limiter_energy_core[ir] << "  "
-                        << abs_limiter_boundary << "  "
-                        << abs_limiter_core << "  "
-                        << limiter_core_fraction << "  "
-                        << core_limiter_relative_to_work << "  "
-                        << midpoint_result
-                               .region_limiter_active_fraction_boundary[ir]
-                        << "  "
-                        << midpoint_result
-                               .region_limiter_active_fraction_core[ir]
-                        << "  "
-                        << midpoint_result.limiter_min_alpha_boundary
-                        << "  "
-                        << midpoint_result.limiter_min_alpha_core << "  "
-                        << region_diag.max_abs_J_bkg_boundary << "  "
-                        << region_diag.max_abs_J_bkg_core << "  "
-                        << j_core_to_boundary_ratio << "  "
-                        << region_diag.rms_J_bkg_boundary << "  "
-                        << region_diag.rms_J_bkg_core << "  "
-                        << region_diag.mean_abs_J_bkg_boundary << "  "
-                        << region_diag.mean_abs_J_bkg_core << "  "
-                        << region_diag.max_abs_Ex_boundary << "  "
-                        << region_diag.max_abs_Ex_core << "  "
-                        << region_diag.W_bkg_E_boundary << "  "
-                        << region_diag.W_bkg_E_core << "  "
-                        << region_diag.anomaly_inward_E/Const::micro << "  "
-                        << region_diag.anomaly_inward_J/Const::micro << "  "
-                        << region_diag.anomaly_inward_n/Const::micro << "  "
-                        << region_diag.anomaly_inward_Mneg/Const::micro << "  "
-                        << conclusion << "\n";
-                }
-            }
-            if (mpi_rank == 0) {
-                boundary_core_monitor.flush();
-            }
-        }
-        const bool midpoint_stage_values_are_valid =
-            midpoint_result.stage_min_f.size() >= 3 &&
-            midpoint_result.stage_neg_mass.size() >= 3 &&
-            midpoint_result.stage_neg_cell_count.size() >= 3 &&
-            std::isfinite(midpoint_result.stage_min_f[0]) &&
-            std::isfinite(midpoint_result.stage_min_f[1]) &&
-            std::isfinite(midpoint_result.stage_min_f[2]);
-        if (midpoint_stage_values_are_valid) {
-            for (int istage = 0; istage < 3; ++istage) {
-                last_accepted_stage_min_f[istage] =
-                    midpoint_result.stage_min_f[static_cast<size_t>(istage)];
-                last_accepted_stage_neg_mass[istage] =
-                    midpoint_result.stage_neg_mass[static_cast<size_t>(istage)];
-                last_accepted_stage_neg_cell_count[istage] =
-                    midpoint_result
-                        .stage_neg_cell_count[static_cast<size_t>(istage)];
-            }
-            last_accepted_stage_valid = true;
         }
         if (bkg_e.collisions_enabled) {
             trace_progress(config, mpi_rank, step, "before collisions");
@@ -2272,7 +1713,43 @@ int main(int argc, char** argv)
         trace_progress(config, mpi_rank, step, "after end sync");
 
         net_nb_change_step = beam.last_injected_number()
-                           - beam.last_outflow_number();
+                            - beam.last_outflow_number();
+
+        if (write_beam_ledger) {
+            // Beam counters are rank-local because injection/outflow may be
+            // owned by different ranks.  Reduce one packed ledger once per
+            // accepted physical substep before appending the audit row.
+            double beam_ledger_local[6] = {
+                beam.last_injected_number(),
+                beam.last_outflow_number(),
+                beam.last_injected_energy(),
+                beam.last_outflow_energy(),
+                beam.last_injected_current() * dt,
+                beam.last_outflow_current() * dt
+            };
+            double beam_ledger_global[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+            MPI_Allreduce(beam_ledger_local, beam_ledger_global, 6, MPI_DOUBLE,
+                          MPI_SUM, MPI_COMM_WORLD);
+            beam_ledger_n_in_total += beam_ledger_global[0];
+            beam_ledger_n_out_total += beam_ledger_global[1];
+            beam_ledger_injected_energy_total += beam_ledger_global[2];
+            beam_ledger_outflow_energy_total += beam_ledger_global[3];
+            beam_ledger_injected_current_impulse_total += beam_ledger_global[4];
+            beam_ledger_outflow_current_impulse_total += beam_ledger_global[5];
+            ++beam_ledger_step_count;
+            if (mpi_rank == 0) {
+                beam_ledger_rows.insert(beam_ledger_rows.end(),
+                                        beam_ledger_global, beam_ledger_global + 6);
+                beam_half_step_ledger
+                    << physical_step << " " << time / Const::femto << " " << dt << " "
+                    << beam_ledger_global[0] << " " << beam_ledger_global[1] << " "
+                    << beam_ledger_global[2] << " " << beam_ledger_global[3] << " "
+                    << beam_ledger_global[4] / dt << " "
+                    << beam_ledger_global[5] / dt << " "
+                    << beam_ledger_global[4] << " " << beam_ledger_global[5] << "\n";
+                beam_half_step_ledger.flush();
+            }
+        }
 
         if (collect_step_diagnostics) {
             const double bkg_ke_step_end = bkg_e.total_kinetic_energy();
@@ -2344,22 +1821,46 @@ int main(int argc, char** argv)
                                         midpoint_result.interface_QC_flux_into_core,
                                         midpoint_result.interface_QC_high_correction_into_core,
                                         midpoint_result.boundary_energy_diagnostic_invalid,
-                                        coupled_iter_step,
-                                        coupled_residual_E_step,
-                                        coupled_residual_J_bkg_step,
-                                        coupled_residual_J_beam_step,
-                                        max_loss_u_high_step,
+                                         coupled_iter_step,
+                                         coupled_residual_E_step,
+                                         coupled_residual_J_bkg_step,
+                                         coupled_residual_J_beam_step,
+                                         midpoint_result.stage5_jn_minus_je_linf,
+                                         midpoint_result.stage5_r_fv,
+                                         midpoint_result.stage5_r_couple,
+                                         max_loss_u_high_step,
                                         x_at_max_loss_u_high_step,
                                         f_u_max_x_step,
                                         integral_f_u_gt_8_x_step);
         }
 
+        current_time = time;
+        ++accepted_after_restart;
+        if (runtime.checkpoint_enabled && next_checkpoint < runtime.checkpoint_times_fs.size() &&
+            current_time / Const::femto >= runtime.checkpoint_times_fs[next_checkpoint]) {
+            char checkpoint_name[128];
+            std::sprintf(checkpoint_name, "%s/checkpoints/t_%010.6ffs_step_%08lld",
+                         runtime.output_dir.c_str(), current_time / Const::femto,
+                         physical_step);
+            CheckpointControlState control = { physical_step, current_time, dt, next_snapshot,
+                                                last_snapshot_step, cumulative_collision_energy_delta };
+            if (!write_checkpoint(checkpoint_name, control, bkg_e, beam, fields, sgrid,
+                                  mpi_rank, mpi_size, runtime_error,
+                                  midpoint_solver.low_order_only(),
+                                  midpoint_solver.nonuniform_high_order_enabled(),
+                                  midpoint_solver.fct_enabled())) {
+                if (mpi_rank == 0) std::fprintf(stderr, "Checkpoint error: %s\n", runtime_error.c_str());
+                MPI_Abort(MPI_COMM_WORLD, 12); return 12;
+            }
+            if (mpi_rank == 0) std::printf("Checkpoint written: %s\n", checkpoint_name);
+            ++next_checkpoint;
+        }
         if (step % stdout_freq == 0) {
-            diag.write_scalars(time, step, bkg_e, beam, fields,
+            diag.write_scalars(time, static_cast<int>(physical_step), bkg_e, beam, fields,
                                cumulative_collision_energy_delta,
                                mpi_rank, mpi_size);
             if (mpi_rank == 0) {
-                printf("Step %d / %d, t = %.4f fs\n", step, nsteps, time / Const::femto);
+                printf("Step %lld, t = %.4f fs\n", physical_step, time / Const::femto);
             }
         }
 
@@ -2369,9 +1870,11 @@ int main(int argc, char** argv)
                            config.enable_full_fe_output,
                            &latest_bkg_energy_current_face,
                            &latest_bkg_ampere_current_face);
-            last_snapshot_step = step;
+            last_snapshot_step = static_cast<int>(physical_step);
             next_snapshot += Param::dt_snapshot;
         }
+        if ((runtime.stop_after_accepted_steps >= 0 && accepted_after_restart >= runtime.stop_after_accepted_steps) ||
+            current_time / Const::femto >= runtime.stop_time_fs) break;
     }
 
     sync_moments_and_charge(bkg_e, beam, fields, ion_density_profile,
@@ -2379,24 +1882,104 @@ int main(int argc, char** argv)
     fields.update_gauss_residual_diagnostics(mpi_rank, mpi_size);
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
     if (config.enable_debug_diagnostics) {
-        diag.write_debug_state(nsteps, Param::t_end, "final", bkg_e, beam, fields,
+        diag.write_debug_state(static_cast<int>(restored_step + accepted_after_restart), current_time, "final", bkg_e, beam, fields,
                                sgrid, mpi_rank, mpi_size);
     }
 #endif
-    diag.write_scalars(Param::t_end, nsteps, bkg_e, beam, fields,
+    diag.write_scalars(current_time, static_cast<int>(restored_step + accepted_after_restart), bkg_e, beam, fields,
                        cumulative_collision_energy_delta,
                        mpi_rank, mpi_size);
-    if (last_snapshot_step != nsteps) {
-        write_snapshot(diag, Param::t_end, bkg_e, beam, fields, ion_density_profile,
+    if (last_snapshot_step != restored_step + accepted_after_restart) {
+        write_snapshot(diag, current_time, bkg_e, beam, fields, ion_density_profile,
                        sgrid, mpi_rank, mpi_size, config.enable_full_fe_output,
                        &latest_bkg_energy_current_face,
                        &latest_bkg_ampere_current_face);
     }
 
     if (mpi_rank == 0) {
+        if (write_beam_ledger) {
+            beam_half_step_ledger.close();
+            double reference_n_in = 0.0;
+            double reference_current_impulse = 0.0;
+            const bool have_reference = runtime.beam_ledger_reference_enabled &&
+                read_beam_ledger_total(runtime.beam_ledger_reference,
+                                       reference_n_in, reference_current_impulse);
+            const double n_in_difference = have_reference
+                ? std::fabs(reference_n_in - beam_ledger_n_in_total) : 0.0;
+            const double current_impulse_difference = have_reference
+                ? std::fabs(reference_current_impulse -
+                            beam_ledger_injected_current_impulse_total) : 0.0;
+            const double n_in_scale = std::max(1.0, std::max(
+                std::fabs(reference_n_in), std::fabs(beam_ledger_n_in_total)));
+            const double current_impulse_scale = std::max(1.0, std::max(
+                std::fabs(reference_current_impulse),
+                std::fabs(beam_ledger_injected_current_impulse_total)));
+            const bool reference_comparison_pass = !have_reference ||
+                (n_in_difference <= 4096.0 * std::numeric_limits<double>::epsilon() *
+                 n_in_scale &&
+                 current_impulse_difference <=
+                 4096.0 * std::numeric_limits<double>::epsilon() *
+                 current_impulse_scale);
+            const bool formal_dt_half_mode =
+                std::fabs(runtime.dt_scale - 0.5) <=
+                16.0 * std::numeric_limits<double>::epsilon();
+            const bool two_substep_ledger_complete = !formal_dt_half_mode ||
+                beam_ledger_step_count == 2;
+            std::ofstream ledger_result(
+                output_path(runtime, "beam_dt_half_time_consistency.result").c_str());
+            ledger_result << std::setprecision(17)
+                << "accepted_substeps " << beam_ledger_step_count << "\n"
+                << "dt_scale " << runtime.dt_scale << "\n"
+                << "formal_dt_half_mode " << (formal_dt_half_mode ? 1 : 0) << "\n"
+                << "two_substep_ledger_complete "
+                << (two_substep_ledger_complete ? 1 : 0) << "\n"
+                << "N_in_total " << beam_ledger_n_in_total << "\n"
+                << "N_out_total " << beam_ledger_n_out_total << "\n"
+                << "injected_energy_total " << beam_ledger_injected_energy_total << "\n"
+                << "outflow_energy_total " << beam_ledger_outflow_energy_total << "\n"
+                << "injected_current_impulse_total "
+                << beam_ledger_injected_current_impulse_total << "\n"
+                << "outflow_current_impulse_total "
+                << beam_ledger_outflow_current_impulse_total << "\n"
+                << "reference_available " << (have_reference ? 1 : 0) << "\n"
+                << "reference_comparison_pass "
+                << (reference_comparison_pass ? 1 : 0) << "\n";
+            for (int substep = 0; substep < beam_ledger_step_count; ++substep) {
+                const size_t base = static_cast<size_t>(6 * substep);
+                ledger_result << "substep_" << (substep + 1) << "_N_in "
+                    << beam_ledger_rows[base] << "\n"
+                    << "substep_" << (substep + 1) << "_N_out "
+                    << beam_ledger_rows[base + 1] << "\n"
+                    << "substep_" << (substep + 1) << "_injected_energy "
+                    << beam_ledger_rows[base + 2] << "\n"
+                    << "substep_" << (substep + 1) << "_outflow_energy "
+                    << beam_ledger_rows[base + 3] << "\n"
+                    << "substep_" << (substep + 1) << "_injected_current_impulse "
+                    << beam_ledger_rows[base + 4] << "\n"
+                    << "substep_" << (substep + 1) << "_outflow_current_impulse "
+                    << beam_ledger_rows[base + 5] << "\n";
+            }
+            if (have_reference) {
+                ledger_result << "reference_N_in_total " << reference_n_in << "\n"
+                    << "N_in_A_minus_D_sum " << n_in_difference << "\n"
+                    << "reference_injected_current_impulse_total "
+                    << reference_current_impulse << "\n"
+                    << "injected_current_impulse_A_minus_D_sum "
+                    << current_impulse_difference << "\n";
+            }
+            ledger_result.close();
+            // Keep the old reference filename during the transition so an A
+            // run made with the documented 12.6 command remains usable by D.
+            // The canonical, self-describing result is the consistency file.
+            std::ifstream consistency_input(
+                output_path(runtime, "beam_dt_half_time_consistency.result").c_str());
+            std::ofstream legacy_summary(
+                output_path(runtime, "beam_dt_half_time_summary.result").c_str());
+            legacy_summary << consistency_input.rdbuf();
+        }
         printf("============================================================\n");
         printf("  Simulation complete: t = %.1f fs, %d steps\n",
-               Param::t_end / Const::femto, nsteps);
+               current_time / Const::femto, static_cast<int>(restored_step + accepted_after_restart));
         printf("============================================================\n");
     }
 
