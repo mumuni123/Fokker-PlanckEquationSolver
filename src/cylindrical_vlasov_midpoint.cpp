@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <mpi.h>
@@ -95,6 +97,56 @@ void low_order_solver_checkpoint(bool enabled, const char* phase, int mpi_rank)
                   << std::endl;
     }
     MPI_Barrier(MPI_COMM_WORLD);
+}
+
+unsigned long long hash_physical_distribution(const Species& species,
+                                              const SpatialGrid& sg,
+                                              int mpi_rank, int mpi_size)
+{
+    const int ng = sg.nghost;
+    unsigned long long local = 1469598103934665603ULL ^
+        static_cast<unsigned long long>(sg.ix_start + 1);
+    for (int ix = 0; ix < sg.nx_local; ++ix) {
+        const size_t base = static_cast<size_t>(ng + ix) * Param::Nvmu;
+        for (size_t q = 0; q < Param::Nvmu; ++q) {
+            unsigned long long bits = 0;
+            std::memcpy(&bits, &species.f[base + q], sizeof(bits));
+            local ^= bits + 0x9e3779b97f4a7c15ULL + (local << 6) +
+                (local >> 2);
+            local *= 1099511628211ULL;
+        }
+    }
+    unsigned long long global = 0;
+    MPI_Allreduce(&local, &global, 1, MPI_UNSIGNED_LONG_LONG, MPI_BXOR,
+                  MPI_COMM_WORLD);
+    (void)mpi_rank;
+    (void)mpi_size;
+    return global;
+}
+
+unsigned long long hash_face_values(const std::vector<double>& values,
+                                    const SpatialGrid& sg)
+{
+    unsigned long long local = 1469598103934665603ULL ^
+        static_cast<unsigned long long>(sg.ix_start + 1);
+    for (int iface = 0; iface < sg.nx_local; ++iface) {
+        unsigned long long bits = 0;
+        std::memcpy(&bits, &values[static_cast<size_t>(iface)],
+                    sizeof(bits));
+        local ^= bits + 0x9e3779b97f4a7c15ULL + (local << 6) +
+            (local >> 2);
+        local *= 1099511628211ULL;
+    }
+    unsigned long long global = 0;
+    MPI_Allreduce(&local, &global, 1, MPI_UNSIGNED_LONG_LONG, MPI_BXOR,
+                  MPI_COMM_WORLD);
+    return global;
+}
+
+unsigned long long hash_midpoint_field(const EMFields& fields,
+                                       const SpatialGrid& sg)
+{
+    return hash_face_values(fields.Ex_face, sg);
 }
 
 }
@@ -200,6 +252,34 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
     std::vector<double> u_momentum_cell(static_cast<size_t>(nxl), 0.0);
     std::vector<double> u_boundary_energy_cell(static_cast<size_t>(nxl), 0.0);
     std::vector<double> u_boundary_momentum_cell(static_cast<size_t>(nxl), 0.0);
+    const auto current_moment_from_x_flux = [&](const std::vector<double>& flux,
+                                                 std::vector<double>& current) {
+        current.assign(nface, 0.0);
+        if (flux.size() < high_xflux_size) return;
+        #pragma omp parallel for schedule(static)
+        for (int iface = 0; iface <= nxl; ++iface) {
+            double gamma = 0.0;
+            for (int j = 0; j < Param::Nv; ++j)
+                for (int k = 0; k < Param::Nmu; ++k)
+                    gamma += flux[xface_index(iface, j, k)];
+            current[static_cast<size_t>(iface)] = bkg_n.charge * gamma;
+        }
+    };
+    const auto current_moment_from_x_flux_by_u = [&]
+        (const std::vector<double>& flux, std::vector<double>& current) {
+        current.assign(nface * static_cast<size_t>(Param::Nv), 0.0);
+        if (flux.size() < high_xflux_size) return;
+        #pragma omp parallel for schedule(static)
+        for (int iface = 0; iface <= nxl; ++iface) {
+            for (int j = 0; j < Param::Nv; ++j) {
+                double gamma = 0.0;
+                for (int k = 0; k < Param::Nmu; ++k)
+                    gamma += flux[xface_index(iface, j, k)];
+                current[static_cast<size_t>(iface) * Param::Nv + j] =
+                    bkg_n.charge * gamma;
+            }
+        }
+    };
     result.j_bkg_face_mid.assign(nface, 0.0);
     result.j_bkg_face_low_mid.assign(nface, 0.0);
     result.j_bkg_face_center_mid.assign(nface, 0.0);
@@ -345,6 +425,30 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
         }
         exchange_ghosts_x_persistent(midpoint_state, sg, mpi_rank, mpi_size);
         Species work = bkg_n;
+        if (fixed_candidate) {
+            // Section 11.5 audit: report exactly which state/field each
+            // production transport layer reads.  The low donor base is
+            // intentionally step-start; both high-order x and u candidates
+            // read the same Picard midpoint state and midpoint field.
+            result.x_low_state_hash = hash_physical_distribution(
+                work, sg, mpi_rank, mpi_size);
+            result.u_low_state_hash = result.x_low_state_hash;
+            result.x_high_state_hash = hash_physical_distribution(
+                midpoint_state, sg, mpi_rank, mpi_size);
+            result.u_high_state_hash = result.x_high_state_hash;
+            // x transport has no E input; the u donor and both high layers
+            // read the same midpoint E.
+            result.x_low_field_hash = 0ULL;
+            result.u_low_field_hash = hash_midpoint_field(fields_mid, sg);
+            result.x_high_field_hash = result.u_low_field_hash;
+            result.u_high_field_hash = result.u_low_field_hash;
+            result.start_field_hash = hash_midpoint_field(fields_n, sg);
+            result.end_field_hash = hash_face_values(e_end, sg);
+            result.x_low_time_layer = 0;
+            result.u_low_time_layer = 0;
+            result.x_high_time_layer = 1;
+            result.u_high_time_layer = 1;
+        }
         std::vector<double>& integrated_jn = integrated_jn_buffer;
         std::vector<double>& integrated_jn_low = integrated_jn_low_buffer;
         std::vector<double>& integrated_jn_high = integrated_jn_high_buffer;
@@ -639,10 +743,29 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                 return false;
             };
         for (int sub = 0; sub < nsub; ++sub) {
+            CouplingSubstepSeamAudit substep_audit = {};
+            if (fixed_candidate) {
+                substep_audit.substep = sub;
+                substep_audit.dt_substep = h;
+                substep_audit.e_face_mid = fields_mid.Ex_face;
+            }
             if (iter == 0 && sub == 0)
                 low_order_solver_checkpoint(low_order_only_, "substep_begin", mpi_rank);
             if (sub == 0)
                 exchange_ghosts_x_persistent(work, sg, mpi_rank, mpi_size);
+            if (fixed_candidate) {
+                result.x_low_state_hash_history.push_back(
+                    hash_physical_distribution(work, sg, mpi_rank, mpi_size));
+                result.u_low_state_hash_history.push_back(
+                    result.x_low_state_hash_history.back());
+                result.x_high_state_hash_history.push_back(
+                    hash_physical_distribution(midpoint_state, sg, mpi_rank,
+                                               mpi_size));
+                result.u_high_state_hash_history.push_back(
+                    result.x_high_state_hash_history.back());
+                result.u_field_hash_history.push_back(
+                    hash_midpoint_field(fields_mid, sg));
+            }
             std::fill(fx_low.begin(), fx_low.end(), 0.0);
             std::fill(fx_high.begin(), fx_high.end(), 0.0);
             std::fill(fu_low.begin(), fu_low.end(), 0.0);
@@ -667,6 +790,9 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                     }
                 }
             }
+            if (fixed_candidate)
+                current_moment_from_x_flux(fx_low,
+                    substep_audit.jn_low_pre_sync);
             close_periodic_face_blocks(fx_low, nxl, Param::Nvmu,
                                        mpi_rank, mpi_size, 901);
             #pragma omp parallel for schedule(static)
@@ -741,15 +867,26 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                                 fbar(ir, j, k), fbar(ir + 1, j, k),
                                 x_center(il - 1), x_center(il),
                                 x_center(ir), x_center(ir + 1), s_face);
+                        const double analytic_speed =
+                            bkg_n.cgrid.vx[idx2(j, k)];
+                        const double transport_speed =
+                            energy_consistent_x_high_velocity_for_test_
+                            ? Stage5::energy_consistent_cell_speed_candidate(
+                                bkg_n.cgrid, bkg_n.mass, j, k,
+                                analytic_speed)
+                            : analytic_speed;
                         const double state = NonuniformMuscl::upwind_state(
-                            states, bkg_n.cgrid.vx[idx2(j, k)]);
+                            states, transport_speed);
                         fx_high[xface_index(iface, j, k)] =
-                            bkg_n.cgrid.vx[idx2(j, k)] * state *
+                            transport_speed * state *
                             bkg_n.cgrid.upar_widths[j] *
                             bkg_n.cgrid.uperp_ring_areas[k];
                     }
                 }
             }
+            if (fixed_candidate)
+                current_moment_from_x_flux(fx_high,
+                    substep_audit.jn_high_pre_sync);
             close_periodic_face_blocks(fx_high, nxl, Param::Nvmu,
                                        mpi_rank, mpi_size, 908);
 
@@ -1100,6 +1237,9 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                     return result;
                 if (iter == 0 && sub == 0)
                     low_order_solver_checkpoint(low_order_only_, "low_state_committed", mpi_rank);
+                if (fixed_candidate)
+                    substep_audit.jn_final_pre_sync =
+                        substep_audit.jn_low_pre_sync;
             } else if (!fct_enabled_) {
                 // High-order/no-FCT verification path.  The MUSCL face fluxes
                 // are the final conservative fluxes: the same arrays update
@@ -1107,6 +1247,9 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                 fx_final = fx_high;
                 fu_final = fu_high;
                 cu_final = cu_high;
+                if (fixed_candidate)
+                    substep_audit.jn_final_pre_sync =
+                        substep_audit.jn_high_pre_sync;
                 #pragma omp parallel for schedule(static)
                 for (int ix = 0; ix < nxl; ++ix) {
                     for (int j = 0; j < Param::Nv; ++j) {
@@ -1224,6 +1367,9 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                     }
                 }
             }
+            if (fixed_candidate)
+                current_moment_from_x_flux(fx_final,
+                    substep_audit.jn_final_pre_sync);
             close_periodic_face_blocks(fx_final, nxl, Param::Nvmu,
                                        mpi_rank, mpi_size, 905);
 
@@ -1717,6 +1863,9 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                                                Param::Nvmu + p];
                             fx_final[id] += alpha * anti;
                         }
+                if (fixed_candidate)
+                    current_moment_from_x_flux(fx_final,
+                        substep_audit.jn_final_pre_sync);
                 close_periodic_face_blocks(fx_final, nxl, Param::Nvmu,
                                            mpi_rank, mpi_size, 905);
 
@@ -2002,6 +2151,22 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                 ? fu_low : fu_final;
             const std::vector<double>& cu_final_used = low_order_only_
                 ? cu_low : cu_final;
+            std::vector<double> sub_je_low_cell;
+            std::vector<double> sub_je_high_cell;
+            std::vector<double> sub_je_final_cell;
+            std::vector<double> sub_je_low_cell_by_u;
+            std::vector<double> sub_je_high_cell_by_u;
+            std::vector<double> sub_je_final_cell_by_u;
+            if (fixed_candidate) {
+                sub_je_low_cell.assign(static_cast<size_t>(nxl), 0.0);
+                sub_je_high_cell.assign(static_cast<size_t>(nxl), 0.0);
+                sub_je_final_cell.assign(static_cast<size_t>(nxl), 0.0);
+                const size_t resolved_size = static_cast<size_t>(nxl) *
+                    Param::Nv;
+                sub_je_low_cell_by_u.assign(resolved_size, 0.0);
+                sub_je_high_cell_by_u.assign(resolved_size, 0.0);
+                sub_je_final_cell_by_u.assign(resolved_size, 0.0);
+            }
 
             #pragma omp parallel for schedule(static)
             for (int iface = 0; iface <= nxl; ++iface) {
@@ -2055,6 +2220,23 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                     je_high += dke * current_factor * coefficient_high;
                     je_center += dke * current_factor * coefficient_center;
                     je_final += dke * current_factor * coefficient_final;
+                    if (fixed_candidate) {
+                        const double low_contribution =
+                            dke * current_factor * coefficient_low;
+                        const double high_contribution =
+                            dke * current_factor * coefficient_high;
+                        const double final_contribution =
+                            dke * current_factor * coefficient_final;
+                        const size_t left = static_cast<size_t>(ix) *
+                            Param::Nv + static_cast<size_t>(jf - 1);
+                        const size_t right = left + 1;
+                        sub_je_low_cell_by_u[left] += 0.5 * low_contribution;
+                        sub_je_low_cell_by_u[right] += 0.5 * low_contribution;
+                        sub_je_high_cell_by_u[left] += 0.5 * high_contribution;
+                        sub_je_high_cell_by_u[right] += 0.5 * high_contribution;
+                        sub_je_final_cell_by_u[left] += 0.5 * final_contribution;
+                        sub_je_final_cell_by_u[right] += 0.5 * final_contribution;
+                    }
                     u_energy += dke * flux_final;
                     u_momentum += bkg_n.mass * Const::c *
                         center_distance * flux_final;
@@ -2065,6 +2247,11 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                 integrated_je_center_cell[ix] += h * je_center;
                 u_energy_cell[ix] += h * u_energy;
                 u_momentum_cell[ix] += h * u_momentum;
+                if (fixed_candidate) {
+                    sub_je_low_cell[static_cast<size_t>(ix)] = je_low;
+                    sub_je_high_cell[static_cast<size_t>(ix)] = je_high;
+                    sub_je_final_cell[static_cast<size_t>(ix)] = je_final;
+                }
             }
 
             for (int k = 0; k < Param::Nmu; ++k) {
@@ -2083,6 +2270,49 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                         (bkg_n.cgrid.upar_cells[Param::Nv - 1] * f_hi -
                          bkg_n.cgrid.upar_cells[0] * f_lo);
                 }
+            }
+            if (fixed_candidate) {
+                current_moment_from_x_flux(fx_low_used,
+                    substep_audit.jn_low_post_sync);
+                current_moment_from_x_flux(fx_high_used,
+                    substep_audit.jn_high_post_sync);
+                current_moment_from_x_flux(fx_final_used,
+                    substep_audit.jn_final_post_sync);
+                current_moment_from_x_flux_by_u(fx_low_used,
+                    substep_audit.jn_low_by_u_post_sync);
+                current_moment_from_x_flux_by_u(fx_high_used,
+                    substep_audit.jn_high_by_u_post_sync);
+                current_moment_from_x_flux_by_u(fx_final_used,
+                    substep_audit.jn_final_by_u_post_sync);
+                const int audit_tag = 1200 + 40 * sub;
+                PeriodicStaggered::audit_cell_to_face_Gstar_sync(
+                    sub_je_low_cell,
+                    substep_audit.gstar_je_low_pre_sync,
+                    substep_audit.gstar_je_low_post_sync,
+                    nxl, mpi_rank, mpi_size, audit_tag);
+                PeriodicStaggered::audit_cell_to_face_Gstar_sync(
+                    sub_je_high_cell,
+                    substep_audit.gstar_je_high_pre_sync,
+                    substep_audit.gstar_je_high_post_sync,
+                    nxl, mpi_rank, mpi_size, audit_tag + 4);
+                PeriodicStaggered::audit_cell_to_face_Gstar_sync(
+                    sub_je_final_cell,
+                    substep_audit.gstar_je_final_pre_sync,
+                    substep_audit.gstar_je_final_post_sync,
+                    nxl, mpi_rank, mpi_size, audit_tag + 8);
+                PeriodicStaggered::audit_cell_blocks_to_face_Gstar(
+                    sub_je_low_cell_by_u,
+                    substep_audit.gstar_je_low_by_u_post_sync,
+                    nxl, Param::Nv, mpi_rank, mpi_size, audit_tag + 20);
+                PeriodicStaggered::audit_cell_blocks_to_face_Gstar(
+                    sub_je_high_cell_by_u,
+                    substep_audit.gstar_je_high_by_u_post_sync,
+                    nxl, Param::Nv, mpi_rank, mpi_size, audit_tag + 24);
+                PeriodicStaggered::audit_cell_blocks_to_face_Gstar(
+                    sub_je_final_cell_by_u,
+                    substep_audit.gstar_je_final_by_u_post_sync,
+                    nxl, Param::Nv, mpi_rank, mpi_size, audit_tag + 28);
+                result.coupling_substep_seam_audit.push_back(substep_audit);
             }
         }
 
@@ -2133,6 +2363,11 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
             je_center_cell[ix] = integrated_je_center_cell[ix] / dt;
         }
         result.j_bkg_energy_cell_mid = je_cell;
+        if (fixed_candidate) {
+            result.j_bkg_energy_low_cell_mid = je_low_cell;
+            result.j_bkg_energy_center_cell_mid = je_center_cell;
+            result.j_bkg_energy_high_cell_mid = je_high_cell;
+        }
         const auto assemble_gstar_face = [&](const std::vector<double>& cell,
                                              std::vector<double>& face,
                                              int message_tag) {
@@ -2143,6 +2378,72 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
         assemble_gstar_face(je_center_cell, result.j_bkg_energy_center_debug_face, 908);
         assemble_gstar_face(je_high_cell, result.j_bkg_energy_high_debug_face, 910);
         assemble_gstar_face(je_cell, result.j_bkg_energy_debug_face, 912);
+        if (fixed_candidate && substeps_used == 1) {
+            // Independently re-form every final current moment from the same
+            // final FV flux arrays.  This is intentionally an audit-only
+            // calculation: J_N remains the production charge current.
+            std::vector<double> direct_jn(nface, 0.0);
+            std::vector<double> direct_je_cell(static_cast<size_t>(nxl), 0.0);
+            std::vector<double> direct_gstar(nface, 0.0);
+            const std::vector<double>& audit_fx = low_order_only_ ? fx_low : fx_final;
+            const std::vector<double>& audit_cu = low_order_only_ ? cu_low : cu_final;
+            for (int iface = 0; iface <= nxl; ++iface) {
+                double gamma = 0.0;
+                for (int j = 0; j < Param::Nv; ++j)
+                    for (int k = 0; k < Param::Nmu; ++k)
+                        gamma += audit_fx[xface_index(iface, j, k)];
+                direct_jn[static_cast<size_t>(iface)] = bkg_n.charge * gamma;
+            }
+            for (int ix = 0; ix < nxl; ++ix) {
+                double je = 0.0;
+                for (int jf = 1; jf < Param::Nv; ++jf)
+                    for (int k = 0; k < Param::Nmu; ++k) {
+                        const double current_factor = bkg_n.charge /
+                            (bkg_n.mass * Const::c * sg.dx);
+                        je += Stage5::delta_energy(bkg_n.cgrid, jf, k) *
+                            current_factor * audit_cu[uface_index(ix, jf, k)];
+                    }
+                direct_je_cell[static_cast<size_t>(ix)] = je;
+            }
+            PeriodicStaggered::apply_cell_to_face_Gstar(
+                direct_je_cell, direct_gstar, nxl, mpi_rank, mpi_size, 914);
+            double local_audit[7] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0};
+            for (int iface = 0; iface <= nxl; ++iface) {
+                const size_t p = static_cast<size_t>(iface);
+                local_audit[0] = std::max(local_audit[0], std::fabs(
+                    direct_jn[p] - result.j_bkg_face_mid[p]));
+                local_audit[1] = std::max(local_audit[1], std::max(
+                    std::fabs(direct_jn[p]), std::fabs(result.j_bkg_face_mid[p])));
+                local_audit[4] = std::max(local_audit[4], std::fabs(
+                    direct_gstar[p] - result.j_bkg_energy_debug_face[p]));
+                local_audit[5] = std::max(local_audit[5], std::max(
+                    std::fabs(direct_gstar[p]),
+                    std::fabs(result.j_bkg_energy_debug_face[p])));
+                if (!std::isfinite(direct_jn[p]) || !std::isfinite(direct_gstar[p]))
+                    local_audit[6] = 0.0;
+            }
+            for (int ix = 0; ix < nxl; ++ix) {
+                const size_t p = static_cast<size_t>(ix);
+                local_audit[2] = std::max(local_audit[2], std::fabs(
+                    direct_je_cell[p] - je_cell[p]));
+                local_audit[3] = std::max(local_audit[3], std::max(
+                    std::fabs(direct_je_cell[p]), std::fabs(je_cell[p])));
+                if (!std::isfinite(direct_je_cell[p])) local_audit[6] = 0.0;
+            }
+            MPI_Allreduce(MPI_IN_PLACE, local_audit, 6, MPI_DOUBLE, MPI_MAX,
+                          MPI_COMM_WORLD);
+            MPI_Allreduce(MPI_IN_PLACE, local_audit + 6, 1, MPI_DOUBLE, MPI_MIN,
+                          MPI_COMM_WORLD);
+            result.final_flux_current_moment_audit_valid = 1;
+            result.final_flux_current_moment_audit_finite =
+                local_audit[6] > 0.5 ? 1 : 0;
+            result.final_flux_to_jn_linf = local_audit[0];
+            result.final_flux_to_jn_scale = local_audit[1];
+            result.final_flux_to_je_linf = local_audit[2];
+            result.final_flux_to_je_scale = local_audit[3];
+            result.final_flux_to_gstar_je_linf = local_audit[4];
+            result.final_flux_to_gstar_je_scale = local_audit[5];
+        }
         for (int iface = 0; iface < nxl; ++iface) {
             result.j_beam_face_mid[iface] = jbeam[iface];
             result.j_total_face_mid[iface] = result.j_bkg_face_mid[iface] + jbeam[iface];
@@ -2588,7 +2889,28 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
             result.fields_np1 = fields_new;
             result.converged = true;
             result.state_advanced = 1;
+            // Preserve all production layers for the fixed-state operator
+            // bundle.  Normal stepping does not retain these extra copies.
+            result.low_x_flux = fx_low;
+            result.high_x_flux = low_order_only_ ? fx_low : fx_high;
             result.final_x_flux = low_order_only_ ? fx_low : fx_final;
+            result.low_u_flux = fu_low;
+            result.center_u_flux = low_order_only_ ? fu_low :
+                std::vector<double>(fu_high.size(), 0.0);
+            result.center_u_coefficient = low_order_only_ ? cu_low :
+                cu_high_center;
+            result.center_u_reconstruction_mass = midpoint_state.f;
+            if (!low_order_only_) {
+                for (size_t p = 0; p < fu_high.size(); ++p) {
+                    const double coefficient = cu_high_center[p];
+                    const int ix = static_cast<int>(p /
+                        (static_cast<size_t>(Param::Nv + 1) * Param::Nmu));
+                    const double a = bkg_n.charge * fields_mid.Ex[ng + ix] /
+                        (bkg_n.mass * Const::c);
+                    result.center_u_flux[p] = a * coefficient;
+                }
+            }
+            result.high_u_flux = low_order_only_ ? fu_low : fu_high;
             result.final_u_flux = low_order_only_ ? fu_low : fu_final;
             if (step_diagnostics_enabled_ || fixed_candidate)
                 finalize_coupling_regions();

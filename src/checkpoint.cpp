@@ -12,13 +12,23 @@
 #include <mpi.h>
 #include <sstream>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 
 namespace {
 const unsigned int kVersion = 1U;
 const unsigned int kEndian = 0x01020304U;
 const char kMagic[] = "FPCHKPT1";
 
-bool make_dir(const std::string& path) { return mkdir(path.c_str(), 0777) == 0 || errno == EEXIST; }
+bool make_dir(const std::string& path)
+{
+#ifdef _WIN32
+    return _mkdir(path.c_str()) == 0 || errno == EEXIST;
+#else
+    return mkdir(path.c_str(), 0777) == 0 || errno == EEXIST;
+#endif
+}
 std::string rank_path(const std::string& d, int r) { char b[64]; std::sprintf(b, "/rank_%06d.bin", r); return d + b; }
 bool finite_vector(const std::vector<double>& values) { for (size_t i=0;i<values.size();++i) if (!std::isfinite(values[i])) return false; return true; }
 bool finite_particles(const std::vector<BeamParticle>& particles) { for (size_t i=0;i<particles.size();++i) if (!std::isfinite(particles[i].x) || !std::isfinite(particles[i].px) || !std::isfinite(particles[i].weight)) return false; return true; }
@@ -517,6 +527,7 @@ bool read_midpoint_audit_state(
     const SpatialGrid& sg, int rank, int size, std::string& error)
 {
     int ok = 1;
+    std::string manifest_error;
     std::vector<unsigned long long> audit_file_table;
     unsigned long long expected_velocity_hash = 0ULL;
     if (rank == 0) {
@@ -525,7 +536,10 @@ bool read_midpoint_audit_state(
         int saved_size = -1, saved_nx = -1, saved_nv = -1, saved_nmu = -1;
         unsigned long long saved_hash = 0ULL, saved_velocity_hash = 0ULL,
                            saved_physics_hash = 0ULL;
-        if (!(manifest >> key >> magic) || key != "magic" || magic != "FPMIDPT5") ok = 0;
+        if (!(manifest >> key >> magic) || key != "magic" || magic != "FPMIDPT5") {
+            ok = 0;
+            manifest_error = "midpoint audit manifest is missing or has invalid magic";
+        }
         while (manifest >> key) {
             if (key == "mpi_size") manifest >> saved_size;
             else if (key == "nx") manifest >> saved_nx;
@@ -545,15 +559,45 @@ bool read_midpoint_audit_state(
             }
             else { std::string ignored; std::getline(manifest, ignored); }
         }
-        if (saved_size != size || saved_nx != Param::nx || saved_nv != Param::Nv ||
-            saved_nmu != Param::Nmu || saved_hash != checkpoint_configuration_hash() ||
-            saved_physics_hash != checkpoint_physics_parameter_hash() ||
-            audit_file_table.size() != static_cast<size_t>(2 * size) ||
-            saved_velocity_hash == 0ULL) ok = 0;
+        const unsigned long long expected_config_hash =
+            checkpoint_configuration_hash();
+        const unsigned long long expected_physics_hash =
+            checkpoint_physics_parameter_hash();
+        const bool size_mismatch = saved_size != size;
+        const bool grid_mismatch = saved_nx != Param::nx ||
+            saved_nv != Param::Nv || saved_nmu != Param::Nmu;
+        const bool config_mismatch = saved_hash != expected_config_hash;
+        const bool physics_mismatch = saved_physics_hash != expected_physics_hash;
+        const bool table_mismatch = audit_file_table.size() !=
+            static_cast<size_t>(2 * size);
+        const bool velocity_hash_missing = saved_velocity_hash == 0ULL;
+        if (size_mismatch || grid_mismatch || config_mismatch ||
+            physics_mismatch || table_mismatch || velocity_hash_missing) {
+            ok = 0;
+            std::ostringstream detail;
+            detail << "midpoint audit manifest is incompatible:"
+                   << " mpi_size(saved=" << saved_size
+                   << " expected=" << size << ")"
+                   << " grid(saved=" << saved_nx << "," << saved_nv << ","
+                   << saved_nmu << " expected=" << Param::nx << ","
+                   << Param::Nv << "," << Param::Nmu << ")"
+                   << " config_hash(saved=" << saved_hash
+                   << " expected=" << expected_config_hash << ")"
+                   << " physics_hash(saved=" << saved_physics_hash
+                   << " expected=" << expected_physics_hash << ")"
+                   << " velocity_hash=" << saved_velocity_hash
+                   << " rank_table_entries=" << audit_file_table.size() / 2
+                   << " expected_rank_entries=" << size;
+            manifest_error = detail.str();
+        }
         expected_velocity_hash = saved_velocity_hash;
     }
     MPI_Bcast(&ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    if (!ok) { error = "midpoint audit manifest is incompatible"; return false; }
+    if (!ok) {
+        error = (rank == 0 && !manifest_error.empty()) ? manifest_error :
+            "midpoint audit manifest is incompatible on rank 0";
+        return false;
+    }
     if (rank != 0) audit_file_table.resize(static_cast<size_t>(2 * size), 0ULL);
     MPI_Bcast(&audit_file_table[0], 2 * size, MPI_UNSIGNED_LONG_LONG, 0,
               MPI_COMM_WORLD);

@@ -172,6 +172,37 @@ public:
         int next_step_donor;
     };
 
+    // Audit-only currents for one true transport substep.  Each vector uses
+    // the local Yee-face layout 0..nx_local, including the right periodic
+    // alias.  No production update reads these values.
+    struct CouplingSubstepSeamAudit {
+        int substep;
+        double dt_substep;
+        std::vector<double> e_face_mid;
+        std::vector<double> jn_low_pre_sync;
+        std::vector<double> jn_high_pre_sync;
+        std::vector<double> jn_final_pre_sync;
+        std::vector<double> jn_low_post_sync;
+        std::vector<double> jn_high_post_sync;
+        std::vector<double> jn_final_post_sync;
+        std::vector<double> gstar_je_low_pre_sync;
+        std::vector<double> gstar_je_high_pre_sync;
+        std::vector<double> gstar_je_final_pre_sync;
+        std::vector<double> gstar_je_low_post_sync;
+        std::vector<double> gstar_je_high_post_sync;
+        std::vector<double> gstar_je_final_post_sync;
+        // Face-major, u_parallel-cell-resolved current contributions.  The
+        // G*J_E arrays split every internal u-face contribution equally over
+        // its two adjacent u cells, so summing over u reconstructs the exact
+        // post-sync current above.
+        std::vector<double> jn_low_by_u_post_sync;
+        std::vector<double> jn_high_by_u_post_sync;
+        std::vector<double> jn_final_by_u_post_sync;
+        std::vector<double> gstar_je_low_by_u_post_sync;
+        std::vector<double> gstar_je_high_by_u_post_sync;
+        std::vector<double> gstar_je_final_by_u_post_sync;
+    };
+
     struct Result {
         Species species_np1;
         BeamPIC beam_np1;
@@ -193,10 +224,43 @@ public:
         // Cell-centered J_E assembled directly from final u-face energy
         // fluxes. It is never formed by dividing power by E.
         std::vector<double> j_bkg_energy_cell_mid;
+        std::vector<double> j_bkg_energy_low_cell_mid;
+        std::vector<double> j_bkg_energy_center_cell_mid;
+        std::vector<double> j_bkg_energy_high_cell_mid;
         // Present for fixed midpoint-operator audits only.  These are the
         // exact final FV fluxes used to form the returned candidate state.
+        std::vector<double> low_x_flux;
+        std::vector<double> high_x_flux;
         std::vector<double> final_x_flux;
+        std::vector<double> low_u_flux;
+        std::vector<double> center_u_flux;
+        std::vector<double> high_u_flux;
         std::vector<double> final_u_flux;
+        // Fixed-operator audit only: C_u before multiplication by the local
+        // acceleration, plus the exact cylindrical mass state reconstructed
+        // by the centered u_parallel operator.
+        std::vector<double> center_u_coefficient;
+        std::vector<double> center_u_reconstruction_mass;
+        unsigned long long x_low_state_hash;
+        unsigned long long u_low_state_hash;
+        unsigned long long x_high_state_hash;
+        unsigned long long u_high_state_hash;
+        unsigned long long x_low_field_hash;
+        unsigned long long u_low_field_hash;
+        unsigned long long x_high_field_hash;
+        unsigned long long u_high_field_hash;
+        unsigned long long start_field_hash;
+        unsigned long long end_field_hash;
+        int x_low_time_layer;
+        int u_low_time_layer;
+        int x_high_time_layer;
+        int u_high_time_layer;
+        std::vector<unsigned long long> x_low_state_hash_history;
+        std::vector<unsigned long long> u_low_state_hash_history;
+        std::vector<unsigned long long> x_high_state_hash_history;
+        std::vector<unsigned long long> u_high_state_hash_history;
+        std::vector<unsigned long long> u_field_hash_history;
+        std::vector<CouplingSubstepSeamAudit> coupling_substep_seam_audit;
         Species operator_input_guess;
         // Exact endpoint field guess supplied to the final production-kernel
         // evaluation.  This is distinct from fields_np1, which is the result
@@ -585,9 +649,102 @@ public:
         bool protected_converged;
         int transport_low_order_only;
         int substeps_used;
+        // Fixed-operator-only audit.  These compare independent moment
+        // reconstructions from the final FV fluxes with the currents returned
+        // to Ampere; normal production stepping neither needs nor uses them.
+        int final_flux_current_moment_audit_valid;
+        int final_flux_current_moment_audit_finite;
+        double final_flux_to_jn_linf;
+        double final_flux_to_jn_scale;
+        double final_flux_to_je_linf;
+        double final_flux_to_je_scale;
+        double final_flux_to_gstar_je_linf;
+        double final_flux_to_gstar_je_scale;
     };
 
     typedef Result MidpointOperatorEvaluation;
+
+    // Read-only view of the exact transport layers produced by one fixed
+    // production midpoint-operator evaluation.  This is deliberately a
+    // testing/audit interface: it does not alter the returned state or the
+    // Ampere current, and prevents standalone tests from reimplementing the
+    // cylindrical x/u flux formulas.
+    struct BackgroundCouplingFluxBundle {
+        std::vector<double> fx_low;
+        std::vector<double> fx_high;
+        std::vector<double> fx_final;
+        std::vector<double> fu_low;
+        std::vector<double> fu_center;
+        std::vector<double> fu_high;
+        std::vector<double> fu_final;
+        std::vector<double> cu_center;
+        std::vector<double> cu_reconstruction_mass;
+        std::vector<double> jn_low;
+        std::vector<double> jn_high;
+        std::vector<double> jn_final;
+        std::vector<double> je_low;
+        std::vector<double> je_center;
+        std::vector<double> je_high;
+        std::vector<double> je_final;
+        std::vector<double> gstar_je_low;
+        std::vector<double> gstar_je_center;
+        std::vector<double> gstar_je_high;
+        std::vector<double> gstar_je_final;
+        // Hashes are reductions over the physical cells read by each
+        // transport layer.  Time-layer values: 0=step-start, 1=Picard
+        // midpoint.  They make split-state use observable in section 11.5.
+        unsigned long long x_low_state_hash;
+        unsigned long long u_low_state_hash;
+        unsigned long long x_high_state_hash;
+        unsigned long long u_high_state_hash;
+        unsigned long long x_low_field_hash;
+        unsigned long long u_low_field_hash;
+        unsigned long long x_high_field_hash;
+        unsigned long long u_high_field_hash;
+        unsigned long long start_field_hash;
+        unsigned long long end_field_hash;
+        int x_low_time_layer;
+        int u_low_time_layer;
+        int x_high_time_layer;
+        int u_high_time_layer;
+        std::vector<unsigned long long> x_low_state_hash_history;
+        std::vector<unsigned long long> u_low_state_hash_history;
+        std::vector<unsigned long long> x_high_state_hash_history;
+        std::vector<unsigned long long> u_high_state_hash_history;
+        std::vector<unsigned long long> u_field_hash_history;
+        std::vector<CouplingSubstepSeamAudit> coupling_substep_seam_audit;
+        int state_advanced;
+        int finite;
+        // These fields intentionally distinguish a protected-operator
+        // failure from non-finite output.  Section-11 raw high-order audits
+        // may allow finite negative debt, but never non-finite output.
+        int operator_failed;
+        int outputs_finite;
+        int failure_reason;
+        int failure_iteration;
+        int failure_substep;
+        int substeps_used;
+        double low_order_candidate_min;
+        long long low_order_negative_count;
+        double low_order_negative_mass;
+        double final_candidate_min;
+        int fct_active;
+        double limiter_active_fraction;
+        double limiter_min_alpha;
+        double r_couple;
+        // Direct fixed-state identity audit: final fluxes -> J_N/J_E/G*J_E.
+        // It is valid only for a single physical substep, because the raw
+        // stored fluxes are the final substep while returned currents are
+        // time averages over all substeps.
+        int final_flux_current_moment_audit_valid;
+        int final_flux_current_moment_audit_finite;
+        double final_flux_to_jn_linf;
+        double final_flux_to_jn_scale;
+        double final_flux_to_je_linf;
+        double final_flux_to_je_scale;
+        double final_flux_to_gstar_je_linf;
+        double final_flux_to_gstar_je_scale;
+    };
 
     VlasovAmpereMidpointSolver();
 
@@ -623,6 +780,14 @@ public:
     // upwind branch solely for comparison.
     void set_legacy_boundary_upwind_high_candidate_for_test(bool enabled) {
         legacy_boundary_upwind_high_candidate_for_test_ = enabled;
+    }
+    // Test-only A/B path for section-11 common-velocity experiments.  When
+    // enabled, the production x high-order reconstruction uses the same
+    // energy-chain-rule cell speed candidate used by the cylindrical
+    // velocity-space force audit (primarily u_parallel and u_perp).
+    // Normal production always leaves this disabled.
+    void set_energy_consistent_x_high_velocity_for_test(bool enabled) {
+        energy_consistent_x_high_velocity_for_test_ = enabled;
     }
     // Test-only convergence tracing does not alter the midpoint equation,
     // relaxation, fluxes, or production acceptance rules.
@@ -668,6 +833,13 @@ public:
     // endpoint.  It is intentionally side-effect free: callers receive a
     // Result and decide whether to advance physical state.
     MidpointOperatorEvaluation evaluate_fixed_midpoint_operator(
+        const Species& bkg_n, const BeamPIC& beam_n, const EMFields& fields_n,
+        const Species& guess_np1, const EMFields& fields_end_guess,
+        const std::vector<double>& fixed_j_beam_face_mid,
+        const CouplingRegionLayout& coupling_layout,
+        const SpatialGrid& sg, double dt, double time, int mpi_rank,
+        int mpi_size) const;
+    BackgroundCouplingFluxBundle evaluate_background_coupling_flux_bundle(
         const Species& bkg_n, const BeamPIC& beam_n, const EMFields& fields_n,
         const Species& guess_np1, const EMFields& fields_end_guess,
         const std::vector<double>& fixed_j_beam_face_mid,
@@ -970,6 +1142,7 @@ private:
     bool fct_enabled_;
     bool capture_midpoint_input_;
     bool legacy_boundary_upwind_high_candidate_for_test_;
+    bool energy_consistent_x_high_velocity_for_test_;
     int max_midpoint_iterations_;
     bool midpoint_iteration_trace_for_test_;
     bool fct_activation_audit_enabled_;

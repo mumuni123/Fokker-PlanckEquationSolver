@@ -17,6 +17,8 @@ option(FP_BUILD_CHECKPOINT_TESTS
        "Build checkpoint/restart infrastructure tests" OFF)
 option(FP_BUILD_PERIODIC_STAGGERED_TESTS
        "Build periodic G/G* adjoint and x-face topology tests" OFF)
+option(FP_BUILD_BACKGROUND_COUPLING_TESTS
+       "Build section-11 production-kernel background coupling audits" OFF)
 set(FP_VELOCITY_GRID_UPAR_STRETCH "6.2" CACHE STRING
     "Smooth cylindrical u_parallel sinh mapping parameter")
 set(FP_VELOCITY_GRID_UPERP_STRETCH "5.9" CACHE STRING
@@ -140,6 +142,133 @@ if(FP_BUILD_PERIODIC_STAGGERED_TESTS)
         src/species.cpp src/maxwell.cpp src/periodic_staggered_operators.cpp)
     target_include_directories(periodic_x_flux_topology_test PRIVATE src)
     target_link_libraries(periodic_x_flux_topology_test ${MPI_CXX_LIBRARIES})
+endif()
+
+if(FP_BUILD_BACKGROUND_COUPLING_TESTS)
+    if(NOT MPI_CXX_FOUND)
+        message(FATAL_ERROR "FP_BUILD_BACKGROUND_COUPLING_TESTS requires MPI")
+    endif()
+    function(add_background_coupling_kernel_test target_name source_file nx nv nmu)
+        add_executable(${target_name}
+            ${source_file}
+            src/species.cpp
+            src/vlasov_ampere_midpoint.cpp
+            src/cylindrical_vlasov_midpoint.cpp
+            src/nonuniform_reconstruction.cpp
+            src/checkpoint.cpp
+            src/maxwell.cpp
+            src/periodic_staggered_operators.cpp
+            src/beam_pic.cpp)
+        target_include_directories(${target_name} PRIVATE src tests)
+        target_compile_definitions(${target_name} PRIVATE
+            FP_SPATIAL_GRID_NX=${nx}
+            FP_VELOCITY_GRID_NV=${nv}
+            FP_VELOCITY_GRID_NMU=${nmu})
+        target_link_libraries(${target_name} ${MPI_CXX_LIBRARIES})
+        if(MPI_CXX_COMPILE_FLAGS)
+            set_target_properties(${target_name} PROPERTIES
+                                  COMPILE_FLAGS "${MPI_CXX_COMPILE_FLAGS}")
+        endif()
+        if(MPI_CXX_LINK_FLAGS)
+            set_target_properties(${target_name} PROPERTIES
+                                  LINK_FLAGS "${MPI_CXX_LINK_FLAGS}")
+        endif()
+    endfunction()
+
+    # 11.2 uses a compact spatial/velocity refinement sequence.  The same
+    # source calls the production bundle; only immutable grid macros differ.
+    add_background_coupling_kernel_test(background_coupling_smooth_periodic_test_coarse
+        tests/background_coupling_smooth_periodic_test.cpp 1000 48 32)
+    add_background_coupling_kernel_test(background_coupling_smooth_periodic_test
+        tests/background_coupling_smooth_periodic_test.cpp 2000 96 64)
+    add_background_coupling_kernel_test(background_coupling_smooth_periodic_test_fine
+        tests/background_coupling_smooth_periodic_test.cpp 4000 192 128)
+    add_executable(background_coupling_smooth_convergence_audit
+        tests/background_coupling_smooth_convergence_audit.cpp)
+
+    # 11.3--11.5 use the established production resolution and differ only
+    # in what they audit from the same fixed production operator call.
+    add_background_coupling_kernel_test(background_coupling_gradient_translation_test
+        tests/background_coupling_gradient_translation_test.cpp 4000 96 64)
+    add_background_coupling_kernel_test(background_coupling_velocity_consistency_test
+        tests/background_coupling_velocity_consistency_test.cpp 4000 96 64)
+    add_background_coupling_kernel_test(background_coupling_midpoint_state_test
+        tests/background_coupling_midpoint_state_test.cpp 4000 96 64)
+
+    # Direction-separated convergence audits for x, u_parallel and u_perp.
+    # FCT is disabled inside the shared test source for every target so all
+    # three resolutions use the same raw high-order operator branch.
+    function(add_directional_grid_triplet prefix kind
+             nx0 nu0 nmu0 nx1 nu1 nmu1 nx2 nu2 nmu2)
+        add_background_coupling_kernel_test(${prefix}_coarse
+            tests/background_coupling_directional_grid_test.cpp ${nx0} ${nu0} ${nmu0})
+        add_background_coupling_kernel_test(${prefix}
+            tests/background_coupling_directional_grid_test.cpp ${nx1} ${nu1} ${nmu1})
+        add_background_coupling_kernel_test(${prefix}_fine
+            tests/background_coupling_directional_grid_test.cpp ${nx2} ${nu2} ${nmu2})
+        target_compile_definitions(${prefix}_coarse PRIVATE FP_DIRECTIONAL_GRID_KIND=${kind})
+        target_compile_definitions(${prefix} PRIVATE FP_DIRECTIONAL_GRID_KIND=${kind})
+        target_compile_definitions(${prefix}_fine PRIVATE FP_DIRECTIONAL_GRID_KIND=${kind})
+    endfunction()
+    add_directional_grid_triplet(background_coupling_x_refinement 1
+        1000 96 64 2000 96 64 4000 96 64)
+    add_directional_grid_triplet(background_coupling_u_parallel_refinement 2
+        2000 48 64 2000 96 64 2000 192 64)
+    add_directional_grid_triplet(background_coupling_u_perp_refinement 3
+        2000 96 32 2000 96 64 2000 96 128)
+    add_executable(background_coupling_directional_grid_audit
+        tests/background_coupling_directional_grid_audit.cpp)
+
+    # Test-only common-speed A/B.  The alternative speed is selected while
+    # the production x high-order face flux is reconstructed, never by
+    # rescaling an already constructed flux in the test.
+    add_background_coupling_kernel_test(background_coupling_common_speed_flux_test
+        tests/background_coupling_common_speed_flux_test.cpp 2000 96 64)
+
+    # Section 12: frozen production u_parallel reconstruction/operator
+    # audits.  These are small-grid diagnostics only; they never select a
+    # different production transport or Ampere path.
+    add_background_coupling_kernel_test(background_coupling_upar_dual_audit
+        tests/background_coupling_upar_dual_audit.cpp 800 96 64)
+    target_compile_definitions(background_coupling_upar_dual_audit PRIVATE
+        FP_UPAR_AUDIT_DETAILED=1)
+    # Uses the production checkpoint grid.  It is separate from the compact
+    # manufactured-state scan because midpoint checkpoints are grid-exact.
+    add_background_coupling_kernel_test(background_coupling_upar_checkpoint_audit
+        tests/background_coupling_upar_dual_audit.cpp 4000 96 64)
+    target_compile_definitions(background_coupling_upar_checkpoint_audit PRIVATE
+        FP_UPAR_AUDIT_DETAILED=1)
+    add_background_coupling_kernel_test(background_coupling_upar_transpose_audit_coarse
+        tests/background_coupling_upar_dual_audit.cpp 800 48 64)
+    add_background_coupling_kernel_test(background_coupling_upar_transpose_audit
+        tests/background_coupling_upar_dual_audit.cpp 800 96 64)
+    add_background_coupling_kernel_test(background_coupling_upar_transpose_audit_fine
+        tests/background_coupling_upar_dual_audit.cpp 800 192 64)
+    add_executable(background_coupling_upar_transpose_convergence_audit
+        tests/background_coupling_upar_transpose_convergence_audit.cpp)
+    # Run the three producers before the aggregate reader.  This target is
+    # intentionally serial so the convergence audit can never observe a
+    # partially written fine-grid result.
+    add_custom_target(background_coupling_upar_transpose_audit_chain
+        COMMAND ${CMAKE_COMMAND} -E rm -f
+            output/background_coupling_upar_transpose_Nx800_Nu48_Nuperp64.result
+            output/background_coupling_upar_transpose_Nx800_Nu96_Nuperp64.result
+            output/background_coupling_upar_transpose_Nx800_Nu192_Nuperp64.result
+            output/background_coupling_upar_transpose_convergence_audit.result
+        COMMAND $<TARGET_FILE:background_coupling_upar_transpose_audit_coarse>
+        COMMAND $<TARGET_FILE:background_coupling_upar_transpose_audit>
+        COMMAND $<TARGET_FILE:background_coupling_upar_transpose_audit_fine>
+        COMMAND $<TARGET_FILE:background_coupling_upar_transpose_convergence_audit>
+            output/background_coupling_upar_transpose_Nx800_Nu48_Nuperp64.result
+            output/background_coupling_upar_transpose_Nx800_Nu96_Nuperp64.result
+            output/background_coupling_upar_transpose_Nx800_Nu192_Nuperp64.result
+        DEPENDS
+            background_coupling_upar_transpose_audit_coarse
+            background_coupling_upar_transpose_audit
+            background_coupling_upar_transpose_audit_fine
+            background_coupling_upar_transpose_convergence_audit
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        USES_TERMINAL)
 endif()
 
 if(FP_BUILD_PPM_CTU_TESTS)

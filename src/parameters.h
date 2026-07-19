@@ -34,6 +34,12 @@
 #define FP_VELOCITY_GRID_UPERP_STRETCH 5.9
 #endif
 
+// Section-11 operator tests use small spatial-grid convergence builds.  The
+// production build keeps this unset and therefore retains nx=4000 exactly.
+#ifndef FP_SPATIAL_GRID_NX
+#define FP_SPATIAL_GRID_NX 4000
+#endif
+
 namespace Const {
     const double me   = 9.10938e-31;
     const double qe   = 1.60218e-19;
@@ -63,10 +69,20 @@ namespace Param {
     const double beam_v0   = betab * Const::c;
     const double beam_p0   = gambetab * Const::me * Const::c;
 
-    const double dx    = 0.002 * Const::micro;
     const double Lx    = 8.0 * Const::micro;
+    const int    nx    = FP_SPATIAL_GRID_NX;
+#if FP_SPATIAL_GRID_NX == 4000
+    // Preserve the bit pattern used by production checkpoints created before
+    // FP_SPATIAL_GRID_NX became configurable.  Although Lx / 4000 is
+    // mathematically identical, it differs by one binary64 ULP and changes
+    // dx-dependent Beam weights and checkpoint identity hashes.
+    const double dx    = 0.002 * Const::micro;
+#else
+    // Operator convergence builds keep the same physical domain while
+    // varying only the number of spatial cells.
+    const double dx    = Lx / static_cast<double>(nx);
+#endif
     const double plasma_length = Lx;
-    const int    nx    = static_cast<int>(std::lround(Lx / dx));
 
     const double t_end         = 120.0 * Const::femto;
     const double t_inject_start = 0.0   * Const::femto;

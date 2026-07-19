@@ -31,6 +31,7 @@ VlasovAmpereMidpointSolver::VlasovAmpereMidpointSolver()
       low_order_only_(false), nonuniform_high_order_enabled_(false),
       fct_enabled_(true), capture_midpoint_input_(false),
       legacy_boundary_upwind_high_candidate_for_test_(false),
+      energy_consistent_x_high_velocity_for_test_(false),
       max_midpoint_iterations_(20), midpoint_iteration_trace_for_test_(false),
       fct_activation_audit_enabled_(false),
       controlled_fct_flux_injection_enabled_(false),
@@ -240,4 +241,120 @@ VlasovAmpereMidpointSolver::evaluate_fixed_midpoint_operator(
         bkg_n, beam_n, fields_n, sg, dt, time, mpi_rank, mpi_size, 1,
         &guess_np1, &fields_end_guess, &fixed_j_beam_face_mid,
         &coupling_layout, true);
+}
+
+VlasovAmpereMidpointSolver::BackgroundCouplingFluxBundle
+VlasovAmpereMidpointSolver::evaluate_background_coupling_flux_bundle(
+    const Species& bkg_n, const BeamPIC& beam_n, const EMFields& fields_n,
+    const Species& guess_np1, const EMFields& fields_end_guess,
+    const std::vector<double>& fixed_j_beam_face_mid,
+    const CouplingRegionLayout& coupling_layout,
+    const SpatialGrid& sg, double dt, double time, int mpi_rank,
+    int mpi_size) const
+{
+    const MidpointOperatorEvaluation evaluation = evaluate_fixed_midpoint_operator(
+        bkg_n, beam_n, fields_n, guess_np1, fields_end_guess,
+        fixed_j_beam_face_mid, coupling_layout, sg, dt, time, mpi_rank,
+        mpi_size);
+    BackgroundCouplingFluxBundle bundle;
+    bundle.fx_low = evaluation.low_x_flux;
+    bundle.fx_high = evaluation.high_x_flux;
+    bundle.fx_final = evaluation.final_x_flux;
+    bundle.fu_low = evaluation.low_u_flux;
+    bundle.fu_center = evaluation.center_u_flux;
+    bundle.fu_high = evaluation.high_u_flux;
+    bundle.fu_final = evaluation.final_u_flux;
+    bundle.cu_center = evaluation.center_u_coefficient;
+    bundle.cu_reconstruction_mass = evaluation.center_u_reconstruction_mass;
+    bundle.jn_low = evaluation.j_bkg_face_low_mid;
+    bundle.jn_high = evaluation.j_bkg_face_high_mid;
+    bundle.jn_final = evaluation.j_bkg_face_mid;
+    bundle.je_low = evaluation.j_bkg_energy_low_cell_mid;
+    bundle.je_center = evaluation.j_bkg_energy_center_cell_mid;
+    bundle.je_high = evaluation.j_bkg_energy_high_cell_mid;
+    bundle.je_final = evaluation.j_bkg_energy_cell_mid;
+    bundle.gstar_je_low = evaluation.j_bkg_energy_low_debug_face;
+    bundle.gstar_je_center = evaluation.j_bkg_energy_center_debug_face;
+    bundle.gstar_je_high = evaluation.j_bkg_energy_high_debug_face;
+    bundle.gstar_je_final = evaluation.j_bkg_energy_debug_face;
+    bundle.x_low_state_hash = evaluation.x_low_state_hash;
+    bundle.u_low_state_hash = evaluation.u_low_state_hash;
+    bundle.x_high_state_hash = evaluation.x_high_state_hash;
+    bundle.u_high_state_hash = evaluation.u_high_state_hash;
+    bundle.x_low_field_hash = evaluation.x_low_field_hash;
+    bundle.u_low_field_hash = evaluation.u_low_field_hash;
+    bundle.x_high_field_hash = evaluation.x_high_field_hash;
+    bundle.u_high_field_hash = evaluation.u_high_field_hash;
+    bundle.start_field_hash = evaluation.start_field_hash;
+    bundle.end_field_hash = evaluation.end_field_hash;
+    bundle.x_low_time_layer = evaluation.x_low_time_layer;
+    bundle.u_low_time_layer = evaluation.u_low_time_layer;
+    bundle.x_high_time_layer = evaluation.x_high_time_layer;
+    bundle.u_high_time_layer = evaluation.u_high_time_layer;
+    bundle.x_low_state_hash_history = evaluation.x_low_state_hash_history;
+    bundle.u_low_state_hash_history = evaluation.u_low_state_hash_history;
+    bundle.x_high_state_hash_history = evaluation.x_high_state_hash_history;
+    bundle.u_high_state_hash_history = evaluation.u_high_state_hash_history;
+    bundle.u_field_hash_history = evaluation.u_field_hash_history;
+    bundle.coupling_substep_seam_audit =
+        evaluation.coupling_substep_seam_audit;
+    bundle.state_advanced = evaluation.state_advanced ? 1 : 0;
+    bundle.operator_failed = evaluation.failed ? 1 : 0;
+    bundle.failure_reason = evaluation.failure_reason;
+    bundle.failure_iteration = evaluation.failure_iteration;
+    bundle.failure_substep = evaluation.failure_substep;
+    bundle.substeps_used = evaluation.substeps_used;
+    bundle.low_order_candidate_min = evaluation.low_order_candidate_min;
+    bundle.low_order_negative_count = evaluation.low_order_negative_count;
+    bundle.low_order_negative_mass = evaluation.low_order_negative_mass;
+    bundle.final_candidate_min = evaluation.failure_final_min;
+    double local_final_min = std::numeric_limits<double>::infinity();
+    if (evaluation.species_np1.f.size() >=
+        static_cast<size_t>(sg.nx_total) * Param::Nvmu) {
+        for (int ix = 0; ix < sg.nx_local; ++ix)
+            for (int j = 0; j < Param::Nv; ++j)
+                for (int k = 0; k < Param::Nmu; ++k)
+                    local_final_min = std::min(local_final_min,
+                        evaluation.species_np1.f[idx3(sg.nghost + ix, j, k)]);
+    }
+    MPI_Allreduce(MPI_IN_PLACE, &local_final_min, 1, MPI_DOUBLE, MPI_MIN,
+                  MPI_COMM_WORLD);
+    if (std::isfinite(local_final_min))
+        bundle.final_candidate_min = local_final_min;
+
+    const auto finite_vector = [](const std::vector<double>& values) {
+        for (size_t p = 0; p < values.size(); ++p)
+            if (!std::isfinite(values[p])) return false;
+        return true;
+    };
+    bool outputs_finite = finite_vector(evaluation.species_np1.f) &&
+        finite_vector(evaluation.fields_np1.Ex_face) &&
+        finite_vector(evaluation.fields_np1.Ex) &&
+        finite_vector(bundle.fx_high) && finite_vector(bundle.fu_center) &&
+        finite_vector(bundle.jn_high) && finite_vector(bundle.je_center) &&
+        finite_vector(bundle.gstar_je_center);
+    int global_outputs_finite = outputs_finite ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_outputs_finite, 1, MPI_INT, MPI_MIN,
+                  MPI_COMM_WORLD);
+    bundle.outputs_finite = global_outputs_finite;
+    // Keep the legacy field for existing tests, but it now means finite data,
+    // not merely "the operator did not report failure".
+    bundle.finite = bundle.outputs_finite;
+    bundle.fct_active = evaluation.limiter_active_fraction > 0.0 ? 1 : 0;
+    bundle.limiter_active_fraction = evaluation.limiter_active_fraction;
+    bundle.limiter_min_alpha = evaluation.limiter_min_alpha;
+    bundle.r_couple = evaluation.stage5_r_couple;
+    bundle.final_flux_current_moment_audit_valid =
+        evaluation.final_flux_current_moment_audit_valid;
+    bundle.final_flux_current_moment_audit_finite =
+        evaluation.final_flux_current_moment_audit_finite;
+    bundle.final_flux_to_jn_linf = evaluation.final_flux_to_jn_linf;
+    bundle.final_flux_to_jn_scale = evaluation.final_flux_to_jn_scale;
+    bundle.final_flux_to_je_linf = evaluation.final_flux_to_je_linf;
+    bundle.final_flux_to_je_scale = evaluation.final_flux_to_je_scale;
+    bundle.final_flux_to_gstar_je_linf =
+        evaluation.final_flux_to_gstar_je_linf;
+    bundle.final_flux_to_gstar_je_scale =
+        evaluation.final_flux_to_gstar_je_scale;
+    return bundle;
 }

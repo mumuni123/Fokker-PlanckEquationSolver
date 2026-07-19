@@ -67,4 +67,78 @@ void apply_cell_to_face_Gstar(const std::vector<double>& cell,
     close_right_face_alias(face, nxl, 1, mpi_rank, mpi_size, message_tag + 1);
 }
 
+void audit_cell_to_face_Gstar_sync(const std::vector<double>& cell,
+                                   std::vector<double>& independent_face,
+                                   std::vector<double>& closed_face, int nxl,
+                                   int mpi_rank, int mpi_size,
+                                   int message_tag)
+{
+    independent_face.assign(static_cast<size_t>(std::max(0, nxl) + 1), 0.0);
+    closed_face.assign(static_cast<size_t>(std::max(0, nxl) + 1), 0.0);
+    if (nxl <= 0 || cell.size() < static_cast<size_t>(nxl)) return;
+
+    double left_neighbor = cell[static_cast<size_t>(nxl - 1)];
+    double right_neighbor = cell[0];
+    if (mpi_size > 1) {
+        const int left = (mpi_rank + mpi_size - 1) % mpi_size;
+        const int right = (mpi_rank + 1) % mpi_size;
+        const double first = cell[0];
+        const double last = cell[static_cast<size_t>(nxl - 1)];
+        MPI_Sendrecv(&last, 1, MPI_DOUBLE, right, message_tag,
+                     &left_neighbor, 1, MPI_DOUBLE, left, message_tag,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Sendrecv(&first, 1, MPI_DOUBLE, left, message_tag + 1,
+                     &right_neighbor, 1, MPI_DOUBLE, right, message_tag + 1,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    }
+    for (int iface = 0; iface < nxl; ++iface) {
+        const double left_cell = iface == 0
+            ? left_neighbor : cell[static_cast<size_t>(iface - 1)];
+        independent_face[static_cast<size_t>(iface)] = 0.5 *
+            (left_cell + cell[static_cast<size_t>(iface)]);
+    }
+    independent_face[static_cast<size_t>(nxl)] = 0.5 *
+        (cell[static_cast<size_t>(nxl - 1)] + right_neighbor);
+    closed_face = independent_face;
+    close_right_face_alias(closed_face, nxl, 1, mpi_rank, mpi_size,
+                           message_tag + 2);
+}
+
+void audit_cell_blocks_to_face_Gstar(const std::vector<double>& cell,
+                                     std::vector<double>& face, int nxl,
+                                     int block, int mpi_rank, int mpi_size,
+                                     int message_tag)
+{
+    const size_t face_size = static_cast<size_t>(std::max(0, nxl) + 1) *
+        static_cast<size_t>(std::max(0, block));
+    face.assign(face_size, 0.0);
+    if (nxl <= 0 || block <= 0 ||
+        cell.size() < static_cast<size_t>(nxl) * block) return;
+
+    std::vector<double> left_neighbor(static_cast<size_t>(block), 0.0);
+    const double* last = cell.data() + static_cast<size_t>(nxl - 1) * block;
+    if (mpi_size == 1) {
+        std::copy(last, last + block, left_neighbor.begin());
+    } else {
+        const int left = (mpi_rank + mpi_size - 1) % mpi_size;
+        const int right = (mpi_rank + 1) % mpi_size;
+        MPI_Sendrecv(last, block, MPI_DOUBLE, right, message_tag,
+                     left_neighbor.data(), block, MPI_DOUBLE, left,
+                     message_tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    }
+    for (int iface = 0; iface < nxl; ++iface) {
+        const double* left_cell = iface == 0
+            ? left_neighbor.data()
+            : cell.data() + static_cast<size_t>(iface - 1) * block;
+        const double* right_cell =
+            cell.data() + static_cast<size_t>(iface) * block;
+        double* output = face.data() + static_cast<size_t>(iface) * block;
+        for (int component = 0; component < block; ++component)
+            output[component] = 0.5 *
+                (left_cell[component] + right_cell[component]);
+    }
+    close_right_face_alias(face, nxl, block, mpi_rank, mpi_size,
+                           message_tag + 1);
+}
+
 } // namespace PeriodicStaggered

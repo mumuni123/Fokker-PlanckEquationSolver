@@ -23,6 +23,23 @@ void apply_cell_to_face_Gstar(const std::vector<double>& cell,
                               std::vector<double>& face, int nxl,
                               int mpi_rank, int mpi_size, int message_tag);
 
+// Audit-only form of G*.  `independent_face` evaluates both local endpoint
+// faces from neighbouring cell values before the right face is replaced by
+// its periodic alias; `closed_face` is the production periodic result.
+void audit_cell_to_face_Gstar_sync(const std::vector<double>& cell,
+                                   std::vector<double>& independent_face,
+                                   std::vector<double>& closed_face, int nxl,
+                                   int mpi_rank, int mpi_size,
+                                   int message_tag);
+
+// Audit-only block form of G*.  `cell` is cell-major with `block` values per
+// spatial cell; `face` uses the corresponding local Yee-face layout and has
+// its right periodic alias closed before return.
+void audit_cell_blocks_to_face_Gstar(const std::vector<double>& cell,
+                                     std::vector<double>& face, int nxl,
+                                     int block, int mpi_rank, int mpi_size,
+                                     int message_tag);
+
 } // namespace PeriodicStaggered
 
 #endif

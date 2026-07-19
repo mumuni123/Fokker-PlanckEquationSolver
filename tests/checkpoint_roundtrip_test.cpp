@@ -59,9 +59,17 @@ int main(int argc, char** argv)
     advance_beam_one_step(beam_before, grid, fields_before, beam_dt, beam_dt,
                           rank, size);
     CheckpointControlState c = {7, 2.5, 0.125, 3.0, 6, 9.0};
+    const double legacy_production_dx = 0.002 * Const::micro;
+    const unsigned long long legacy_production_hash = 4103088182132129165ULL;
+    const bool production_identity_match = Param::nx != 4000 ||
+        (Param::dx == legacy_production_dx &&
+         checkpoint_configuration_hash() == legacy_production_hash &&
+         checkpoint_physics_parameter_hash() == legacy_production_hash);
     std::string error;
     const std::string dir = "checkpoint_roundtrip_tmp";
-    bool ok = write_checkpoint(dir, c, before, beam_before, fields_before, grid, rank, size, error);
+    bool ok = production_identity_match &&
+        write_checkpoint(dir, c, before, beam_before, fields_before, grid,
+                         rank, size, error);
     Species after; after.init("bkg_e", SpeciesType::BACKGROUND_ELECTRON, -Const::qe,
                               Const::me, Param::dens, Param::temperature_e, false, grid);
     BeamPIC beam_after; beam_after.init(grid); EMFields fields_after; fields_after.init(grid);
@@ -103,10 +111,13 @@ int main(int argc, char** argv)
     if (rank == 0) std::printf(
         "checkpoint_roundtrip f_difference=%.17e Ex_face_difference=%.17e "
         "beam_particle_difference=%.17e beam_density_reconstruction_difference=%.17e "
-        "persistent_state_match=%d control_state_match=%d status=%s\n",
+        "persistent_state_match=%d control_state_match=%d "
+        "production_identity_match=%d config_hash=%llu status=%s\n",
         differences[0], differences[1], differences[2], differences[3],
         std::memcmp(&before_persistent, &after_persistent,
                     sizeof(BeamPersistentState)) == 0 ? 1 : 0,
-        control_match ? 1 : 0, (all_ok && local_max == 0.0) ? "PASS" : "FAIL");
+        control_match ? 1 : 0, production_identity_match ? 1 : 0,
+        checkpoint_configuration_hash(),
+        (all_ok && local_max == 0.0) ? "PASS" : "FAIL");
     MPI_Finalize(); return (all_ok && local_max == 0.0) ? 0 : 1;
 }
