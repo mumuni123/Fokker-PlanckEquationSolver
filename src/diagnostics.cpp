@@ -285,7 +285,8 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                       << "effective_T_eV  "
                       << "x_at_max_loss_u_high[m]  "
                       << "f_u_max_x_mu_avg[u^-3_m^-3]  "
-                      << "integral_f_u_gt_8_x[m^-3]\n";
+                      << "integral_f_u_gt_8_x[m^-3]  "
+                      << "background_coupling_mode\n";
             step_file << std::scientific << std::setprecision(8);
 
         }
@@ -582,7 +583,8 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                                       double local_max_loss_u_high,
                                          double local_x_at_max_loss_u_high,
                                          double local_f_u_max_x,
-                                         double local_integral_f_u_gt_8_x)
+                                         double local_integral_f_u_gt_8_x,
+                                         int background_coupling_mode)
 {
     if (!step_enabled) return;
 
@@ -850,7 +852,8 @@ void Diagnostics::write_step_diagnostics(int step, double time,
                   << effective_T_eV << "  "
                   << global_x_at_max_loss_u_high << "  "
                   << global_f_u_max_x << "  "
-                  << global_integral_f_u_gt_8_x << "\n";
+                  << global_integral_f_u_gt_8_x << "  "
+                  << background_coupling_mode << "\n";
         step_file.flush();
     }
 }

@@ -15,6 +15,8 @@ struct RuntimeOptions {
     double dt_scale;
     int midpoint_max_iters;
     int diagnostic_level;
+    // 0 = legacy charge/energy coupling; 1 = opt-in dual-u coupling.
+    int background_coupling_mode;
     bool dump_final_midpoint;
     bool overwrite_output;
     bool checkpoint_enabled;

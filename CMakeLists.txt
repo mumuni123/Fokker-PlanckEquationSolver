@@ -246,6 +246,75 @@ if(FP_BUILD_BACKGROUND_COUPLING_TESTS)
         tests/background_coupling_upar_dual_audit.cpp 800 192 64)
     add_executable(background_coupling_upar_transpose_convergence_audit
         tests/background_coupling_upar_transpose_convergence_audit.cpp)
+    # Section 15.2 stage-1: fixed midpoint, no Beam, no FCT.  It compares the
+    # untouched legacy path with the opt-in local dual-u rank-one operator.
+    add_background_coupling_kernel_test(background_coupling_dual_u_center_test
+        tests/background_coupling_dual_u_center_test.cpp 800 96 64)
+
+    # Section 15.3 stage-2: fixed production midpoint operator, no Beam and
+    # no FCT.  Every producer compares the untouched legacy coupling with the
+    # opt-in dual-u operator and writes the same conservation/pairing ledger.
+    set(FP_DUAL_U_STAGE2_GIT_REVISION "unknown")
+    set(FP_DUAL_U_STAGE2_GIT_DIRTY -1)
+    execute_process(COMMAND git rev-parse --short=12 HEAD
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        RESULT_VARIABLE FP_DUAL_U_STAGE2_GIT_RESULT
+        OUTPUT_VARIABLE FP_DUAL_U_STAGE2_GIT_REVISION_RAW
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+    if(FP_DUAL_U_STAGE2_GIT_RESULT EQUAL 0)
+        set(FP_DUAL_U_STAGE2_GIT_REVISION
+            "${FP_DUAL_U_STAGE2_GIT_REVISION_RAW}")
+        execute_process(COMMAND git diff --quiet --ignore-submodules HEAD
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+            RESULT_VARIABLE FP_DUAL_U_STAGE2_DIRTY_RESULT
+            ERROR_QUIET)
+        if(FP_DUAL_U_STAGE2_DIRTY_RESULT EQUAL 0)
+            set(FP_DUAL_U_STAGE2_GIT_DIRTY 0)
+        else()
+            set(FP_DUAL_U_STAGE2_GIT_DIRTY 1)
+        endif()
+    endif()
+    function(add_dual_u_stage2_test target_name case_id nx nv nmu)
+        add_background_coupling_kernel_test(${target_name}
+            tests/background_coupling_dual_u_stage2_test.cpp ${nx} ${nv} ${nmu})
+        target_compile_definitions(${target_name} PRIVATE
+            FP_DUAL_U_STAGE2_CASE=${case_id}
+            FP_DUAL_U_STAGE2_GIT_REVISION="${FP_DUAL_U_STAGE2_GIT_REVISION}"
+            FP_DUAL_U_STAGE2_GIT_DIRTY=${FP_DUAL_U_STAGE2_GIT_DIRTY})
+    endfunction()
+    add_dual_u_stage2_test(background_coupling_dual_u_zero_field_test
+        1 800 96 64)
+    add_dual_u_stage2_test(background_coupling_dual_u_field_symmetry_test
+        2 800 96 64)
+    add_dual_u_stage2_test(background_coupling_dual_u_phase_test
+        3 800 96 64)
+    add_dual_u_stage2_test(background_coupling_dual_u_nonuniform_grid_test
+        4 800 96 64)
+    add_dual_u_stage2_test(background_coupling_dual_u_manufactured_coarse
+        5 800 48 64)
+    add_dual_u_stage2_test(background_coupling_dual_u_manufactured_base
+        5 800 96 64)
+    add_dual_u_stage2_test(background_coupling_dual_u_manufactured_fine
+        5 800 192 64)
+    add_dual_u_stage2_test(background_coupling_dual_u_endpoint_flux_test
+        6 800 96 64)
+    add_dual_u_stage2_test(background_coupling_dual_u_mpi_consistency_test
+        7 800 96 64)
+    add_executable(background_coupling_dual_u_convergence_audit
+        tests/background_coupling_dual_u_convergence_audit.cpp)
+    add_executable(background_coupling_dual_u_mpi_consistency_audit
+        tests/background_coupling_dual_u_mpi_consistency_audit.cpp)
+
+    # Section 15.4 stage-3: reconnect the opt-in dual-u high candidate to the
+    # unchanged donor-cell base and production shared-face FCT.  One fixed
+    # operator test audits all six required low/high/final layers.
+    add_background_coupling_kernel_test(background_coupling_dual_u_muscl_fct_test
+        tests/background_coupling_dual_u_stage3_test.cpp 800 96 64)
+    # Section 15.5 stage-4: compare accepted legacy/dual production midpoint
+    # dumps.  It reads dumps only and never changes the production solver.
+    add_background_coupling_kernel_test(background_coupling_stage4_ab_compare
+        tests/background_coupling_stage4_ab_compare.cpp 4000 96 64)
     # Run the three producers before the aggregate reader.  This target is
     # intentionally serial so the convergence audit can never observe a
     # partially written fine-grid result.

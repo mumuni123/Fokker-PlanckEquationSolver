@@ -8,7 +8,10 @@ namespace Config {
     const bool enable_full_fe_output = false;
     const bool enable_progress_trace = false;
 
-    const int step_diagnostics_interval = 100;
+    // Full accepted-step diagnostics scan the phase-space distribution and
+    // append several closure ledgers.  Keep ordinary production output sparse;
+    // diagnostic-level 2 probe/audit runs still force every accepted step.
+    const int step_diagnostics_interval = 500;
     const int progress_trace_initial_steps = 3;
     const int progress_trace_interval = 100;
 }

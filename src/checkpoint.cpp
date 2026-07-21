@@ -460,11 +460,13 @@ bool write_midpoint_audit_state(
         const unsigned long long count = static_cast<unsigned long long>(sg.nx_local) * Param::Nvmu;
         const unsigned long long face_count = static_cast<unsigned long long>(sg.nx_local);
         const int type_length = static_cast<int>(state.acceptance_type.size());
-        out.write("FPMIDPT5", 8); out.write(reinterpret_cast<const char*>(&state.step), sizeof(state.step));
+        out.write("FPMIDPT6", 8); out.write(reinterpret_cast<const char*>(&state.step), sizeof(state.step));
         out.write(reinterpret_cast<const char*>(&state.time_s), sizeof(state.time_s)); out.write(reinterpret_cast<const char*>(&state.dt_s), sizeof(state.dt_s));
         out.write(reinterpret_cast<const char*>(&state.substeps_used), sizeof(state.substeps_used)); out.write(reinterpret_cast<const char*>(&state.nonlinear_iterations), sizeof(state.nonlinear_iterations));
         const unsigned char switches[3] = { static_cast<unsigned char>(state.low_order_only), static_cast<unsigned char>(state.high_order_enabled), static_cast<unsigned char>(state.fct_enabled) };
         out.write(reinterpret_cast<const char*>(switches), sizeof(switches));
+        out.write(reinterpret_cast<const char*>(&state.background_coupling_mode),
+                  sizeof(state.background_coupling_mode));
         out.write(reinterpret_cast<const char*>(&type_length), sizeof(type_length)); out.write(state.acceptance_type.data(), type_length);
         out.write(reinterpret_cast<const char*>(&count), sizeof(count)); out.write(reinterpret_cast<const char*>(&face_count), sizeof(face_count));
         for (int ix=0; ix<sg.nx_local; ++ix) {
@@ -475,10 +477,22 @@ bool write_midpoint_audit_state(
         }
         out.write(reinterpret_cast<const char*>(&state.fields_n.Ex_face[0]), static_cast<std::streamsize>(face_count*sizeof(double)));
         out.write(reinterpret_cast<const char*>(&state.fields_end_guess.Ex_face[0]), static_cast<std::streamsize>(face_count*sizeof(double)));
+        out.write(reinterpret_cast<const char*>(&state.fields_np1.Ex_face[0]),
+                  static_cast<std::streamsize>(face_count * sizeof(double)));
         out.write(reinterpret_cast<const char*>(&state.reference_stage5_r_fv),
                   sizeof(state.reference_stage5_r_fv));
         out.write(reinterpret_cast<const char*>(&state.reference_stage5_r_couple),
                   sizeof(state.reference_stage5_r_couple));
+        const double limiter_values[6] = {
+            state.limiter_active_fraction,
+            state.limiter_active_fraction_core,
+            state.limiter_active_fraction_boundary,
+            state.x_limiter_active_fraction,
+            state.u_limiter_active_fraction,
+            state.limiter_min_alpha
+        };
+        out.write(reinterpret_cast<const char*>(limiter_values),
+                  sizeof(limiter_values));
         out.write(reinterpret_cast<const char*>(&state.coupling_layout.beam_front_ix),
                   sizeof(state.coupling_layout.beam_front_ix));
         out.write(reinterpret_cast<const char*>(&state.coupling_layout.wave_core_end_m),
@@ -511,7 +525,7 @@ bool write_midpoint_audit_state(
                1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
     if(rank==0 && all_ok) {
         std::ofstream manifest((directory+"/manifest.dat.tmp").c_str());
-        manifest<<"magic FPMIDPT5\nmpi_size "<<size<<"\nnx "<<Param::nx<<"\nnv "<<Param::Nv<<"\nnmu "<<Param::Nmu<<"\nconfig_hash "<<checkpoint_configuration_hash()<<"\nvelocity_grid_hash "<<checkpoint_velocity_grid_hash(state.bkg_n)<<"\nphysics_parameter_hash "<<checkpoint_physics_parameter_hash()<<"\nstep "<<state.step<<"\ntime_s "<<std::setprecision(17)<<state.time_s<<"\ndt_s "<<state.dt_s<<"\nacceptance "<<state.acceptance_type<<"\n";
+        manifest<<"magic FPMIDPT6\nmpi_size "<<size<<"\nnx "<<Param::nx<<"\nnv "<<Param::Nv<<"\nnmu "<<Param::Nmu<<"\nconfig_hash "<<checkpoint_configuration_hash()<<"\nvelocity_grid_hash "<<checkpoint_velocity_grid_hash(state.bkg_n)<<"\nphysics_parameter_hash "<<checkpoint_physics_parameter_hash()<<"\nstep "<<state.step<<"\ntime_s "<<std::setprecision(17)<<state.time_s<<"\ndt_s "<<state.dt_s<<"\nbackground_coupling_mode "<<state.background_coupling_mode<<"\nacceptance "<<state.acceptance_type<<"\n";
         for (int r = 0; r < size; ++r) manifest << "rank " << r << " "
             << all_bytes[r] << " " << all_hash[r] << "\n";
         manifest.close();
@@ -536,7 +550,7 @@ bool read_midpoint_audit_state(
         int saved_size = -1, saved_nx = -1, saved_nv = -1, saved_nmu = -1;
         unsigned long long saved_hash = 0ULL, saved_velocity_hash = 0ULL,
                            saved_physics_hash = 0ULL;
-        if (!(manifest >> key >> magic) || key != "magic" || magic != "FPMIDPT5") {
+        if (!(manifest >> key >> magic) || key != "magic" || magic != "FPMIDPT6") {
             ok = 0;
             manifest_error = "midpoint audit manifest is missing or has invalid magic";
         }
@@ -617,7 +631,7 @@ bool read_midpoint_audit_state(
     std::ifstream in(rank_path(directory, rank).c_str(), std::ios::binary);
     char magic[8] = {0};
     in.read(magic, sizeof(magic));
-    if (!in || std::memcmp(magic, "FPMIDPT5", sizeof(magic)) != 0) ok = 0;
+    if (!in || std::memcmp(magic, "FPMIDPT6", sizeof(magic)) != 0) ok = 0;
     unsigned char switches[3] = {0, 0, 0};
     int type_length = 0;
     unsigned long long count = 0, face_count = 0;
@@ -628,8 +642,14 @@ bool read_midpoint_audit_state(
         in.read(reinterpret_cast<char*>(&state.substeps_used), sizeof(state.substeps_used));
         in.read(reinterpret_cast<char*>(&state.nonlinear_iterations), sizeof(state.nonlinear_iterations));
         in.read(reinterpret_cast<char*>(switches), sizeof(switches));
+        in.read(reinterpret_cast<char*>(&state.background_coupling_mode),
+                sizeof(state.background_coupling_mode));
         in.read(reinterpret_cast<char*>(&type_length), sizeof(type_length));
-        if (!in || type_length < 0 || type_length > 128) ok = 0;
+        if (!in || type_length < 0 || type_length > 128 ||
+            state.background_coupling_mode <
+                VlasovAmpereMidpointSolver::LEGACY_COUPLING ||
+            state.background_coupling_mode >
+                VlasovAmpereMidpointSolver::DUAL_U_COUPLING) ok = 0;
     }
     if (ok) {
         state.acceptance_type.assign(static_cast<size_t>(type_length), '\0');
@@ -647,6 +667,7 @@ bool read_midpoint_audit_state(
     state.operator_input_guess = species_template;
     state.fields_n = fields_template;
     state.fields_end_guess = fields_template;
+    state.fields_np1 = fields_template;
     for (int ix = 0; ok && ix < sg.nx_local; ++ix) {
         const size_t base = static_cast<size_t>(sg.nghost + ix) * Param::Nvmu;
         in.read(reinterpret_cast<char*>(&state.bkg_n.f[base]), Param::Nvmu * sizeof(double));
@@ -658,10 +679,20 @@ bool read_midpoint_audit_state(
                 static_cast<std::streamsize>(face_count * sizeof(double)));
         in.read(reinterpret_cast<char*>(&state.fields_end_guess.Ex_face[0]),
                 static_cast<std::streamsize>(face_count * sizeof(double)));
+        in.read(reinterpret_cast<char*>(&state.fields_np1.Ex_face[0]),
+                static_cast<std::streamsize>(face_count * sizeof(double)));
         in.read(reinterpret_cast<char*>(&state.reference_stage5_r_fv),
                 sizeof(state.reference_stage5_r_fv));
         in.read(reinterpret_cast<char*>(&state.reference_stage5_r_couple),
                 sizeof(state.reference_stage5_r_couple));
+        double limiter_values[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 1.0};
+        in.read(reinterpret_cast<char*>(limiter_values), sizeof(limiter_values));
+        state.limiter_active_fraction = limiter_values[0];
+        state.limiter_active_fraction_core = limiter_values[1];
+        state.limiter_active_fraction_boundary = limiter_values[2];
+        state.x_limiter_active_fraction = limiter_values[3];
+        state.u_limiter_active_fraction = limiter_values[4];
+        state.limiter_min_alpha = limiter_values[5];
         in.read(reinterpret_cast<char*>(&state.coupling_layout.beam_front_ix),
                 sizeof(state.coupling_layout.beam_front_ix));
         in.read(reinterpret_cast<char*>(&state.coupling_layout.wave_core_end_m),
@@ -690,8 +721,15 @@ bool read_midpoint_audit_state(
                !finite_vector(state.operator_input_guess.f) ||
                !finite_vector(state.fields_n.Ex_face) ||
                !finite_vector(state.fields_end_guess.Ex_face) ||
+               !finite_vector(state.fields_np1.Ex_face) ||
                 !std::isfinite(state.reference_stage5_r_fv) ||
-                !std::isfinite(state.reference_stage5_r_couple) ||
+               !std::isfinite(state.reference_stage5_r_couple) ||
+               !std::isfinite(state.limiter_active_fraction) ||
+               !std::isfinite(state.limiter_active_fraction_core) ||
+               !std::isfinite(state.limiter_active_fraction_boundary) ||
+               !std::isfinite(state.x_limiter_active_fraction) ||
+               !std::isfinite(state.u_limiter_active_fraction) ||
+               !std::isfinite(state.limiter_min_alpha) ||
                 !std::isfinite(state.coupling_layout.wave_core_end_m) ||
                 !finite_periodic_seam_audit ||
                 !std::isfinite(state.time_s) || !std::isfinite(state.dt_s))) ok = 0;
@@ -700,6 +738,7 @@ bool read_midpoint_audit_state(
     if (!global_ok) { error = "midpoint audit rank file failed validation"; return false; }
     state.fields_n.sync_cell_ex_from_faces(rank, size);
     state.fields_end_guess.sync_cell_ex_from_faces(rank, size);
+    state.fields_np1.sync_cell_ex_from_faces(rank, size);
     MPI_Bcast(&expected_velocity_hash, 1, MPI_UNSIGNED_LONG_LONG, 0,
               MPI_COMM_WORLD);
     if (expected_velocity_hash != checkpoint_velocity_grid_hash(state.bkg_n)) {

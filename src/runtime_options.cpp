@@ -22,6 +22,7 @@ RuntimeOptions defaults()
     o.dt_scale = 1.0;
     o.midpoint_max_iters = 40;
     o.diagnostic_level = 1;
+    o.background_coupling_mode = 0;
     o.dump_final_midpoint = false;
     o.overwrite_output = false;
     o.checkpoint_enabled = false;
@@ -103,13 +104,22 @@ RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,
                 options.midpoint_max_iters = std::atoi(value); ++i;
             } else if (arg == "--diagnostic-level" && has_value) {
                 options.diagnostic_level = std::atoi(value); ++i;
+            } else if (arg == "--background-coupling-mode" && has_value) {
+                const std::string mode(value);
+                if (mode == "legacy") options.background_coupling_mode = 0;
+                else if (mode == "dual-u" || mode == "dual_u")
+                    options.background_coupling_mode = 1;
+                else error = "invalid --background-coupling-mode (use legacy or dual-u)";
+                ++i;
             } else if (arg == "--output-dir" && has_value) {
                 options.output_dir = value; ++i;
             } else error = "unknown or incomplete runtime option: " + arg;
         }
         if (options.dt_scale <= 0.0 || options.midpoint_max_iters < 1 ||
             options.diagnostic_level < 0 || options.diagnostic_level > 2 ||
-            options.stop_time_fs < 0.0 || options.stop_after_accepted_steps < -1)
+            options.stop_time_fs < 0.0 || options.stop_after_accepted_steps < -1 ||
+            options.background_coupling_mode < 0 ||
+            options.background_coupling_mode > 1)
             error = "invalid runtime option value";
         if (options.operator_audit_mode && (options.restart_enabled ||
                                             options.checkpoint_enabled ||
@@ -127,12 +137,13 @@ RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,
     broadcast_string(options.beam_ledger_reference, 0);
     double numbers[2] = {options.stop_time_fs, options.dt_scale};
     long long accepted = options.stop_after_accepted_steps;
-    int ints[6] = {options.midpoint_max_iters, options.diagnostic_level,
+    int ints[7] = {options.midpoint_max_iters, options.diagnostic_level,
                    options.dump_final_midpoint ? 1 : 0, options.overwrite_output ? 1 : 0,
-                   options.checkpoint_enabled ? 1 : 0, options.restart_enabled ? 1 : 0};
+                   options.checkpoint_enabled ? 1 : 0, options.restart_enabled ? 1 : 0,
+                   options.background_coupling_mode};
     MPI_Bcast(numbers, 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(&accepted, 1, MPI_LONG_LONG_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(ints, 6, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(ints, 7, MPI_INT, 0, MPI_COMM_WORLD);
     int audit = options.operator_audit_mode ? 1 : 0;
     MPI_Bcast(&audit, 1, MPI_INT, 0, MPI_COMM_WORLD);
     int beam_ledger_reference = options.beam_ledger_reference_enabled ? 1 : 0;
@@ -146,6 +157,7 @@ RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,
     options.diagnostic_level = ints[1]; options.dump_final_midpoint = ints[2] != 0;
     options.overwrite_output = ints[3] != 0; options.checkpoint_enabled = ints[4] != 0;
     options.restart_enabled = ints[5] != 0; options.operator_audit_mode = audit != 0;
+    options.background_coupling_mode = ints[6];
     options.beam_ledger_reference_enabled = beam_ledger_reference != 0;
     (void)mpi_size;
     return options;

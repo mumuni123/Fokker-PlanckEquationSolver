@@ -12,6 +12,10 @@
 
 class VlasovAmpereMidpointSolver {
 public:
+    enum BackgroundCouplingMode {
+        LEGACY_COUPLING = 0,
+        DUAL_U_COUPLING = 1
+    };
     // Dynamic part of the accepted regional closure partition.  A fixed
     // operator audit reuses this layout rather than inferring it from a
     // frozen Beam state/current.
@@ -31,12 +35,16 @@ public:
         bool low_order_only;
         bool high_order_enabled;
         bool fct_enabled;
+        int background_coupling_mode;
         std::string acceptance_type;
         Species bkg_n;
         Species guess_np1;
         Species operator_input_guess;
         EMFields fields_n;
         EMFields fields_end_guess;
+        // Exact accepted endpoint field, separate from the final operator
+        // input guess used for C fixed-state replay.
+        EMFields fields_np1;
         std::vector<double> j_beam_face_mid;
         std::vector<double> reference_jn_face;
         std::vector<double> reference_je_cell;
@@ -48,6 +56,12 @@ public:
         // reference as JN/JE/G*JE and must be reproduced independently.
         double reference_stage5_r_fv;
         double reference_stage5_r_couple;
+        double limiter_active_fraction;
+        double limiter_active_fraction_core;
+        double limiter_active_fraction_boundary;
+        double x_limiter_active_fraction;
+        double u_limiter_active_fraction;
+        double limiter_min_alpha;
     };
     enum NegativeDebtLevel {
         NEG_DEBT_OK = 0,
@@ -201,6 +215,15 @@ public:
         std::vector<double> gstar_je_low_by_u_post_sync;
         std::vector<double> gstar_je_high_by_u_post_sync;
         std::vector<double> gstar_je_final_by_u_post_sync;
+        // Audit-only FCT coverage for this true transport substep.  Entries
+        // are grouped by [x region][velocity region].  Each weight group is
+        // [total mass, active mass, total |q v_x| mass, active current
+        // weight, total kinetic-energy mass, active energy weight].  Counts
+        // are [all cells, active cells, physical donor-beta cells].
+        // x regions: core, periodic seam; velocity regions: thermal body,
+        // |u| near one, low-density tail.
+        std::vector<double> fct_weighted_coverage;
+        std::vector<double> fct_weighted_counts;
     };
 
     struct Result {
@@ -236,11 +259,42 @@ public:
         std::vector<double> center_u_flux;
         std::vector<double> high_u_flux;
         std::vector<double> final_u_flux;
+        std::vector<double> low_u_coefficient;
+        std::vector<double> high_u_coefficient;
+        // Fixed-operator audit only: the exact C_u paired with final_u_flux.
+        // Production runs do not retain this phase-space array.
+        std::vector<double> final_u_coefficient;
+        // Stage-3 fixed-candidate limiter audit.  These cell arrays are
+        // retained only for an explicit fixed operator evaluation so the
+        // test harness can distinguish real donor exhaustion from an empty
+        // velocity-tail point count.  They are never allocated by normal
+        // production stepping.
+        std::vector<double> fct_donor_beta;
+        std::vector<double> fct_donor_low_mass;
+        std::vector<double> fct_donor_limited_outflow;
         // Fixed-operator audit only: C_u before multiplication by the local
         // acceleration, plus the exact cylindrical mass state reconstructed
         // by the centered u_parallel operator.
         std::vector<double> center_u_coefficient;
+        // Dual-u prototype audit layers.  These are populated only for a
+        // fixed, no-Beam dual evaluation; stage 3 also permits FCT.
+        std::vector<double> legacy_center_u_coefficient;
+        std::vector<double> dual_target_jn_cell;
+        std::vector<double> dual_target_jn_replay_cell;
+        std::vector<double> dual_legacy_je_cell;
+        std::vector<double> dual_je_cell;
         std::vector<double> center_u_reconstruction_mass;
+        int background_coupling_mode;
+        int dual_u_operator_valid;
+        double dual_u_target_replay_linf;
+        double dual_u_target_replay_scale;
+        double dual_u_legacy_operator_replay_linf;
+        double dual_u_legacy_operator_replay_scale;
+        double dual_u_legacy_current_linf;
+        double dual_u_current_linf;
+        double dual_u_correction_l2;
+        double dual_u_correction_linf;
+        long long dual_u_corrected_cell_count;
         unsigned long long x_low_state_hash;
         unsigned long long u_low_state_hash;
         unsigned long long x_high_state_hash;
@@ -282,6 +336,16 @@ public:
         double u_boundary_particle_outflow;
         double u_boundary_momentum_outflow;
         double u_boundary_energy_outflow;
+        double u_boundary_energy_lower;
+        double u_boundary_energy_upper;
+        // Stage-2 fixed-operator conservation ledger.  These are read-only
+        // audit scalars and never participate in the transport update.
+        double stage2_mass_change;
+        double stage2_mass_scale;
+        double stage2_mass_residual;
+        double stage2_momentum_change;
+        double stage2_momentum_scale;
+        double stage2_momentum_residual;
         // Stage 5: finite-volume and field-current closure are deliberately
         // separate diagnostics.  No compatibility projection is active yet.
         double stage5_r_fv;
@@ -386,7 +450,11 @@ public:
         // 0=none, 1=CFL limit, 2=low-order positivity,
         // 3=FCT final positivity, 4=non-finite state,
         // 5=high-low identity, 6=donor capacity, 7=interface checksum,
-        // 12=nonuniform high-order transport disabled by configuration.
+        // 12=nonuniform high-order transport disabled by configuration,
+        // 13=dual-u prototype used outside its fixed/no-Beam/no-FCT envelope,
+        // 14=dual-u positive Gram denominator is degenerate,
+        // 15=dual-u correction/current is non-finite,
+        // 16=dual-u local input contract is invalid.
         int failure_reason;
         int failure_iteration;
         int failure_substep;
@@ -425,6 +493,10 @@ public:
         double residual_J_beam;
         double limiter_active_fraction;
         double limiter_min_alpha;
+        double x_limiter_active_fraction;
+        double x_limiter_min_alpha;
+        double u_limiter_active_fraction;
+        double u_limiter_min_alpha;
         double limiter_active_fraction_core;
         double limiter_active_fraction_boundary;
         double limiter_min_alpha_core;
@@ -677,8 +749,27 @@ public:
         std::vector<double> fu_center;
         std::vector<double> fu_high;
         std::vector<double> fu_final;
+        std::vector<double> cu_low;
+        std::vector<double> cu_high;
+        std::vector<double> cu_final;
         std::vector<double> cu_center;
+        std::vector<double> cu_legacy_center;
+        std::vector<double> dual_target_jn_cell;
+        std::vector<double> dual_target_jn_replay_cell;
+        std::vector<double> dual_legacy_je_cell;
+        std::vector<double> dual_je_cell;
         std::vector<double> cu_reconstruction_mass;
+        int background_coupling_mode;
+        int dual_u_operator_valid;
+        double dual_u_target_replay_linf;
+        double dual_u_target_replay_scale;
+        double dual_u_legacy_operator_replay_linf;
+        double dual_u_legacy_operator_replay_scale;
+        double dual_u_legacy_current_linf;
+        double dual_u_current_linf;
+        double dual_u_correction_l2;
+        double dual_u_correction_linf;
+        long long dual_u_corrected_cell_count;
         std::vector<double> jn_low;
         std::vector<double> jn_high;
         std::vector<double> jn_final;
@@ -690,6 +781,10 @@ public:
         std::vector<double> gstar_je_center;
         std::vector<double> gstar_je_high;
         std::vector<double> gstar_je_final;
+        std::vector<double> final_state_mass;
+        std::vector<double> donor_beta;
+        std::vector<double> donor_low_mass;
+        std::vector<double> donor_limited_outflow;
         // Hashes are reductions over the physical cells read by each
         // transport layer.  Time-layer values: 0=step-start, 1=Picard
         // midpoint.  They make split-state use observable in section 11.5.
@@ -731,7 +826,32 @@ public:
         int fct_active;
         double limiter_active_fraction;
         double limiter_min_alpha;
+        double x_limiter_active_fraction;
+        double x_limiter_min_alpha;
+        double u_limiter_active_fraction;
+        double u_limiter_min_alpha;
+        long long donor_beta_applied_count;
+        double donor_beta_min;
         double r_couple;
+        double r_fv;
+        // Read-only decomposition of R_FV from the production operator.
+        // These values let endpoint tests distinguish state, spatial-boundary,
+        // velocity-work, and velocity-boundary bookkeeping without replaying
+        // any production formula.
+        double delta_ke_bkg;
+        double stage5_u_energy_moment;
+        double stage5_spatial_energy_boundary;
+        double mass_change;
+        double mass_scale;
+        double mass_residual;
+        double momentum_change;
+        double momentum_scale;
+        double momentum_residual;
+        double u_boundary_particle;
+        double u_boundary_momentum;
+        double u_boundary_energy;
+        double u_boundary_energy_lower;
+        double u_boundary_energy_upper;
         // Direct fixed-state identity audit: final fluxes -> J_N/J_E/G*J_E.
         // It is valid only for a single physical substep, because the raw
         // stored fluxes are the final substep while returned currents are
@@ -763,6 +883,12 @@ public:
         nonuniform_high_order_enabled_ = enabled;
     }
     void set_fct_enabled(bool enabled) { fct_enabled_ = enabled; }
+    void set_background_coupling_mode(BackgroundCouplingMode mode) {
+        background_coupling_mode_ = mode;
+    }
+    BackgroundCouplingMode background_coupling_mode() const {
+        return background_coupling_mode_;
+    }
     void set_max_midpoint_iterations(int iterations) {
         max_midpoint_iterations_ = iterations > 0 ? iterations : 1;
     }
@@ -808,6 +934,12 @@ public:
     // the production executable.
     void set_controlled_fct_flux_injection_enabled(bool enabled) {
         controlled_fct_flux_injection_enabled_ = enabled;
+    }
+    // Stage-3 test-only injection on one internal shared u_parallel face.
+    // The injected pair still satisfies Phi_u=a*C_u and is never enabled by
+    // the production executable.
+    void set_controlled_u_fct_flux_injection_enabled(bool enabled) {
+        controlled_u_fct_flux_injection_enabled_ = enabled;
     }
     // Section-7.3 no-FCT verification may retain finite, non-macroscopic
     // negative debt so the raw high-order dynamics can be audited.  This is
@@ -1140,6 +1272,7 @@ private:
     bool low_order_only_;
     bool nonuniform_high_order_enabled_;
     bool fct_enabled_;
+    BackgroundCouplingMode background_coupling_mode_;
     bool capture_midpoint_input_;
     bool legacy_boundary_upwind_high_candidate_for_test_;
     bool energy_consistent_x_high_velocity_for_test_;
@@ -1147,6 +1280,7 @@ private:
     bool midpoint_iteration_trace_for_test_;
     bool fct_activation_audit_enabled_;
     bool controlled_fct_flux_injection_enabled_;
+    bool controlled_u_fct_flux_injection_enabled_;
     bool allow_finite_negative_debt_for_test_;
     mutable std::vector<double> ghost_send_left_;
     mutable std::vector<double> ghost_send_right_;

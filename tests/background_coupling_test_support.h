@@ -27,16 +27,21 @@ struct BundleOptions {
     const Species* guess_np1;
     const EMFields* fields_end_guess;
     bool controlled_fct_injection;
+    bool controlled_u_fct_injection;
     bool fct_enabled;
     bool allow_finite_negative_debt;
     bool energy_consistent_x_high_velocity;
+    VlasovAmpereMidpointSolver::BackgroundCouplingMode coupling_mode;
     const VlasovAmpereMidpointSolver::CouplingRegionLayout* coupling_layout;
 
     BundleOptions()
         : guess_np1(0), fields_end_guess(0),
-          controlled_fct_injection(false), fct_enabled(true),
-          allow_finite_negative_debt(false),
-          energy_consistent_x_high_velocity(false), coupling_layout(0) {}
+          controlled_fct_injection(false), controlled_u_fct_injection(false),
+          fct_enabled(true),
+           allow_finite_negative_debt(false),
+          energy_consistent_x_high_velocity(false),
+          coupling_mode(VlasovAmpereMidpointSolver::LEGACY_COUPLING),
+          coupling_layout(0) {}
 };
 
 inline double wave_number(const SpatialGrid& sg, int mode)
@@ -97,6 +102,7 @@ evaluate_bundle(const Species& background, const EMFields& fields,
     solver.set_low_order_only(false);
     solver.set_nonuniform_high_order_enabled(true);
     solver.set_fct_enabled(options.fct_enabled);
+    solver.set_background_coupling_mode(options.coupling_mode);
     solver.set_allow_finite_negative_debt_for_test(
         options.allow_finite_negative_debt);
     solver.set_energy_consistent_x_high_velocity_for_test(
@@ -104,6 +110,8 @@ evaluate_bundle(const Species& background, const EMFields& fields,
     solver.set_fct_activation_audit_enabled(options.controlled_fct_injection);
     solver.set_controlled_fct_flux_injection_enabled(
         options.controlled_fct_injection);
+    solver.set_controlled_u_fct_flux_injection_enabled(
+        options.controlled_u_fct_injection);
     const std::vector<double> no_beam(static_cast<size_t>(sg.nx_local + 1),
                                       0.0);
     VlasovAmpereMidpointSolver::CouplingRegionLayout default_layout = {};

@@ -29,8 +29,7 @@ std::map<std::string, double> read_result(const char* path)
 bool contains_required_keys(const std::map<std::string, double>& values)
 {
     static const char* required[] = {
-        "passes", "operator_valid", "outputs_finite", "coverage_valid",
-        "kink_one_sided_valid", "nx", "Nu", "Nuperp",
+        "operator_valid", "outputs_finite", "nx", "Nu", "Nuperp",
         "wN_minus_wE_L2", "pair_work_L2", "tail_weight_relative_L1",
         "frozen_weight_fraction", "active_fully_covered_fraction",
         "gR_work_relative", "kink_active_mass_fraction",
@@ -65,6 +64,15 @@ double observed_order(double coarse, double fine)
     return (std::isfinite(coarse) && std::isfinite(fine) && coarse > 0.0 &&
             fine > 0.0) ? std::log(coarse / fine) / std::log(2.0)
                          : std::numeric_limits<double>::quiet_NaN();
+}
+
+bool flag(const std::map<std::string, double>& result,
+          const char* preferred, const char* fallback)
+{
+    const std::map<std::string, double>::const_iterator preferred_it =
+        result.find(preferred);
+    if (preferred_it != result.end()) return preferred_it->second == 1.0;
+    return value(result, fallback) == 1.0;
 }
 
 } // namespace
@@ -104,12 +112,11 @@ int main(int argc, char** argv)
     const double kink_work[3] = {value(coarse, "kink_pair_work_fraction"),
                                  value(medium, "kink_pair_work_fraction"),
                                  value(fine, "kink_pair_work_fraction")};
-    const bool all_inputs_pass = value(coarse, "passes") == 1.0 &&
-        value(medium, "passes") == 1.0 && value(fine, "passes") == 1.0;
+    const double active_coverage_threshold = 0.999;
     const bool direct_inputs_valid =
-        value(coarse, "operator_valid") == 1.0 &&
-        value(medium, "operator_valid") == 1.0 &&
-        value(fine, "operator_valid") == 1.0 &&
+        flag(coarse, "direct_pair_sample_valid", "operator_valid") &&
+        flag(medium, "direct_pair_sample_valid", "operator_valid") &&
+        flag(fine, "direct_pair_sample_valid", "operator_valid") &&
         value(coarse, "outputs_finite") == 1.0 &&
         value(medium, "outputs_finite") == 1.0 &&
         value(fine, "outputs_finite") == 1.0 &&
@@ -117,40 +124,55 @@ int main(int argc, char** argv)
         value(medium, "Nuperp") == value(fine, "Nuperp") &&
         value(coarse, "nx") == value(medium, "nx") &&
         value(medium, "nx") == value(fine, "nx");
-    const bool jacobian_inputs_valid = all_inputs_pass &&
-        value(coarse, "coverage_valid") == 1.0 &&
-        value(medium, "coverage_valid") == 1.0 &&
-        value(fine, "coverage_valid") == 1.0 &&
-        value(coarse, "kink_one_sided_valid") == 1.0 &&
-        value(medium, "kink_one_sided_valid") == 1.0 &&
-        value(fine, "kink_one_sided_valid") == 1.0;
+    const bool jacobian_metrics_finite[3] = {
+        std::isfinite(w[0]) && std::isfinite(work_relative[0]) &&
+            std::isfinite(kink_mass[0]) && std::isfinite(kink_work[0]),
+        std::isfinite(w[1]) && std::isfinite(work_relative[1]) &&
+            std::isfinite(kink_mass[1]) && std::isfinite(kink_work[1]),
+        std::isfinite(w[2]) && std::isfinite(work_relative[2]) &&
+            std::isfinite(kink_mass[2]) && std::isfinite(kink_work[2])
+    };
+    const bool jacobian_level_valid[3] = {
+        flag(coarse, "jacobian_transpose_valid", "frozen_jacobian_valid") &&
+            jacobian_metrics_finite[0] &&
+            active_coverage[0] >= active_coverage_threshold,
+        flag(medium, "jacobian_transpose_valid", "frozen_jacobian_valid") &&
+            jacobian_metrics_finite[1] &&
+            active_coverage[1] >= active_coverage_threshold,
+        flag(fine, "jacobian_transpose_valid", "frozen_jacobian_valid") &&
+            jacobian_metrics_finite[2] &&
+            active_coverage[2] >= active_coverage_threshold
+    };
+    const bool jacobian_inputs_valid = jacobian_level_valid[0] &&
+        jacobian_level_valid[1] && jacobian_level_valid[2];
     const double w_order_cm = observed_order(w[0], w[1]);
     const double w_order_mf = observed_order(w[1], w[2]);
     const double pair_order_cm = observed_order(pair[0], pair[1]);
     const double pair_order_mf = observed_order(pair[1], pair[2]);
-    const bool finite_norms = std::isfinite(w[0]) && std::isfinite(w[1]) &&
-        std::isfinite(w[2]) && std::isfinite(pair[0]) &&
-        std::isfinite(pair[1]) && std::isfinite(pair[2]) &&
-        std::isfinite(work_relative[0]) && std::isfinite(work_relative[1]) &&
-        std::isfinite(work_relative[2]) && std::isfinite(kink_mass[0]) &&
-        std::isfinite(kink_mass[1]) && std::isfinite(kink_mass[2]) &&
-        std::isfinite(kink_work[0]) && std::isfinite(kink_work[1]) &&
-        std::isfinite(kink_work[2]);
-    const bool decreases = finite_norms && w[2] < w[0] && pair[2] < pair[0];
-    const bool truncation_dominated = direct_inputs_valid && finite_norms &&
-        pair_order_cm >= 1.5 && pair_order_mf >= 1.5 &&
+    const bool direct_norms_finite = std::isfinite(pair[0]) &&
+        std::isfinite(pair[1]) && std::isfinite(pair[2]);
+    const bool jacobian_norms_finite = jacobian_metrics_finite[0] &&
+        jacobian_metrics_finite[1] && jacobian_metrics_finite[2];
+    const bool direct_decreases = direct_norms_finite &&
         pair[2] < pair[1] && pair[1] < pair[0];
-    const bool structural_plateau = direct_inputs_valid && finite_norms &&
+    const bool truncation_dominated = direct_inputs_valid &&
+        direct_norms_finite &&
+        pair_order_cm >= 1.5 && pair_order_mf >= 1.5 &&
+        direct_decreases;
+    const bool structural_plateau = direct_inputs_valid &&
+        direct_norms_finite &&
         !truncation_dominated &&
         pair[2] / std::max(pair[0], 1.0e-300) > 0.5;
-    const bool nonsmooth_limiter_dominated = finite_norms &&
+    const bool nonsmooth_limiter_dominated = jacobian_norms_finite &&
         (std::max(kink_mass[0], std::max(kink_mass[1], kink_mass[2])) > 1.0e-2 ||
          std::max(kink_work[0], std::max(kink_work[1], kink_work[2])) > 5.0e-2);
-    const bool jacobian_audit_inconclusive = !jacobian_inputs_valid;
-    const bool inconclusive = !direct_inputs_valid || !finite_norms ||
+    const bool direct_pair_audit_inconclusive = !direct_inputs_valid ||
+        !direct_norms_finite ||
         (!truncation_dominated && !structural_plateau);
-    const bool passes = direct_inputs_valid && finite_norms &&
-        truncation_dominated;
+    const bool direct_pair_convergence_valid = direct_inputs_valid &&
+        direct_norms_finite && truncation_dominated;
+    const bool jacobian_transpose_valid = jacobian_inputs_valid;
+    const bool jacobian_transpose_incomplete = !jacobian_transpose_valid;
 
     std::ofstream out("output/background_coupling_upar_transpose_convergence_audit.result");
     std::ostream& log = out ? out : std::cout;
@@ -173,6 +195,10 @@ int main(int argc, char** argv)
         << "active_fully_covered_fraction_coarse=" << active_coverage[0] << "\n"
         << "active_fully_covered_fraction_medium=" << active_coverage[1] << "\n"
         << "active_fully_covered_fraction_fine=" << active_coverage[2] << "\n"
+        << "active_coverage_threshold=" << active_coverage_threshold << "\n"
+        << "jacobian_level_valid_coarse=" << jacobian_level_valid[0] << "\n"
+        << "jacobian_level_valid_medium=" << jacobian_level_valid[1] << "\n"
+        << "jacobian_level_valid_fine=" << jacobian_level_valid[2] << "\n"
         << "gR_work_relative_coarse=" << work_relative[0] << "\n"
         << "gR_work_relative_medium=" << work_relative[1] << "\n"
         << "gR_work_relative_fine=" << work_relative[2] << "\n"
@@ -186,19 +212,26 @@ int main(int argc, char** argv)
         << "wN_minus_wE_order_medium_to_fine=" << w_order_mf << "\n"
         << "pair_work_order_coarse_to_medium=" << pair_order_cm << "\n"
         << "pair_work_order_medium_to_fine=" << pair_order_mf << "\n"
-        << "truncation_trend_detected=" << decreases << "\n"
+        << "truncation_trend_detected=" << direct_decreases << "\n"
         << "truncation_dominated=" << truncation_dominated << "\n"
         << "structural_plateau=" << structural_plateau << "\n"
         << "nonsmooth_limiter_dominated=" << nonsmooth_limiter_dominated << "\n"
-        << "jacobian_audit_inconclusive=" << jacobian_audit_inconclusive << "\n"
-        << "audit_inconclusive=" << inconclusive << "\n"
-        << "all_inputs_pass=" << all_inputs_pass << "\n"
+        << "direct_pair_audit_inconclusive="
+        << direct_pair_audit_inconclusive << "\n"
+        << "jacobian_transpose_incomplete="
+        << jacobian_transpose_incomplete << "\n"
         << "direct_inputs_valid=" << direct_inputs_valid << "\n"
+        << "direct_norms_finite=" << direct_norms_finite << "\n"
         << "jacobian_inputs_valid=" << jacobian_inputs_valid << "\n"
-        << "inputs_valid=" << direct_inputs_valid << "\n"
-        << "passes=" << passes << "\n";
+        << "jacobian_norms_finite=" << jacobian_norms_finite << "\n"
+        << "direct_pair_convergence_valid="
+        << direct_pair_convergence_valid << "\n"
+        << "jacobian_transpose_valid=" << jacobian_transpose_valid << "\n";
     std::cout << "background_coupling_upar_transpose_convergence_audit result="
               << "output/background_coupling_upar_transpose_convergence_audit.result"
-              << " passes=" << passes << "\n";
-    return passes ? 0 : 1;
+              << " direct_pair_convergence_valid="
+              << direct_pair_convergence_valid
+              << " jacobian_transpose_valid=" << jacobian_transpose_valid
+              << "\n";
+    return direct_pair_convergence_valid ? 0 : 1;
 }

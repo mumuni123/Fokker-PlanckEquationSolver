@@ -57,10 +57,13 @@ int main(int argc, char** argv)
     written.low_order_only = solver.low_order_only();
     written.high_order_enabled = solver.nonuniform_high_order_enabled();
     written.fct_enabled = solver.fct_enabled();
+    written.background_coupling_mode =
+        static_cast<int>(solver.background_coupling_mode());
     written.acceptance_type = reference.converged ? "strict" : "soft";
     written.bkg_n = bkg; written.guess_np1 = bkg;
     written.operator_input_guess = bkg;
     written.fields_n = fields; written.fields_end_guess = fields;
+    written.fields_np1 = reference.fields_np1;
     written.coupling_layout = layout;
     written.j_beam_face_mid = reference.j_beam_face_mid;
     written.reference_jn_face = reference.j_bkg_face_mid;
@@ -69,6 +72,14 @@ int main(int argc, char** argv)
     written.periodic_seam_face_audit = reference.periodic_seam_face_audit;
     written.reference_stage5_r_fv = reference.stage5_r_fv;
     written.reference_stage5_r_couple = reference.stage5_r_couple;
+    written.limiter_active_fraction = reference.limiter_active_fraction;
+    written.limiter_active_fraction_core =
+        reference.limiter_active_fraction_core;
+    written.limiter_active_fraction_boundary =
+        reference.limiter_active_fraction_boundary;
+    written.x_limiter_active_fraction = reference.x_limiter_active_fraction;
+    written.u_limiter_active_fraction = reference.u_limiter_active_fraction;
+    written.limiter_min_alpha = reference.limiter_min_alpha;
     std::string error;
     bool ok = reference.state_advanced && !reference.failed &&
         write_midpoint_audit_state("fixed_midpoint_operator_audit_tmp", written,

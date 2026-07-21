@@ -1,4 +1,5 @@
 #include "vlasov_ampere_midpoint.h"
+#include "dual_u_coupling.h"
 #include "nonuniform_reconstruction.h"
 #include "discrete_moment_operators.h"
 #include "periodic_staggered_operators.h"
@@ -55,7 +56,12 @@ inline bool normalize_roundoff_negative_candidate(double& candidate,
         return false;
     }
     if (candidate > 0.0) return false;
-    if (-candidate > roundoff_tolerance) return false;
+    // A negative subnormal is an underflow residue, not a resolvable mass
+    // deficit.  The flux-difference arithmetic can accumulate more than the
+    // fixed denorm_min allowance before it underflows, so preserve the local
+    // tolerance for normal values and canonicalize subnormals explicitly.
+    const bool subnormal = std::fpclassify(candidate) == FP_SUBNORMAL;
+    if (!subnormal && -candidate > roundoff_tolerance) return false;
     normalized_mass = -candidate;
     candidate = 0.0; // Canonical positive zero, not a global distribution clip.
     return true;
@@ -164,6 +170,22 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
     low_order_solver_checkpoint(low_order_only_, "entry", mpi_rank);
     Result result;
     reset_result(result);
+    result.background_coupling_mode =
+        static_cast<int>(background_coupling_mode_);
+    result.dual_u_operator_valid =
+        background_coupling_mode_ == LEGACY_COUPLING ? 1 : 0;
+    if (background_coupling_mode_ == DUAL_U_COUPLING && low_order_only_) {
+        result.failed = true;
+        result.state_advanced = 0;
+        result.failure_reason = 13;
+        if (mpi_rank == 0) {
+            std::cerr << "dual_u_coupling configuration error: "
+                      << "requires low_order_only=0; the explicit runtime "
+                      << "dual-u experiment otherwise retains the production "
+                      << "Beam, Ampere, and FCT paths\n";
+        }
+        return result;
+    }
     result.transport_low_order_only = low_order_only_ ? 1 : 0;
     result.substeps_used = substeps_used;
     result.species_np1 = bkg_n;
@@ -205,6 +227,10 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
     // Centered u-force candidate is kept separately from the selected high
     // flux so the closure audit can isolate boundary/upwind stabilization.
     std::vector<double> cu_high_center(high_uflux_size, 0.0);
+    const bool dual_u_enabled =
+        background_coupling_mode_ == DUAL_U_COUPLING;
+    std::vector<double> cu_legacy_center(
+        dual_u_enabled ? high_uflux_size : 0, 0.0);
     std::vector<double> inv_cell_volume(low_order_only_ ? 0 : Param::Nvmu, 0.0);
     if (!low_order_only_) {
         for (int j = 0; j < Param::Nv; ++j) {
@@ -225,6 +251,8 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
     std::vector<double> cu_final(high_uflux_size, 0.0);
     std::vector<double> candidate_mass(high_local_cell_count, 0.0);
     std::vector<double> donor_beta(high_local_cell_count, 1.0);
+    std::vector<double> donor_low_mass(high_local_cell_count, 0.0);
+    std::vector<double> donor_limited_outflow(high_local_cell_count, 0.0);
     Species low_state_buffer = bkg_n;
     std::vector<double> e_mid_buffer(static_cast<size_t>(nxl), 0.0);
     std::vector<double> next_e_buffer(static_cast<size_t>(nxl), 0.0);
@@ -252,6 +280,27 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
     std::vector<double> u_momentum_cell(static_cast<size_t>(nxl), 0.0);
     std::vector<double> u_boundary_energy_cell(static_cast<size_t>(nxl), 0.0);
     std::vector<double> u_boundary_momentum_cell(static_cast<size_t>(nxl), 0.0);
+    // These u_parallel-face factors depend only on the immutable velocity
+    // grid and species constants for this solve.  Reusing them removes the
+    // same scalar divisions/products from every x cell and force substep.
+    std::vector<double> u_face_energy_delta(Param::Nvmu, 0.0);
+    std::vector<double> u_face_momentum_delta(Param::Nvmu, 0.0);
+    std::vector<double> u_face_energy_current_weight(Param::Nvmu, 0.0);
+    const double energy_current_factor =
+        bkg_n.charge / (bkg_n.mass * Const::c * sg.dx);
+    for (int jf = 1; jf < Param::Nv; ++jf) {
+        const double momentum_delta = bkg_n.mass * Const::c *
+            bkg_n.cgrid.upar_center_distances[jf];
+        for (int k = 0; k < Param::Nmu; ++k) {
+            const size_t face = idx2(jf, k);
+            const double energy_delta =
+                Stage5::delta_energy(bkg_n.cgrid, jf, k);
+            u_face_energy_delta[face] = energy_delta;
+            u_face_momentum_delta[face] = momentum_delta;
+            u_face_energy_current_weight[face] =
+                energy_delta * energy_current_factor;
+        }
+    }
     const auto current_moment_from_x_flux = [&](const std::vector<double>& flux,
                                                  std::vector<double>& current) {
         current.assign(nface, 0.0);
@@ -487,11 +536,19 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
         double limiter_energy_core = 0.0;
         double limiter_energy_boundary = 0.0;
         double u_boundary_energy = 0.0;
+        double u_boundary_energy_lower = 0.0;
+        double u_boundary_energy_upper = 0.0;
         double u_boundary_particle = 0.0;
         double u_boundary_momentum = 0.0;
         double limiter_faces = 0.0;
         double limiter_active = 0.0;
         double limiter_min = 1.0;
+        double x_limiter_faces = 0.0;
+        double x_limiter_active = 0.0;
+        double x_limiter_min = 1.0;
+        double u_limiter_faces = 0.0;
+        double u_limiter_active = 0.0;
+        double u_limiter_min = 1.0;
         double limiter_faces_core = 0.0;
         double limiter_faces_boundary = 0.0;
         double limiter_active_core = 0.0;
@@ -624,6 +681,36 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
             };
         const auto transport_safe_step_gate =
             [&](Species& candidate_state, int completed_substeps) {
+                // A final copy or ghost synchronization may preserve a signed
+                // subnormal that was already below the FCT candidate roundoff
+                // scale.  Canonicalize only this underflow residue on the
+                // conservative low/FCT paths; ordinary finite negative mass
+                // remains subject to the existing hard gate below.
+                double local_subnormal_zeroed_count = 0.0;
+                double local_subnormal_zeroed_mass = 0.0;
+                if (low_order_only_ || fct_enabled_) {
+                    #pragma omp parallel for reduction(+:local_subnormal_zeroed_count,local_subnormal_zeroed_mass) schedule(static)
+                    for (int ix = 0; ix < nxl; ++ix)
+                        for (int j = 0; j < Param::Nv; ++j)
+                            for (int k = 0; k < Param::Nmu; ++k) {
+                                double& m = candidate_state.f[
+                                    mass_index(ng + ix, j, k)];
+                                if (m < 0.0 && std::isfinite(m) &&
+                                    std::fpclassify(m) == FP_SUBNORMAL) {
+                                    local_subnormal_zeroed_count += 1.0;
+                                    local_subnormal_zeroed_mass += -m;
+                                    m = 0.0;
+                                }
+                            }
+                    double subnormal_zeroed[2] = {
+                        local_subnormal_zeroed_count,
+                        local_subnormal_zeroed_mass};
+                    MPI_Allreduce(MPI_IN_PLACE, subnormal_zeroed, 2,
+                                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+                    result.fct_roundoff_zeroed_count +=
+                        static_cast<long long>(subnormal_zeroed[0]);
+                    result.fct_roundoff_zeroed_mass += subnormal_zeroed[1];
+                }
                 // Synchronize first so the next physical step cannot obtain
                 // an unchecked ghost donor.  Physical cells are then enough
                 // for the global minimum because ghosts are copies of them.
@@ -955,6 +1042,232 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                     cu_high_center[upper] = cu_low[upper];
                 }
             }
+
+            if (dual_u_enabled) {
+                // Freeze and replay both real production functionals before
+                // constructing the local rank-one dual operator.  The x
+                // functional is evaluated from the same high flux that forms
+                // J_N; the u functional uses the exact MC/minmod branches that
+                // formed cu_high_center.
+                cu_legacy_center = cu_high_center;
+                std::vector<double> jn_high_face;
+                current_moment_from_x_flux(fx_high, jn_high_face);
+                result.dual_target_jn_cell.assign(
+                    static_cast<size_t>(nxl), 0.0);
+                result.dual_target_jn_replay_cell.assign(
+                    static_cast<size_t>(nxl), 0.0);
+                double u_replay_linf = 0.0;
+                double u_replay_scale = 0.0;
+
+                const auto replay_x_face_current = [&](int iface) {
+                    const int il = ng + iface - 1;
+                    const int ir = ng + iface;
+                    const double s_face = sg.x_min +
+                        (sg.ix_start + iface) * sg.dx;
+                    double current = 0.0;
+                    for (int j = 0; j < Param::Nv; ++j) {
+                        for (int k = 0; k < Param::Nmu; ++k) {
+                            const double speed = bkg_n.cgrid.vx[idx2(j, k)];
+                            NonuniformMuscl::FrozenCenteredLinearization frozen;
+                            if (speed == 0.0) {
+                                frozen = NonuniformMuscl::frozen_centered_linearization(
+                                    fbar(il - 1, j, k), fbar(il, j, k),
+                                    fbar(ir, j, k), fbar(ir + 1, j, k),
+                                    x_center(il - 1), x_center(il),
+                                    x_center(ir), x_center(ir + 1), s_face);
+                            } else {
+                                frozen = NonuniformMuscl::frozen_upwind_linearization(
+                                    fbar(il - 1, j, k), fbar(il, j, k),
+                                    fbar(ir, j, k), fbar(ir + 1, j, k),
+                                    x_center(il - 1), x_center(il),
+                                    x_center(ir), x_center(ir + 1), s_face,
+                                    speed > 0.0);
+                            }
+                            const double q[4] = {
+                                fbar(il - 1, j, k), fbar(il, j, k),
+                                fbar(ir, j, k), fbar(ir + 1, j, k)};
+                            double face_state = 0.0;
+                            for (int p = 0; p < 4; ++p)
+                                face_state += frozen.coefficient[p] * q[p];
+                            current += bkg_n.charge * speed * face_state *
+                                bkg_n.cgrid.upar_widths[j] *
+                                bkg_n.cgrid.uperp_ring_areas[k];
+                        }
+                    }
+                    return current;
+                };
+
+                std::vector<double> replay_jn_face(nface, 0.0);
+                #pragma omp parallel for schedule(static)
+                for (int iface = 0; iface <= nxl; ++iface)
+                    replay_jn_face[static_cast<size_t>(iface)] =
+                        replay_x_face_current(iface);
+                #pragma omp parallel for reduction(max:u_replay_linf,u_replay_scale) schedule(static)
+                for (int ix = 0; ix < nxl; ++ix) {
+                    result.dual_target_jn_cell[static_cast<size_t>(ix)] =
+                        0.5 * (jn_high_face[static_cast<size_t>(ix)] +
+                               jn_high_face[static_cast<size_t>(ix + 1)]);
+                    result.dual_target_jn_replay_cell[static_cast<size_t>(ix)] =
+                        0.5 * (replay_jn_face[static_cast<size_t>(ix)] +
+                               replay_jn_face[static_cast<size_t>(ix + 1)]);
+                    const int storage_ix = ng + ix;
+                    for (int jf = 1; jf < Param::Nv; ++jf) {
+                        const int jl = jf - 1;
+                        const int jr = jf;
+                        const int jll = jl == 0 ? jl : jl - 1;
+                        const int jrr = jr + 1 == Param::Nv ? jr : jr + 1;
+                        const double s_jll = jl == 0
+                            ? bkg_n.cgrid.upar_cells[jl] -
+                              bkg_n.cgrid.upar_widths[jl]
+                            : bkg_n.cgrid.upar_cells[jll];
+                        const double s_jrr = jr + 1 == Param::Nv
+                            ? bkg_n.cgrid.upar_cells[jr] +
+                              bkg_n.cgrid.upar_widths[jr]
+                            : bkg_n.cgrid.upar_cells[jrr];
+                        for (int k = 0; k < Param::Nmu; ++k) {
+                            const NonuniformMuscl::FrozenCenteredLinearization
+                                frozen = NonuniformMuscl::frozen_centered_linearization(
+                                    fbar(storage_ix, jll, k),
+                                    fbar(storage_ix, jl, k),
+                                    fbar(storage_ix, jr, k),
+                                    fbar(storage_ix, jrr, k), s_jll,
+                                    bkg_n.cgrid.upar_cells[jl],
+                                    bkg_n.cgrid.upar_cells[jr], s_jrr,
+                                    bkg_n.cgrid.upar_faces[jf]);
+                            const double q[4] = {
+                                fbar(storage_ix, jll, k),
+                                fbar(storage_ix, jl, k),
+                                fbar(storage_ix, jr, k),
+                                fbar(storage_ix, jrr, k)};
+                            double state = 0.0;
+                            for (int p = 0; p < 4; ++p)
+                                state += frozen.coefficient[p] * q[p];
+                            const double replay =
+                                NonuniformMuscl::upar_face_coefficient(state,
+                                    sg.dx,
+                                    bkg_n.cgrid.uperp_ring_areas[k]);
+                            const size_t id = uface_index(ix, jf, k);
+                            u_replay_linf = std::max(u_replay_linf,
+                                std::fabs(replay - cu_legacy_center[id]));
+                            u_replay_scale = std::max(u_replay_scale,
+                                std::max(std::fabs(replay),
+                                         std::fabs(cu_legacy_center[id])));
+                        }
+                    }
+                }
+
+                DualUCoupling::Diagnostics dual_diagnostics =
+                    DualUCoupling::apply_local_rank_one(
+                        bkg_n.cgrid, bkg_n.charge, bkg_n.mass, sg.dx, nxl,
+                        result.dual_target_jn_cell,
+                        result.dual_target_jn_replay_cell,
+                        cu_legacy_center, cu_high_center,
+                        result.dual_legacy_je_cell, result.dual_je_cell);
+                // A local dual failure must become one collective decision.
+                // Returning on only the affected rank would leave the other
+                // ranks in later collectives and eventually hang the job.
+                const int local_failed_rank = dual_diagnostics.valid
+                    ? std::numeric_limits<int>::max() : mpi_rank;
+                int first_failed_rank = local_failed_rank;
+                MPI_Allreduce(MPI_IN_PLACE, &first_failed_rank, 1, MPI_INT,
+                              MPI_MIN, MPI_COMM_WORLD);
+                int failure_subtype = DualUCoupling::FAILURE_NONE;
+                int failure_global_ix = -1;
+                double failure_record[8] = {0.0};
+                if (first_failed_rank != std::numeric_limits<int>::max()) {
+                    if (mpi_rank == first_failed_rank) {
+                        failure_subtype = dual_diagnostics.failure_subtype;
+                        failure_global_ix = dual_diagnostics.failure_local_ix < 0
+                            ? -1 : sg.ix_start +
+                                dual_diagnostics.failure_local_ix;
+                        failure_record[0] = dual_diagnostics.failure_target;
+                        failure_record[1] = dual_diagnostics.failure_replay;
+                        failure_record[2] = dual_diagnostics.failure_legacy;
+                        failure_record[3] = dual_diagnostics.failure_residual;
+                        failure_record[4] = dual_diagnostics.failure_denominator;
+                        failure_record[5] =
+                            dual_diagnostics.failure_maximum_coefficient;
+                        failure_record[6] =
+                            dual_diagnostics.failure_support_floor;
+                        failure_record[7] = dual_diagnostics.failure_scale;
+                    }
+                    MPI_Bcast(&failure_subtype, 1, MPI_INT, first_failed_rank,
+                              MPI_COMM_WORLD);
+                    MPI_Bcast(&failure_global_ix, 1, MPI_INT,
+                              first_failed_rank, MPI_COMM_WORLD);
+                    MPI_Bcast(failure_record, 8, MPI_DOUBLE,
+                              first_failed_rank, MPI_COMM_WORLD);
+                }
+                cu_high = cu_high_center;
+                #pragma omp parallel for schedule(static)
+                for (int ix = 0; ix < nxl; ++ix) {
+                    const double acceleration = bkg_n.charge *
+                        fields_mid.Ex[ng + ix] / (bkg_n.mass * Const::c);
+                    for (int jf = 0; jf <= Param::Nv; ++jf)
+                        for (int k = 0; k < Param::Nmu; ++k) {
+                            const size_t id = uface_index(ix, jf, k);
+                            fu_high[id] = acceleration * cu_high[id];
+                        }
+                }
+                result.legacy_center_u_coefficient = cu_legacy_center;
+                result.dual_u_operator_valid =
+                    first_failed_rank == std::numeric_limits<int>::max();
+                result.dual_u_target_replay_linf =
+                    dual_diagnostics.target_replay_linf;
+                result.dual_u_target_replay_scale =
+                    dual_diagnostics.target_replay_scale;
+                result.dual_u_legacy_operator_replay_linf = u_replay_linf;
+                result.dual_u_legacy_operator_replay_scale = u_replay_scale;
+                result.dual_u_legacy_current_linf =
+                    dual_diagnostics.legacy_current_linf;
+                result.dual_u_current_linf =
+                    dual_diagnostics.dual_current_linf;
+                result.dual_u_correction_l2 =
+                    dual_diagnostics.correction_l2;
+                result.dual_u_correction_linf =
+                    dual_diagnostics.correction_linf;
+                result.dual_u_corrected_cell_count =
+                    dual_diagnostics.corrected_cell_count;
+                if (!result.dual_u_operator_valid) {
+                    result.failed = true;
+                    result.state_advanced = 0;
+                    result.failure_reason = failure_subtype ==
+                        DualUCoupling::FAILURE_GRAM_DEGENERATE ? 14 :
+                        (failure_subtype ==
+                         DualUCoupling::FAILURE_INPUT_CONTRACT ? 16 : 15);
+                    result.failure_iteration = iter;
+                    result.failure_substep = sub;
+                    if (mpi_rank == 0) {
+                        const char* subtype_name =
+                            failure_subtype ==
+                                DualUCoupling::FAILURE_GRAM_DEGENERATE
+                            ? "gram_degenerate"
+                            : (failure_subtype ==
+                                DualUCoupling::FAILURE_CORRECTION_NONFINITE
+                               ? "correction_nonfinite"
+                               : (failure_subtype ==
+                                    DualUCoupling::FAILURE_DUAL_CURRENT_NONFINITE
+                                  ? "dual_current_nonfinite"
+                                  : "input_contract"));
+                        std::cerr << std::scientific
+                                  << "dual_u_coupling_failure"
+                                  << " subtype=" << subtype_name
+                                  << " rank=" << first_failed_rank
+                                  << " global_ix=" << failure_global_ix
+                                  << " target=" << failure_record[0]
+                                  << " replay=" << failure_record[1]
+                                  << " legacy=" << failure_record[2]
+                                  << " residual=" << failure_record[3]
+                                  << " denominator=" << failure_record[4]
+                                  << " maximum_coefficient="
+                                  << failure_record[5]
+                                  << " support_floor=" << failure_record[6]
+                                  << " scale=" << failure_record[7]
+                                  << std::endl;
+                    }
+                    return result;
+                }
+            }
             } // !low_order_only_: nonuniform MUSCL high-order candidate
 
             Species& low_state = low_state_buffer;
@@ -1227,6 +1540,44 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                     static_cast<long long>(local_injection_count);
             }
 
+            if (controlled_u_fct_flux_injection_enabled_ && fct_enabled_) {
+                double local_injection_count = 0.0;
+                if (mpi_rank == 0 && nxl >= 1 && h > 0.0) {
+                    const int ix = nxl / 2;
+                    const double acceleration = bkg_n.charge *
+                        fields_mid.Ex[ng + ix] / (bkg_n.mass * Const::c);
+                    if (acceleration != 0.0 && std::isfinite(acceleration)) {
+                        int donor_j = 1;
+                        int donor_k = 0;
+                        double donor_mass = -1.0;
+                        for (int j = 1; j + 1 < Param::Nv; ++j)
+                            for (int k = 0; k < Param::Nmu; ++k) {
+                                const double mass = low_state.f[
+                                    mass_index(ng + ix, j, k)];
+                                if (mass > donor_mass) {
+                                    donor_mass = mass;
+                                    donor_j = j;
+                                    donor_k = k;
+                                }
+                            }
+                        if (donor_mass > 0.0) {
+                            const int jf = acceleration > 0.0
+                                ? donor_j + 1 : donor_j;
+                            const size_t face = uface_index(ix, jf, donor_k);
+                            const double added_flux = std::copysign(
+                                1.25 * donor_mass / h, acceleration);
+                            fu_high[face] += added_flux;
+                            cu_high[face] += added_flux / acceleration;
+                            local_injection_count = 1.0;
+                        }
+                    }
+                }
+                MPI_Allreduce(MPI_IN_PLACE, &local_injection_count, 1,
+                              MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+                result.fct_controlled_injection_count +=
+                    static_cast<long long>(local_injection_count);
+            }
+
             if (low_order_only_) {
                 // Do not enter FCT/donor-capacity processing in the low-order
                 // production test.  Commit the already checked low-order
@@ -1480,7 +1831,8 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                 double thread_donor_scale = 1.0;
                 int thread_donor_global_linear = -1;
             #pragma omp for schedule(static) reduction(min:candidate_min,high_candidate_min) reduction(max:high_candidate_donor_excess,high_low_identity_linf,high_low_identity_violation,final_tolerance_linf,final_positivity_violation,candidate_nonfinite,donor_roundoff_warning) reduction(+:donor_beta_count,roundoff_normalized_count,roundoff_normalized_mass) reduction(min:donor_beta_min)
-            for (int ix = 0; ix < nxl; ++ix) for (int j = 0; j < Param::Nv; ++j)
+            for (int ix = 0; ix < nxl; ++ix) {
+                for (int j = 0; j < Param::Nv; ++j) {
                 for (int k = 0; k < Param::Nmu; ++k) {
                     const size_t p = static_cast<size_t>(ix) * Param::Nvmu + idx2(j, k);
                     const double m_low = low_state.f[mass_index(ng + ix, j, k)];
@@ -1643,6 +1995,9 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                                                 limited_outflow_ld)))
                         : 1.0;
                     donor_beta[p] = beta;
+                    donor_low_mass[p] = m_low;
+                    donor_limited_outflow[p] =
+                        static_cast<double>(limited_outflow_ld);
                     if (beta < 1.0) {
                         donor_beta_count += 1.0;
                         donor_beta_min = std::min(donor_beta_min, beta);
@@ -1658,6 +2013,8 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                         candidate_nonfinite = 1.0;
                     }
                 }
+                }
+            }
                 #pragma omp critical(cylindrical_identity_worst)
                 {
                     if (thread_identity_ratio > local_identity_ratio) {
@@ -2128,6 +2485,48 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                             limiter_energy_boundary += dlim;
                     }
 
+            // Direction-separated limiter rates are needed only by the
+            // fixed-candidate stage-3 audit.  Keep this extra alpha scan out
+            // of the production stepping path.
+            if (fixed_candidate) {
+                #pragma omp parallel for schedule(static) reduction(+:x_limiter_faces,x_limiter_active) reduction(min:x_limiter_min)
+                for (int iface = 0; iface < nxl; ++iface)
+                    for (int j = 0; j < Param::Nv; ++j)
+                        for (int k = 0; k < Param::Nmu; ++k) {
+                            const size_t id = xface_index(iface, j, k);
+                            const double anti = fx_high[id] - fx_low[id];
+                            const size_t p = idx2(j, k);
+                            const double alpha = anti >= 0.0
+                                ? (iface == 0 ? left_alpha_x_right[p] :
+                                   alpha_x_right[
+                                       static_cast<size_t>(iface - 1) *
+                                       Param::Nvmu + p])
+                                : alpha_x_left[
+                                      static_cast<size_t>(iface) *
+                                      Param::Nvmu + p];
+                            x_limiter_faces += 1.0;
+                            if (alpha < 1.0 - 1.0e-14)
+                                x_limiter_active += 1.0;
+                            x_limiter_min = std::min(x_limiter_min, alpha);
+                        }
+                #pragma omp parallel for schedule(static) reduction(+:u_limiter_faces,u_limiter_active) reduction(min:u_limiter_min)
+                for (int ix = 0; ix < nxl; ++ix)
+                    for (int jf = 1; jf < Param::Nv; ++jf)
+                        for (int k = 0; k < Param::Nmu; ++k) {
+                            const size_t id = uface_index(ix, jf, k);
+                            const double anti = fu_high[id] - fu_low[id];
+                            const size_t base = static_cast<size_t>(ix) *
+                                                Param::Nvmu;
+                            const double alpha = anti >= 0.0
+                                ? alpha_u_upper[base + idx2(jf - 1, k)]
+                                : alpha_u_lower[base + idx2(jf, k)];
+                            u_limiter_faces += 1.0;
+                            if (alpha < 1.0 - 1.0e-14)
+                                u_limiter_active += 1.0;
+                            u_limiter_min = std::min(u_limiter_min, alpha);
+                        }
+            }
+
             #pragma omp parallel for schedule(static)
             for (int ix = 0; ix < nxl; ++ix) for (int j = 0; j < Param::Nv; ++j)
                 for (int k = 0; k < Param::Nmu; ++k)
@@ -2202,10 +2601,11 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                 double u_energy = 0.0;
                 double u_momentum = 0.0;
                 for (int jf = 1; jf < Param::Nv; ++jf) for (int k = 0; k < Param::Nmu; ++k) {
-                    const double dke = Stage5::delta_energy(bkg_n.cgrid, jf, k);
-                    const double center_distance = Stage5::upar_center_distance(
-                        bkg_n.cgrid, jf);
                     const size_t id = uface_index(ix, jf, k);
+                    const size_t face = idx2(jf, k);
+                    const double dke = u_face_energy_delta[face];
+                    const double energy_current_weight =
+                        u_face_energy_current_weight[face];
                     const double coefficient_high = cu_high_used[id];
                     const double coefficient_center = cu_high_center_used[id];
                     const double coefficient_final = cu_final_used[id];
@@ -2214,19 +2614,17 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                     // J_E = q/(m c dx) sum(delta_K * C_u).  The dx division
                     // converts the cell-integrated C_u back to a current
                     // density; h-weighting and /dt occur outside this loop.
-                    const double current_factor =
-                        bkg_n.charge / (bkg_n.mass * Const::c * sg.dx);
-                    je_low += dke * current_factor * coefficient_low;
-                    je_high += dke * current_factor * coefficient_high;
-                    je_center += dke * current_factor * coefficient_center;
-                    je_final += dke * current_factor * coefficient_final;
+                    je_low += energy_current_weight * coefficient_low;
+                    je_high += energy_current_weight * coefficient_high;
+                    je_center += energy_current_weight * coefficient_center;
+                    je_final += energy_current_weight * coefficient_final;
                     if (fixed_candidate) {
                         const double low_contribution =
-                            dke * current_factor * coefficient_low;
+                            energy_current_weight * coefficient_low;
                         const double high_contribution =
-                            dke * current_factor * coefficient_high;
+                            energy_current_weight * coefficient_high;
                         const double final_contribution =
-                            dke * current_factor * coefficient_final;
+                            energy_current_weight * coefficient_final;
                         const size_t left = static_cast<size_t>(ix) *
                             Param::Nv + static_cast<size_t>(jf - 1);
                         const size_t right = left + 1;
@@ -2238,8 +2636,7 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                         sub_je_final_cell_by_u[right] += 0.5 * final_contribution;
                     }
                     u_energy += dke * flux_final;
-                    u_momentum += bkg_n.mass * Const::c *
-                        center_distance * flux_final;
+                    u_momentum += u_face_momentum_delta[face] * flux_final;
                 }
                 integrated_je_low_cell[ix] += h * je_low;
                 integrated_je_cell[ix] += h * je_final;
@@ -2261,6 +2658,8 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                     const double f_hi = fu_final_used[uface_index(ix, Param::Nv, k)];
                     const double f_lo = fu_final_used[uface_index(ix, 0, k)];
                     u_boundary_energy += h * (ke_hi * f_hi - ke_lo * f_lo);
+                    u_boundary_energy_lower += -h * ke_lo * f_lo;
+                    u_boundary_energy_upper += h * ke_hi * f_hi;
                     u_boundary_particle += h * (f_hi - f_lo);
                     u_boundary_momentum += h * bkg_n.mass * Const::c *
                         (bkg_n.cgrid.upar_cells[Param::Nv - 1] * f_hi -
@@ -2312,6 +2711,108 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                     sub_je_final_cell_by_u,
                     substep_audit.gstar_je_final_by_u_post_sync,
                     nxl, Param::Nv, mpi_rank, mpi_size, audit_tag + 28);
+                // Diagnostic-only physical weighting of FCT activity.  This
+                // reads the already-finalized low/high/final fluxes and never
+                // feeds back into the transport update.
+                substep_audit.fct_weighted_coverage.assign(2 * 3 * 6, 0.0);
+                substep_audit.fct_weighted_counts.assign(2 * 3 * 3, 0.0);
+                double local_peak = 0.0;
+                for (int ix = 0; ix < nxl; ++ix)
+                    for (int j = 0; j < Param::Nv; ++j)
+                        for (int k = 0; k < Param::Nmu; ++k) {
+                            const size_t p = static_cast<size_t>(ix) *
+                                Param::Nvmu + idx2(j, k);
+                            const double volume = sg.dx *
+                                bkg_n.cgrid.cell_phase_volume(j, k);
+                            if (volume > 0.0)
+                                local_peak = std::max(local_peak,
+                                    std::max(0.0, donor_low_mass[p]) / volume);
+                        }
+                double global_peak = 0.0;
+                MPI_Allreduce(&local_peak, &global_peak, 1, MPI_DOUBLE,
+                              MPI_MAX, MPI_COMM_WORLD);
+                const double tail_floor = std::max(
+                    std::numeric_limits<double>::min(), global_peak * 1.0e-8);
+                const int seam_cells = std::max(1, static_cast<int>(std::ceil(
+                    0.1 * Const::micro / sg.dx)));
+                const double activity_tolerance = 1024.0 *
+                    std::numeric_limits<double>::epsilon();
+                for (int ix = 0; ix < nxl; ++ix) {
+                    const int global_ix = sg.ix_start + ix;
+                    const int x_region = (global_ix < seam_cells ||
+                        global_ix >= sg.nx_global - seam_cells) ? 1 : 0;
+                    for (int j = 0; j < Param::Nv; ++j)
+                        for (int k = 0; k < Param::Nmu; ++k) {
+                            const size_t p = static_cast<size_t>(ix) *
+                                Param::Nvmu + idx2(j, k);
+                            const double mass = std::max(0.0, donor_low_mass[p]);
+                            const double volume = sg.dx *
+                                bkg_n.cgrid.cell_phase_volume(j, k);
+                            const double fbar = volume > 0.0 ? mass / volume : 0.0;
+                            const double upar = bkg_n.cgrid.upar_cells[j];
+                            const double uperp = bkg_n.cgrid.uperp_cells[k];
+                            const double umag = std::sqrt(upar * upar + uperp * uperp);
+                            const double unit_half_width = std::max(0.10,
+                                std::max(bkg_n.cgrid.upar_widths[j],
+                                         bkg_n.cgrid.uperp_widths[k]));
+                            const int velocity_region =
+                                std::fabs(umag - 1.0) <= unit_half_width ? 1 :
+                                (fbar >= tail_floor ? 0 : 2);
+                            bool active = false;
+                            const size_t xfaces[2] = {
+                                xface_index(ix, j, k), xface_index(ix + 1, j, k)};
+                            const size_t ufaces[2] = {
+                                uface_index(ix, j, k), uface_index(ix, j + 1, k)};
+                            for (int face = 0; face < 2 && !active; ++face) {
+                                const double dx_high = fx_high[xfaces[face]] -
+                                    fx_low[xfaces[face]];
+                                const double du_high = fu_high[ufaces[face]] -
+                                    fu_low[ufaces[face]];
+                                const bool x_changed = std::fabs(dx_high) >
+                                    activity_tolerance * std::max(1.0,
+                                        std::max(std::fabs(fx_high[xfaces[face]]),
+                                                 std::fabs(fx_low[xfaces[face]]))) &&
+                                    std::fabs(fx_final[xfaces[face]] -
+                                              fx_high[xfaces[face]]) >
+                                    activity_tolerance * std::max(1.0,
+                                                                  std::fabs(dx_high));
+                                const bool u_changed = std::fabs(du_high) >
+                                    activity_tolerance * std::max(1.0,
+                                        std::max(std::fabs(fu_high[ufaces[face]]),
+                                                 std::fabs(fu_low[ufaces[face]]))) &&
+                                    std::fabs(fu_final[ufaces[face]] -
+                                              fu_high[ufaces[face]]) >
+                                    activity_tolerance * std::max(1.0,
+                                                                  std::fabs(du_high));
+                                active = x_changed || u_changed;
+                            }
+                            const double gamma = std::sqrt(1.0 + umag * umag);
+                            const double vx = Const::c * upar / gamma;
+                            const double current_weight =
+                                std::fabs(bkg_n.charge * vx) * mass;
+                            const double energy_weight =
+                                bkg_n.cgrid.kinetic_energy[idx2(j, k)] * mass;
+                            const size_t bin = static_cast<size_t>(
+                                x_region * 3 + velocity_region);
+                            double* weights = &substep_audit.fct_weighted_coverage[
+                                bin * 6];
+                            double* counts = &substep_audit.fct_weighted_counts[
+                                bin * 3];
+                            counts[0] += 1.0;
+                            weights[0] += mass;
+                            weights[2] += current_weight;
+                            weights[4] += energy_weight;
+                            if (active) {
+                                counts[1] += 1.0;
+                                weights[1] += mass;
+                                weights[3] += current_weight;
+                                weights[5] += energy_weight;
+                            }
+                            if (donor_beta[p] < 1.0 - 1.0e-14 &&
+                                donor_low_mass[p] > 0.0)
+                                counts[2] += 1.0;
+                        }
+                }
                 result.coupling_substep_seam_audit.push_back(substep_audit);
             }
         }
@@ -2322,14 +2823,23 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
         for (int ix = 0; ix < nxl; ++ix) {
             double ke = 0.0;
             double pp = 0.0;
+            long double delta_ke = 0.0L;
             for (int j = 0; j < Param::Nv; ++j) for (int k = 0; k < Param::Nmu; ++k) {
-                const double mass = work.f[mass_index(ng + ix, j, k)];
+                const size_t id = mass_index(ng + ix, j, k);
+                const double mass = work.f[id];
                 ke += bkg_n.cgrid.kinetic_energy[idx2(j, k)] * mass;
                 pp += bkg_n.mass * Const::c * bkg_n.cgrid.upar_cells[j] * mass;
+                // Accumulate the small accepted-state increment directly.
+                // Subtracting separately summed O(K) totals loses this signal
+                // when the update is close to machine precision.
+                delta_ke += static_cast<long double>(
+                    bkg_n.cgrid.kinetic_energy[idx2(j, k)]) *
+                    (static_cast<long double>(mass) -
+                     static_cast<long double>(bkg_n.f[id]));
             }
             final_ke_cell[ix] = ke;
             final_p_cell[ix] = pp;
-            delta_ke_cell[ix] = ke - initial_ke_cell[ix];
+            delta_ke_cell[ix] = static_cast<double>(delta_ke);
             delta_p_cell[ix] = pp - initial_p_cell[ix];
             local_energy_residual[ix] = delta_ke_cell[ix] +
                 psi_k_x[ix + 1] - psi_k_x[ix] - u_energy_cell[ix] -
@@ -2398,10 +2908,8 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                 double je = 0.0;
                 for (int jf = 1; jf < Param::Nv; ++jf)
                     for (int k = 0; k < Param::Nmu; ++k) {
-                        const double current_factor = bkg_n.charge /
-                            (bkg_n.mass * Const::c * sg.dx);
-                        je += Stage5::delta_energy(bkg_n.cgrid, jf, k) *
-                            current_factor * audit_cu[uface_index(ix, jf, k)];
+                        je += u_face_energy_current_weight[idx2(jf, k)] *
+                            audit_cu[uface_index(ix, jf, k)];
                     }
                 direct_je_cell[static_cast<size_t>(ix)] = je;
             }
@@ -2499,16 +3007,6 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
             if (have_previous) local_dj = std::max(local_dj,
                 std::fabs(result.j_bkg_face_mid[iface] - previous_j[iface]));
         }
-        double norms[4] = {local_de, local_e, local_dj, local_j};
-        MPI_Allreduce(MPI_IN_PLACE, norms, 4, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-        result.residual_E = norms[0] / std::max(1.0, norms[1]);
-        result.residual_J_bkg = norms[2] / std::max(1.0, std::max(std::fabs(Param::jb), norms[3]));
-        if (midpoint_iteration_trace_for_test_) {
-            result.midpoint_residual_e_history.push_back(result.residual_E);
-            result.midpoint_residual_j_bkg_history.push_back(result.residual_J_bkg);
-            result.midpoint_residual_j_beam_history.push_back(result.residual_J_beam);
-        }
-
         double local_df = 0.0, local_f = 0.0;
         for (int ix = 0; ix < nxl; ++ix) for (int j = 0; j < Param::Nv; ++j)
             for (int k = 0; k < Param::Nmu; ++k) {
@@ -2516,9 +3014,22 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                 local_df = std::max(local_df, std::fabs(work.f[p] - guess.f[p]));
                 local_f = std::max(local_f, std::fabs(work.f[p]));
             }
-        double f_norms[2] = {local_df, local_f};
-        MPI_Allreduce(MPI_IN_PLACE, f_norms, 2, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-        result.residual_f = f_norms[0] / std::max(1.0, f_norms[1]);
+        // All six values use the same associative MAX reduction and are
+        // independent.  Combining them removes one global synchronization
+        // from every coupled midpoint iteration without changing any norm.
+        double norms[6] = {local_de, local_e, local_dj, local_j,
+                           local_df, local_f};
+        MPI_Allreduce(MPI_IN_PLACE, norms, 6, MPI_DOUBLE, MPI_MAX,
+                      MPI_COMM_WORLD);
+        result.residual_E = norms[0] / std::max(1.0, norms[1]);
+        result.residual_J_bkg = norms[2] /
+            std::max(1.0, std::max(std::fabs(Param::jb), norms[3]));
+        result.residual_f = norms[4] / std::max(1.0, norms[5]);
+        if (midpoint_iteration_trace_for_test_) {
+            result.midpoint_residual_e_history.push_back(result.residual_E);
+            result.midpoint_residual_j_bkg_history.push_back(result.residual_J_bkg);
+            result.midpoint_residual_j_beam_history.push_back(result.residual_J_beam);
+        }
         if (midpoint_iteration_trace_for_test_)
             result.midpoint_residual_f_history.push_back(result.residual_f);
         result.nonlinear_residual = std::max(result.residual_E / field_tol,
@@ -2562,18 +3073,40 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
         double local_stage5[7] = {0.0, 0.0, 0.0, 0.0,
                                   psi_k_x[nxl] - psi_k_x[0],
                                   psi_p_x[nxl] - psi_p_x[0], 0.0};
+        double local_mass_change = 0.0;
+        double local_mass_scale = 0.0;
+        double local_momentum_scale = 0.0;
         for (int ix = 0; ix < nxl; ++ix) {
             local_stage5[0] += local_energy_residual[ix];
             local_stage5[1] += local_momentum_residual[ix];
             local_stage5[2] += u_energy_cell[ix];
             local_stage5[3] += u_momentum_cell[ix];
             local_stage5[6] += delta_ke_cell[ix];
+            for (int j = 0; j < Param::Nv; ++j)
+                for (int k = 0; k < Param::Nmu; ++k) {
+                    local_mass_change += work.f[
+                        mass_index(ng + ix, j, k)] - bkg_n.f[
+                        mass_index(ng + ix, j, k)];
+                    local_mass_scale += std::fabs(work.f[
+                        mass_index(ng + ix, j, k)]) + std::fabs(bkg_n.f[
+                        mass_index(ng + ix, j, k)]);
+                }
+            local_momentum_scale += std::fabs(initial_p_cell[ix]) +
+                                    std::fabs(final_p_cell[ix]);
         }
         MPI_Allreduce(MPI_IN_PLACE, local_stage5, 7, MPI_DOUBLE, MPI_SUM,
                       MPI_COMM_WORLD);
-        double u_boundary_global[3] = {u_boundary_particle, u_boundary_momentum,
-                                       u_boundary_energy};
-        MPI_Allreduce(MPI_IN_PLACE, u_boundary_global, 3, MPI_DOUBLE, MPI_SUM,
+        MPI_Allreduce(MPI_IN_PLACE, &local_mass_change, 1, MPI_DOUBLE, MPI_SUM,
+                      MPI_COMM_WORLD);
+        MPI_Allreduce(MPI_IN_PLACE, &local_mass_scale, 1, MPI_DOUBLE, MPI_SUM,
+                      MPI_COMM_WORLD);
+        MPI_Allreduce(MPI_IN_PLACE, &local_momentum_scale, 1, MPI_DOUBLE,
+                      MPI_SUM, MPI_COMM_WORLD);
+        double u_boundary_global[5] = {u_boundary_particle, u_boundary_momentum,
+                                       u_boundary_energy,
+                                       u_boundary_energy_lower,
+                                       u_boundary_energy_upper};
+        MPI_Allreduce(MPI_IN_PLACE, u_boundary_global, 5, MPI_DOUBLE, MPI_SUM,
                       MPI_COMM_WORLD);
         double global_fct_budget_violation = fct_budget_violation;
         MPI_Allreduce(MPI_IN_PLACE, &global_fct_budget_violation, 1, MPI_DOUBLE,
@@ -2602,6 +3135,19 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
         result.u_boundary_particle_outflow = u_boundary_global[0];
         result.u_boundary_momentum_outflow = u_boundary_global[1];
         result.u_boundary_energy_outflow = u_boundary_global[2];
+        result.u_boundary_energy_lower = u_boundary_global[3];
+        result.u_boundary_energy_upper = u_boundary_global[4];
+        result.stage2_mass_change = local_mass_change;
+        result.stage2_mass_scale = local_mass_scale;
+        result.stage2_mass_residual = result.stage2_mass_change +
+            u_boundary_global[0];
+        result.stage2_momentum_change = 0.0;
+        result.stage2_momentum_scale = local_momentum_scale;
+        for (int ix = 0; ix < nxl; ++ix)
+            result.stage2_momentum_change += delta_p_cell[ix];
+        MPI_Allreduce(MPI_IN_PLACE, &result.stage2_momentum_change, 1,
+                      MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        result.stage2_momentum_residual = local_stage5[1];
         result.stage5_fct_budget_violation = global_fct_budget_violation;
         double local_jmax[4] = {0.0, 0.0, 0.0, 0.0};
         for (int iface = 0; iface < nxl; ++iface) {
@@ -2677,6 +3223,15 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
             limiter_min, limiter_min_core, limiter_min_boundary};
         MPI_Allreduce(MPI_IN_PLACE, limiter_alpha_global, 3, MPI_DOUBLE,
                       MPI_MIN, MPI_COMM_WORLD);
+        double directional_limiter_sum[4] = {
+            x_limiter_faces, x_limiter_active,
+            u_limiter_faces, u_limiter_active};
+        MPI_Allreduce(MPI_IN_PLACE, directional_limiter_sum, 4, MPI_DOUBLE,
+                      MPI_SUM, MPI_COMM_WORLD);
+        double directional_limiter_min[2] = {
+            x_limiter_min, u_limiter_min};
+        MPI_Allreduce(MPI_IN_PLACE, directional_limiter_min, 2, MPI_DOUBLE,
+                      MPI_MIN, MPI_COMM_WORLD);
         result.limiter_energy_defect = limiter_sum[0];
         result.limiter_energy_defect_positive = limiter_sum[4];
         result.limiter_energy_defect_negative = limiter_sum[5];
@@ -2692,6 +3247,12 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
         result.limiter_min_alpha = limiter_alpha_global[0];
         result.limiter_min_alpha_core = limiter_alpha_global[1];
         result.limiter_min_alpha_boundary = limiter_alpha_global[2];
+        result.x_limiter_active_fraction = directional_limiter_sum[0] > 0.0
+            ? directional_limiter_sum[1] / directional_limiter_sum[0] : 0.0;
+        result.x_limiter_min_alpha = directional_limiter_min[0];
+        result.u_limiter_active_fraction = directional_limiter_sum[2] > 0.0
+            ? directional_limiter_sum[3] / directional_limiter_sum[2] : 0.0;
+        result.u_limiter_min_alpha = directional_limiter_min[1];
         result.flux_pos[0].alpha_active_fraction = result.limiter_active_fraction;
         result.flux_pos[1].alpha_active_fraction = result.limiter_active_fraction;
         result.flux_pos[0].alpha_min = limiter_alpha_global[0];
@@ -2899,6 +3460,8 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                 std::vector<double>(fu_high.size(), 0.0);
             result.center_u_coefficient = low_order_only_ ? cu_low :
                 cu_high_center;
+            if (dual_u_enabled)
+                result.legacy_center_u_coefficient = cu_legacy_center;
             result.center_u_reconstruction_mass = midpoint_state.f;
             if (!low_order_only_) {
                 for (size_t p = 0; p < fu_high.size(); ++p) {
@@ -2912,6 +3475,12 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
             }
             result.high_u_flux = low_order_only_ ? fu_low : fu_high;
             result.final_u_flux = low_order_only_ ? fu_low : fu_final;
+            result.low_u_coefficient = cu_low;
+            result.high_u_coefficient = low_order_only_ ? cu_low : cu_high;
+            result.final_u_coefficient = low_order_only_ ? cu_low : cu_final;
+            result.fct_donor_beta = donor_beta;
+            result.fct_donor_low_mass = donor_low_mass;
+            result.fct_donor_limited_outflow = donor_limited_outflow;
             if (step_diagnostics_enabled_ || fixed_candidate)
                 finalize_coupling_regions();
             return result;

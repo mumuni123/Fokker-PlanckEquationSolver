@@ -619,15 +619,23 @@ int main(int argc, char** argv)
     midpoint_solver.set_low_order_only(false);
     midpoint_solver.set_nonuniform_high_order_enabled(true);
     midpoint_solver.set_fct_enabled(true);
+    midpoint_solver.set_background_coupling_mode(
+        runtime.background_coupling_mode == 1
+        ? VlasovAmpereMidpointSolver::DUAL_U_COUPLING
+        : VlasovAmpereMidpointSolver::LEGACY_COUPLING);
     midpoint_solver.set_max_midpoint_iterations(runtime.midpoint_max_iters);
     midpoint_solver.set_capture_midpoint_input(runtime.diagnostic_level >= 2);
     midpoint_solver.set_midpoint_iteration_trace(runtime.diagnostic_level >= 2);
     if (mpi_rank == 0) {
         printf("Transport configuration: low_order_only=%s, "
-               "nonuniform_high_order=%s, FCT=%s, midpoint_max_iters=%d\n",
+               "nonuniform_high_order=%s, FCT=%s, background_coupling=%s, "
+               "midpoint_max_iters=%d\n",
                midpoint_solver.low_order_only() ? "ON" : "OFF",
                midpoint_solver.nonuniform_high_order_enabled() ? "ON" : "OFF",
                midpoint_solver.fct_enabled() ? "ON" : "OFF",
+               midpoint_solver.background_coupling_mode() ==
+                   VlasovAmpereMidpointSolver::DUAL_U_COUPLING
+                   ? "dual_u" : "legacy",
                midpoint_solver.max_midpoint_iterations());
     }
 
@@ -647,6 +655,17 @@ int main(int argc, char** argv)
         midpoint_solver.set_nonuniform_high_order_enabled(
             audit_state.high_order_enabled);
         midpoint_solver.set_fct_enabled(audit_state.fct_enabled);
+        midpoint_solver.set_background_coupling_mode(
+            audit_state.background_coupling_mode ==
+            VlasovAmpereMidpointSolver::DUAL_U_COUPLING
+            ? VlasovAmpereMidpointSolver::DUAL_U_COUPLING
+            : VlasovAmpereMidpointSolver::LEGACY_COUPLING);
+        if (mpi_rank == 0) {
+            std::printf("Operator-audit background coupling: %s\n",
+                        midpoint_solver.background_coupling_mode() ==
+                        VlasovAmpereMidpointSolver::DUAL_U_COUPLING
+                        ? "dual_u" : "legacy");
+        }
         const VlasovAmpereMidpointSolver::MidpointOperatorEvaluation evaluated =
             midpoint_solver.evaluate_fixed_midpoint_operator(
                 audit_state.bkg_n, beam, audit_state.fields_n,
@@ -734,6 +753,10 @@ int main(int argc, char** argv)
             std::ofstream out(output_path(runtime, "fixed_midpoint_operator_audit.result").c_str());
             out << std::setprecision(17)
                 << "audit_input " << runtime.operator_audit_dir << "\n"
+                << "background_coupling_mode "
+                << (audit_state.background_coupling_mode ==
+                    VlasovAmpereMidpointSolver::DUAL_U_COUPLING
+                    ? "dual_u" : "legacy") << "\n"
                 << "step " << audit_state.step << "\n"
                 << "time_s " << audit_state.time_s << "\n"
                 << "dt_s " << audit_state.dt_s << "\n"
@@ -1525,6 +1548,8 @@ int main(int argc, char** argv)
             audit_state.low_order_only = midpoint_solver.low_order_only();
             audit_state.high_order_enabled = midpoint_solver.nonuniform_high_order_enabled();
             audit_state.fct_enabled = midpoint_solver.fct_enabled();
+            audit_state.background_coupling_mode =
+                midpoint_result.background_coupling_mode;
             audit_state.acceptance_type = midpoint_result.converged
                 ? "strict_converged"
                 : (midpoint_result.soft_unconverged ? "soft_accepted" : "unconverged_best_trial");
@@ -1534,6 +1559,7 @@ int main(int argc, char** argv)
             audit_state.fields_n = fields_step_start;
             audit_state.fields_end_guess =
                 midpoint_result.operator_input_fields_end_guess;
+            audit_state.fields_np1 = fields;
             audit_state.coupling_layout.beam_front_ix =
                 midpoint_result.coupling_beam_front_ix;
             audit_state.coupling_layout.wave_core_end_m =
@@ -1548,6 +1574,16 @@ int main(int argc, char** argv)
                 midpoint_result.periodic_seam_face_audit;
             audit_state.reference_stage5_r_fv = midpoint_result.stage5_r_fv;
             audit_state.reference_stage5_r_couple = midpoint_result.stage5_r_couple;
+            audit_state.limiter_active_fraction = midpoint_result.limiter_active_fraction;
+            audit_state.limiter_active_fraction_core =
+                midpoint_result.limiter_active_fraction_core;
+            audit_state.limiter_active_fraction_boundary =
+                midpoint_result.limiter_active_fraction_boundary;
+            audit_state.x_limiter_active_fraction =
+                midpoint_result.x_limiter_active_fraction;
+            audit_state.u_limiter_active_fraction =
+                midpoint_result.u_limiter_active_fraction;
+            audit_state.limiter_min_alpha = midpoint_result.limiter_min_alpha;
             if (!write_midpoint_audit_state(output_path(runtime, "final_midpoint"),
                                             audit_state, sgrid, mpi_rank,
                                             mpi_size, runtime_error)) {
@@ -1831,7 +1867,8 @@ int main(int argc, char** argv)
                                          max_loss_u_high_step,
                                         x_at_max_loss_u_high_step,
                                         f_u_max_x_step,
-                                        integral_f_u_gt_8_x_step);
+                                        integral_f_u_gt_8_x_step,
+                                        midpoint_result.background_coupling_mode);
         }
 
         current_time = time;

@@ -115,9 +115,10 @@ public:
                                  double global_stage5_r_fv,
                                  double global_stage5_r_couple,
                                  double local_max_loss_u_high,
-                                double local_x_at_max_loss_u_high,
+                                 double local_x_at_max_loss_u_high,
                                 double local_f_u_max_x,
-                                double local_integral_f_u_gt_8_x);
+                                double local_integral_f_u_gt_8_x,
+                                int background_coupling_mode);
 
     void write_fields(double time,
                       const EMFields& fields,

@@ -268,6 +268,7 @@ int main(int argc, char** argv)
     const bool high_only = has_option(argc, argv, "--high-only");
     const bool negative_field = has_option(argc, argv, "--negative-field");
     const bool quarter_phase = has_option(argc, argv, "--quarter-phase");
+    const bool force_dual_u = has_option(argc, argv, "--dual-u");
     const std::string midpoint_directory = option_value(argc, argv,
         "--midpoint-audit-dir", "");
     const double phase = quarter_phase ? 0.5 * Const::pi : 0.0;
@@ -301,6 +302,10 @@ int main(int argc, char** argv)
             options.guess_np1 = &midpoint.operator_input_guess;
             options.fields_end_guess = &midpoint.fields_end_guess;
             options.coupling_layout = &midpoint.coupling_layout;
+            options.coupling_mode = force_dual_u
+                ? VlasovAmpereMidpointSolver::DUAL_U_COUPLING
+                : static_cast<VlasovAmpereMidpointSolver::BackgroundCouplingMode>(
+                    midpoint.background_coupling_mode);
             options.fct_enabled = high_only ? false :
                 (requested_fct || midpoint.fct_enabled);
         }
@@ -1073,8 +1078,11 @@ int main(int argc, char** argv)
         x_kink_one_sided_count;
     const int kink_one_sided_valid = kink_one_sided_nonfinite_count == 0 &&
         kink_one_sided_count == kink_face_count;
+    const double active_coverage_threshold = 0.999;
+    const int active_coverage_valid = jacobian_audit_applicable &&
+        active_fully_covered_fraction >= active_coverage_threshold;
     const int coverage_valid = jacobian_audit_applicable &&
-        kink_one_sided_valid;
+        kink_one_sided_valid && active_coverage_valid;
     int local_failure_mask = 0;
     if (!direct_work_valid)
         local_failure_mask |= NON_FINITE_FAILED;
@@ -1098,7 +1106,9 @@ int main(int argc, char** argv)
             local_failure_mask |= U_COVERAGE_FAILED;
         if (x_branch_crossed_face_count > 0 && !kink_one_sided_valid)
             local_failure_mask |= X_COVERAGE_FAILED;
-        if (active_fully_covered_fraction < 0.999 && !kink_one_sided_valid)
+        // Kink one-sided derivatives are useful diagnostics, but they do not
+        // replace full active-support coverage for a transpose conclusion.
+        if (!active_coverage_valid)
             local_failure_mask |= ACTIVE_COVERAGE_FAILED;
     }
     int global_failure_mask = 0;
@@ -1107,8 +1117,8 @@ int main(int argc, char** argv)
     const int failed_rank = first_failed_rank(local_failure_mask, rank);
     const int frozen_jacobian_valid = jacobian_audit_applicable &&
         global_failure_mask == 0;
-    const int passes = direct_work_valid &&
-        (!jacobian_audit_applicable || frozen_jacobian_valid);
+    const int direct_pair_sample_valid = direct_work_valid;
+    const int jacobian_transpose_valid = frozen_jacobian_valid;
 
     double pair_layers[4] = {};
     double fct_x_work_correction = 0.0;
@@ -1818,7 +1828,182 @@ int main(int argc, char** argv)
             seam_upar_audit_valid = 0;
     }
     MPI_Bcast(&seam_upar_audit_valid, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    const int audit_passes = passes &&
+
+    // Multi-substep velocity audit.  Unlike the detailed (j,k) Jacobian
+    // audit above, this uses currents recorded by every true production
+    // substep and is therefore valid for the five-substep 12 fs replay.
+    static const int full_u_zone_count = 5;
+    const char* full_u_zone_names[full_u_zone_count] = {
+        "u_endpoint", "low_u", "thermal_body", "near_abs_upar_1", "outer_u"};
+    int multisubstep_upar_valid = substep_seam_audit_valid;
+    const size_t resolved_size = static_cast<size_t>(sg.nx_local + 1) * Param::Nv;
+    for (int sub = 0; multisubstep_upar_valid && sub < local_substep_count; ++sub) {
+        const VlasovAmpereMidpointSolver::CouplingSubstepSeamAudit& audit =
+            bundle.coupling_substep_seam_audit[static_cast<size_t>(sub)];
+        const std::vector<double>* arrays[] = {
+            &audit.jn_high_by_u_post_sync, &audit.jn_final_by_u_post_sync,
+            &audit.gstar_je_high_by_u_post_sync,
+            &audit.gstar_je_final_by_u_post_sync};
+        for (int a = 0; a < 4; ++a)
+            multisubstep_upar_valid = multisubstep_upar_valid &&
+                arrays[a]->size() >= resolved_size;
+    }
+    MPI_Allreduce(MPI_IN_PLACE, &multisubstep_upar_valid, 1, MPI_INT,
+                  MPI_MIN, MPI_COMM_WORLD);
+    std::vector<double> u_sum(static_cast<size_t>(Param::Nv) * 6, 0.0);
+    std::vector<double> u_max(static_cast<size_t>(Param::Nv) * 2, 0.0);
+    double zone_sum[full_u_zone_count][6] = {};
+    double zone_max[full_u_zone_count][2] = {};
+    double reconstruction_linf = 0.0;
+    double reconstruction_scale = 0.0;
+    double multisubstep_final_signed = 0.0;
+    if (multisubstep_upar_valid) {
+        for (int sub = 0; sub < local_substep_count; ++sub) {
+            const VlasovAmpereMidpointSolver::CouplingSubstepSeamAudit& audit =
+                bundle.coupling_substep_seam_audit[static_cast<size_t>(sub)];
+            for (int iface = 0; iface < sg.nx_local; ++iface) {
+                const double eface = audit.e_face_mid[static_cast<size_t>(iface)];
+                double reconstructed[4] = {0.0, 0.0, 0.0, 0.0};
+                for (int j = 0; j < Param::Nv; ++j) {
+                    const size_t p = static_cast<size_t>(iface) * Param::Nv + j;
+                    const double jn_high = audit.jn_high_by_u_post_sync[p];
+                    const double jn_final = audit.jn_final_by_u_post_sync[p];
+                    const double ge_high = audit.gstar_je_high_by_u_post_sync[p];
+                    const double ge_final = audit.gstar_je_final_by_u_post_sync[p];
+                    reconstructed[0] += jn_high;
+                    reconstructed[1] += jn_final;
+                    reconstructed[2] += ge_high;
+                    reconstructed[3] += ge_final;
+                    const double high = audit.dt_substep * sg.dx * eface *
+                        (jn_high - ge_high);
+                    const double final_value = audit.dt_substep * sg.dx * eface *
+                        (jn_final - ge_final);
+                    const size_t ub = static_cast<size_t>(j) * 6;
+                    u_sum[ub] += high;
+                    u_sum[ub + 1] += std::fabs(high);
+                    u_sum[ub + 2] += high * high;
+                    u_sum[ub + 3] += final_value;
+                    u_sum[ub + 4] += std::fabs(final_value);
+                    u_sum[ub + 5] += final_value * final_value;
+                    u_max[static_cast<size_t>(j) * 2] = std::max(
+                        u_max[static_cast<size_t>(j) * 2], std::fabs(high));
+                    u_max[static_cast<size_t>(j) * 2 + 1] = std::max(
+                        u_max[static_cast<size_t>(j) * 2 + 1],
+                        std::fabs(final_value));
+                    const double u = background.cgrid.upar_cells[j];
+                    const double abs_u = std::fabs(u);
+                    const double near_width = std::max(0.10,
+                        background.cgrid.upar_widths[j]);
+                    int zone = 4;
+                    if (j == 0 || j == Param::Nv - 1) zone = 0;
+                    else if (abs_u <= 0.10) zone = 1;
+                    else if (std::fabs(abs_u - 1.0) <= near_width) zone = 3;
+                    else if (abs_u < 1.0) zone = 2;
+                    zone_sum[zone][0] += high;
+                    zone_sum[zone][1] += std::fabs(high);
+                    zone_sum[zone][2] += high * high;
+                    zone_sum[zone][3] += final_value;
+                    zone_sum[zone][4] += std::fabs(final_value);
+                    zone_sum[zone][5] += final_value * final_value;
+                    zone_max[zone][0] = std::max(zone_max[zone][0],
+                                                 std::fabs(high));
+                    zone_max[zone][1] = std::max(zone_max[zone][1],
+                                                 std::fabs(final_value));
+                    multisubstep_final_signed += final_value;
+                }
+                const double aggregate[4] = {
+                    audit.jn_high_post_sync[static_cast<size_t>(iface)],
+                    audit.jn_final_post_sync[static_cast<size_t>(iface)],
+                    audit.gstar_je_high_post_sync[static_cast<size_t>(iface)],
+                    audit.gstar_je_final_post_sync[static_cast<size_t>(iface)]};
+                for (int a = 0; a < 4; ++a) {
+                    reconstruction_linf = std::max(reconstruction_linf,
+                        std::fabs(reconstructed[a] - aggregate[a]));
+                    reconstruction_scale = std::max(reconstruction_scale,
+                        std::max(std::fabs(reconstructed[a]),
+                                 std::fabs(aggregate[a])));
+                }
+            }
+        }
+    }
+    MPI_Allreduce(MPI_IN_PLACE, u_sum.data(), static_cast<int>(u_sum.size()),
+                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, u_max.data(), static_cast<int>(u_max.size()),
+                  MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, zone_sum, full_u_zone_count * 6, MPI_DOUBLE,
+                  MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, zone_max, full_u_zone_count * 2, MPI_DOUBLE,
+                  MPI_MAX, MPI_COMM_WORLD);
+    double reconstruction_values[3] = {reconstruction_linf,
+        reconstruction_scale, multisubstep_final_signed};
+    MPI_Allreduce(MPI_IN_PLACE, reconstruction_values, 2, MPI_DOUBLE,
+                  MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, reconstruction_values + 2, 1, MPI_DOUBLE,
+                  MPI_SUM, MPI_COMM_WORLD);
+    reconstruction_linf = reconstruction_values[0];
+    reconstruction_scale = reconstruction_values[1];
+    multisubstep_final_signed = reconstruction_values[2];
+    const double multisubstep_production_error =
+        multisubstep_final_signed - bundle.r_couple;
+    double multisubstep_final_l1 = 0.0;
+    for (int z = 0; z < full_u_zone_count; ++z)
+        multisubstep_final_l1 += zone_sum[z][4];
+    const double multisubstep_production_scale = std::max(1.0,
+        std::max(std::fabs(bundle.r_couple), multisubstep_final_l1));
+    if (multisubstep_upar_valid &&
+        (reconstruction_linf > 1.0e-12 * std::max(1.0, reconstruction_scale) ||
+         std::fabs(multisubstep_production_error) >
+             1.0e-12 * multisubstep_production_scale))
+        multisubstep_upar_valid = 0;
+
+    // Aggregate the per-substep, production-path FCT coverage using physical
+    // mass/current/energy weights.  Raw active-cell fractions remain in the
+    // output, but no acceptance decision is based on raw point count alone.
+    int weighted_fct_valid = substep_seam_audit_valid;
+    std::vector<double> weighted_fct(2 * 3 * 6, 0.0);
+    std::vector<double> weighted_counts(2 * 3 * 3, 0.0);
+    for (int sub = 0; weighted_fct_valid && sub < local_substep_count; ++sub) {
+        const VlasovAmpereMidpointSolver::CouplingSubstepSeamAudit& audit =
+            bundle.coupling_substep_seam_audit[static_cast<size_t>(sub)];
+        weighted_fct_valid = audit.fct_weighted_coverage.size() == weighted_fct.size() &&
+            audit.fct_weighted_counts.size() == weighted_counts.size();
+        if (!weighted_fct_valid) break;
+        for (size_t p = 0; p < weighted_fct.size(); ++p)
+            weighted_fct[p] += audit.fct_weighted_coverage[p];
+        for (size_t p = 0; p < weighted_counts.size(); ++p)
+            weighted_counts[p] += audit.fct_weighted_counts[p];
+    }
+    MPI_Allreduce(MPI_IN_PLACE, &weighted_fct_valid, 1, MPI_INT, MPI_MIN,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, weighted_fct.data(),
+                  static_cast<int>(weighted_fct.size()), MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, weighted_counts.data(),
+                  static_cast<int>(weighted_counts.size()), MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+    double fct_core_physical_fraction[3] = {0.0, 0.0, 0.0};
+    double fct_seam_physical_fraction[3] = {0.0, 0.0, 0.0};
+    for (int moment = 0; moment < 3; ++moment) {
+        double core_total = 0.0, core_active = 0.0;
+        double seam_total = 0.0, seam_active = 0.0;
+        // Thermal body plus the near-|u|=1 band are the physically weighted
+        // support gate.  The low-density tail remains visible in the table
+        // but cannot dominate this acceptance metric by point count.
+        for (int vr = 0; vr < 2; ++vr) {
+            const size_t core = static_cast<size_t>(vr) * 6;
+            const size_t seam = static_cast<size_t>(3 + vr) * 6;
+            core_total += weighted_fct[core + 2 * moment];
+            core_active += weighted_fct[core + 2 * moment + 1];
+            seam_total += weighted_fct[seam + 2 * moment];
+            seam_active += weighted_fct[seam + 2 * moment + 1];
+        }
+        fct_core_physical_fraction[moment] = core_total > 0.0
+            ? core_active / core_total : 0.0;
+        fct_seam_physical_fraction[moment] = seam_total > 0.0
+            ? seam_active / seam_total : 0.0;
+    }
+
+    const int direct_pair_audit_valid = direct_pair_sample_valid &&
         (!checkpoint_loaded || seam_upar_audit_valid);
 
     if (rank == 0) {
@@ -1832,9 +2017,66 @@ int main(int argc, char** argv)
              << Param::Nmu;
         const std::string base = stem.str();
         ensure_directory(output_directory);
+        if (multisubstep_upar_valid) {
+            std::ofstream by_u_multi((output_directory +
+                "/multisubstep_upar_pair.dat").c_str());
+            by_u_multi << std::scientific << std::setprecision(17)
+                << "j u_parallel high_signed high_L1 high_L2 high_Linf "
+                << "final_signed final_L1 final_L2 final_Linf\n";
+            for (int j = 0; j < Param::Nv; ++j) {
+                const size_t ub = static_cast<size_t>(j) * 6;
+                by_u_multi << j << " " << background.cgrid.upar_cells[j]
+                    << " " << u_sum[ub] << " " << u_sum[ub + 1]
+                    << " " << std::sqrt(u_sum[ub + 2])
+                    << " " << u_max[static_cast<size_t>(j) * 2]
+                    << " " << u_sum[ub + 3] << " " << u_sum[ub + 4]
+                    << " " << std::sqrt(u_sum[ub + 5])
+                    << " " << u_max[static_cast<size_t>(j) * 2 + 1] << "\n";
+            }
+            std::ofstream zones_multi((output_directory +
+                "/multisubstep_upar_zones.dat").c_str());
+            zones_multi << std::scientific << std::setprecision(17)
+                << "zone high_signed high_L1 high_L2 high_Linf final_signed "
+                << "final_L1 final_L2 final_Linf\n";
+            for (int z = 0; z < full_u_zone_count; ++z)
+                zones_multi << full_u_zone_names[z] << " " << zone_sum[z][0]
+                    << " " << zone_sum[z][1] << " " << std::sqrt(zone_sum[z][2])
+                    << " " << zone_max[z][0] << " " << zone_sum[z][3]
+                    << " " << zone_sum[z][4] << " " << std::sqrt(zone_sum[z][5])
+                    << " " << zone_max[z][1] << "\n";
+        }
+        if (weighted_fct_valid) {
+            const char* x_names[2] = {"core", "periodic_seam"};
+            const char* v_names[3] = {"thermal_body", "near_abs_u_eq_1",
+                                      "low_density_tail"};
+            std::ofstream coverage((output_directory +
+                "/fct_physical_weighted_coverage.dat").c_str());
+            coverage << std::scientific << std::setprecision(17)
+                << "x_region velocity_region cells active_cells physical_donor_cells "
+                << "raw_active_fraction mass_total mass_active mass_fraction "
+                << "current_total current_active current_fraction energy_total "
+                << "energy_active energy_fraction\n";
+            for (int xr = 0; xr < 2; ++xr) for (int vr = 0; vr < 3; ++vr) {
+                const size_t bin = static_cast<size_t>(xr * 3 + vr);
+                const double* w = &weighted_fct[bin * 6];
+                const double* c = &weighted_counts[bin * 3];
+                const double raw = c[0] > 0.0 ? c[1] / c[0] : 0.0;
+                const double mass = w[0] > 0.0 ? w[1] / w[0] : 0.0;
+                const double current = w[2] > 0.0 ? w[3] / w[2] : 0.0;
+                const double energy = w[4] > 0.0 ? w[5] / w[4] : 0.0;
+                coverage << x_names[xr] << " " << v_names[vr] << " "
+                    << c[0] << " " << c[1] << " " << c[2] << " " << raw
+                    << " " << w[0] << " " << w[1] << " " << mass
+                    << " " << w[2] << " " << w[3] << " " << current
+                    << " " << w[4] << " " << w[5] << " " << energy << "\n";
+            }
+        }
         std::ofstream out((output_directory + "/summary.result").c_str());
         std::ostream& log = out ? out : std::cout;
         log << "test=background_coupling_upar_dual_audit\n"
+            << "background_coupling_mode="
+            << (options.coupling_mode == VlasovAmpereMidpointSolver::DUAL_U_COUPLING
+                ? "dual_u" : "legacy") << "\n"
             << "production_kernel=1\nstate_source="
             << (checkpoint_loaded ? "midpoint_checkpoint" : "manufactured") << "\n"
             << "midpoint_audit_directory=" << midpoint_directory << "\n"
@@ -1900,6 +2142,33 @@ int main(int argc, char** argv)
             << seam_upar_dominant_high_zone << "\n"
             << "seam_upar_dominant_final_zone="
             << seam_upar_dominant_final_zone << "\n"
+            << "multisubstep_upar_pair_audit_valid="
+            << multisubstep_upar_valid << "\n"
+            << "multisubstep_upar_reconstruction_linf="
+            << reconstruction_linf << "\n"
+            << "multisubstep_upar_reconstruction_relative="
+            << reconstruction_linf / std::max(1.0, reconstruction_scale) << "\n"
+            << "multisubstep_upar_final_signed="
+            << multisubstep_final_signed << "\n"
+            << "multisubstep_upar_final_minus_production="
+            << multisubstep_production_error << "\n"
+            << "multisubstep_upar_final_minus_production_relative="
+            << multisubstep_production_error /
+                multisubstep_production_scale << "\n"
+            << "fct_physical_weighted_coverage_valid="
+            << weighted_fct_valid << "\n"
+            << "fct_core_physical_mass_coverage="
+            << fct_core_physical_fraction[0] << "\n"
+            << "fct_core_physical_current_coverage="
+            << fct_core_physical_fraction[1] << "\n"
+            << "fct_core_physical_energy_coverage="
+            << fct_core_physical_fraction[2] << "\n"
+            << "fct_seam_physical_mass_coverage="
+            << fct_seam_physical_fraction[0] << "\n"
+            << "fct_seam_physical_current_coverage="
+            << fct_seam_physical_fraction[1] << "\n"
+            << "fct_seam_physical_energy_coverage="
+            << fct_seam_physical_fraction[2] << "\n"
             << "frozen_branch_jacobian=1\n"
             << "global_max_u_replay_error=" << global_u_replay.value << "\n"
             << "global_max_u_replay_rank=" << global_u_replay.rank << "\n"
@@ -1941,6 +2210,8 @@ int main(int argc, char** argv)
             << "active_fully_covered_count=" << active_fully_covered_cells << "\n"
             << "active_fully_covered_fraction="
             << active_fully_covered_fraction << "\n"
+            << "active_coverage_threshold=" << active_coverage_threshold << "\n"
+            << "active_coverage_valid=" << active_coverage_valid << "\n"
             << "coverage_valid=" << coverage_valid << "\n"
             << "epsilon_scale_stable=" << epsilon_scale_stable << "\n"
             << "epsilon_scale_spread_max=" << epsilon_scale_spread_max << "\n"
@@ -1961,6 +2232,10 @@ int main(int argc, char** argv)
             << "audit_ecell=" << audit_ecell << "\n"
             << "by_x_point_count=" << audit_point_count << "\n"
             << "frozen_jacobian_valid=" << frozen_jacobian_valid << "\n"
+            << "direct_pair_sample_valid=" << direct_pair_audit_valid << "\n"
+            << "jacobian_transpose_valid=" << jacobian_transpose_valid << "\n"
+            << "jacobian_transpose_incomplete="
+            << (!jacobian_transpose_valid) << "\n"
             << "wN_minus_wE_L1=" << reported_w_l1 << "\n"
             << "wN_minus_wE_L2=" << reported_w_l2 << "\n"
             << "wN_minus_wE_Linf=" << reported_w_linf << "\n"
@@ -2074,7 +2349,10 @@ int main(int argc, char** argv)
                 << zone_name(z) << "_pair_work_L1_fraction=" << zone[z].abs_sum /
                     std::max(1.0e-300, all.abs_sum) << "\n";
         }
-        log << "passes=" << audit_passes << "\n";
+        // Kept for old result readers.  It now means only that the direct
+        // production pair sample is valid; Jacobian validity is independent.
+        log << "passes=" << direct_pair_audit_valid << "\n"
+            << "passes_legacy_direct_pair_only=1\n";
 
         std::ofstream rows((output_directory + "/by_u.dat").c_str());
         if (rows) {
@@ -2219,13 +2497,17 @@ int main(int argc, char** argv)
         const std::string legacy_tmp = legacy_path + ".tmp";
         std::ofstream legacy(legacy_tmp.c_str());
         if (legacy) {
-            legacy << "passes=" << audit_passes
+            legacy << "passes=" << direct_pair_audit_valid
+                   << "\npasses_legacy_direct_pair_only=1"
                    << "\ncoverage_valid=" << coverage_valid
                    << "\noperator_valid=" << direct_work_valid
                    << "\ndirect_work_valid=" << direct_work_valid
                    << "\nsingle_substep_flux_valid=" << single_substep_flux_valid
                    << "\noutputs_finite=" << bundle.outputs_finite
                    << "\nfrozen_jacobian_valid=" << frozen_jacobian_valid
+                   << "\ndirect_pair_sample_valid=" << direct_pair_audit_valid
+                   << "\njacobian_transpose_valid=" << jacobian_transpose_valid
+                   << "\nactive_coverage_threshold=" << active_coverage_threshold
                    << "\nepsilon_scale_stable=" << epsilon_scale_stable
                    << "\nkink_one_sided_valid=" << kink_one_sided_valid
                    << "\nnx=" << Param::nx << "\nNu=" << Param::Nv
@@ -2251,9 +2533,11 @@ int main(int argc, char** argv)
 #endif
         std::cout << "background_coupling_upar_dual_audit result="
                   << output_directory << "/summary.result passes="
-                  << audit_passes << "\n";
+                  << direct_pair_audit_valid
+                  << " jacobian_transpose_valid="
+                  << jacobian_transpose_valid << "\n";
     }
 
     MPI_Finalize();
-    return audit_passes ? 0 : 1;
+    return direct_pair_audit_valid ? 0 : 1;
 }

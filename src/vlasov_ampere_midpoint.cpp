@@ -29,12 +29,14 @@ void fill_periodic_ghosts(Species& sp, const SpatialGrid& sg)
 VlasovAmpereMidpointSolver::VlasovAmpereMidpointSolver()
     : step_diagnostics_enabled_(false), beam_enabled_(true),
       low_order_only_(false), nonuniform_high_order_enabled_(false),
-      fct_enabled_(true), capture_midpoint_input_(false),
+      fct_enabled_(true), background_coupling_mode_(LEGACY_COUPLING),
+      capture_midpoint_input_(false),
       legacy_boundary_upwind_high_candidate_for_test_(false),
       energy_consistent_x_high_velocity_for_test_(false),
       max_midpoint_iterations_(20), midpoint_iteration_trace_for_test_(false),
       fct_activation_audit_enabled_(false),
       controlled_fct_flux_injection_enabled_(false),
+      controlled_u_fct_flux_injection_enabled_(false),
       allow_finite_negative_debt_for_test_(false),
       core_macro_debt_consecutive_steps_(0)
 {}
@@ -48,6 +50,8 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
 {
     result = Result();
     result.limiter_min_alpha = 1.0;
+    result.x_limiter_min_alpha = 1.0;
+    result.u_limiter_min_alpha = 1.0;
     result.limiter_min_alpha_core = 1.0;
     result.limiter_min_alpha_boundary = 1.0;
     result.mu_low_u_alpha_min = 1.0;
@@ -264,8 +268,35 @@ VlasovAmpereMidpointSolver::evaluate_background_coupling_flux_bundle(
     bundle.fu_center = evaluation.center_u_flux;
     bundle.fu_high = evaluation.high_u_flux;
     bundle.fu_final = evaluation.final_u_flux;
+    bundle.cu_low = evaluation.low_u_coefficient;
+    bundle.cu_high = evaluation.high_u_coefficient;
+    bundle.cu_final = evaluation.final_u_coefficient;
+    bundle.donor_beta = evaluation.fct_donor_beta;
+    bundle.donor_low_mass = evaluation.fct_donor_low_mass;
+    bundle.donor_limited_outflow = evaluation.fct_donor_limited_outflow;
     bundle.cu_center = evaluation.center_u_coefficient;
+    bundle.cu_legacy_center = evaluation.legacy_center_u_coefficient;
+    bundle.dual_target_jn_cell = evaluation.dual_target_jn_cell;
+    bundle.dual_target_jn_replay_cell =
+        evaluation.dual_target_jn_replay_cell;
+    bundle.dual_legacy_je_cell = evaluation.dual_legacy_je_cell;
+    bundle.dual_je_cell = evaluation.dual_je_cell;
     bundle.cu_reconstruction_mass = evaluation.center_u_reconstruction_mass;
+    bundle.background_coupling_mode = evaluation.background_coupling_mode;
+    bundle.dual_u_operator_valid = evaluation.dual_u_operator_valid;
+    bundle.dual_u_target_replay_linf = evaluation.dual_u_target_replay_linf;
+    bundle.dual_u_target_replay_scale = evaluation.dual_u_target_replay_scale;
+    bundle.dual_u_legacy_operator_replay_linf =
+        evaluation.dual_u_legacy_operator_replay_linf;
+    bundle.dual_u_legacy_operator_replay_scale =
+        evaluation.dual_u_legacy_operator_replay_scale;
+    bundle.dual_u_legacy_current_linf =
+        evaluation.dual_u_legacy_current_linf;
+    bundle.dual_u_current_linf = evaluation.dual_u_current_linf;
+    bundle.dual_u_correction_l2 = evaluation.dual_u_correction_l2;
+    bundle.dual_u_correction_linf = evaluation.dual_u_correction_linf;
+    bundle.dual_u_corrected_cell_count =
+        evaluation.dual_u_corrected_cell_count;
     bundle.jn_low = evaluation.j_bkg_face_low_mid;
     bundle.jn_high = evaluation.j_bkg_face_high_mid;
     bundle.jn_final = evaluation.j_bkg_face_mid;
@@ -277,6 +308,19 @@ VlasovAmpereMidpointSolver::evaluate_background_coupling_flux_bundle(
     bundle.gstar_je_center = evaluation.j_bkg_energy_center_debug_face;
     bundle.gstar_je_high = evaluation.j_bkg_energy_high_debug_face;
     bundle.gstar_je_final = evaluation.j_bkg_energy_debug_face;
+    bundle.final_state_mass.resize(static_cast<size_t>(sg.nx_local) *
+                                   Param::Nvmu);
+    if (evaluation.species_np1.f.size() >=
+        static_cast<size_t>(sg.nx_total) * Param::Nvmu) {
+        for (int ix = 0; ix < sg.nx_local; ++ix) {
+            const size_t source = static_cast<size_t>(sg.nghost + ix) *
+                                  Param::Nvmu;
+            const size_t target = static_cast<size_t>(ix) * Param::Nvmu;
+            std::copy(evaluation.species_np1.f.begin() + source,
+                      evaluation.species_np1.f.begin() + source + Param::Nvmu,
+                      bundle.final_state_mass.begin() + target);
+        }
+    }
     bundle.x_low_state_hash = evaluation.x_low_state_hash;
     bundle.u_low_state_hash = evaluation.u_low_state_hash;
     bundle.x_high_state_hash = evaluation.x_high_state_hash;
@@ -343,7 +387,32 @@ VlasovAmpereMidpointSolver::evaluate_background_coupling_flux_bundle(
     bundle.fct_active = evaluation.limiter_active_fraction > 0.0 ? 1 : 0;
     bundle.limiter_active_fraction = evaluation.limiter_active_fraction;
     bundle.limiter_min_alpha = evaluation.limiter_min_alpha;
+    bundle.x_limiter_active_fraction =
+        evaluation.x_limiter_active_fraction;
+    bundle.x_limiter_min_alpha = evaluation.x_limiter_min_alpha;
+    bundle.u_limiter_active_fraction =
+        evaluation.u_limiter_active_fraction;
+    bundle.u_limiter_min_alpha = evaluation.u_limiter_min_alpha;
+    bundle.donor_beta_applied_count =
+        evaluation.fct_donor_beta_applied_count;
+    bundle.donor_beta_min = evaluation.fct_donor_beta_min;
     bundle.r_couple = evaluation.stage5_r_couple;
+    bundle.r_fv = evaluation.stage5_r_fv;
+    bundle.delta_ke_bkg = evaluation.delta_ke_bkg;
+    bundle.stage5_u_energy_moment = evaluation.stage5_u_energy_moment;
+    bundle.stage5_spatial_energy_boundary =
+        evaluation.stage5_spatial_energy_boundary;
+    bundle.mass_change = evaluation.stage2_mass_change;
+    bundle.mass_scale = evaluation.stage2_mass_scale;
+    bundle.mass_residual = evaluation.stage2_mass_residual;
+    bundle.momentum_change = evaluation.stage2_momentum_change;
+    bundle.momentum_scale = evaluation.stage2_momentum_scale;
+    bundle.momentum_residual = evaluation.stage2_momentum_residual;
+    bundle.u_boundary_particle = evaluation.u_boundary_particle_outflow;
+    bundle.u_boundary_momentum = evaluation.u_boundary_momentum_outflow;
+    bundle.u_boundary_energy = evaluation.u_boundary_energy_outflow;
+    bundle.u_boundary_energy_lower = evaluation.u_boundary_energy_lower;
+    bundle.u_boundary_energy_upper = evaluation.u_boundary_energy_upper;
     bundle.final_flux_current_moment_audit_valid =
         evaluation.final_flux_current_moment_audit_valid;
     bundle.final_flux_current_moment_audit_finite =
