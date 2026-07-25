@@ -28,6 +28,8 @@ BeamPIC::BeamPIC()
       last_continuity_l1_error_(0.0),
       last_continuity_linf_error_(0.0),
       last_boundary_flux_error_(0.0),
+      last_boundary_source_error_(0.0),
+      last_open_face_error_(0.0),
       last_trajectory_reconstruction_error_(0.0),
       rng_state_(0x9e3779b97f4a7c15ULL),
       injected_begin_(0)
@@ -90,6 +92,8 @@ void BeamPIC::import_persistent_state(const BeamPersistentState& s,
     last_continuity_l1_error_ = s.last_continuity_l1_error;
     last_continuity_linf_error_ = s.last_continuity_linf_error;
     last_boundary_flux_error_ = s.last_boundary_flux_error;
+    last_boundary_source_error_ = s.last_boundary_flux_error;
+    last_open_face_error_ = 0.0;
     last_trajectory_reconstruction_error_ = s.last_trajectory_reconstruction_error;
     rng_state_ = s.rng_state;
     injected_begin_ = particles.size();
@@ -289,6 +293,8 @@ void BeamPIC::init(const SpatialGrid& sg)
     last_continuity_l1_error_ = 0.0;
     last_continuity_linf_error_ = 0.0;
     last_boundary_flux_error_ = 0.0;
+    last_boundary_source_error_ = 0.0;
+    last_open_face_error_ = 0.0;
     last_trajectory_reconstruction_error_ = 0.0;
     rng_state_ = 0x9e3779b97f4a7c15ULL;
     injected_begin_ = 0;
@@ -327,6 +333,8 @@ void BeamPIC::begin_step(const SpatialGrid& sg, double dt)
     last_continuity_l1_error_ = 0.0;
     last_continuity_linf_error_ = 0.0;
     last_boundary_flux_error_ = 0.0;
+    last_boundary_source_error_ = 0.0;
+    last_open_face_error_ = 0.0;
     last_trajectory_reconstruction_error_ = 0.0;
     injected_begin_ = 0;
     injected_push_dt_.clear();
@@ -995,8 +1003,15 @@ void BeamPIC::finalize_charge_conserving_current(const SpatialGrid& sg,
 
     last_boundary_flux_error_ = 0.0;
     last_trajectory_reconstruction_error_ = 0.0;
+    // Keep diagnostics well scaled after injection switches off.  Using only
+    // the instantaneous injected flux makes any finite cancellation residue
+    // larger than one particle/s normalize to exactly one.
+    const double reference_current_scale = std::max(1.0, std::fabs(Param::jb));
+    const double reference_number_flux_scale =
+        reference_current_scale / Const::qe;
     const double current_scale = std::max(
-        1.0, Const::qe * global_boundary_numbers[0] * inv_dt);
+        reference_current_scale,
+        Const::qe * std::fabs(global_boundary_numbers[0]) * inv_dt);
     for (size_t iface = 0; iface < current_face_x.size(); ++iface) {
         const double scale = std::max(
             current_scale,
@@ -1045,24 +1060,28 @@ void BeamPIC::finalize_charge_conserving_current(const SpatialGrid& sg,
         global_boundary_numbers[0] + global_boundary_numbers[1]
         - global_boundary_numbers[2]);
     const double source_number_scale = std::max(
-        1.0, std::max(std::fabs(expected_source_number),
-                      std::fabs(global_boundary_numbers[3])));
-    last_boundary_flux_error_ =
+        reference_number_flux_scale * elapsed_dt,
+        std::max(std::fabs(expected_source_number),
+                 std::fabs(global_boundary_numbers[3])));
+    last_boundary_source_error_ =
         std::fabs(global_boundary_numbers[3] - expected_source_number) /
         source_number_scale;
+    last_boundary_flux_error_ = last_boundary_source_error_;
+    last_open_face_error_ = 0.0;
 
     if (mpi_rank == mpi_size - 1) {
         const double expected_right_flux = global_boundary_numbers[5] * inv_dt;
         const double flux_scale = std::max(
-            1.0, std::max(global_boundary_numbers[0] * inv_dt,
+            reference_number_flux_scale,
+            std::max(std::fabs(global_boundary_numbers[0]) * inv_dt,
                           std::max(std::fabs(trajectory_flux),
                                    std::max(std::fabs(reconstructed_flux),
-                                             std::fabs(expected_right_flux)))));
-        const double open_face_error = std::max(
+                                            std::fabs(expected_right_flux)))));
+        last_open_face_error_ = std::max(
             std::fabs(trajectory_flux - expected_right_flux),
             std::fabs(reconstructed_flux - expected_right_flux)) / flux_scale;
         last_boundary_flux_error_ =
-            std::max(last_boundary_flux_error_, open_face_error);
+            std::max(last_boundary_flux_error_, last_open_face_error_);
     }
 }
 

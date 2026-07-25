@@ -81,6 +81,10 @@ public:
     double last_continuity_l1_error() const { return last_continuity_l1_error_; }
     double last_continuity_linf_error() const { return last_continuity_linf_error_; }
     double last_boundary_flux_error() const { return last_boundary_flux_error_; }
+    double last_boundary_source_error() const {
+        return last_boundary_source_error_;
+    }
+    double last_open_face_error() const { return last_open_face_error_; }
     double last_trajectory_reconstruction_error() const {
         return last_trajectory_reconstruction_error_;
     }
@@ -111,6 +115,10 @@ private:
     double last_continuity_l1_error_;
     double last_continuity_linf_error_;
     double last_boundary_flux_error_;
+    // Diagnostic components are transient and intentionally excluded from
+    // BeamPersistentState; they are recomputed by every accepted Beam step.
+    double last_boundary_source_error_;
+    double last_open_face_error_;
     double last_trajectory_reconstruction_error_;
     unsigned long long rng_state_;
     size_t injected_begin_;

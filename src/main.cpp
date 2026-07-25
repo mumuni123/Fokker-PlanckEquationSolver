@@ -20,6 +20,9 @@
 #include <mpi.h>
 #include <omp.h>
 #include <vector>
+#if !defined(_WIN32)
+#include <sys/resource.h>
+#endif
 
 double compute_dt(const Species& electron, const SpatialGrid& sg)
 {
@@ -220,13 +223,15 @@ void write_snapshot(Diagnostics& diag,
                     int mpi_size,
                     bool write_full_fe,
                     const std::vector<double>* bkg_energy_current_face = 0,
-                    const std::vector<double>* bkg_ampere_current_face = 0)
+                    const std::vector<double>* bkg_ampere_current_face = 0,
+                    bool bkg_energy_current_valid = false)
 {
     fields.compute_potential(mpi_rank, mpi_size);
     diag.write_fields(time, fields, sgrid, mpi_rank, mpi_size);
     diag.write_current_density(time, bkg_e, beam, sgrid, mpi_rank, mpi_size,
                                bkg_energy_current_face,
-                               bkg_ampere_current_face);
+                               bkg_ampere_current_face,
+                               bkg_energy_current_valid);
     diag.write_density_profile(time, bkg_e, beam.density, ion_density_profile,
                                sgrid, mpi_rank, mpi_size);
     diag.write_px_distribution(time, bkg_e, mpi_rank, mpi_size);
@@ -624,19 +629,43 @@ int main(int argc, char** argv)
         ? VlasovAmpereMidpointSolver::DUAL_U_COUPLING
         : VlasovAmpereMidpointSolver::LEGACY_COUPLING);
     midpoint_solver.set_max_midpoint_iterations(runtime.midpoint_max_iters);
+    midpoint_solver.set_midpoint_acceleration_mode(
+        runtime.midpoint_acceleration_mode == RUNTIME_MIDPOINT_ACCELERATION_AITKEN
+        ? VlasovAmpereMidpointSolver::MIDPOINT_ACCELERATION_AITKEN
+        : runtime.midpoint_acceleration_mode == RUNTIME_MIDPOINT_ACCELERATION_ANDERSON
+        ? VlasovAmpereMidpointSolver::MIDPOINT_ACCELERATION_ANDERSON
+        : VlasovAmpereMidpointSolver::MIDPOINT_ACCELERATION_NONE);
+    midpoint_solver.set_anderson_depth(runtime.anderson_depth);
+    midpoint_solver.set_acceleration_start_iter(runtime.acceleration_start_iter);
+    midpoint_solver.set_acceleration_accept_ratio(runtime.acceleration_accept_ratio);
+    midpoint_solver.set_acceleration_max_coefficient(runtime.acceleration_max_coefficient);
     midpoint_solver.set_capture_midpoint_input(runtime.diagnostic_level >= 2);
     midpoint_solver.set_midpoint_iteration_trace(runtime.diagnostic_level >= 2);
+    midpoint_solver.set_progress_trace_window_fs(
+        runtime.midpoint_trace_start_fs, runtime.midpoint_trace_end_fs);
     if (mpi_rank == 0) {
+        const char* const beam_ledger_mode = runtime.beam_ledger_mode == BEAM_LEDGER_FULL
+            ? "full" : runtime.beam_ledger_mode == BEAM_LEDGER_SUMMARY ? "summary" : "off";
+        const char* const midpoint_acceleration =
+            runtime.midpoint_acceleration_mode == RUNTIME_MIDPOINT_ACCELERATION_AITKEN
+            ? "aitken" : runtime.midpoint_acceleration_mode ==
+                RUNTIME_MIDPOINT_ACCELERATION_ANDERSON ? "anderson" : "none";
         printf("Transport configuration: low_order_only=%s, "
                "nonuniform_high_order=%s, FCT=%s, background_coupling=%s, "
-               "midpoint_max_iters=%d\n",
+               "midpoint_max_iters=%d, midpoint_acceleration=%s, "
+               "anderson_depth=%d, acceleration_start_iter=%d, "
+               "acceleration_accept_ratio=%.3f, acceleration_max_coefficient=%.3f, "
+               "beam_ledger_mode=%s\n",
                midpoint_solver.low_order_only() ? "ON" : "OFF",
                midpoint_solver.nonuniform_high_order_enabled() ? "ON" : "OFF",
                midpoint_solver.fct_enabled() ? "ON" : "OFF",
                midpoint_solver.background_coupling_mode() ==
                    VlasovAmpereMidpointSolver::DUAL_U_COUPLING
                    ? "dual_u" : "legacy",
-               midpoint_solver.max_midpoint_iterations());
+                midpoint_solver.max_midpoint_iterations(), midpoint_acceleration,
+                runtime.anderson_depth, runtime.acceleration_start_iter,
+                runtime.acceleration_accept_ratio, runtime.acceleration_max_coefficient,
+                beam_ledger_mode);
     }
 
     if (runtime.operator_audit_mode) {
@@ -1068,28 +1097,32 @@ int main(int argc, char** argv)
         static_cast<size_t>(sgrid.nx_local + 1), 0.0);
     std::vector<double> latest_bkg_ampere_current_face(
         static_cast<size_t>(sgrid.nx_local + 1), 0.0);
+    bool latest_bkg_energy_current_valid = false;
     write_snapshot(diag, current_time, bkg_e, beam, fields, ion_density_profile,
                    sgrid, mpi_rank, mpi_size, config.enable_full_fe_output,
                    &latest_bkg_energy_current_face,
-                   &latest_bkg_ampere_current_face);
+                   &latest_bkg_ampere_current_face,
+                   latest_bkg_energy_current_valid);
 
     int stdout_freq = 1000;
     double cumulative_bkg_energy_residual = 0.0;
     std::ofstream accepted_coupling_region_monitor;
     std::ofstream midpoint_iteration_residual_monitor;
     std::ofstream beam_half_step_ledger;
-    double beam_ledger_n_in_total = 0.0;
-    double beam_ledger_n_out_total = 0.0;
-    double beam_ledger_injected_energy_total = 0.0;
-    double beam_ledger_outflow_energy_total = 0.0;
-    double beam_ledger_injected_current_impulse_total = 0.0;
-    double beam_ledger_outflow_current_impulse_total = 0.0;
-    int beam_ledger_step_count = 0;
-    std::vector<double> beam_ledger_rows;
-    const bool write_beam_ledger = runtime.diagnostic_level >= 2 ||
-        runtime.beam_ledger_reference_enabled ||
-        std::fabs(runtime.dt_scale - 0.5) <=
-            16.0 * std::numeric_limits<double>::epsilon();
+    std::array<double, 6> beam_ledger_local_totals = {{0.0, 0.0, 0.0,
+                                                        0.0, 0.0, 0.0}};
+    std::array<double, 6> beam_ledger_full_totals = {{0.0, 0.0, 0.0,
+                                                       0.0, 0.0, 0.0}};
+    std::array<double, 12> beam_reference_rows = {{0.0}};
+    int beam_reference_row_count = 0;
+    const double beam_ledger_start_time_s = current_time;
+    const bool beam_ledger_enabled = runtime.beam_ledger_mode != BEAM_LEDGER_OFF;
+    const bool write_beam_ledger = runtime.beam_ledger_mode == BEAM_LEDGER_FULL;
+    const auto flush_full_beam_ledger = [&]() {
+        if (mpi_rank == 0 && beam_half_step_ledger.is_open()) {
+            beam_half_step_ledger.flush();
+        }
+    };
     if (mpi_rank == 0) {
         accepted_coupling_region_monitor.open(
             output_path(runtime, "accepted_coupling_residual_by_region.dat").c_str());
@@ -1124,7 +1157,8 @@ int main(int argc, char** argv)
                 << "# step time_fs iteration residual_E residual_J_bkg "
                 << "residual_E_contraction residual_J_bkg_contraction "
                 << "record_interval residual_J_beam residual_f accepted state_advanced "
-                << "converged soft_unconverged\n";
+                << "converged soft_unconverged acceleration_coefficient "
+                << "acceleration_residual_before acceleration_status\n";
             midpoint_iteration_residual_monitor << std::scientific
                                                 << std::setprecision(17);
         }
@@ -1153,6 +1187,37 @@ int main(int argc, char** argv)
 
     }
     long long accepted_after_restart = 0;
+    long long performance_total_nonlinear_iterations = 0;
+    long long performance_total_operator_evaluations = 0;
+    long long performance_strict_accepted_steps = 0;
+    long long performance_soft_accepted_steps = 0;
+    long long performance_acceleration_attempts = 0;
+    long long performance_acceleration_accepted = 0;
+    long long performance_acceleration_fallback_evaluations = 0;
+    long long performance_acceleration_rejected_residual = 0;
+    long long performance_acceleration_rejected_nonfinite = 0;
+    long long performance_acceleration_rejected_hard_failure = 0;
+    long long performance_acceleration_rejected_coefficient = 0;
+    long long performance_acceleration_history_resets = 0;
+    double performance_final_residual_e = 0.0;
+    double performance_final_residual_j_bkg = 0.0;
+    double performance_final_residual_f = 0.0;
+    double performance_max_residual_e = 0.0;
+    double performance_max_residual_j_bkg = 0.0;
+    double performance_max_residual_f = 0.0;
+    double performance_limiter_active_sum = 0.0;
+    double performance_limiter_active_min =
+        std::numeric_limits<double>::infinity();
+    double performance_limiter_active_max = 0.0;
+    double performance_limiter_min_alpha = 1.0;
+    double performance_x_limiter_active_sum = 0.0;
+    double performance_x_limiter_active_min =
+        std::numeric_limits<double>::infinity();
+    double performance_x_limiter_active_max = 0.0;
+    double performance_x_limiter_min_alpha = 1.0;
+    const double performance_start_time_s = current_time;
+    MPI_Barrier(MPI_COMM_WORLD);
+    const double performance_wall_start = MPI_Wtime();
     size_t next_checkpoint = 0;
     while (next_checkpoint < runtime.checkpoint_times_fs.size() &&
            current_time / Const::femto >= runtime.checkpoint_times_fs[next_checkpoint]) ++next_checkpoint;
@@ -1176,7 +1241,8 @@ int main(int argc, char** argv)
         // Probe/audit runs need every accepted step, independent of the
         // production cadence, so their field/current closure can be replayed.
         const bool collect_step_diagnostics = runtime.diagnostic_level >= 2 ||
-            should_write_step_diagnostics(config, step);
+            should_write_step_diagnostics(config, step) ||
+            time >= next_snapshot || step == nsteps;
         double dke_bkg_step = 0.0;
         double dke_beam_push = 0.0;
         double dE_field_step = 0.0;
@@ -1230,11 +1296,37 @@ int main(int argc, char** argv)
 
         trace_progress(config, mpi_rank, step,
                        "before coupled midpoint FV solve");
+        const double time_fs_for_trace = time / Const::femto;
+        const bool midpoint_live_trace =
+            runtime.midpoint_trace_start_fs >= 0.0 &&
+            time_fs_for_trace >= runtime.midpoint_trace_start_fs &&
+            time_fs_for_trace <= runtime.midpoint_trace_end_fs;
+        if (midpoint_live_trace && mpi_rank == 0) {
+            std::printf(
+                "[step-live] physical_step=%lld restart_relative_step=%d "
+                "t_fs=%.16e stage=midpoint_begin\n",
+                physical_step, step, time_fs_for_trace);
+            std::fflush(stdout);
+        }
         midpoint_solver.set_step_diagnostics_enabled(collect_step_diagnostics);
         VlasovAmpereMidpointSolver::Result midpoint_result =
             midpoint_solver.advance_background_and_fields(
                 bkg_step_start, beam_step_start, fields_step_start, sgrid,
                 dt, time, mpi_rank, mpi_size);
+        if (midpoint_live_trace && mpi_rank == 0) {
+            std::printf(
+                "[step-live] physical_step=%lld restart_relative_step=%d "
+                "t_fs=%.16e stage=midpoint_end iterations=%d substeps=%d "
+                "converged=%d soft=%d failed=%d state_advanced=%d\n",
+                physical_step, step, time_fs_for_trace,
+                midpoint_result.nonlinear_iterations,
+                midpoint_result.substeps_used,
+                midpoint_result.converged ? 1 : 0,
+                midpoint_result.soft_unconverged ? 1 : 0,
+                midpoint_result.failed ? 1 : 0,
+                midpoint_result.state_advanced);
+            std::fflush(stdout);
+        }
         trace_progress(config, mpi_rank, step,
                        "after coupled midpoint FV solve");
         if (mpi_rank == 0 && runtime.diagnostic_level >= 2) {
@@ -1244,8 +1336,10 @@ int main(int argc, char** argv)
             size_t previous_record_iteration = 0;
             bool have_previous_record = false;
             for (size_t iter = 0; iter < count; ++iter) {
-                const bool record_iteration = iter == 0 ||
-                    ((iter + 1) % 10 == 0) || iter + 1 == count;
+                // Level 2 is an explicit nonlinear-solver audit.  Preserve
+                // every candidate so an accelerated field proposal and its
+                // subsequent accept/reject evaluation stay adjacent.
+                const bool record_iteration = true;
                 if (!record_iteration) continue;
                 const double residual_e = midpoint_result.midpoint_residual_e_history[iter];
                 const double residual_j_bkg =
@@ -1272,6 +1366,18 @@ int main(int argc, char** argv)
                     iter < midpoint_result.midpoint_residual_f_history.size()
                     ? midpoint_result.midpoint_residual_f_history[iter]
                     : std::numeric_limits<double>::quiet_NaN();
+                const double acceleration_coefficient =
+                    iter < midpoint_result.midpoint_acceleration_omega_history.size()
+                    ? midpoint_result.midpoint_acceleration_omega_history[iter]
+                    : std::numeric_limits<double>::quiet_NaN();
+                const double acceleration_residual_before =
+                    iter < midpoint_result.midpoint_acceleration_residual_before_history.size()
+                    ? midpoint_result.midpoint_acceleration_residual_before_history[iter]
+                    : std::numeric_limits<double>::quiet_NaN();
+                const int acceleration_status =
+                    iter < midpoint_result.midpoint_acceleration_status_history.size()
+                    ? midpoint_result.midpoint_acceleration_status_history[iter]
+                    : -1;
                 midpoint_iteration_residual_monitor
                     << physical_step << " " << time / Const::femto << " "
                     << (iter + 1) << " "
@@ -1283,7 +1389,10 @@ int main(int argc, char** argv)
                     << (midpoint_result.state_advanced && !midpoint_result.failed ? 1 : 0)
                     << " " << midpoint_result.state_advanced << " "
                     << midpoint_result.converged << " "
-                    << midpoint_result.soft_unconverged << "\n";
+                    << midpoint_result.soft_unconverged << " "
+                    << acceleration_coefficient << " "
+                    << acceleration_residual_before << " "
+                    << acceleration_status << "\n";
                 previous_record_e = residual_e;
                 previous_record_j_bkg = residual_j_bkg;
                 previous_record_iteration = iter + 1;
@@ -1308,6 +1417,7 @@ int main(int argc, char** argv)
             case 6: failure_reason = "FCT_DONOR_CAPACITY"; break;
             case 7: failure_reason = "FCT_INTERFACE_CHECKSUM"; break;
             case 12: failure_reason = "NONUNIFORM_HIGH_ORDER_DISABLED"; break;
+            case 17: failure_reason = "NONFINITE_BEAM_CONTINUITY"; break;
             default: break;
             }
             if (mpi_rank == 0) {
@@ -1511,6 +1621,7 @@ int main(int argc, char** argv)
                         midpoint_result.state_advanced,
                         midpoint_result.trial_failure_downgraded);
                 }
+                flush_full_beam_ledger();
                 MPI_Abort(MPI_COMM_WORLD, 8);
                 return 8;
             }
@@ -1524,6 +1635,7 @@ int main(int argc, char** argv)
                     "state at step %d; aborting to prevent frozen output.\n",
                     step);
             }
+            flush_full_beam_ledger();
             MPI_Abort(MPI_COMM_WORLD, 9);
             return 9;
         }
@@ -1531,6 +1643,10 @@ int main(int argc, char** argv)
         bkg_e = midpoint_result.species_np1;
         beam = midpoint_result.beam_np1;
         fields = midpoint_result.fields_np1;
+        // The midpoint kernel only evaluates moments on diagnostic trials.
+        // Refresh once for the accepted production state below, rather than
+        // once for every Picard iterate.
+        moments_current = false;
         if (runtime.diagnostic_level >= 2 && !midpoint_result.failed) {
             write_fixed_midpoint_face_pairing(
                 output_path(runtime, "fixed_midpoint_face_pairing.dat"),
@@ -1588,6 +1704,7 @@ int main(int argc, char** argv)
                                             audit_state, sgrid, mpi_rank,
                                             mpi_size, runtime_error)) {
                 if (mpi_rank == 0) std::fprintf(stderr, "Midpoint audit error: %s\n", runtime_error.c_str());
+                flush_full_beam_ledger();
                 MPI_Abort(MPI_COMM_WORLD, 13);
                 return 13;
             }
@@ -1643,7 +1760,9 @@ int main(int argc, char** argv)
         }
         latest_bkg_energy_current_face =
             midpoint_result.j_bkg_energy_debug_face;
-        moments_current = true;
+        latest_bkg_energy_current_valid =
+            collect_step_diagnostics &&
+            !latest_bkg_energy_current_face.empty();
         latest_bkg_ampere_current_face = midpoint_result.j_bkg_face_mid;
         // All current diagnostics returned by the midpoint solver are global
         // MPI values despite this legacy per-step storage name.
@@ -1751,10 +1870,11 @@ int main(int argc, char** argv)
         net_nb_change_step = beam.last_injected_number()
                             - beam.last_outflow_number();
 
-        if (write_beam_ledger) {
-            // Beam counters are rank-local because injection/outflow may be
-            // owned by different ranks.  Reduce one packed ledger once per
-            // accepted physical substep before appending the audit row.
+        if (beam_ledger_enabled) {
+            // Beam counters are local because injection and outflow can be
+            // owned by different ranks.  Summary mode accumulates locally and
+            // performs one final reduction; only the explicit full audit mode
+            // pays for a collective at every accepted step.
             double beam_ledger_local[6] = {
                 beam.last_injected_number(),
                 beam.last_outflow_number(),
@@ -1763,27 +1883,44 @@ int main(int argc, char** argv)
                 beam.last_injected_current() * dt,
                 beam.last_outflow_current() * dt
             };
-            double beam_ledger_global[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-            MPI_Allreduce(beam_ledger_local, beam_ledger_global, 6, MPI_DOUBLE,
-                          MPI_SUM, MPI_COMM_WORLD);
-            beam_ledger_n_in_total += beam_ledger_global[0];
-            beam_ledger_n_out_total += beam_ledger_global[1];
-            beam_ledger_injected_energy_total += beam_ledger_global[2];
-            beam_ledger_outflow_energy_total += beam_ledger_global[3];
-            beam_ledger_injected_current_impulse_total += beam_ledger_global[4];
-            beam_ledger_outflow_current_impulse_total += beam_ledger_global[5];
-            ++beam_ledger_step_count;
-            if (mpi_rank == 0) {
-                beam_ledger_rows.insert(beam_ledger_rows.end(),
-                                        beam_ledger_global, beam_ledger_global + 6);
-                beam_half_step_ledger
-                    << physical_step << " " << time / Const::femto << " " << dt << " "
-                    << beam_ledger_global[0] << " " << beam_ledger_global[1] << " "
-                    << beam_ledger_global[2] << " " << beam_ledger_global[3] << " "
-                    << beam_ledger_global[4] / dt << " "
-                    << beam_ledger_global[5] / dt << " "
-                    << beam_ledger_global[4] << " " << beam_ledger_global[5] << "\n";
-                beam_half_step_ledger.flush();
+            if (runtime.beam_ledger_mode == BEAM_LEDGER_SUMMARY) {
+                for (int value = 0; value < 6; ++value) {
+                    beam_ledger_local_totals[static_cast<size_t>(value)] +=
+                        beam_ledger_local[value];
+                }
+            }
+            if (write_beam_ledger) {
+                double beam_ledger_global[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+                MPI_Allreduce(beam_ledger_local, beam_ledger_global, 6, MPI_DOUBLE,
+                              MPI_SUM, MPI_COMM_WORLD);
+                if (mpi_rank == 0) {
+                    for (int value = 0; value < 6; ++value) {
+                        beam_ledger_full_totals[static_cast<size_t>(value)] +=
+                            beam_ledger_global[value];
+                    }
+                    if (runtime.beam_ledger_reference_enabled &&
+                        beam_reference_row_count < 2) {
+                        const size_t row = static_cast<size_t>(6 * beam_reference_row_count);
+                        for (int value = 0; value < 6; ++value) {
+                            beam_reference_rows[row + static_cast<size_t>(value)] =
+                                beam_ledger_global[value];
+                        }
+                        ++beam_reference_row_count;
+                    }
+                    beam_half_step_ledger
+                        << physical_step << " " << time / Const::femto << " " << dt << " "
+                        << beam_ledger_global[0] << " " << beam_ledger_global[1] << " "
+                        << beam_ledger_global[2] << " " << beam_ledger_global[3] << " "
+                        << beam_ledger_global[4] / dt << " "
+                        << beam_ledger_global[5] / dt << " "
+                        << beam_ledger_global[4] << " " << beam_ledger_global[5] << "\n";
+                    const bool checkpoint_due = runtime.checkpoint_enabled &&
+                        next_checkpoint < runtime.checkpoint_times_fs.size() &&
+                        time / Const::femto >= runtime.checkpoint_times_fs[next_checkpoint];
+                    if (physical_step % 500 == 0 || time >= next_snapshot || checkpoint_due) {
+                        flush_full_beam_ledger();
+                    }
+                }
             }
         }
 
@@ -1873,8 +2010,63 @@ int main(int argc, char** argv)
 
         current_time = time;
         ++accepted_after_restart;
+        performance_total_nonlinear_iterations +=
+            midpoint_result.nonlinear_iterations;
+        performance_total_operator_evaluations +=
+            midpoint_result.operator_evaluations;
+        performance_acceleration_attempts += midpoint_result.acceleration_attempts;
+        performance_acceleration_accepted += midpoint_result.acceleration_accepted;
+        performance_acceleration_fallback_evaluations +=
+            midpoint_result.acceleration_fallback_evaluations;
+        performance_acceleration_rejected_residual +=
+            midpoint_result.acceleration_rejected_residual;
+        performance_acceleration_rejected_nonfinite +=
+            midpoint_result.acceleration_rejected_nonfinite;
+        performance_acceleration_rejected_hard_failure +=
+            midpoint_result.acceleration_rejected_hard_failure;
+        performance_acceleration_rejected_coefficient +=
+            midpoint_result.acceleration_rejected_coefficient;
+        performance_acceleration_history_resets +=
+            midpoint_result.acceleration_history_resets;
+        performance_final_residual_e = midpoint_result.residual_E;
+        performance_final_residual_j_bkg = midpoint_result.residual_J_bkg;
+        performance_final_residual_f = midpoint_result.residual_f;
+        performance_max_residual_e = std::max(performance_max_residual_e,
+                                              midpoint_result.max_residual_E);
+        performance_max_residual_j_bkg = std::max(performance_max_residual_j_bkg,
+                                                  midpoint_result.max_residual_J_bkg);
+        performance_max_residual_f = std::max(performance_max_residual_f,
+                                              midpoint_result.max_residual_f);
+        if (midpoint_result.soft_unconverged) {
+            ++performance_soft_accepted_steps;
+        } else {
+            ++performance_strict_accepted_steps;
+        }
+        performance_limiter_active_sum +=
+            midpoint_result.limiter_active_fraction;
+        performance_limiter_active_min = std::min(
+            performance_limiter_active_min,
+            midpoint_result.limiter_active_fraction);
+        performance_limiter_active_max = std::max(
+            performance_limiter_active_max,
+            midpoint_result.limiter_active_fraction);
+        performance_limiter_min_alpha = std::min(
+            performance_limiter_min_alpha,
+            midpoint_result.limiter_min_alpha);
+        performance_x_limiter_active_sum +=
+            midpoint_result.x_limiter_active_fraction;
+        performance_x_limiter_active_min = std::min(
+            performance_x_limiter_active_min,
+            midpoint_result.x_limiter_active_fraction);
+        performance_x_limiter_active_max = std::max(
+            performance_x_limiter_active_max,
+            midpoint_result.x_limiter_active_fraction);
+        performance_x_limiter_min_alpha = std::min(
+            performance_x_limiter_min_alpha,
+            midpoint_result.x_limiter_min_alpha);
         if (runtime.checkpoint_enabled && next_checkpoint < runtime.checkpoint_times_fs.size() &&
             current_time / Const::femto >= runtime.checkpoint_times_fs[next_checkpoint]) {
+            flush_full_beam_ledger();
             char checkpoint_name[128];
             std::sprintf(checkpoint_name, "%s/checkpoints/t_%010.6ffs_step_%08lld",
                          runtime.output_dir.c_str(), current_time / Const::femto,
@@ -1887,6 +2079,7 @@ int main(int argc, char** argv)
                                   midpoint_solver.nonuniform_high_order_enabled(),
                                   midpoint_solver.fct_enabled())) {
                 if (mpi_rank == 0) std::fprintf(stderr, "Checkpoint error: %s\n", runtime_error.c_str());
+                flush_full_beam_ledger();
                 MPI_Abort(MPI_COMM_WORLD, 12); return 12;
             }
             if (mpi_rank == 0) std::printf("Checkpoint written: %s\n", checkpoint_name);
@@ -1906,7 +2099,8 @@ int main(int argc, char** argv)
                            sgrid, mpi_rank, mpi_size,
                            config.enable_full_fe_output,
                            &latest_bkg_energy_current_face,
-                           &latest_bkg_ampere_current_face);
+                           &latest_bkg_ampere_current_face,
+                           latest_bkg_energy_current_valid);
             last_snapshot_step = static_cast<int>(physical_step);
             next_snapshot += Param::dt_snapshot;
         }
@@ -1930,71 +2124,209 @@ int main(int argc, char** argv)
         write_snapshot(diag, current_time, bkg_e, beam, fields, ion_density_profile,
                        sgrid, mpi_rank, mpi_size, config.enable_full_fe_output,
                        &latest_bkg_energy_current_face,
-                       &latest_bkg_ampere_current_face);
+                       &latest_bkg_ampere_current_face,
+                       latest_bkg_energy_current_valid);
+    }
+
+    const double performance_wall_local =
+        MPI_Wtime() - performance_wall_start;
+    double performance_wall_max = 0.0;
+    MPI_Reduce(&performance_wall_local, &performance_wall_max, 1, MPI_DOUBLE,
+               MPI_MAX, 0, MPI_COMM_WORLD);
+    unsigned long long local_max_rss_kib = 0ULL;
+#if !defined(_WIN32)
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        local_max_rss_kib =
+            static_cast<unsigned long long>(usage.ru_maxrss);
+    }
+#endif
+    unsigned long long global_max_rss_kib = 0ULL;
+    MPI_Reduce(&local_max_rss_kib, &global_max_rss_kib, 1,
+               MPI_UNSIGNED_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    const CheckpointStateHashes final_state_hashes =
+        checkpoint_state_hashes(bkg_e, beam, fields, sgrid,
+                                mpi_rank, mpi_size);
+    if (mpi_rank == 0) {
+        const double accepted_scale =
+            accepted_after_restart > 0
+            ? static_cast<double>(accepted_after_restart) : 1.0;
+        const double iteration_scale =
+            performance_total_nonlinear_iterations > 0
+            ? static_cast<double>(performance_total_nonlinear_iterations)
+            : 1.0;
+        const double operator_evaluation_scale =
+            performance_total_operator_evaluations > 0
+            ? static_cast<double>(performance_total_operator_evaluations)
+            : 1.0;
+        const double physical_time_fs = std::max(
+            (current_time - performance_start_time_s) / Const::femto,
+            std::numeric_limits<double>::min());
+        std::ofstream performance_summary(
+            output_path(runtime, "performance_summary.result").c_str());
+        const char* const performance_beam_ledger_mode =
+            runtime.beam_ledger_mode == BEAM_LEDGER_FULL ? "full" :
+            runtime.beam_ledger_mode == BEAM_LEDGER_SUMMARY ? "summary" : "off";
+        performance_summary << std::setprecision(17)
+            << "status PASS\n"
+            << "beam_ledger_mode " << performance_beam_ledger_mode << "\n"
+            << "accepted_steps " << accepted_after_restart << "\n"
+            << "total_nonlinear_iterations "
+            << performance_total_nonlinear_iterations << "\n"
+            << "total_operator_evaluations "
+            << performance_total_operator_evaluations << "\n"
+            << "mean_iterations_per_step "
+            << performance_total_nonlinear_iterations / accepted_scale << "\n"
+            << "mean_operator_evaluations_per_step "
+            << performance_total_operator_evaluations / accepted_scale << "\n"
+            << "strict_accepted_steps "
+            << performance_strict_accepted_steps << "\n"
+            << "soft_accepted_steps "
+            << performance_soft_accepted_steps << "\n"
+            << "wall_seconds_internal " << performance_wall_max << "\n"
+            << "wall_seconds_per_accepted_step "
+            << performance_wall_max / accepted_scale << "\n"
+            << "wall_seconds_per_nonlinear_iteration "
+            << performance_wall_max / iteration_scale << "\n"
+            << "wall_seconds_per_operator_evaluation "
+            << performance_wall_max / operator_evaluation_scale << "\n"
+            << "wall_seconds_per_physical_fs "
+            << performance_wall_max / physical_time_fs << "\n"
+            << "midpoint_acceleration_mode "
+            << (runtime.midpoint_acceleration_mode == RUNTIME_MIDPOINT_ACCELERATION_AITKEN
+                ? "aitken" : runtime.midpoint_acceleration_mode ==
+                    RUNTIME_MIDPOINT_ACCELERATION_ANDERSON ? "anderson" : "none") << "\n"
+            << "acceleration_attempts " << performance_acceleration_attempts << "\n"
+            << "acceleration_accepted " << performance_acceleration_accepted << "\n"
+            << "acceleration_fallback_evaluations "
+            << performance_acceleration_fallback_evaluations << "\n"
+            << "acceleration_rejected_residual "
+            << performance_acceleration_rejected_residual << "\n"
+            << "acceleration_rejected_nonfinite "
+            << performance_acceleration_rejected_nonfinite << "\n"
+            << "acceleration_rejected_hard_failure "
+            << performance_acceleration_rejected_hard_failure << "\n"
+            << "acceleration_rejected_coefficient "
+            << performance_acceleration_rejected_coefficient << "\n"
+            << "acceleration_history_resets " << performance_acceleration_history_resets << "\n"
+            << "final_residual_E " << performance_final_residual_e << "\n"
+            << "final_residual_J_bkg " << performance_final_residual_j_bkg << "\n"
+            << "final_residual_f " << performance_final_residual_f << "\n"
+            << "max_residual_E " << performance_max_residual_e << "\n"
+            << "max_residual_J_bkg " << performance_max_residual_j_bkg << "\n"
+            << "max_residual_f " << performance_max_residual_f << "\n"
+            << "limiter_active_fraction_mean "
+            << performance_limiter_active_sum / accepted_scale << "\n"
+            << "limiter_active_fraction_min "
+            << (accepted_after_restart > 0
+                ? performance_limiter_active_min : 0.0) << "\n"
+            << "limiter_active_fraction_max "
+            << performance_limiter_active_max << "\n"
+            << "limiter_min_alpha "
+            << performance_limiter_min_alpha << "\n"
+            << "x_limiter_active_fraction_mean "
+            << performance_x_limiter_active_sum / accepted_scale << "\n"
+            << "x_limiter_active_fraction_min "
+            << (accepted_after_restart > 0
+                ? performance_x_limiter_active_min : 0.0) << "\n"
+            << "x_limiter_active_fraction_max "
+            << performance_x_limiter_active_max << "\n"
+            << "x_limiter_min_alpha "
+            << performance_x_limiter_min_alpha << "\n"
+            << "max_rss_per_rank_kib " << global_max_rss_kib << "\n"
+            << "max_rss_available "
+            << (global_max_rss_kib > 0ULL ? 1 : 0) << "\n"
+            << "energy_diagnostic_current_valid "
+            << (latest_bkg_energy_current_valid ? 1 : 0) << "\n"
+            << "final_state_hash_background "
+            << final_state_hashes.background << "\n"
+            << "final_state_hash_field_faces "
+            << final_state_hashes.field_faces << "\n"
+            << "final_state_hash_beam "
+            << final_state_hashes.beam << "\n";
+    }
+
+    std::array<double, 6> beam_ledger_global_totals = {{0.0, 0.0, 0.0,
+                                                          0.0, 0.0, 0.0}};
+    if (runtime.beam_ledger_mode == BEAM_LEDGER_SUMMARY) {
+        MPI_Reduce(beam_ledger_local_totals.data(), beam_ledger_global_totals.data(), 6,
+                   MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    } else if (runtime.beam_ledger_mode == BEAM_LEDGER_FULL && mpi_rank == 0) {
+        beam_ledger_global_totals = beam_ledger_full_totals;
     }
 
     if (mpi_rank == 0) {
         if (write_beam_ledger) {
+            flush_full_beam_ledger();
             beam_half_step_ledger.close();
+        }
+        if (beam_ledger_enabled) {
+            const char* const mode_name = runtime.beam_ledger_mode == BEAM_LEDGER_FULL
+                ? "full" : "summary";
+            std::ofstream ledger_summary(
+                output_path(runtime, "beam_ledger_summary.result").c_str());
+            ledger_summary << std::setprecision(17)
+                << "beam_ledger_mode " << mode_name << "\n"
+                << "accepted_substeps " << accepted_after_restart << "\n"
+                << "start_time_s " << beam_ledger_start_time_s << "\n"
+                << "end_time_s " << current_time << "\n"
+                << "dt_s " << dt << "\n"
+                << "N_in_total " << beam_ledger_global_totals[0] << "\n"
+                << "N_out_total " << beam_ledger_global_totals[1] << "\n"
+                << "injected_energy_total " << beam_ledger_global_totals[2] << "\n"
+                << "outflow_energy_total " << beam_ledger_global_totals[3] << "\n"
+                << "injected_current_impulse_total " << beam_ledger_global_totals[4] << "\n"
+                << "outflow_current_impulse_total " << beam_ledger_global_totals[5] << "\n";
+        }
+        if (runtime.beam_ledger_reference_enabled) {
             double reference_n_in = 0.0;
             double reference_current_impulse = 0.0;
-            const bool have_reference = runtime.beam_ledger_reference_enabled &&
-                read_beam_ledger_total(runtime.beam_ledger_reference,
-                                       reference_n_in, reference_current_impulse);
+            const bool have_reference = read_beam_ledger_total(
+                runtime.beam_ledger_reference, reference_n_in, reference_current_impulse);
             const double n_in_difference = have_reference
-                ? std::fabs(reference_n_in - beam_ledger_n_in_total) : 0.0;
+                ? std::fabs(reference_n_in - beam_ledger_global_totals[0]) : 0.0;
             const double current_impulse_difference = have_reference
-                ? std::fabs(reference_current_impulse -
-                            beam_ledger_injected_current_impulse_total) : 0.0;
+                ? std::fabs(reference_current_impulse - beam_ledger_global_totals[4]) : 0.0;
             const double n_in_scale = std::max(1.0, std::max(
-                std::fabs(reference_n_in), std::fabs(beam_ledger_n_in_total)));
+                std::fabs(reference_n_in), std::fabs(beam_ledger_global_totals[0])));
             const double current_impulse_scale = std::max(1.0, std::max(
-                std::fabs(reference_current_impulse),
-                std::fabs(beam_ledger_injected_current_impulse_total)));
+                std::fabs(reference_current_impulse), std::fabs(beam_ledger_global_totals[4])));
             const bool reference_comparison_pass = !have_reference ||
                 (n_in_difference <= 4096.0 * std::numeric_limits<double>::epsilon() *
-                 n_in_scale &&
-                 current_impulse_difference <=
-                 4096.0 * std::numeric_limits<double>::epsilon() *
-                 current_impulse_scale);
-            const bool formal_dt_half_mode =
-                std::fabs(runtime.dt_scale - 0.5) <=
-                16.0 * std::numeric_limits<double>::epsilon();
-            const bool two_substep_ledger_complete = !formal_dt_half_mode ||
-                beam_ledger_step_count == 2;
+                 n_in_scale && current_impulse_difference <=
+                 4096.0 * std::numeric_limits<double>::epsilon() * current_impulse_scale);
+            const bool two_substep_ledger_complete = beam_reference_row_count == 2 &&
+                accepted_after_restart == 2;
             std::ofstream ledger_result(
                 output_path(runtime, "beam_dt_half_time_consistency.result").c_str());
             ledger_result << std::setprecision(17)
-                << "accepted_substeps " << beam_ledger_step_count << "\n"
+                << "accepted_substeps " << accepted_after_restart << "\n"
                 << "dt_scale " << runtime.dt_scale << "\n"
-                << "formal_dt_half_mode " << (formal_dt_half_mode ? 1 : 0) << "\n"
                 << "two_substep_ledger_complete "
                 << (two_substep_ledger_complete ? 1 : 0) << "\n"
-                << "N_in_total " << beam_ledger_n_in_total << "\n"
-                << "N_out_total " << beam_ledger_n_out_total << "\n"
-                << "injected_energy_total " << beam_ledger_injected_energy_total << "\n"
-                << "outflow_energy_total " << beam_ledger_outflow_energy_total << "\n"
-                << "injected_current_impulse_total "
-                << beam_ledger_injected_current_impulse_total << "\n"
-                << "outflow_current_impulse_total "
-                << beam_ledger_outflow_current_impulse_total << "\n"
+                << "N_in_total " << beam_ledger_global_totals[0] << "\n"
+                << "N_out_total " << beam_ledger_global_totals[1] << "\n"
+                << "injected_energy_total " << beam_ledger_global_totals[2] << "\n"
+                << "outflow_energy_total " << beam_ledger_global_totals[3] << "\n"
+                << "injected_current_impulse_total " << beam_ledger_global_totals[4] << "\n"
+                << "outflow_current_impulse_total " << beam_ledger_global_totals[5] << "\n"
                 << "reference_available " << (have_reference ? 1 : 0) << "\n"
-                << "reference_comparison_pass "
-                << (reference_comparison_pass ? 1 : 0) << "\n";
-            for (int substep = 0; substep < beam_ledger_step_count; ++substep) {
+                << "reference_comparison_pass " << (reference_comparison_pass ? 1 : 0) << "\n";
+            for (int substep = 0; substep < beam_reference_row_count; ++substep) {
                 const size_t base = static_cast<size_t>(6 * substep);
                 ledger_result << "substep_" << (substep + 1) << "_N_in "
-                    << beam_ledger_rows[base] << "\n"
+                    << beam_reference_rows[base] << "\n"
                     << "substep_" << (substep + 1) << "_N_out "
-                    << beam_ledger_rows[base + 1] << "\n"
+                    << beam_reference_rows[base + 1] << "\n"
                     << "substep_" << (substep + 1) << "_injected_energy "
-                    << beam_ledger_rows[base + 2] << "\n"
+                    << beam_reference_rows[base + 2] << "\n"
                     << "substep_" << (substep + 1) << "_outflow_energy "
-                    << beam_ledger_rows[base + 3] << "\n"
+                    << beam_reference_rows[base + 3] << "\n"
                     << "substep_" << (substep + 1) << "_injected_current_impulse "
-                    << beam_ledger_rows[base + 4] << "\n"
+                    << beam_reference_rows[base + 4] << "\n"
                     << "substep_" << (substep + 1) << "_outflow_current_impulse "
-                    << beam_ledger_rows[base + 5] << "\n";
+                    << beam_reference_rows[base + 5] << "\n";
             }
             if (have_reference) {
                 ledger_result << "reference_N_in_total " << reference_n_in << "\n"
@@ -2005,9 +2337,6 @@ int main(int argc, char** argv)
                     << current_impulse_difference << "\n";
             }
             ledger_result.close();
-            // Keep the old reference filename during the transition so an A
-            // run made with the documented 12.6 command remains usable by D.
-            // The canonical, self-describing result is the consistency file.
             std::ifstream consistency_input(
                 output_path(runtime, "beam_dt_half_time_consistency.result").c_str());
             std::ofstream legacy_summary(

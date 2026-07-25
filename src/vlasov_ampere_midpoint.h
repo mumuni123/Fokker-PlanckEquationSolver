@@ -16,6 +16,11 @@ public:
         LEGACY_COUPLING = 0,
         DUAL_U_COUPLING = 1
     };
+    enum MidpointAccelerationMode {
+        MIDPOINT_ACCELERATION_NONE = 0,
+        MIDPOINT_ACCELERATION_AITKEN = 1,
+        MIDPOINT_ACCELERATION_ANDERSON = 2
+    };
     // Dynamic part of the accepted regional closure partition.  A fixed
     // operator audit reuses this layout rather than inferring it from a
     // frozen Beam state/current.
@@ -454,7 +459,8 @@ public:
         // 13=dual-u prototype used outside its fixed/no-Beam/no-FCT envelope,
         // 14=dual-u positive Gram denominator is degenerate,
         // 15=dual-u correction/current is non-finite,
-        // 16=dual-u local input contract is invalid.
+        // 16=dual-u local input contract is invalid,
+        // 17=non-finite Beam continuity diagnostic.
         int failure_reason;
         int failure_iteration;
         int failure_substep;
@@ -486,11 +492,17 @@ public:
         int failure_low_on_mpi_interface;
         double continuity_residual_bkg;
         double beam_continuity_residual;
+        double beam_boundary_source_residual;
+        double beam_open_face_residual;
+        int beam_continuity_valid;
         double nonlinear_residual;
         double residual_E;
         double residual_f;
         double residual_J_bkg;
         double residual_J_beam;
+        double max_residual_E;
+        double max_residual_J_bkg;
+        double max_residual_f;
         double limiter_active_fraction;
         double limiter_min_alpha;
         double x_limiter_active_fraction;
@@ -710,10 +722,23 @@ public:
         int f_neg_iv;
         int f_neg_imu;
         int nonlinear_iterations;
+        int operator_evaluations;
+        int midpoint_acceleration_mode;
+        long long acceleration_attempts;
+        long long acceleration_accepted;
+        long long acceleration_fallback_evaluations;
+        long long acceleration_rejected_residual;
+        long long acceleration_rejected_nonfinite;
+        long long acceleration_rejected_hard_failure;
+        long long acceleration_rejected_coefficient;
+        long long acceleration_history_resets;
         std::vector<double> midpoint_residual_e_history;
         std::vector<double> midpoint_residual_j_bkg_history;
         std::vector<double> midpoint_residual_j_beam_history;
         std::vector<double> midpoint_residual_f_history;
+        std::vector<double> midpoint_acceleration_omega_history;
+        std::vector<double> midpoint_acceleration_residual_before_history;
+        std::vector<int> midpoint_acceleration_status_history;
         bool converged;
         bool failed;
         bool soft_accepted;
@@ -892,6 +917,21 @@ public:
     void set_max_midpoint_iterations(int iterations) {
         max_midpoint_iterations_ = iterations > 0 ? iterations : 1;
     }
+    void set_midpoint_acceleration_mode(MidpointAccelerationMode mode) {
+        midpoint_acceleration_mode_ = mode;
+    }
+    void set_anderson_depth(int depth) {
+        anderson_depth_ = depth == 2 ? 2 : 3;
+    }
+    void set_acceleration_start_iter(int iteration) {
+        acceleration_start_iter_ = iteration > 0 ? iteration : 1;
+    }
+    void set_acceleration_accept_ratio(double ratio) {
+        acceleration_accept_ratio_ = ratio;
+    }
+    void set_acceleration_max_coefficient(double value) {
+        acceleration_max_coefficient_ = value;
+    }
     void set_capture_midpoint_input(bool enabled) {
         capture_midpoint_input_ = enabled;
     }
@@ -901,6 +941,9 @@ public:
     }
     bool fct_enabled() const { return fct_enabled_; }
     int max_midpoint_iterations() const { return max_midpoint_iterations_; }
+    MidpointAccelerationMode midpoint_acceleration_mode() const {
+        return midpoint_acceleration_mode_;
+    }
     // Test-only A/B control.  Production always uses the centered high-order
     // candidate at every x; enabling this restores the former boundary
     // upwind branch solely for comparison.
@@ -922,6 +965,10 @@ public:
     }
     void set_midpoint_iteration_trace(bool enabled) {
         midpoint_iteration_trace_for_test_ = enabled;
+    }
+    void set_progress_trace_window_fs(double start_fs, double end_fs) {
+        progress_trace_start_fs_ = start_fs;
+        progress_trace_end_fs_ = end_fs;
     }
     // Raw high-candidate accounting is needed by the controlled FCT test,
     // but is intentionally off in production runs to avoid extra per-cell
@@ -1277,7 +1324,14 @@ private:
     bool legacy_boundary_upwind_high_candidate_for_test_;
     bool energy_consistent_x_high_velocity_for_test_;
     int max_midpoint_iterations_;
+    MidpointAccelerationMode midpoint_acceleration_mode_;
+    int anderson_depth_;
+    int acceleration_start_iter_;
+    double acceleration_accept_ratio_;
+    double acceleration_max_coefficient_;
     bool midpoint_iteration_trace_for_test_;
+    double progress_trace_start_fs_;
+    double progress_trace_end_fs_;
     bool fct_activation_audit_enabled_;
     bool controlled_fct_flux_injection_enabled_;
     bool controlled_u_fct_flux_injection_enabled_;
@@ -1286,6 +1340,13 @@ private:
     mutable std::vector<double> ghost_send_right_;
     mutable std::vector<double> ghost_recv_left_;
     mutable std::vector<double> ghost_recv_right_;
+    // Per-step nonlinear-solver scratch.  These are endpoint-field arrays
+    // only: the acceleration layer never stores or combines Species::f.
+    mutable std::vector<double> acceleration_re_previous_;
+    mutable std::vector<double> acceleration_re_current_;
+    mutable std::vector<double> acceleration_fallback_e_;
+    mutable std::array<std::vector<double>, 3> acceleration_e_history_;
+    mutable std::array<std::vector<double>, 3> acceleration_re_history_;
     int core_macro_debt_consecutive_steps_;
 };
 

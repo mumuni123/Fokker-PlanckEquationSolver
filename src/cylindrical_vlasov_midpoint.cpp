@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -170,6 +171,24 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
     low_order_solver_checkpoint(low_order_only_, "entry", mpi_rank);
     Result result;
     reset_result(result);
+    const double time_fs = time / Const::femto;
+    const bool live_trace =
+        progress_trace_start_fs_ >= 0.0 &&
+        time_fs >= progress_trace_start_fs_ &&
+        time_fs <= progress_trace_end_fs_;
+    const double live_trace_start = MPI_Wtime();
+    const auto trace_live = [&](const char* stage, int iter, int sub) {
+        if (live_trace && mpi_rank == 0) {
+            std::printf(
+                "[midpoint-live] t_fs=%.16e wall_s=%.6f iter=%d sub=%d "
+                "stage=%s injection_active=%d beam_local_rank0=%llu\n",
+                time_fs, MPI_Wtime() - live_trace_start, iter, sub, stage,
+                time <= Param::t_inject_end ? 1 : 0,
+                static_cast<unsigned long long>(beam_n.particles.size()));
+            std::fflush(stdout);
+        }
+    };
+    trace_live("operator_entry", -1, -1);
     result.background_coupling_mode =
         static_cast<int>(background_coupling_mode_);
     result.dual_u_operator_valid =
@@ -229,8 +248,17 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
     std::vector<double> cu_high_center(high_uflux_size, 0.0);
     const bool dual_u_enabled =
         background_coupling_mode_ == DUAL_U_COUPLING;
-    std::vector<double> cu_legacy_center(
-        dual_u_enabled ? high_uflux_size : 0, 0.0);
+    // Replaying the x and u reconstruction operators is a fixed-state/audit
+    // check.  The rank-one production correction itself uses the original
+    // production fluxes directly, so ordinary production iterations do not
+    // need a second full phase-space reconstruction.
+    const bool dual_u_replay_audit = fixed_candidate ||
+        capture_midpoint_input_;
+    // Worst-cell metadata is diagnostic-only.  The limiter decisions and
+    // transport safety gates use their own reductions below, so ordinary
+    // production steps do not need MAXLOC/Bcast traffic for this metadata.
+    const bool detailed_operator_diagnostics =
+        step_diagnostics_enabled_ || fixed_candidate;
     std::vector<double> inv_cell_volume(low_order_only_ ? 0 : Param::Nvmu, 0.0);
     if (!low_order_only_) {
         for (int j = 0; j < Param::Nv; ++j) {
@@ -276,6 +304,20 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
     std::vector<double> local_energy_residual(static_cast<size_t>(nxl), 0.0);
     std::vector<double> local_momentum_residual(static_cast<size_t>(nxl), 0.0);
     std::vector<double> psi_k_x(nface, 0.0), psi_p_x(nface, 0.0);
+    // Dual-u scratch is allocated once per outer solve and reused by every
+    // midpoint iteration/substep.  Do not store these in Result unless an
+    // explicit audit requests them.
+    std::vector<double> dual_jn_high_face(dual_u_enabled ? nface : 0, 0.0);
+    std::vector<double> dual_target_jn_cell(dual_u_enabled ?
+        static_cast<size_t>(nxl) : 0, 0.0);
+    std::vector<double> dual_target_jn_replay_cell(dual_u_enabled ?
+        static_cast<size_t>(nxl) : 0, 0.0);
+    std::vector<double> dual_replay_jn_face(dual_u_replay_audit ? nface : 0,
+                                             0.0);
+    std::vector<double> dual_legacy_je_cell(dual_u_enabled ?
+        static_cast<size_t>(nxl) : 0, 0.0);
+    std::vector<double> dual_je_cell(dual_u_enabled ?
+        static_cast<size_t>(nxl) : 0, 0.0);
     std::vector<double> u_energy_cell(static_cast<size_t>(nxl), 0.0);
     std::vector<double> u_momentum_cell(static_cast<size_t>(nxl), 0.0);
     std::vector<double> u_boundary_energy_cell(static_cast<size_t>(nxl), 0.0);
@@ -358,21 +400,83 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
     std::vector<double> previous_j(static_cast<size_t>(nxl), 0.0);
     bool have_previous = false;
 
+    // Acceleration is deliberately field-only.  The distribution guess keeps
+    // the regular Picard update, so an attempted field extrapolation can be
+    // rejected and re-evaluated with the exact same input Species state.
+    const bool midpoint_acceleration_enabled =
+        !fixed_candidate &&
+        midpoint_acceleration_mode_ != MIDPOINT_ACCELERATION_NONE;
+    result.midpoint_acceleration_mode = midpoint_acceleration_enabled
+        ? static_cast<int>(midpoint_acceleration_mode_)
+        : MIDPOINT_ACCELERATION_NONE;
+    bool acceleration_trial_pending = false;
+    bool fallback_plain_evaluation = false;
+    double acceleration_residual_before = 0.0;
+    double acceleration_trial_coefficient = 0.55;
+    double aitken_previous_omega = 0.55;
+    bool have_acceleration_residual = false;
+    int anderson_history_count = 0;
+    if (midpoint_acceleration_enabled) {
+        const size_t face_count = static_cast<size_t>(nxl);
+        const auto prepare_acceleration_vector =
+            [face_count](std::vector<double>& values) {
+                if (values.size() != face_count) values.assign(face_count, 0.0);
+            };
+        prepare_acceleration_vector(acceleration_re_previous_);
+        prepare_acceleration_vector(acceleration_re_current_);
+        prepare_acceleration_vector(acceleration_fallback_e_);
+        for (int h = 0; h < 3; ++h) {
+            prepare_acceleration_vector(acceleration_e_history_[h]);
+            prepare_acceleration_vector(acceleration_re_history_[h]);
+        }
+    }
+    const auto reject_accelerated_trial_before_residual = [&]() {
+        if (!acceleration_trial_pending) return false;
+        ++result.acceleration_rejected_hard_failure;
+        ++result.acceleration_fallback_evaluations;
+        ++result.acceleration_history_resets;
+        if (midpoint_iteration_trace_for_test_ &&
+            !result.midpoint_acceleration_status_history.empty()) {
+            result.midpoint_acceleration_status_history.back() = 4;
+        }
+        e_end = acceleration_fallback_e_;
+        acceleration_trial_pending = false;
+        fallback_plain_evaluation = true;
+        have_acceleration_residual = false;
+        anderson_history_count = 0;
+        aitken_previous_omega = 0.55;
+        result.failed = false;
+        result.state_advanced = 0;
+        result.failure_reason = 0;
+        return true;
+    };
+
     // Stage 7 is deliberately not enabled: the beam is a controlled
     // predictor during phases 1--5, and its lag is kept explicit.
+    trace_live("beam_copy_begin", -1, -1);
     BeamPIC beam_predictor = beam_n;
+    trace_live("beam_copy_end", -1, -1);
     EMFields beam_field = fields_n;
     double beam_ke_before = 0.0;
     double beam_ke_after = 0.0;
     if (beam_enabled_ && !fixed_j_beam_face_mid) {
+        trace_live("beam_begin_step_begin", -1, -1);
         beam_predictor.begin_step(sg, dt);
+        trace_live("beam_inject_begin", -1, -1);
         beam_predictor.inject(sg, beam_field, dt, time, mpi_rank, mpi_size);
+        trace_live("beam_inject_end", -1, -1);
         beam_ke_before = beam_predictor.total_kinetic_energy();
+        trace_live("beam_push_begin", -1, -1);
         beam_predictor.push(sg, beam_field, dt, mpi_rank, mpi_size);
+        trace_live("beam_push_end", -1, -1);
         beam_ke_after = beam_predictor.total_kinetic_energy();
+        trace_live("beam_density_begin", -1, -1);
         beam_predictor.deposit_density(sg, mpi_rank, mpi_size);
+        trace_live("beam_density_end", -1, -1);
+        trace_live("beam_current_begin", -1, -1);
         beam_predictor.finalize_charge_conserving_current(sg, dt, mpi_rank,
                                                           mpi_size);
+        trace_live("beam_current_end", -1, -1);
     }
     low_order_solver_checkpoint(low_order_only_, "beam_predictor_ready",
                                 mpi_rank);
@@ -389,6 +493,64 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
         }
     }
 
+    // Beam boundary diagnostics are assembled from an open particle topology.
+    // In particular, the right-boundary contribution is owned by the last MPI
+    // rank, so the raw BeamPIC diagnostic is not guaranteed to be identical on
+    // every rank.  The value participates in the collective control-flow
+    // decision below and therefore must be globalized before the Picard loop.
+    const double local_beam_continuity_residual = std::max(
+        beam_predictor.last_continuity_linf_error(),
+        beam_predictor.last_boundary_flux_error());
+    const double local_beam_boundary_source_residual =
+        beam_predictor.last_boundary_source_error();
+    const double local_beam_open_face_residual =
+        beam_predictor.last_open_face_error();
+    double global_beam_continuity_residual = local_beam_continuity_residual;
+    MPI_Allreduce(MPI_IN_PLACE, &global_beam_continuity_residual, 1,
+                  MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    double beam_boundary_components[2] = {
+        local_beam_boundary_source_residual,
+        local_beam_open_face_residual};
+    MPI_Allreduce(MPI_IN_PLACE, beam_boundary_components, 2, MPI_DOUBLE,
+                  MPI_MAX, MPI_COMM_WORLD);
+    int beam_diagnostics_finite =
+        std::isfinite(local_beam_continuity_residual) &&
+        std::isfinite(local_beam_boundary_source_residual) &&
+        std::isfinite(local_beam_open_face_residual) ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &beam_diagnostics_finite, 1, MPI_INT,
+                  MPI_MIN, MPI_COMM_WORLD);
+    result.beam_boundary_source_residual = beam_boundary_components[0];
+    result.beam_open_face_residual = beam_boundary_components[1];
+    result.beam_continuity_valid =
+        beam_diagnostics_finite &&
+        std::isfinite(global_beam_continuity_residual) &&
+        global_beam_continuity_residual <= 1.0e-6 ? 1 : 0;
+    if (live_trace) {
+        double min_beam_continuity_residual = local_beam_continuity_residual;
+        MPI_Allreduce(MPI_IN_PLACE, &min_beam_continuity_residual, 1,
+                      MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+        if (mpi_rank == 0) {
+            std::printf(
+                "[midpoint-live] t_fs=%.16e wall_s=%.6f iter=-1 sub=-1 "
+                "stage=beam_continuity_globalized local_min=%.16e "
+                "global_max=%.16e source=%.16e open_face=%.16e valid=%d\n",
+                time_fs, MPI_Wtime() - live_trace_start,
+                min_beam_continuity_residual,
+                global_beam_continuity_residual,
+                result.beam_boundary_source_residual,
+                result.beam_open_face_residual,
+                result.beam_continuity_valid);
+            std::fflush(stdout);
+        }
+    }
+    if (!beam_diagnostics_finite ||
+        !std::isfinite(global_beam_continuity_residual)) {
+        result.failed = true;
+        result.state_advanced = 0;
+        result.failure_reason = 17;
+        return result;
+    }
+
     const int max_iters = fixed_candidate ? 1 : max_midpoint_iterations_;
     if (midpoint_iteration_trace_for_test_) {
         result.midpoint_residual_e_history.reserve(
@@ -399,11 +561,20 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
             static_cast<size_t>(max_iters));
         result.midpoint_residual_f_history.reserve(
             static_cast<size_t>(max_iters));
+        result.midpoint_acceleration_omega_history.reserve(
+            static_cast<size_t>(max_iters));
+        result.midpoint_acceleration_residual_before_history.reserve(
+            static_cast<size_t>(max_iters));
+        result.midpoint_acceleration_status_history.reserve(
+            static_cast<size_t>(max_iters));
     }
     const double field_tol = 1.0e-6;
     const double current_tol = 1.0e-5;
     const double omega = 0.55;
     for (int iter = 0; iter < max_iters; ++iter) {
+midpoint_iteration_retry:
+        ++result.operator_evaluations;
+        trace_live("iteration_begin", iter + 1, -1);
         if (iter == 0)
             low_order_solver_checkpoint(low_order_only_, "iteration_begin", mpi_rank);
         // Preserve the exact endpoint guess used by this kernel call.  The
@@ -446,6 +617,14 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
         MPI_Allreduce(MPI_IN_PLACE, &global_cfl, 1, MPI_DOUBLE, MPI_MAX,
                       MPI_COMM_WORLD);
         const int nsub = std::max(1, static_cast<int>(std::ceil(global_cfl / 0.8)));
+        if (live_trace && mpi_rank == 0) {
+            std::printf(
+                "[midpoint-live] t_fs=%.16e wall_s=%.6f iter=%d sub=-1 "
+                "stage=cfl_ready global_cfl=%.16e nsub=%d\n",
+                time_fs, MPI_Wtime() - live_trace_start, iter + 1,
+                global_cfl, nsub);
+            std::fflush(stdout);
+        }
         // Report the real force-subcycle count rather than only the outer
         // retry count supplied at entry.
         result.substeps_used = nsub;
@@ -456,6 +635,8 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
             result.failure_iteration = iter;
             result.failure_global_cfl = global_cfl;
             result.x_low_failure_kind = 3; // genuine combined CFL failure
+            if (reject_accelerated_trial_before_residual())
+                goto midpoint_iteration_retry;
             return result;
         }
         if (iter == 0)
@@ -830,6 +1011,7 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                 return false;
             };
         for (int sub = 0; sub < nsub; ++sub) {
+            trace_live("transport_substep_begin", iter + 1, sub + 1);
             CouplingSubstepSeamAudit substep_audit = {};
             if (fixed_candidate) {
                 substep_audit.substep = sub;
@@ -924,6 +1106,7 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
             }
             if (iter == 0 && sub == 0)
                 low_order_solver_checkpoint(low_order_only_, "low_fluxes_ready", mpi_rank);
+            trace_live("low_fluxes_ready", iter + 1, sub + 1);
 
             if (low_order_only_) {
                 // Test-only production mode: high-order reconstruction and
@@ -1044,21 +1227,25 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
             }
 
             if (dual_u_enabled) {
-                // Freeze and replay both real production functionals before
-                // constructing the local rank-one dual operator.  The x
-                // functional is evaluated from the same high flux that forms
-                // J_N; the u functional uses the exact MC/minmod branches that
-                // formed cu_high_center.
-                cu_legacy_center = cu_high_center;
-                std::vector<double> jn_high_face;
-                current_moment_from_x_flux(fx_high, jn_high_face);
-                result.dual_target_jn_cell.assign(
-                    static_cast<size_t>(nxl), 0.0);
-                result.dual_target_jn_replay_cell.assign(
-                    static_cast<size_t>(nxl), 0.0);
+                // The correction uses the production x-current functional
+                // directly.  Reconstruction replay is intentionally an
+                // audit-only operation; it is not needed to advance dual-u.
+                current_moment_from_x_flux(fx_high, dual_jn_high_face);
+                #pragma omp parallel for schedule(static)
+                for (int ix = 0; ix < nxl; ++ix) {
+                    const double target = 0.5 * (
+                        dual_jn_high_face[static_cast<size_t>(ix)] +
+                        dual_jn_high_face[static_cast<size_t>(ix + 1)]);
+                    dual_target_jn_cell[static_cast<size_t>(ix)] = target;
+                    // In production this aliases the direct target.  The
+                    // independently reconstructed value is filled below only
+                    // for fixed-state or diagnostic-level-2 audit runs.
+                    dual_target_jn_replay_cell[static_cast<size_t>(ix)] = target;
+                }
                 double u_replay_linf = 0.0;
                 double u_replay_scale = 0.0;
 
+                if (dual_u_replay_audit) {
                 const auto replay_x_face_current = [&](int iface) {
                     const int il = ng + iface - 1;
                     const int ir = ng + iface;
@@ -1097,19 +1284,15 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                     return current;
                 };
 
-                std::vector<double> replay_jn_face(nface, 0.0);
                 #pragma omp parallel for schedule(static)
                 for (int iface = 0; iface <= nxl; ++iface)
-                    replay_jn_face[static_cast<size_t>(iface)] =
+                    dual_replay_jn_face[static_cast<size_t>(iface)] =
                         replay_x_face_current(iface);
                 #pragma omp parallel for reduction(max:u_replay_linf,u_replay_scale) schedule(static)
                 for (int ix = 0; ix < nxl; ++ix) {
-                    result.dual_target_jn_cell[static_cast<size_t>(ix)] =
-                        0.5 * (jn_high_face[static_cast<size_t>(ix)] +
-                               jn_high_face[static_cast<size_t>(ix + 1)]);
-                    result.dual_target_jn_replay_cell[static_cast<size_t>(ix)] =
-                        0.5 * (replay_jn_face[static_cast<size_t>(ix)] +
-                               replay_jn_face[static_cast<size_t>(ix + 1)]);
+                    dual_target_jn_replay_cell[static_cast<size_t>(ix)] =
+                        0.5 * (dual_replay_jn_face[static_cast<size_t>(ix)] +
+                               dual_replay_jn_face[static_cast<size_t>(ix + 1)]);
                     const int storage_ix = ng + ix;
                     for (int jf = 1; jf < Param::Nv; ++jf) {
                         const int jl = jf - 1;
@@ -1148,21 +1331,23 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                                     bkg_n.cgrid.uperp_ring_areas[k]);
                             const size_t id = uface_index(ix, jf, k);
                             u_replay_linf = std::max(u_replay_linf,
-                                std::fabs(replay - cu_legacy_center[id]));
+                                std::fabs(replay - cu_high_center[id]));
                             u_replay_scale = std::max(u_replay_scale,
                                 std::max(std::fabs(replay),
-                                         std::fabs(cu_legacy_center[id])));
+                                         std::fabs(cu_high_center[id])));
                         }
                     }
                 }
+                } // dual_u_replay_audit
 
                 DualUCoupling::Diagnostics dual_diagnostics =
                     DualUCoupling::apply_local_rank_one(
                         bkg_n.cgrid, bkg_n.charge, bkg_n.mass, sg.dx, nxl,
-                        result.dual_target_jn_cell,
-                        result.dual_target_jn_replay_cell,
-                        cu_legacy_center, cu_high_center,
-                        result.dual_legacy_je_cell, result.dual_je_cell);
+                        dual_target_jn_cell,
+                        dual_target_jn_replay_cell,
+                        u_face_energy_current_weight,
+                        cu_high_center, cu_high,
+                        dual_legacy_je_cell, dual_je_cell);
                 // A local dual failure must become one collective decision.
                 // Returning on only the affected rank would leave the other
                 // ranks in later collectives and eventually hang the job.
@@ -1198,7 +1383,6 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                     MPI_Bcast(failure_record, 8, MPI_DOUBLE,
                               first_failed_rank, MPI_COMM_WORLD);
                 }
-                cu_high = cu_high_center;
                 #pragma omp parallel for schedule(static)
                 for (int ix = 0; ix < nxl; ++ix) {
                     const double acceleration = bkg_n.charge *
@@ -1209,7 +1393,14 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                             fu_high[id] = acceleration * cu_high[id];
                         }
                 }
-                result.legacy_center_u_coefficient = cu_legacy_center;
+                if (dual_u_replay_audit) {
+                    result.legacy_center_u_coefficient = cu_high_center;
+                    result.dual_target_jn_cell = dual_target_jn_cell;
+                    result.dual_target_jn_replay_cell =
+                        dual_target_jn_replay_cell;
+                    result.dual_legacy_je_cell = dual_legacy_je_cell;
+                    result.dual_je_cell = dual_je_cell;
+                }
                 result.dual_u_operator_valid =
                     first_failed_rank == std::numeric_limits<int>::max();
                 result.dual_u_target_replay_linf =
@@ -1265,9 +1456,12 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                                   << " scale=" << failure_record[7]
                                   << std::endl;
                     }
+                    if (reject_accelerated_trial_before_residual())
+                        goto midpoint_iteration_retry;
                     return result;
                 }
             }
+            trace_live("high_fluxes_dual_u_ready", iter + 1, sub + 1);
             } // !low_order_only_: nonuniform MUSCL high-order candidate
 
             Species& low_state = low_state_buffer;
@@ -1504,8 +1698,11 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                     static_cast<int>(low_failure[17]);
                 result.failure_low_work_input_min = low_failure[18];
                 set_failure_location(static_cast<int>(low_failure[0]));
+                if (reject_accelerated_trial_before_residual())
+                    goto midpoint_iteration_retry;
                 return result;
             }
+            trace_live("low_state_checked", iter + 1, sub + 1);
 
             if (controlled_fct_flux_injection_enabled_ && fct_enabled_) {
                 double local_injection_count = 0.0;
@@ -1584,8 +1781,11 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                 // conservative state and retain identical low/high/final
                 // diagnostic layers for the shared accounting below.
                 work = low_state;
-                if (!transport_safe_step_gate(work, sub + 1))
+                if (!transport_safe_step_gate(work, sub + 1)) {
+                    if (reject_accelerated_trial_before_residual())
+                        goto midpoint_iteration_retry;
                     return result;
+                }
                 if (iter == 0 && sub == 0)
                     low_order_solver_checkpoint(low_order_only_, "low_state_committed", mpi_rank);
                 if (fixed_candidate)
@@ -1614,8 +1814,11 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                     }
                 }
                 exchange_ghosts_x_persistent(work, sg, mpi_rank, mpi_size);
-                if (!transport_safe_step_gate(work, sub + 1))
+                if (!transport_safe_step_gate(work, sub + 1)) {
+                    if (reject_accelerated_trial_before_residual())
+                        goto midpoint_iteration_retry;
                     return result;
+                }
             } else {
             std::fill(alpha_x_left.begin(), alpha_x_left.end(), 1.0);
             std::fill(alpha_x_right.begin(), alpha_x_right.end(), 1.0);
@@ -2042,99 +2245,101 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                 }
             }
 
-            struct IdentityMaxLoc {
-                double ratio;
-                int rank;
-            };
-            IdentityMaxLoc local_identity_owner = {
-                local_identity_ratio, mpi_rank};
-            IdentityMaxLoc global_identity_owner = {0.0, 0};
-            MPI_Allreduce(&local_identity_owner, &global_identity_owner, 1,
-                          MPI_DOUBLE_INT, MPI_MAXLOC, MPI_COMM_WORLD);
-            if (global_identity_owner.ratio >
-                result.fct_high_low_identity_ratio_linf) {
-                double identity_metadata[3] = {0.0, 0.0, -1.0};
-                if (mpi_rank == global_identity_owner.rank) {
-                    identity_metadata[0] = local_identity_residual;
-                    identity_metadata[1] = local_identity_scale;
-                    identity_metadata[2] =
-                        static_cast<double>(local_identity_global_linear);
-                }
-                MPI_Bcast(identity_metadata, 3, MPI_DOUBLE,
-                          global_identity_owner.rank, MPI_COMM_WORLD);
-                result.fct_high_low_identity_ratio_linf =
-                    global_identity_owner.ratio;
-                result.fct_high_low_identity_worst_residual =
-                    identity_metadata[0];
-                result.fct_high_low_identity_worst_scale =
-                    identity_metadata[1];
-                result.fct_high_low_identity_worst_relative =
-                    (identity_metadata[1] != 0.0)
-                    ? identity_metadata[0] / identity_metadata[1] : 0.0;
-                const int global_linear =
-                    static_cast<int>(identity_metadata[2]);
-                if (global_linear >= 0) {
-                    result.fct_high_low_identity_worst_ix =
-                        global_linear / Param::Nvmu;
-                    const int velocity_linear =
-                        global_linear % Param::Nvmu;
-                    result.fct_high_low_identity_worst_iv =
-                        velocity_linear / Param::Nmu;
-                    result.fct_high_low_identity_worst_imu =
-                        velocity_linear % Param::Nmu;
-                }
-            }
-
-            struct DonorMaxLoc {
-                double ratio;
-                int rank;
-            };
-            DonorMaxLoc local_donor_owner = {local_donor_ratio, mpi_rank};
-            DonorMaxLoc global_donor_owner = {0.0, 0};
-            MPI_Allreduce(&local_donor_owner, &global_donor_owner, 1,
-                          MPI_DOUBLE_INT, MPI_MAXLOC, MPI_COMM_WORLD);
-            if (global_donor_owner.ratio >
-                result.fct_donor_worst_relative) {
-                double donor_metadata[12] = {
-                    0.0, 0.0, 0.0, 0.0, 0.0,
-                    1.0, 1.0, 1.0, 1.0,
-                    0.0, 1.0, -1.0};
-                if (mpi_rank == global_donor_owner.rank) {
-                    donor_metadata[0] = local_donor_m_low;
-                    for (int f = 0; f < 4; ++f) {
-                        donor_metadata[1 + f] = local_donor_transfer[f];
-                        donor_metadata[5 + f] = local_donor_alpha[f];
+            if (detailed_operator_diagnostics) {
+                struct IdentityMaxLoc {
+                    double ratio;
+                    int rank;
+                };
+                IdentityMaxLoc local_identity_owner = {
+                    local_identity_ratio, mpi_rank};
+                IdentityMaxLoc global_identity_owner = {0.0, 0};
+                MPI_Allreduce(&local_identity_owner, &global_identity_owner, 1,
+                              MPI_DOUBLE_INT, MPI_MAXLOC, MPI_COMM_WORLD);
+                if (global_identity_owner.ratio >
+                    result.fct_high_low_identity_ratio_linf) {
+                    double identity_metadata[3] = {0.0, 0.0, -1.0};
+                    if (mpi_rank == global_identity_owner.rank) {
+                        identity_metadata[0] = local_identity_residual;
+                        identity_metadata[1] = local_identity_scale;
+                        identity_metadata[2] =
+                            static_cast<double>(local_identity_global_linear);
                     }
-                    donor_metadata[9] = local_donor_outflow;
-                    donor_metadata[10] = local_donor_scale;
-                    donor_metadata[11] =
-                        static_cast<double>(local_donor_global_linear);
+                    MPI_Bcast(identity_metadata, 3, MPI_DOUBLE,
+                              global_identity_owner.rank, MPI_COMM_WORLD);
+                    result.fct_high_low_identity_ratio_linf =
+                        global_identity_owner.ratio;
+                    result.fct_high_low_identity_worst_residual =
+                        identity_metadata[0];
+                    result.fct_high_low_identity_worst_scale =
+                        identity_metadata[1];
+                    result.fct_high_low_identity_worst_relative =
+                        (identity_metadata[1] != 0.0)
+                        ? identity_metadata[0] / identity_metadata[1] : 0.0;
+                    const int global_linear =
+                        static_cast<int>(identity_metadata[2]);
+                    if (global_linear >= 0) {
+                        result.fct_high_low_identity_worst_ix =
+                            global_linear / Param::Nvmu;
+                        const int velocity_linear =
+                            global_linear % Param::Nvmu;
+                        result.fct_high_low_identity_worst_iv =
+                            velocity_linear / Param::Nmu;
+                        result.fct_high_low_identity_worst_imu =
+                            velocity_linear % Param::Nmu;
+                    }
                 }
-                MPI_Bcast(donor_metadata, 12, MPI_DOUBLE,
-                          global_donor_owner.rank, MPI_COMM_WORLD);
-                result.fct_donor_worst_relative = global_donor_owner.ratio;
-                result.fct_donor_worst_m_low = donor_metadata[0];
-                result.fct_donor_worst_ax_left = donor_metadata[1];
-                result.fct_donor_worst_ax_right = donor_metadata[2];
-                result.fct_donor_worst_au_lower = donor_metadata[3];
-                result.fct_donor_worst_au_upper = donor_metadata[4];
-                result.fct_donor_worst_alpha_x_left = donor_metadata[5];
-                result.fct_donor_worst_alpha_x_right = donor_metadata[6];
-                result.fct_donor_worst_alpha_u_lower = donor_metadata[7];
-                result.fct_donor_worst_alpha_u_upper = donor_metadata[8];
-                result.fct_donor_worst_outflow = donor_metadata[9];
-                result.fct_donor_worst_scale = donor_metadata[10];
-                const int global_linear =
-                    static_cast<int>(donor_metadata[11]);
-                if (global_linear >= 0) {
-                    result.fct_donor_worst_ix =
-                        global_linear / Param::Nvmu;
-                    const int velocity_linear =
-                        global_linear % Param::Nvmu;
-                    result.fct_donor_worst_iv =
-                        velocity_linear / Param::Nmu;
-                    result.fct_donor_worst_imu =
-                        velocity_linear % Param::Nmu;
+
+                struct DonorMaxLoc {
+                    double ratio;
+                    int rank;
+                };
+                DonorMaxLoc local_donor_owner = {local_donor_ratio, mpi_rank};
+                DonorMaxLoc global_donor_owner = {0.0, 0};
+                MPI_Allreduce(&local_donor_owner, &global_donor_owner, 1,
+                              MPI_DOUBLE_INT, MPI_MAXLOC, MPI_COMM_WORLD);
+                if (global_donor_owner.ratio >
+                    result.fct_donor_worst_relative) {
+                    double donor_metadata[12] = {
+                        0.0, 0.0, 0.0, 0.0, 0.0,
+                        1.0, 1.0, 1.0, 1.0,
+                        0.0, 1.0, -1.0};
+                    if (mpi_rank == global_donor_owner.rank) {
+                        donor_metadata[0] = local_donor_m_low;
+                        for (int f = 0; f < 4; ++f) {
+                            donor_metadata[1 + f] = local_donor_transfer[f];
+                            donor_metadata[5 + f] = local_donor_alpha[f];
+                        }
+                        donor_metadata[9] = local_donor_outflow;
+                        donor_metadata[10] = local_donor_scale;
+                        donor_metadata[11] =
+                            static_cast<double>(local_donor_global_linear);
+                    }
+                    MPI_Bcast(donor_metadata, 12, MPI_DOUBLE,
+                              global_donor_owner.rank, MPI_COMM_WORLD);
+                    result.fct_donor_worst_relative = global_donor_owner.ratio;
+                    result.fct_donor_worst_m_low = donor_metadata[0];
+                    result.fct_donor_worst_ax_left = donor_metadata[1];
+                    result.fct_donor_worst_ax_right = donor_metadata[2];
+                    result.fct_donor_worst_au_lower = donor_metadata[3];
+                    result.fct_donor_worst_au_upper = donor_metadata[4];
+                    result.fct_donor_worst_alpha_x_left = donor_metadata[5];
+                    result.fct_donor_worst_alpha_x_right = donor_metadata[6];
+                    result.fct_donor_worst_alpha_u_lower = donor_metadata[7];
+                    result.fct_donor_worst_alpha_u_upper = donor_metadata[8];
+                    result.fct_donor_worst_outflow = donor_metadata[9];
+                    result.fct_donor_worst_scale = donor_metadata[10];
+                    const int global_linear =
+                        static_cast<int>(donor_metadata[11]);
+                    if (global_linear >= 0) {
+                        result.fct_donor_worst_ix =
+                            global_linear / Param::Nvmu;
+                        const int velocity_linear =
+                            global_linear % Param::Nvmu;
+                        result.fct_donor_worst_iv =
+                            velocity_linear / Param::Nmu;
+                        result.fct_donor_worst_imu =
+                            velocity_linear % Param::Nmu;
+                    }
                 }
             }
 
@@ -2461,6 +2666,8 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                 result.failure_final_min = candidate_min;
                 if (global_worst != std::numeric_limits<int>::max())
                     set_failure_location(global_worst);
+                if (reject_accelerated_trial_before_residual())
+                    goto midpoint_iteration_retry;
                 return result;
             }
 
@@ -2533,8 +2740,11 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                     work.f[mass_index(ng + ix, j, k)] =
                         candidate_mass[static_cast<size_t>(ix) * Param::Nvmu +
                                        idx2(j, k)];
-            if (!transport_safe_step_gate(work, sub + 1))
+            if (!transport_safe_step_gate(work, sub + 1)) {
+                if (reject_accelerated_trial_before_residual())
+                    goto midpoint_iteration_retry;
                 return result;
+            }
             } // high-order/FCT donor-capacity closure
 
             const std::vector<double>& cu_high_used = low_order_only_
@@ -2815,6 +3025,7 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                 }
                 result.coupling_substep_seam_audit.push_back(substep_audit);
             }
+            trace_live("transport_substep_end", iter + 1, sub + 1);
         }
 
         close_periodic_face_blocks(psi_k_x, nxl, 1, mpi_rank, mpi_size, 909);
@@ -2884,10 +3095,6 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
             PeriodicStaggered::apply_cell_to_face_Gstar(
                 cell, face, nxl, mpi_rank, mpi_size, message_tag);
         };
-        assemble_gstar_face(je_low_cell, result.j_bkg_energy_low_debug_face, 906);
-        assemble_gstar_face(je_center_cell, result.j_bkg_energy_center_debug_face, 908);
-        assemble_gstar_face(je_high_cell, result.j_bkg_energy_high_debug_face, 910);
-        assemble_gstar_face(je_cell, result.j_bkg_energy_debug_face, 912);
         if (fixed_candidate && substeps_used == 1) {
             // Independently re-form every final current moment from the same
             // final FV flux arrays.  This is intentionally an audit-only
@@ -2962,37 +3169,16 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
         }
         if (iter == 0)
             low_order_solver_checkpoint(low_order_only_, "currents_ready", mpi_rank);
-        // Keep the two representations of the global periodic seam separate
-        // for fixed-state replay.  Face 0 is owned by rank 0; face nxl on the
-        // final rank is its periodic alias at x = L.  This is audit-only: it
-        // neither closes nor modifies either current.
-        double seam_local[4] = {0.0, 0.0, 0.0, 0.0};
-        if (nxl > 0 && mpi_rank == 0) {
-            seam_local[0] = result.j_bkg_face_mid[0];
-            seam_local[2] = result.j_bkg_energy_debug_face[0];
-        }
-        if (nxl > 0 && mpi_rank == mpi_size - 1) {
-            seam_local[1] = result.j_bkg_face_mid[nxl];
-            seam_local[3] = result.j_bkg_energy_debug_face[nxl];
-        }
-        double seam_global[4] = {0.0, 0.0, 0.0, 0.0};
-        MPI_Allreduce(seam_local, seam_global, 4, MPI_DOUBLE, MPI_SUM,
-                      MPI_COMM_WORLD);
-        result.periodic_seam_face_audit[0] = seam_global[0];
-        result.periodic_seam_face_audit[1] = seam_global[1];
-        result.periodic_seam_face_audit[2] = seam_global[2];
-        result.periodic_seam_face_audit[3] = seam_global[3];
-        result.periodic_seam_face_audit[4] = seam_global[0] - seam_global[2];
-        result.periodic_seam_face_audit[5] = seam_global[1] - seam_global[3];
-
         // A fixed operator audit evaluates the FV/current operator at an
         // externally supplied endpoint. It must not perform a second Ampere
         // update or advance/reinject Beam particles.
         EMFields fields_new = (fixed_candidate && fixed_fields_end)
             ? *fixed_fields_end : fields_n;
         if (!fixed_candidate) {
+            trace_live("ampere_begin", iter + 1, -1);
             fields_new.advance_ampere_face_from_midpoint_current(
                 result.j_total_face_mid, dt, mpi_rank, mpi_size);
+            trace_live("ampere_end", iter + 1, -1);
         }
         if (iter == 0)
             low_order_solver_checkpoint(low_order_only_, "ampere_ready", mpi_rank);
@@ -3034,10 +3220,159 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
             result.midpoint_residual_f_history.push_back(result.residual_f);
         result.nonlinear_residual = std::max(result.residual_E / field_tol,
             result.residual_J_bkg / current_tol);
+        if (midpoint_iteration_trace_for_test_ &&
+            midpoint_acceleration_enabled) {
+            result.midpoint_acceleration_omega_history.push_back(omega);
+            result.midpoint_acceleration_residual_before_history.push_back(
+                result.nonlinear_residual);
+            result.midpoint_acceleration_status_history.push_back(0);
+        }
+        result.max_residual_E = std::max(result.max_residual_E,
+            result.residual_E);
+        result.max_residual_J_bkg = std::max(result.max_residual_J_bkg,
+            result.residual_J_bkg);
+        result.max_residual_f = std::max(result.max_residual_f,
+            result.residual_f);
 
-        work.compute_moments();
+        result.beam_continuity_residual = global_beam_continuity_residual;
+        if (live_trace && mpi_rank == 0) {
+            std::printf(
+                "[midpoint-live] t_fs=%.16e wall_s=%.6f iter=%d sub=-1 "
+                "stage=residuals E=%.16e J_bkg=%.16e J_beam=%.16e "
+                "f=%.16e beam_continuity=%.16e\n",
+                time_fs, MPI_Wtime() - live_trace_start, iter + 1,
+                result.residual_E, result.residual_J_bkg,
+                result.residual_J_beam, result.residual_f,
+                result.beam_continuity_residual);
+            std::fflush(stdout);
+        }
+        trace_live("all_finite_begin", iter + 1, -1);
+        int finite_candidate_flag =
+            all_finite(work, fields_new, result.j_total_face_mid) ? 1 : 0;
+        MPI_Allreduce(MPI_IN_PLACE, &finite_candidate_flag, 1, MPI_INT,
+                      MPI_MIN, MPI_COMM_WORLD);
+        const bool finite_candidate = finite_candidate_flag != 0;
+        trace_live("all_finite_end", iter + 1, -1);
+        if (!finite_candidate) {
+            if (acceleration_trial_pending) {
+                ++result.acceleration_rejected_nonfinite;
+                ++result.acceleration_fallback_evaluations;
+                ++result.acceleration_history_resets;
+                if (midpoint_iteration_trace_for_test_) {
+                    result.midpoint_acceleration_omega_history.back() =
+                        acceleration_trial_coefficient;
+                    result.midpoint_acceleration_residual_before_history.back() =
+                        acceleration_residual_before;
+                    result.midpoint_acceleration_status_history.back() = 4;
+                }
+                e_end = acceleration_fallback_e_;
+                acceleration_trial_pending = false;
+                fallback_plain_evaluation = true;
+                have_acceleration_residual = false;
+                anderson_history_count = 0;
+                aitken_previous_omega = omega;
+                --iter;
+                continue;
+            }
+            result.failed = true;
+            result.state_advanced = 0;
+            result.failure_reason = 4;
+            result.failure_iteration = iter;
+            result.failure_global_cfl = global_cfl;
+            return result;
+        }
+        const bool strict_candidate = have_previous &&
+            result.residual_E < field_tol &&
+            result.residual_J_bkg < current_tol;
+        if (acceleration_trial_pending) {
+            const bool residual_improved = strict_candidate ||
+                (std::isfinite(result.nonlinear_residual) &&
+                 result.nonlinear_residual <= acceleration_accept_ratio_ *
+                    acceleration_residual_before);
+            if (!residual_improved) {
+                ++result.acceleration_rejected_residual;
+                ++result.acceleration_fallback_evaluations;
+                ++result.acceleration_history_resets;
+                if (midpoint_iteration_trace_for_test_) {
+                    result.midpoint_acceleration_omega_history.back() =
+                        acceleration_trial_coefficient;
+                    result.midpoint_acceleration_residual_before_history.back() =
+                        acceleration_residual_before;
+                    result.midpoint_acceleration_status_history.back() = 3;
+                }
+                e_end = acceleration_fallback_e_;
+                acceleration_trial_pending = false;
+                fallback_plain_evaluation = true;
+                have_acceleration_residual = false;
+                anderson_history_count = 0;
+                aitken_previous_omega = omega;
+                --iter;
+                continue;
+            }
+            ++result.acceleration_accepted;
+            if (midpoint_iteration_trace_for_test_) {
+                result.midpoint_acceleration_omega_history.back() =
+                    acceleration_trial_coefficient;
+                result.midpoint_acceleration_residual_before_history.back() =
+                    acceleration_residual_before;
+                result.midpoint_acceleration_status_history.back() = 2;
+            }
+            acceleration_trial_pending = false;
+        }
+        const bool final_candidate = fixed_candidate ||
+            iter + 1 == max_iters;
+        // Emit expensive closure data once, for the candidate that will be
+        // committed.  Earlier Picard trials need only transport, Ampere and
+        // the convergence/finite checks above.
+        const bool collect_expensive_iteration_audit = fixed_candidate ||
+            (step_diagnostics_enabled_ &&
+             (strict_candidate || final_candidate));
+        if (collect_expensive_iteration_audit) {
+            trace_live("expensive_audit_begin", iter + 1, -1);
+            assemble_gstar_face(je_low_cell,
+                                result.j_bkg_energy_low_debug_face, 906);
+            assemble_gstar_face(je_center_cell,
+                                result.j_bkg_energy_center_debug_face, 908);
+            assemble_gstar_face(je_high_cell,
+                                result.j_bkg_energy_high_debug_face, 910);
+            assemble_gstar_face(je_cell, result.j_bkg_energy_debug_face, 912);
+            // Face 0 is owned by rank 0; the final rank's face nxl is its
+            // periodic alias.  This is diagnostic-only topology accounting.
+            double seam_local[4] = {0.0, 0.0, 0.0, 0.0};
+            if (nxl > 0 && mpi_rank == 0) {
+                seam_local[0] = result.j_bkg_face_mid[0];
+                seam_local[2] = result.j_bkg_energy_debug_face[0];
+            }
+            if (nxl > 0 && mpi_rank == mpi_size - 1) {
+                seam_local[1] = result.j_bkg_face_mid[nxl];
+                seam_local[3] = result.j_bkg_energy_debug_face[nxl];
+            }
+            double seam_global[4] = {0.0, 0.0, 0.0, 0.0};
+            MPI_Allreduce(seam_local, seam_global, 4, MPI_DOUBLE, MPI_SUM,
+                          MPI_COMM_WORLD);
+            result.periodic_seam_face_audit[0] = seam_global[0];
+            result.periodic_seam_face_audit[1] = seam_global[1];
+            result.periodic_seam_face_audit[2] = seam_global[2];
+            result.periodic_seam_face_audit[3] = seam_global[3];
+            result.periodic_seam_face_audit[4] = seam_global[0] - seam_global[2];
+            result.periodic_seam_face_audit[5] = seam_global[1] - seam_global[3];
+            trace_live("gstar_end", iter + 1, -1);
+        }
+
+        // Stage-5, limiter and regional ledgers are not part of the midpoint
+        // acceptance test.  Evaluate them only for an emitted production
+        // diagnostic or a fixed-state audit, rather than for every trial.
+        // Kept in outer scope because accepted-state regional diagnostics
+        // consume them below.  They remain zero on a non-diagnostic trial and
+        // are never used by the acceptance decision.
+        double energy_pair[4] = {0.0, 0.0, 0.0, 0.0};
+        double local_stage5[7] = {0.0, 0.0, 0.0, 0.0,
+                                  0.0, 0.0, 0.0};
         work.current_face_x = result.j_bkg_face_mid;
         last_work = work;
+        if (collect_expensive_iteration_audit) {
+        work.compute_moments();
+        trace_live("moments_end", iter + 1, -1);
         double local_cont = 0.0;
         for (int ix = 0; ix < nxl; ++ix) {
             double mn = 0.0;
@@ -3063,16 +3398,16 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
         }
         for (int iface = 0; iface < nxl; ++iface)
             local_face_work += e_mid[iface] * result.j_bkg_face_mid[iface] * sg.dx;
-        double energy_pair[4] = {local_cell_work, local_face_work,
-                                  local_high_cell_work,
-                                  local_center_cell_work};
+        energy_pair[0] = local_cell_work;
+        energy_pair[1] = local_face_work;
+        energy_pair[2] = local_high_cell_work;
+        energy_pair[3] = local_center_cell_work;
         MPI_Allreduce(MPI_IN_PLACE, energy_pair, 4, MPI_DOUBLE, MPI_SUM,
                       MPI_COMM_WORLD);
         result.energy_residual_bkg = dt * (energy_pair[0] - energy_pair[1]);
 
-        double local_stage5[7] = {0.0, 0.0, 0.0, 0.0,
-                                  psi_k_x[nxl] - psi_k_x[0],
-                                  psi_p_x[nxl] - psi_p_x[0], 0.0};
+        local_stage5[4] = psi_k_x[nxl] - psi_k_x[0];
+        local_stage5[5] = psi_p_x[nxl] - psi_p_x[0];
         double local_mass_change = 0.0;
         double local_mass_scale = 0.0;
         double local_momentum_scale = 0.0;
@@ -3194,6 +3529,7 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
             max_mid_field = std::max(max_mid_field, std::fabs(e_mid[iface]));
         MPI_Allreduce(MPI_IN_PLACE, &max_mid_field, 1, MPI_DOUBLE, MPI_MAX,
                       MPI_COMM_WORLD);
+        trace_live("stage5_reduce_end", iter + 1, -1);
         const double raw_scale = std::max(std::fabs(local_stage5[2]), 1.0);
         result.stage5_compatibility_enabled = 0;
         result.stage5_projection_skipped_zero_field =
@@ -3232,6 +3568,7 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
             x_limiter_min, u_limiter_min};
         MPI_Allreduce(MPI_IN_PLACE, directional_limiter_min, 2, MPI_DOUBLE,
                       MPI_MIN, MPI_COMM_WORLD);
+        trace_live("limiter_reduce_end", iter + 1, -1);
         result.limiter_energy_defect = limiter_sum[0];
         result.limiter_energy_defect_positive = limiter_sum[4];
         result.limiter_energy_defect_negative = limiter_sum[5];
@@ -3259,26 +3596,17 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
         result.flux_pos[1].alpha_min = limiter_alpha_global[0];
 
         result.delta_ke_bkg = local_stage5[6];
-        result.delta_ke_beam = beam_ke_after - beam_ke_before;
         result.field_work_bkg = -dt * energy_pair[1];
+        result.energy_pair_residual_bkg = result.energy_residual_bkg;
+        trace_live("expensive_audit_end", iter + 1, -1);
+        } // collect_expensive_iteration_audit
+        result.delta_ke_beam = beam_ke_after - beam_ke_before;
         result.field_work_beam = -integrate_face_work(jbeam, beam_field, sg, dt);
         result.beam_lag_energy_residual =
             -integrate_face_work(jbeam, fields_mid, sg, dt) - result.field_work_beam;
-        result.energy_pair_residual_bkg = result.energy_residual_bkg;
-        result.beam_continuity_residual = std::max(
-            beam_predictor.last_continuity_linf_error(),
-            beam_predictor.last_boundary_flux_error());
         result.nonlinear_iterations = iter + 1;
-
-        if (!all_finite(work, fields_new, result.j_total_face_mid)) {
-            result.failed = true;
-            result.state_advanced = 0;
-            result.failure_reason = 4;
-            result.failure_iteration = iter;
-            result.failure_global_cfl = global_cfl;
-            return result;
-        }
         const auto finalize_coupling_regions = [&]() {
+            trace_live("regional_audit_begin", iter + 1, -1);
             if (fixed_coupling_layout) {
                 result.coupling_beam_front_ix =
                     fixed_coupling_layout->beam_front_ix;
@@ -3442,6 +3770,7 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
             result.coupling_rj_fct_reconstruction_error =
                 result.coupling_rj_fct_global_sum -
                 result.stage5_r_couple_fct_stabilization;
+            trace_live("regional_audit_end", iter + 1, -1);
         };
         if (fixed_candidate) {
             capture_accepted_transport(work);
@@ -3461,7 +3790,7 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
             result.center_u_coefficient = low_order_only_ ? cu_low :
                 cu_high_center;
             if (dual_u_enabled)
-                result.legacy_center_u_coefficient = cu_legacy_center;
+                result.legacy_center_u_coefficient = cu_high_center;
             result.center_u_reconstruction_mass = midpoint_state.f;
             if (!low_order_only_) {
                 for (size_t p = 0; p < fu_high.size(); ++p) {
@@ -3485,24 +3814,221 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
                 finalize_coupling_regions();
             return result;
         }
-        if (have_previous && result.residual_E < field_tol &&
-            result.residual_J_bkg < current_tol &&
-            result.beam_continuity_residual < 1.0e-6) {
-            if (!transport_safe_step_gate(work, nsub))
+        if (strict_candidate) {
+            trace_live("transport_safe_gate_begin", iter + 1, -1);
+            const bool transport_safe =
+                transport_safe_step_gate(work, nsub);
+            trace_live("transport_safe_gate_end", iter + 1, -1);
+            if (!transport_safe) {
+                if (reject_accelerated_trial_before_residual())
+                    goto midpoint_iteration_retry;
                 return result;
-            capture_accepted_transport(work);
+            }
+            if (detailed_operator_diagnostics) {
+                trace_live("accepted_transport_capture_begin", iter + 1, -1);
+                capture_accepted_transport(work);
+                trace_live("accepted_transport_capture_end", iter + 1, -1);
+            }
             result.species_np1 = work;
             result.beam_np1 = beam_predictor;
             result.fields_np1 = fields_new;
             result.converged = true;
             result.state_advanced = 1;
+            trace_live("strict_accept", iter + 1, -1);
             if (step_diagnostics_enabled_ || fixed_candidate)
                 finalize_coupling_regions();
             return result;
         }
 
+        bool accelerated_next_endpoint = false;
+        bool coefficient_rejected = false;
+        double next_acceleration_coefficient = omega;
+        if (midpoint_acceleration_enabled) {
+            for (int iface = 0; iface < nxl; ++iface) {
+                acceleration_re_current_[iface] = next_e[iface] - e_end[iface];
+                acceleration_fallback_e_[iface] = e_end[iface] +
+                    omega * acceleration_re_current_[iface];
+            }
+
+            const bool can_attempt_acceleration =
+                !fallback_plain_evaluation && iter + 1 < max_iters &&
+                iter + 1 >= acceleration_start_iter_;
+            if (can_attempt_acceleration &&
+                midpoint_acceleration_mode_ == MIDPOINT_ACCELERATION_AITKEN &&
+                have_acceleration_residual) {
+                long double local_pair[2] = {0.0L, 0.0L};
+                for (int iface = 0; iface < nxl; ++iface) {
+                    const long double delta =
+                        static_cast<long double>(acceleration_re_current_[iface]) -
+                        static_cast<long double>(acceleration_re_previous_[iface]);
+                    local_pair[0] += static_cast<long double>(
+                        acceleration_re_previous_[iface]) * delta;
+                    local_pair[1] += delta * delta;
+                }
+                double pair[2] = {static_cast<double>(local_pair[0]),
+                                  static_cast<double>(local_pair[1])};
+                MPI_Allreduce(MPI_IN_PLACE, pair, 2, MPI_DOUBLE, MPI_SUM,
+                              MPI_COMM_WORLD);
+                const double denominator_floor = 128.0 *
+                    std::numeric_limits<double>::epsilon() *
+                    std::max(1.0, std::fabs(pair[0]));
+                double aitken_omega = std::numeric_limits<double>::quiet_NaN();
+                if (std::isfinite(pair[0]) && std::isfinite(pair[1]) &&
+                    pair[1] > denominator_floor) {
+                    aitken_omega = -aitken_previous_omega * pair[0] / pair[1];
+                }
+                if (std::isfinite(aitken_omega) &&
+                    aitken_omega >= 0.1 && aitken_omega <= 1.5) {
+                    for (int iface = 0; iface < nxl; ++iface) {
+                        e_end[iface] += aitken_omega *
+                            acceleration_re_current_[iface];
+                    }
+                    accelerated_next_endpoint = true;
+                    next_acceleration_coefficient = aitken_omega;
+                    aitken_previous_omega = aitken_omega;
+                } else {
+                    coefficient_rejected = true;
+                    ++result.acceleration_rejected_coefficient;
+                    ++result.acceleration_history_resets;
+                    have_acceleration_residual = false;
+                    aitken_previous_omega = omega;
+                }
+            } else if (can_attempt_acceleration &&
+                       midpoint_acceleration_mode_ == MIDPOINT_ACCELERATION_ANDERSON) {
+                const int depth = anderson_depth_;
+                const int old_count = anderson_history_count;
+                for (int h = std::min(depth - 1, old_count); h > 0; --h) {
+                    acceleration_e_history_[h] = acceleration_e_history_[h - 1];
+                    acceleration_re_history_[h] = acceleration_re_history_[h - 1];
+                }
+                acceleration_e_history_[0] = e_end;
+                acceleration_re_history_[0] = acceleration_re_current_;
+                anderson_history_count = std::min(depth, old_count + 1);
+                const int columns = anderson_history_count - 1;
+                if (columns > 0) {
+                    double local_field_scale = 1.0;
+                    for (int iface = 0; iface < nxl; ++iface) {
+                        local_field_scale = std::max(local_field_scale,
+                            std::fabs(e_end[iface]));
+                    }
+                    double field_scale = local_field_scale;
+                    MPI_Allreduce(MPI_IN_PLACE, &field_scale, 1, MPI_DOUBLE,
+                                  MPI_MAX, MPI_COMM_WORLD);
+                    const double inv_scale2 = 1.0 / (field_scale * field_scale);
+                    long double local_ls[5] = {0.0L, 0.0L, 0.0L, 0.0L, 0.0L};
+                    for (int iface = 0; iface < nxl; ++iface) {
+                        const long double d0 = static_cast<long double>(
+                            acceleration_re_history_[0][iface] -
+                            acceleration_re_history_[1][iface]);
+                        local_ls[0] += d0 * d0;
+                        local_ls[2] += d0 * static_cast<long double>(
+                            acceleration_re_history_[0][iface]);
+                        if (columns == 2) {
+                            const long double d1 = static_cast<long double>(
+                                acceleration_re_history_[1][iface] -
+                                acceleration_re_history_[2][iface]);
+                            local_ls[1] += d0 * d1;
+                            local_ls[3] += d1 * d1;
+                            local_ls[4] += d1 * static_cast<long double>(
+                                acceleration_re_history_[0][iface]);
+                        }
+                    }
+                    double ls[5] = {static_cast<double>(local_ls[0]) * inv_scale2,
+                                    static_cast<double>(local_ls[1]) * inv_scale2,
+                                    static_cast<double>(local_ls[2]) * inv_scale2,
+                                    static_cast<double>(local_ls[3]) * inv_scale2,
+                                    static_cast<double>(local_ls[4]) * inv_scale2};
+                    MPI_Allreduce(MPI_IN_PLACE, ls, 5, MPI_DOUBLE, MPI_SUM,
+                                  MPI_COMM_WORLD);
+                    const double regularization = 1.0e-12 *
+                        std::max(1.0, (ls[0] + (columns == 2 ? ls[3] : 0.0)) /
+                            static_cast<double>(columns));
+                    double gamma0 = 0.0, gamma1 = 0.0;
+                    bool valid_system = std::isfinite(regularization);
+                    if (columns == 1) {
+                        const double a00 = ls[0] + regularization;
+                        gamma0 = ls[2] / a00;
+                        valid_system = valid_system && std::isfinite(a00) &&
+                            a00 > 0.0 && std::isfinite(gamma0);
+                    } else {
+                        const double a00 = ls[0] + regularization;
+                        const double a11 = ls[3] + regularization;
+                        const double determinant = a00 * a11 - ls[1] * ls[1];
+                        const double trace = a00 + a11;
+                        const double discriminant = std::max(0.0,
+                            trace * trace - 4.0 * determinant);
+                        const double eigen_min = 0.5 * (trace - std::sqrt(discriminant));
+                        const double eigen_max = 0.5 * (trace + std::sqrt(discriminant));
+                        gamma0 = (ls[2] * a11 - ls[1] * ls[4]) / determinant;
+                        gamma1 = (a00 * ls[4] - ls[1] * ls[2]) / determinant;
+                        valid_system = valid_system && std::isfinite(determinant) &&
+                            determinant > 0.0 && eigen_min > 0.0 &&
+                            eigen_max / eigen_min <= 1.0e10 &&
+                            std::isfinite(gamma0) && std::isfinite(gamma1);
+                    }
+                    const double coefficient_max = std::max(std::fabs(gamma0),
+                        columns == 2 ? std::fabs(gamma1) : 0.0);
+                    if (valid_system &&
+                        coefficient_max <= acceleration_max_coefficient_) {
+                        for (int iface = 0; iface < nxl; ++iface) {
+                            double candidate = acceleration_fallback_e_[iface];
+                            candidate -= gamma0 * ((acceleration_e_history_[0][iface] -
+                                acceleration_e_history_[1][iface]) + omega *
+                                (acceleration_re_history_[0][iface] -
+                                 acceleration_re_history_[1][iface]));
+                            if (columns == 2) {
+                                candidate -= gamma1 * ((acceleration_e_history_[1][iface] -
+                                    acceleration_e_history_[2][iface]) + omega *
+                                    (acceleration_re_history_[1][iface] -
+                                     acceleration_re_history_[2][iface]));
+                            }
+                            e_end[iface] = candidate;
+                        }
+                        accelerated_next_endpoint = true;
+                        next_acceleration_coefficient = coefficient_max;
+                    } else {
+                        coefficient_rejected = true;
+                        ++result.acceleration_rejected_coefficient;
+                        ++result.acceleration_history_resets;
+                        anderson_history_count = 0;
+                        aitken_previous_omega = omega;
+                    }
+                }
+            }
+
+            if (!accelerated_next_endpoint) {
+                e_end = acceleration_fallback_e_;
+            }
+            if (!coefficient_rejected) {
+                acceleration_re_previous_ = acceleration_re_current_;
+                have_acceleration_residual = true;
+            } else {
+                have_acceleration_residual = false;
+            }
+            if (accelerated_next_endpoint) {
+                ++result.acceleration_attempts;
+                acceleration_trial_pending = true;
+                acceleration_residual_before = result.nonlinear_residual;
+                acceleration_trial_coefficient = next_acceleration_coefficient;
+            }
+            if (midpoint_iteration_trace_for_test_) {
+                result.midpoint_acceleration_omega_history.back() =
+                    accelerated_next_endpoint ? next_acceleration_coefficient : omega;
+                result.midpoint_acceleration_residual_before_history.back() =
+                    result.nonlinear_residual;
+                result.midpoint_acceleration_status_history.back() =
+                    coefficient_rejected ? 6 :
+                    (accelerated_next_endpoint ? 1 :
+                     (fallback_plain_evaluation ? 5 : 0));
+            }
+            fallback_plain_evaluation = false;
+        } else {
+            for (int iface = 0; iface < nxl; ++iface) {
+                e_end[iface] = (1.0 - omega) * e_end[iface] +
+                    omega * next_e[iface];
+            }
+        }
         for (int iface = 0; iface < nxl; ++iface) {
-            e_end[iface] = (1.0 - omega) * e_end[iface] + omega * next_e[iface];
             previous_j[iface] = result.j_bkg_face_mid[iface];
         }
         have_previous = true;
@@ -3510,7 +4036,8 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
         if (iter + 1 == max_iters) {
             if (!transport_safe_step_gate(last_work, nsub))
                 return result;
-            capture_accepted_transport(last_work);
+            if (detailed_operator_diagnostics)
+                capture_accepted_transport(last_work);
         if (step_diagnostics_enabled_ || fixed_candidate)
             finalize_coupling_regions();
         }
@@ -3522,5 +4049,6 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
     result.soft_unconverged = true;
     result.soft_accepted = true;
     result.state_advanced = 1;
+    trace_live("soft_accept", max_iters, -1);
     return result;
 }

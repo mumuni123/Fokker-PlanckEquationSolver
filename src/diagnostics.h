@@ -131,7 +131,8 @@ public:
                                const SpatialGrid& sg,
                                int mpi_rank, int mpi_size,
                                const std::vector<double>* bkg_energy_current_face = 0,
-                               const std::vector<double>* bkg_ampere_current_face = 0);
+                               const std::vector<double>* bkg_ampere_current_face = 0,
+                               bool bkg_energy_current_valid = false);
 
     void write_px_distribution(double time,
                                const Species& sp,

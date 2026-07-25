@@ -98,17 +98,17 @@ int main(int argc, char** argv)
     const size_t expected_cell = static_cast<size_t>(sg.nx_local);
     const bool legacy_contract = legacy.state_advanced &&
         !legacy.operator_failed && legacy.fx_high.size() == expected_x_flux &&
-        legacy.fu_center.size() == expected_u_flux &&
+        legacy.fu_high.size() == expected_u_flux &&
         legacy.jn_high.size() == expected_face &&
-        legacy.gstar_je_center.size() == expected_face;
+        legacy.gstar_je_high.size() == expected_face;
     const bool dual_contract = dual.state_advanced && !dual.operator_failed &&
         dual.fx_high.size() == expected_x_flux &&
-        dual.fu_center.size() == expected_u_flux &&
-        dual.cu_center.size() == expected_u_flux &&
+        dual.fu_high.size() == expected_u_flux &&
+        dual.cu_high.size() == expected_u_flux &&
         dual.cu_legacy_center.size() == expected_u_flux &&
         dual.jn_high.size() == expected_face &&
-        dual.je_center.size() == expected_cell &&
-        dual.gstar_je_center.size() == expected_face &&
+        dual.je_high.size() == expected_cell &&
+        dual.gstar_je_high.size() == expected_face &&
         dual.dual_target_jn_cell.size() == expected_cell;
     int local_contract_ok = legacy_contract && dual_contract ? 1 : 0;
     int global_contract_ok = 0;
@@ -129,14 +129,14 @@ int main(int argc, char** argv)
                       << " legacy_state_advanced=" << legacy.state_advanced
                       << " dual_state_advanced=" << dual.state_advanced
                       << " legacy_sizes=(fx=" << legacy.fx_high.size()
-                      << ",fu=" << legacy.fu_center.size()
+                      << ",fu=" << legacy.fu_high.size()
                       << ",jn=" << legacy.jn_high.size() << ")"
                       << " dual_sizes=(fx=" << dual.fx_high.size()
-                      << ",fu=" << dual.fu_center.size()
-                      << ",cu=" << dual.cu_center.size()
+                      << ",fu=" << dual.fu_high.size()
+                      << ",cu=" << dual.cu_high.size()
                       << ",cu_legacy=" << dual.cu_legacy_center.size()
                       << ",jn=" << dual.jn_high.size()
-                      << ",je=" << dual.je_center.size() << ")"
+                      << ",je=" << dual.je_high.size() << ")"
                       << " expected=(fx=" << expected_x_flux
                       << ",u=" << expected_u_flux
                       << ",face=" << expected_face
@@ -161,7 +161,7 @@ int main(int argc, char** argv)
     const double jn_difference = global_max_difference(legacy.jn_high,
                                                         dual.jn_high);
     const double cu_correction = global_max_difference(dual.cu_legacy_center,
-                                                        dual.cu_center);
+                                                        dual.cu_high);
     const double target_scale = global_max_abs(dual.dual_target_jn_cell);
     const double target_replay_relative = dual.dual_u_target_replay_linf /
         std::max(1.0, dual.dual_u_target_replay_scale);
@@ -185,34 +185,34 @@ int main(int argc, char** argv)
             for (int k = 0; k < Param::Nmu; ++k) {
                 const size_t id = uface_index(ix, jf, k);
                 local_fu_contract = std::max(local_fu_contract,
-                    std::fabs(dual.fu_center[id] -
-                              acceleration * dual.cu_center[id]));
+                    std::fabs(dual.fu_high[id] -
+                              acceleration * dual.cu_high[id]));
                 if (jf > 0 && jf < Param::Nv)
                     direct_je += current_factor *
                         Stage5::delta_energy(background.cgrid, jf, k) *
-                        dual.cu_center[id];
+                        dual.cu_high[id];
             }
         }
         local_je_contract = std::max(local_je_contract,
-            std::fabs(direct_je - dual.je_center[static_cast<size_t>(ix)]));
+            std::fabs(direct_je - dual.je_high[static_cast<size_t>(ix)]));
         for (int k = 0; k < Param::Nmu; ++k) {
             local_boundary_coefficient_difference = std::max(
                 local_boundary_coefficient_difference,
-                std::fabs(dual.cu_center[uface_index(ix, 0, k)] -
+                std::fabs(dual.cu_high[uface_index(ix, 0, k)] -
                           dual.cu_legacy_center[uface_index(ix, 0, k)]));
             local_boundary_coefficient_difference = std::max(
                 local_boundary_coefficient_difference,
-                std::fabs(dual.cu_center[uface_index(ix, Param::Nv, k)] -
+                std::fabs(dual.cu_high[uface_index(ix, Param::Nv, k)] -
                           dual.cu_legacy_center[
                               uface_index(ix, Param::Nv, k)]));
         }
         double telescoping = 0.0;
         for (int j = 0; j < Param::Nv; ++j)
             for (int k = 0; k < Param::Nmu; ++k) {
-                const double lower = dual.fu_center[uface_index(ix, j, k)] -
-                    legacy.fu_center[uface_index(ix, j, k)];
-                const double upper = dual.fu_center[uface_index(ix, j + 1, k)] -
-                    legacy.fu_center[uface_index(ix, j + 1, k)];
+                const double lower = dual.fu_high[uface_index(ix, j, k)] -
+                    legacy.fu_high[uface_index(ix, j, k)];
+                const double upper = dual.fu_high[uface_index(ix, j + 1, k)] -
+                    legacy.fu_high[uface_index(ix, j + 1, k)];
                 telescoping += upper - lower;
                 local_correction_flux_scale += std::fabs(lower) +
                                                std::fabs(upper);
@@ -229,14 +229,14 @@ int main(int argc, char** argv)
 
     const BackgroundCouplingTest::Norms legacy_pair =
         BackgroundCouplingTest::face_difference_norms(
-            legacy.jn_high, legacy.gstar_je_center, sg);
+            legacy.jn_high, legacy.gstar_je_high, sg);
     const BackgroundCouplingTest::Norms dual_pair =
         BackgroundCouplingTest::face_difference_norms(
-            dual.jn_high, dual.gstar_je_center, sg);
+            dual.jn_high, dual.gstar_je_high, sg);
     const double flux_scale = std::max(1.0, global_max_abs(legacy.fx_high));
     const double current_scale = std::max(1.0, global_max_abs(legacy.jn_high));
     const double coefficient_scale = std::max(1.0,
-        global_max_abs(dual.cu_center));
+        global_max_abs(dual.cu_high));
     const double flux_tolerance = 256.0 *
         std::numeric_limits<double>::epsilon() * flux_scale;
     const double current_tolerance = 256.0 *

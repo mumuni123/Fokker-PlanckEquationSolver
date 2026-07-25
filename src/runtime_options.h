@@ -4,6 +4,18 @@
 #include <string>
 #include <vector>
 
+enum BeamLedgerMode {
+    BEAM_LEDGER_OFF = 0,
+    BEAM_LEDGER_SUMMARY = 1,
+    BEAM_LEDGER_FULL = 2
+};
+
+enum RuntimeMidpointAccelerationMode {
+    RUNTIME_MIDPOINT_ACCELERATION_NONE = 0,
+    RUNTIME_MIDPOINT_ACCELERATION_AITKEN = 1,
+    RUNTIME_MIDPOINT_ACCELERATION_ANDERSON = 2
+};
+
 struct RuntimeOptions {
     std::string output_dir;
     std::string restart_dir;
@@ -13,9 +25,17 @@ struct RuntimeOptions {
     double stop_time_fs;
     long long stop_after_accepted_steps;
     double dt_scale;
+    double midpoint_trace_start_fs;
+    double midpoint_trace_end_fs;
     int midpoint_max_iters;
     int diagnostic_level;
-    // 0 = legacy charge/energy coupling; 1 = opt-in dual-u coupling.
+    RuntimeMidpointAccelerationMode midpoint_acceleration_mode;
+    int anderson_depth;
+    int acceleration_start_iter;
+    double acceleration_accept_ratio;
+    double acceleration_max_coefficient;
+    BeamLedgerMode beam_ledger_mode;
+    // 0 = explicit legacy fallback; 1 = default dual-u coupling.
     int background_coupling_mode;
     bool dump_final_midpoint;
     bool overwrite_output;

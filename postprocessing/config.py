@@ -4,7 +4,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # Simulation output directory that contains density_*.dat and fields_*.dat.
-DATA_DIR = ROOT / "output"
+DATA_DIR = ROOT / "output" / "dual_u_prod_dt060"
 
 # All postprocessing figures are written here.
 RESULTS_DIR = ROOT / "results"
@@ -19,13 +19,13 @@ TIME_COLUMNS = ["Ex[V/m]"]
 TIME_X_AXIS_RANGE = None
 
 # Settings for plot_space_profile.py.
-SPACE_FILE = DATA_DIR / "fields_00050.dat"
+SPACE_FILE = DATA_DIR / "fields_00095.dat"
 SPACE_COLUMNS = ["Ex[V/m]"]
 # Use None to plot the full available range, or set (min, max) to restrict it.
 # Bounds can also be None individually, e.g. (1.0, None).
 SPACE_X_AXIS_RANGE = None
 
-ALL_DENSITY_FILES = "density_00050.dat"
+ALL_DENSITY_FILES = "density_00095.dat"
 
 # Settings for plot_background_density_evolution.py.
 BACKGROUND_DENSITY_FILES = [

@@ -20,14 +20,20 @@ std::string option_value(int argc, char** argv, const char* option)
     return std::string();
 }
 
-void ensure_directory(const std::string& directory)
+bool ensure_directory(const std::string& directory)
 {
 #ifdef _WIN32
     const std::string command = "mkdir \"" + directory + "\" >nul 2>nul";
 #else
     const std::string command = "mkdir -p \"" + directory + "\"";
 #endif
-    (void)std::system(command.c_str());
+    const int status = std::system(command.c_str());
+    if (status != 0) {
+        std::cerr << "failed to create output directory: " << directory
+                  << " (system status=" << status << ")\n";
+        return false;
+    }
+    return true;
 }
 
 struct Norm {
@@ -43,11 +49,6 @@ struct Norm {
     }
 };
 
-double relative_l2(const Norm& value)
-{
-    return std::sqrt(value.diff2 / std::max(std::numeric_limits<double>::min(),
-                                             value.ref2));
-}
 }
 
 int main(int argc, char** argv)
@@ -68,6 +69,14 @@ int main(int argc, char** argv)
             << " --output-dir DIR\n";
         MPI_Finalize();
         return 2;
+    }
+    int output_directory_ready = 1;
+    if (rank == 0)
+        output_directory_ready = ensure_directory(output_dir) ? 1 : 0;
+    MPI_Bcast(&output_directory_ready, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (output_directory_ready == 0) {
+        MPI_Finalize();
+        return 3;
     }
 
     SpatialGrid sg;
@@ -162,7 +171,6 @@ int main(int argc, char** argv)
                rank == 0 ? gathered_rows.data() : 0,
                static_cast<int>(rows.size()), MPI_DOUBLE, 0, MPI_COMM_WORLD);
     if (rank == 0) {
-        ensure_directory(output_dir);
         std::ofstream result((output_dir + "/stage4_ab_comparison.result").c_str());
         std::ofstream by_x((output_dir + "/stage4_ab_by_x.dat").c_str());
         std::ofstream by_u((output_dir + "/stage4_ab_by_upar.dat").c_str());

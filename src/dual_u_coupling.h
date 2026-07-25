@@ -8,6 +8,10 @@
 #include <limits>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace DualUCoupling {
 
 enum FailureSubtype {
@@ -49,6 +53,38 @@ struct Diagnostics {
           failure_support_floor(0.0), failure_scale(0.0) {}
 };
 
+inline void merge_diagnostics(Diagnostics& target,
+                              const Diagnostics& source)
+{
+    target.target_replay_linf = std::max(target.target_replay_linf,
+                                          source.target_replay_linf);
+    target.target_replay_scale = std::max(target.target_replay_scale,
+                                           source.target_replay_scale);
+    target.legacy_current_linf = std::max(target.legacy_current_linf,
+                                           source.legacy_current_linf);
+    target.dual_current_linf = std::max(target.dual_current_linf,
+                                         source.dual_current_linf);
+    target.correction_l2 += source.correction_l2;
+    target.correction_linf = std::max(target.correction_linf,
+                                       source.correction_linf);
+    target.corrected_cell_count += source.corrected_cell_count;
+    if (!source.valid &&
+        (target.valid || source.failure_local_ix < target.failure_local_ix)) {
+        target.valid = 0;
+        target.failure_subtype = source.failure_subtype;
+        target.failure_local_ix = source.failure_local_ix;
+        target.failure_target = source.failure_target;
+        target.failure_replay = source.failure_replay;
+        target.failure_legacy = source.failure_legacy;
+        target.failure_residual = source.failure_residual;
+        target.failure_denominator = source.failure_denominator;
+        target.failure_maximum_coefficient =
+            source.failure_maximum_coefficient;
+        target.failure_support_floor = source.failure_support_floor;
+        target.failure_scale = source.failure_scale;
+    }
+}
+
 // Fixed-state local rank-one update
 //
 //   A_new = A_legacy + b (w_N - w_E)^T / <l,b>,
@@ -64,6 +100,7 @@ inline Diagnostics apply_local_rank_one(
     const CylindricalVelocityGrid& grid, double charge, double mass,
     double dx, int nx_local, const std::vector<double>& target_current,
     const std::vector<double>& target_current_replay,
+    const std::vector<double>& energy_current_weight,
     const std::vector<double>& legacy_coefficient,
     std::vector<double>& dual_coefficient,
     std::vector<double>& legacy_current,
@@ -72,19 +109,44 @@ inline Diagnostics apply_local_rank_one(
     Diagnostics diagnostics;
     const size_t faces_per_x = static_cast<size_t>(Param::Nv + 1) * Param::Nmu;
     const size_t expected = static_cast<size_t>(nx_local) * faces_per_x;
-    dual_coefficient = legacy_coefficient;
-    legacy_current.assign(static_cast<size_t>(nx_local), 0.0);
-    dual_current.assign(static_cast<size_t>(nx_local), 0.0);
     if (legacy_coefficient.size() != expected ||
         target_current.size() < static_cast<size_t>(nx_local) ||
         target_current_replay.size() < static_cast<size_t>(nx_local) ||
+        energy_current_weight.size() < Param::Nvmu ||
         !(dx > 0.0) || charge == 0.0 || !(mass > 0.0)) {
         diagnostics.valid = 0;
         diagnostics.failure_subtype = FAILURE_INPUT_CONTRACT;
         return diagnostics;
     }
 
+    // Caller-owned work arrays are reused across midpoint iterations.  Keep
+    // the copy explicit, rather than assigning temporary vectors, to avoid
+    // repeated allocation and zero-fill on the production path.
+    if (dual_coefficient.size() != expected) dual_coefficient.resize(expected);
+    std::copy(legacy_coefficient.begin(), legacy_coefficient.end(),
+              dual_coefficient.begin());
+    const size_t cells = static_cast<size_t>(nx_local);
+    if (legacy_current.size() != cells) legacy_current.resize(cells);
+    if (dual_current.size() != cells) dual_current.resize(cells);
+    std::fill(legacy_current.begin(), legacy_current.end(), 0.0);
+    std::fill(dual_current.begin(), dual_current.end(), 0.0);
+
     const double current_factor = charge / (mass * Const::c * dx);
+    int thread_count = 1;
+#ifdef _OPENMP
+    thread_count = omp_get_max_threads();
+#endif
+    std::vector<Diagnostics> thread_diagnostics(
+        static_cast<size_t>(thread_count));
+
+    #pragma omp parallel
+    {
+    int thread_id = 0;
+#ifdef _OPENMP
+    thread_id = omp_get_thread_num();
+#endif
+    Diagnostics& local = thread_diagnostics[static_cast<size_t>(thread_id)];
+    #pragma omp for schedule(static)
     for (int ix = 0; ix < nx_local; ++ix) {
         double legacy = 0.0;
         double maximum_coefficient = 0.0;
@@ -103,13 +165,13 @@ inline Diagnostics apply_local_rank_one(
 
         const double target = target_current[static_cast<size_t>(ix)];
         const double replay = target_current_replay[static_cast<size_t>(ix)];
-        diagnostics.target_replay_linf = std::max(
-            diagnostics.target_replay_linf, std::fabs(target - replay));
-        diagnostics.target_replay_scale = std::max(
-            diagnostics.target_replay_scale,
+        local.target_replay_linf = std::max(
+            local.target_replay_linf, std::fabs(target - replay));
+        local.target_replay_scale = std::max(
+            local.target_replay_scale,
             std::max(std::fabs(target), std::fabs(replay)));
-        diagnostics.legacy_current_linf = std::max(
-            diagnostics.legacy_current_linf, std::fabs(target - legacy));
+        local.legacy_current_linf = std::max(
+            local.legacy_current_linf, std::fabs(target - legacy));
 
         // Freeze a compact support metric from the legacy face state.  A tiny
         // relative floor lets an empty internal face participate without
@@ -127,10 +189,9 @@ inline Diagnostics apply_local_rank_one(
             for (int k = 0; k < Param::Nmu; ++k) {
                 const size_t id = (static_cast<size_t>(ix) * (Param::Nv + 1) +
                                    static_cast<size_t>(jf)) * Param::Nmu + k;
-                const double dke = Stage5::delta_energy(grid, jf, k);
                 const double support = std::max(
                     std::fabs(legacy_coefficient[id]), support_floor);
-                const double functional = current_factor * dke;
+                const double functional = energy_current_weight[idx2(jf, k)];
                 denominator += functional * functional * support;
             }
         }
@@ -142,19 +203,19 @@ inline Diagnostics apply_local_rank_one(
                 std::numeric_limits<double>::denorm_min())) {
             if (std::fabs(residual) >
                 4096.0 * std::numeric_limits<double>::epsilon() * scale) {
-                diagnostics.valid = 0;
-                if (diagnostics.failure_subtype == FAILURE_NONE) {
-                    diagnostics.failure_subtype = FAILURE_GRAM_DEGENERATE;
-                    diagnostics.failure_local_ix = ix;
-                    diagnostics.failure_target = target;
-                    diagnostics.failure_replay = replay;
-                    diagnostics.failure_legacy = legacy;
-                    diagnostics.failure_residual = residual;
-                    diagnostics.failure_denominator = denominator;
-                    diagnostics.failure_maximum_coefficient =
+                local.valid = 0;
+                if (local.failure_subtype == FAILURE_NONE) {
+                    local.failure_subtype = FAILURE_GRAM_DEGENERATE;
+                    local.failure_local_ix = ix;
+                    local.failure_target = target;
+                    local.failure_replay = replay;
+                    local.failure_legacy = legacy;
+                    local.failure_residual = residual;
+                    local.failure_denominator = denominator;
+                    local.failure_maximum_coefficient =
                         maximum_coefficient;
-                    diagnostics.failure_support_floor = support_floor;
-                    diagnostics.failure_scale = scale;
+                    local.failure_support_floor = support_floor;
+                    local.failure_scale = scale;
                 }
             }
         } else {
@@ -165,29 +226,29 @@ inline Diagnostics apply_local_rank_one(
                     const size_t id = (static_cast<size_t>(ix) *
                         (Param::Nv + 1) + static_cast<size_t>(jf)) *
                         Param::Nmu + k;
-                    const double dke = Stage5::delta_energy(grid, jf, k);
                     const double support = std::max(
                         std::fabs(legacy_coefficient[id]), support_floor);
-                    const double functional = current_factor * dke;
+                    const double functional =
+                        energy_current_weight[idx2(jf, k)];
                     const double correction = residual * functional * support /
                                               denominator;
                     const double corrected = dual_coefficient[id] + correction;
                     if (!std::isfinite(correction) ||
                         !std::isfinite(corrected)) {
-                        diagnostics.valid = 0;
-                        if (diagnostics.failure_subtype == FAILURE_NONE) {
-                            diagnostics.failure_subtype =
+                        local.valid = 0;
+                        if (local.failure_subtype == FAILURE_NONE) {
+                            local.failure_subtype =
                                 FAILURE_CORRECTION_NONFINITE;
-                            diagnostics.failure_local_ix = ix;
-                            diagnostics.failure_target = target;
-                            diagnostics.failure_replay = replay;
-                            diagnostics.failure_legacy = legacy;
-                            diagnostics.failure_residual = residual;
-                            diagnostics.failure_denominator = denominator;
-                            diagnostics.failure_maximum_coefficient =
+                            local.failure_local_ix = ix;
+                            local.failure_target = target;
+                            local.failure_replay = replay;
+                            local.failure_legacy = legacy;
+                            local.failure_residual = residual;
+                            local.failure_denominator = denominator;
+                            local.failure_maximum_coefficient =
                                 maximum_coefficient;
-                            diagnostics.failure_support_floor = support_floor;
-                            diagnostics.failure_scale = scale;
+                            local.failure_support_floor = support_floor;
+                            local.failure_scale = scale;
                         }
                         continue;
                     }
@@ -197,10 +258,10 @@ inline Diagnostics apply_local_rank_one(
                                                 std::fabs(correction));
                 }
             }
-            diagnostics.correction_l2 += correction_square;
-            diagnostics.correction_linf = std::max(
-                diagnostics.correction_linf, correction_linf);
-            if (correction_linf > 0.0) ++diagnostics.corrected_cell_count;
+            local.correction_l2 += correction_square;
+            local.correction_linf = std::max(
+                local.correction_linf, correction_linf);
+            if (correction_linf > 0.0) ++local.corrected_cell_count;
         }
 
         double dual = 0.0;
@@ -213,24 +274,27 @@ inline Diagnostics apply_local_rank_one(
             }
         dual *= current_factor;
         dual_current[static_cast<size_t>(ix)] = dual;
-        diagnostics.dual_current_linf = std::max(
-            diagnostics.dual_current_linf, std::fabs(target - dual));
+        local.dual_current_linf = std::max(
+            local.dual_current_linf, std::fabs(target - dual));
         if (!std::isfinite(dual)) {
-            diagnostics.valid = 0;
-            if (diagnostics.failure_subtype == FAILURE_NONE) {
-                diagnostics.failure_subtype = FAILURE_DUAL_CURRENT_NONFINITE;
-                diagnostics.failure_local_ix = ix;
-                diagnostics.failure_target = target;
-                diagnostics.failure_replay = replay;
-                diagnostics.failure_legacy = legacy;
-                diagnostics.failure_residual = residual;
-                diagnostics.failure_denominator = denominator;
-                diagnostics.failure_maximum_coefficient = maximum_coefficient;
-                diagnostics.failure_support_floor = support_floor;
-                diagnostics.failure_scale = scale;
+            local.valid = 0;
+            if (local.failure_subtype == FAILURE_NONE) {
+                local.failure_subtype = FAILURE_DUAL_CURRENT_NONFINITE;
+                local.failure_local_ix = ix;
+                local.failure_target = target;
+                local.failure_replay = replay;
+                local.failure_legacy = legacy;
+                local.failure_residual = residual;
+                local.failure_denominator = denominator;
+                local.failure_maximum_coefficient = maximum_coefficient;
+                local.failure_support_floor = support_floor;
+                local.failure_scale = scale;
             }
         }
     }
+    } // OpenMP parallel region
+    for (size_t thread = 0; thread < thread_diagnostics.size(); ++thread)
+        merge_diagnostics(diagnostics, thread_diagnostics[thread]);
     diagnostics.correction_l2 = std::sqrt(diagnostics.correction_l2);
     return diagnostics;
 }

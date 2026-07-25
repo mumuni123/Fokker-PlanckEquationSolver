@@ -469,8 +469,8 @@ PairMetrics evaluate_pair(const Species& background, const EMFields& fields,
         result.dual.outputs_finite && result.dual.dual_u_operator_valid &&
         result.legacy.jn_high.size() == face_count &&
         result.dual.jn_high.size() == face_count &&
-        result.legacy.gstar_je_center.size() == face_count &&
-        result.dual.gstar_je_center.size() == face_count &&
+        result.legacy.gstar_je_high.size() == face_count &&
+        result.dual.gstar_je_high.size() == face_count &&
         result.dual.dual_target_jn_cell.size() ==
             static_cast<size_t>(sg.nx_local) &&
         result.dual.dual_je_cell.size() ==
@@ -501,17 +501,17 @@ PairMetrics evaluate_pair(const Species& background, const EMFields& fields,
     result.projection_reconstruction_signed = 0.0;
     if (!result.valid) return result;
     result.legacy_pair = BackgroundCouplingTest::face_difference_norms(
-        result.legacy.jn_high, result.legacy.gstar_je_center, sg);
+        result.legacy.jn_high, result.legacy.gstar_je_high, sg);
     result.dual_pair = BackgroundCouplingTest::face_difference_norms(
-        result.dual.jn_high, result.dual.gstar_je_center, sg);
+        result.dual.jn_high, result.dual.gstar_je_high, sg);
     result.legacy_signed = signed_pair(result.legacy.jn_high,
-        result.legacy.gstar_je_center, sg);
+        result.legacy.gstar_je_high, sg);
     result.dual_signed = signed_pair(result.dual.jn_high,
-        result.dual.gstar_je_center, sg);
+        result.dual.gstar_je_high, sg);
     result.jn_difference = global_max_difference(result.legacy.jn_high,
                                                   result.dual.jn_high);
     result.je_difference = global_max_difference(
-        result.legacy.gstar_je_center, result.dual.gstar_je_center);
+        result.legacy.gstar_je_high, result.dual.gstar_je_high);
     result.dual_cell_target = local_vector_difference_norms(
         result.dual.dual_je_cell, result.dual.dual_target_jn_cell,
         sg.nx_local, sg);
@@ -536,9 +536,9 @@ PairMetrics evaluate_pair(const Species& background, const EMFields& fields,
         result.dual.jn_high, projected_target, sg);
     result.projection_reconstruction =
         BackgroundCouplingTest::face_difference_norms(
-            result.dual.gstar_je_center, projected_target, sg);
+            result.dual.gstar_je_high, projected_target, sg);
     result.projection_reconstruction_signed = signed_pair(
-        result.dual.gstar_je_center, projected_target, sg);
+        result.dual.gstar_je_high, projected_target, sg);
     double local_state_l1 = 0.0;
     if (result.legacy.final_state_mass.size() ==
         result.dual.final_state_mass.size())

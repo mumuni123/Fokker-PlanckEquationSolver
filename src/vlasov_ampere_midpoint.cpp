@@ -29,11 +29,16 @@ void fill_periodic_ghosts(Species& sp, const SpatialGrid& sg)
 VlasovAmpereMidpointSolver::VlasovAmpereMidpointSolver()
     : step_diagnostics_enabled_(false), beam_enabled_(true),
       low_order_only_(false), nonuniform_high_order_enabled_(false),
-      fct_enabled_(true), background_coupling_mode_(LEGACY_COUPLING),
+      fct_enabled_(true), background_coupling_mode_(DUAL_U_COUPLING),
       capture_midpoint_input_(false),
       legacy_boundary_upwind_high_candidate_for_test_(false),
       energy_consistent_x_high_velocity_for_test_(false),
-      max_midpoint_iterations_(20), midpoint_iteration_trace_for_test_(false),
+      max_midpoint_iterations_(20),
+      midpoint_acceleration_mode_(MIDPOINT_ACCELERATION_NONE),
+      anderson_depth_(3), acceleration_start_iter_(3),
+      acceleration_accept_ratio_(0.95), acceleration_max_coefficient_(2.0),
+      midpoint_iteration_trace_for_test_(false),
+      progress_trace_start_fs_(-1.0), progress_trace_end_fs_(-1.0),
       fct_activation_audit_enabled_(false),
       controlled_fct_flux_injection_enabled_(false),
       controlled_u_fct_flux_injection_enabled_(false),
@@ -49,6 +54,19 @@ void VlasovAmpereMidpointSolver::reset_current_diag(CurrentDiagnostics& diag) co
 void VlasovAmpereMidpointSolver::reset_result(Result& result) const
 {
     result = Result();
+    result.operator_evaluations = 0;
+    result.midpoint_acceleration_mode = MIDPOINT_ACCELERATION_NONE;
+    result.acceleration_attempts = 0;
+    result.acceleration_accepted = 0;
+    result.acceleration_fallback_evaluations = 0;
+    result.acceleration_rejected_residual = 0;
+    result.acceleration_rejected_nonfinite = 0;
+    result.acceleration_rejected_hard_failure = 0;
+    result.acceleration_rejected_coefficient = 0;
+    result.acceleration_history_resets = 0;
+    result.max_residual_E = 0.0;
+    result.max_residual_J_bkg = 0.0;
+    result.max_residual_f = 0.0;
     result.limiter_min_alpha = 1.0;
     result.x_limiter_min_alpha = 1.0;
     result.u_limiter_min_alpha = 1.0;
@@ -78,6 +96,7 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
     result.low_order_roundoff_zeroed_mass = 0.0;
     result.fct_roundoff_zeroed_count = 0;
     result.fct_roundoff_zeroed_mass = 0.0;
+    result.beam_continuity_valid = 1;
     result.stage5_r_couple_centered = 0.0;
     result.stage5_r_couple_upwind_stabilization = 0.0;
     result.stage5_r_couple_fct_stabilization = 0.0;

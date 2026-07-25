@@ -944,7 +944,8 @@ void Diagnostics::write_current_density(double time,
                                         const SpatialGrid& sg,
                                         int mpi_rank, int mpi_size,
                                         const std::vector<double>* bkg_energy_current_face,
-                                        const std::vector<double>* bkg_ampere_current_face)
+                                        const std::vector<double>* bkg_ampere_current_face,
+                                        bool bkg_energy_current_valid)
 {
     int nxl = sg.nx_local;
     const int local_face_count = nxl + ((mpi_rank == 0) ? 1 : 0);
@@ -998,6 +999,9 @@ void Diagnostics::write_current_density(double time,
               << snapshot_count << ".dat";
         std::ofstream out(fname.str().c_str());
         out << "# time[fs] = " << time / Const::femto << "\n";
+        out << "# J_bkg_energy_diagnostic_valid = "
+            << (bkg_energy_current_valid ? 1 : 0)
+            << " (0 means disabled diagnostic, not zero Ampere current)\n";
         out << "# x_face[um]  J_bkg_charge_face[A/m2]  "
             << "J_bkg_energy_diagnostic_face[A/m2]  "
             << "J_bkg_charge_minus_ampere[A/m2]  "

@@ -268,11 +268,13 @@ struct CylindricalVelocityGrid {
         }
         assert(upar_faces.front() == -umax && upar_faces.back() == umax);
         assert(uperp_faces.front() == 0.0 && uperp_faces.back() == umax);
+#ifndef NDEBUG
         const double symmetry_tolerance = 64.0 *
             std::numeric_limits<double>::epsilon() * umax;
         for (int j = 0; j <= Param::Nv; ++j)
             assert(std::fabs(upar_faces[j] + upar_faces[Param::Nv - j]) <=
                    symmetry_tolerance);
+#endif
         double ring_sum = 0.0;
         for (int k = 0; k < Param::Nmu; ++k) ring_sum += uperp_ring_areas[k];
         assert(std::fabs(ring_sum - Const::pi * umax * umax) /
