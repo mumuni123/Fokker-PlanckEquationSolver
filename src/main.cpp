@@ -17,6 +17,8 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <sstream>
+#include <string>
 #include <mpi.h>
 #include <omp.h>
 #include <vector>
@@ -621,6 +623,7 @@ int main(int argc, char** argv)
 
     VlasovAmpereMidpointSolver midpoint_solver;
     midpoint_solver.set_step_diagnostics_enabled(false);
+    midpoint_solver.set_accepted_energy_audit_enabled(false);
     midpoint_solver.set_low_order_only(false);
     midpoint_solver.set_nonuniform_high_order_enabled(true);
     midpoint_solver.set_fct_enabled(true);
@@ -628,7 +631,25 @@ int main(int argc, char** argv)
         runtime.background_coupling_mode == 1
         ? VlasovAmpereMidpointSolver::DUAL_U_COUPLING
         : VlasovAmpereMidpointSolver::LEGACY_COUPLING);
+    midpoint_solver.set_face_pairing_mode(
+        runtime.face_pairing_mode == 1
+        ? VlasovAmpereMidpointSolver::FACE_PAIRING_REGULARIZED
+        : VlasovAmpereMidpointSolver::FACE_PAIRING_CELL_BASELINE);
+    midpoint_solver.set_face_pairing_parameters(
+        runtime.face_pairing_sigma_cutoff, runtime.face_pairing_lambda,
+        runtime.face_pairing_eta, runtime.face_pairing_trust_fraction);
+    midpoint_solver.set_face_pairing_acceptance_parameters(
+        runtime.face_pairing_correction_trust_fraction,
+        runtime.face_pairing_energy_pair_tolerance,
+        runtime.face_pairing_energy_residual_fraction,
+        runtime.face_pairing_mass_relative_tolerance,
+        runtime.face_pairing_f_residual_growth_tolerance);
     midpoint_solver.set_max_midpoint_iterations(runtime.midpoint_max_iters);
+    midpoint_solver.set_midpoint_initial_guess_mode(
+        runtime.midpoint_initial_guess_mode ==
+                RUNTIME_MIDPOINT_INITIAL_GUESS_FIELD_LINEAR
+        ? VlasovAmpereMidpointSolver::MIDPOINT_INITIAL_GUESS_FIELD_LINEAR
+        : VlasovAmpereMidpointSolver::MIDPOINT_INITIAL_GUESS_NONE);
     midpoint_solver.set_midpoint_acceleration_mode(
         runtime.midpoint_acceleration_mode == RUNTIME_MIDPOINT_ACCELERATION_AITKEN
         ? VlasovAmpereMidpointSolver::MIDPOINT_ACCELERATION_AITKEN
@@ -650,22 +671,76 @@ int main(int argc, char** argv)
             runtime.midpoint_acceleration_mode == RUNTIME_MIDPOINT_ACCELERATION_AITKEN
             ? "aitken" : runtime.midpoint_acceleration_mode ==
                 RUNTIME_MIDPOINT_ACCELERATION_ANDERSON ? "anderson" : "none";
+        const char* const midpoint_initial_guess =
+            runtime.midpoint_initial_guess_mode ==
+                    RUNTIME_MIDPOINT_INITIAL_GUESS_FIELD_LINEAR
+            ? "field-linear" : "none";
         printf("Transport configuration: low_order_only=%s, "
                "nonuniform_high_order=%s, FCT=%s, background_coupling=%s, "
-               "midpoint_max_iters=%d, midpoint_acceleration=%s, "
+               "midpoint_max_iters=%d, midpoint_initial_guess=%s, "
+               "midpoint_acceleration=%s, "
                "anderson_depth=%d, acceleration_start_iter=%d, "
                "acceleration_accept_ratio=%.3f, acceleration_max_coefficient=%.3f, "
-               "beam_ledger_mode=%s\n",
+               "beam_ledger_mode=%s, face_pairing=%s, "
+               "face_sigma_cutoff=%.3e, face_lambda=%.3e, "
+               "face_eta=%.3e, face_capacity=%.3f, "
+               "face_correction_trust=%.3f, face_energy_pair_tol=%.3e, "
+               "face_energy_scale_fraction=%.3f, face_mass_tol=%.3e, "
+               "face_f_growth_tol=%.3f, accepted_energy_audit_cadence=%d, "
+               "accepted_energy_audit_window_fs=[%.6g,%.6g]\n",
                midpoint_solver.low_order_only() ? "ON" : "OFF",
                midpoint_solver.nonuniform_high_order_enabled() ? "ON" : "OFF",
                midpoint_solver.fct_enabled() ? "ON" : "OFF",
                midpoint_solver.background_coupling_mode() ==
                    VlasovAmpereMidpointSolver::DUAL_U_COUPLING
                    ? "dual_u" : "legacy",
-                midpoint_solver.max_midpoint_iterations(), midpoint_acceleration,
+                midpoint_solver.max_midpoint_iterations(),
+                midpoint_initial_guess, midpoint_acceleration,
                 runtime.anderson_depth, runtime.acceleration_start_iter,
                 runtime.acceleration_accept_ratio, runtime.acceleration_max_coefficient,
-                beam_ledger_mode);
+                beam_ledger_mode,
+                midpoint_solver.face_pairing_mode() ==
+                    VlasovAmpereMidpointSolver::FACE_PAIRING_REGULARIZED
+                    ? "regularized" : "cell-baseline",
+                runtime.face_pairing_sigma_cutoff,
+                runtime.face_pairing_lambda, runtime.face_pairing_eta,
+                runtime.face_pairing_trust_fraction,
+                runtime.face_pairing_correction_trust_fraction,
+                runtime.face_pairing_energy_pair_tolerance,
+                runtime.face_pairing_energy_residual_fraction,
+                runtime.face_pairing_mass_relative_tolerance,
+                runtime.face_pairing_f_residual_growth_tolerance,
+                runtime.accepted_energy_audit_cadence,
+                runtime.accepted_energy_audit_start_fs,
+                runtime.accepted_energy_audit_end_fs);
+        std::ofstream pairing_configuration(
+            output_path(runtime, "face_pairing_configuration.result").c_str());
+        pairing_configuration << std::scientific << std::setprecision(16)
+            << "mode "
+            << (midpoint_solver.face_pairing_mode() ==
+                    VlasovAmpereMidpointSolver::FACE_PAIRING_REGULARIZED
+                    ? "regularized" : "cell-baseline") << "\n"
+            << "sigma_cutoff " << runtime.face_pairing_sigma_cutoff << "\n"
+            << "lambda " << runtime.face_pairing_lambda << "\n"
+            << "eta " << runtime.face_pairing_eta << "\n"
+            << "capacity_fraction "
+            << runtime.face_pairing_trust_fraction << "\n"
+            << "correction_trust_fraction "
+            << runtime.face_pairing_correction_trust_fraction << "\n"
+            << "energy_pair_tolerance "
+            << runtime.face_pairing_energy_pair_tolerance << "\n"
+            << "energy_residual_fraction "
+            << runtime.face_pairing_energy_residual_fraction << "\n"
+            << "mass_relative_tolerance "
+            << runtime.face_pairing_mass_relative_tolerance << "\n"
+            << "f_residual_growth_tolerance "
+            << runtime.face_pairing_f_residual_growth_tolerance << "\n";
+        std::ofstream accepted_energy_audit_configuration(
+            output_path(runtime, "accepted_energy_audit_configuration.result").c_str());
+        accepted_energy_audit_configuration << std::scientific << std::setprecision(16)
+            << "cadence " << runtime.accepted_energy_audit_cadence << "\n"
+            << "window_start_fs " << runtime.accepted_energy_audit_start_fs << "\n"
+            << "window_end_fs " << runtime.accepted_energy_audit_end_fs << "\n";
     }
 
     if (runtime.operator_audit_mode) {
@@ -1001,7 +1076,8 @@ int main(int argc, char** argv)
     CollisionOperator collision;
     Diagnostics diag;
     diag.init(runtime.output_dir, mpi_rank, config.enable_debug_diagnostics,
-              config.enable_step_diagnostics || runtime.diagnostic_level >= 2);
+              config.enable_step_diagnostics || runtime.diagnostic_level >= 2,
+              runtime.accepted_energy_audit_cadence > 0);
 
     double dt = compute_dt(bkg_e, sgrid);
     MPI_Allreduce(MPI_IN_PLACE, &dt, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
@@ -1106,7 +1182,10 @@ int main(int argc, char** argv)
 
     int stdout_freq = 1000;
     double cumulative_bkg_energy_residual = 0.0;
+    double cumulative_total_energy_residual_for_audit = 0.0;
     std::ofstream accepted_coupling_region_monitor;
+    std::ofstream fct_macro_budget_monitor;
+    std::ofstream final_dual_u_pairing_monitor;
     std::ofstream midpoint_iteration_residual_monitor;
     std::ofstream beam_half_step_ledger;
     std::array<double, 6> beam_ledger_local_totals = {{0.0, 0.0, 0.0,
@@ -1150,6 +1229,52 @@ int main(int argc, char** argv)
         accepted_coupling_region_monitor << std::scientific
                                          << std::setprecision(10);
 
+        fct_macro_budget_monitor.open(
+            output_path(runtime, "fct_macro_budget_by_region.dat").c_str());
+        fct_macro_budget_monitor
+            << "# step time_fs accepted state_advanced soft_unconverged "
+            << "flux_direction x_region velocity_region face_count active_face_count min_alpha "
+            << "delta_N_fct delta_J_fct delta_K_fct E_dot_J_fct R_fct_E\n";
+        fct_macro_budget_monitor << std::scientific << std::setprecision(10);
+
+        final_dual_u_pairing_monitor.open(
+            output_path(runtime, "final_dual_u_pairing.dat").c_str());
+        final_dual_u_pairing_monitor
+             << "# step time_fs accepted state_advanced soft_unconverged "
+             << "valid target_linf residual_before_linf residual_after_linf "
+             << "residual_after_relative_target residual_reduction_fraction "
+             << "minimum_scale correction_l2 correction_linf candidate_min "
+            << "corrected_cell_count limited_cell_count unresolved_cell_count "
+            << "face_pairing_attempted face_pairing_accepted "
+            << "face_pairing_fallback face_solver_converged "
+            << "face_solver_iterations unresolved_mode_count "
+            << "face_residual_before face_residual_after "
+            << "face_core_residual_before face_core_residual_after "
+            << "unresolved_mode_l2 face_correction_l2 "
+            << "face_correction_linf capacity_active_cells "
+            << "trust_region_active_cells delta_ke delta_work "
+            << "face_candidate_min face_mass_error candidate_valid "
+            << "face_mass_relative_error face_cell_mass_error_linf "
+            << "face_cell_mass_relative_linf face_energy_pair_error "
+            << "face_energy_pair_relative face_energy_residual_scale "
+            << "face_energy_residual_ratio correction_trust_limit "
+            << "correction_trust_ratio face_f_residual_relative_growth "
+            << "candidate_face_residual_after "
+            << "candidate_core_face_residual_after candidate_delta_ke "
+            << "candidate_delta_work candidate_mass_error "
+            << "candidate_min_before_fallback requested_correction_l2 "
+            << "requested_correction_linf applied_correction_l2 "
+            << "applied_correction_linf nonzero_capacity_cells "
+            << "bound_saturated_cells objective_residual "
+            << "objective_smoothness objective_amplitude objective_total "
+            << "rejection_mask pass_solver pass_apply "
+            << "pass_global_residual pass_core_residual "
+            << "pass_correction_trust pass_energy_pair "
+            << "pass_energy_residual_scale pass_candidate_min pass_mass "
+            << "pass_f_residual\n";
+        final_dual_u_pairing_monitor
+            << std::scientific << std::setprecision(10);
+
         if (runtime.diagnostic_level >= 2) {
             midpoint_iteration_residual_monitor.open(
                 output_path(runtime, "midpoint_iteration_residuals.dat").c_str());
@@ -1189,6 +1314,7 @@ int main(int argc, char** argv)
     long long accepted_after_restart = 0;
     long long performance_total_nonlinear_iterations = 0;
     long long performance_total_operator_evaluations = 0;
+    long long performance_midpoint_predictor_used_steps = 0;
     long long performance_strict_accepted_steps = 0;
     long long performance_soft_accepted_steps = 0;
     long long performance_acceleration_attempts = 0;
@@ -1199,6 +1325,9 @@ int main(int argc, char** argv)
     long long performance_acceleration_rejected_hard_failure = 0;
     long long performance_acceleration_rejected_coefficient = 0;
     long long performance_acceleration_history_resets = 0;
+    long long performance_face_pairing_attempted_steps = 0;
+    long long performance_face_pairing_accepted_steps = 0;
+    long long performance_face_pairing_fallback_steps = 0;
     double performance_final_residual_e = 0.0;
     double performance_final_residual_j_bkg = 0.0;
     double performance_final_residual_f = 0.0;
@@ -1221,6 +1350,7 @@ int main(int argc, char** argv)
     size_t next_checkpoint = 0;
     while (next_checkpoint < runtime.checkpoint_times_fs.size() &&
            current_time / Const::femto >= runtime.checkpoint_times_fs[next_checkpoint]) ++next_checkpoint;
+    bool fixed_midpoint_face_pairing_started = false;
     for (int step = 1; step <= nsteps; ++step) {
         const long long physical_step = restored_step + step;
         double time = current_time + dt;
@@ -1243,6 +1373,16 @@ int main(int argc, char** argv)
         const bool collect_step_diagnostics = runtime.diagnostic_level >= 2 ||
             should_write_step_diagnostics(config, step) ||
             time >= next_snapshot || step == nsteps;
+        const double time_fs_for_audit = time / Const::femto;
+        const bool accepted_energy_audit_in_window =
+            runtime.accepted_energy_audit_start_fs < 0.0 ||
+            (time_fs_for_audit >= runtime.accepted_energy_audit_start_fs &&
+             time_fs_for_audit <= runtime.accepted_energy_audit_end_fs);
+        const bool collect_accepted_energy_audit =
+            accepted_energy_audit_in_window &&
+            (physical_step % runtime.accepted_energy_audit_cadence == 0);
+        const bool collect_energy_accounting =
+            collect_step_diagnostics || collect_accepted_energy_audit;
         double dke_bkg_step = 0.0;
         double dke_beam_push = 0.0;
         double dE_field_step = 0.0;
@@ -1280,7 +1420,7 @@ int main(int argc, char** argv)
         const Species bkg_step_start = bkg_e;
         const BeamPIC beam_step_start = beam;
         const EMFields fields_step_start = fields;
-        if (collect_step_diagnostics) {
+        if (collect_energy_accounting) {
             bkg_e.total_particle_number_and_energy(bkg_number_step_start,
                                                    bkg_ke_step_start);
             double global_bkg_start_values[2] = {
@@ -1309,6 +1449,10 @@ int main(int argc, char** argv)
             std::fflush(stdout);
         }
         midpoint_solver.set_step_diagnostics_enabled(collect_step_diagnostics);
+        midpoint_solver.set_accepted_energy_audit_enabled(
+            collect_accepted_energy_audit);
+        midpoint_solver.set_midpoint_iteration_trace(
+            runtime.diagnostic_level >= 2 || collect_accepted_energy_audit);
         VlasovAmpereMidpointSolver::Result midpoint_result =
             midpoint_solver.advance_background_and_fields(
                 bkg_step_start, beam_step_start, fields_step_start, sgrid,
@@ -1652,7 +1796,8 @@ int main(int argc, char** argv)
                 output_path(runtime, "fixed_midpoint_face_pairing.dat"),
                 physical_step, time, dt, midpoint_result, fields_step_start,
                 midpoint_result.operator_input_fields_end_guess, sgrid,
-                mpi_rank, mpi_size, true);
+                mpi_rank, mpi_size, fixed_midpoint_face_pairing_started);
+            fixed_midpoint_face_pairing_started = true;
         }
         if (runtime.diagnostic_level >= 2 && runtime.dump_final_midpoint) {
             VlasovAmpereMidpointSolver::MidpointAuditState audit_state;
@@ -1758,6 +1903,141 @@ int main(int argc, char** argv)
             }
             accepted_coupling_region_monitor.flush();
         }
+        if (mpi_rank == 0 && collect_step_diagnostics &&
+            midpoint_result.state_advanced != 0 && !midpoint_result.failed &&
+            midpoint_result.fct_macro_budget_valid != 0) {
+            static const char* const x_region_names[3] = {
+                "B_left", "core", "B_right"};
+            static const char* const velocity_region_names[2] = {
+                "velocity_core", "velocity_tail"};
+            const std::array<VlasovAmpereMidpointSolver::FctMacroBudget, 6>*
+                direction_budgets[2] = {
+                    &midpoint_result.fct_macro_budget_x,
+                    &midpoint_result.fct_macro_budget_u};
+            static const char* const direction_names[2] = {"x", "u"};
+            for (int direction = 0; direction < 2; ++direction) {
+                for (int x_region = 0; x_region < 3; ++x_region) {
+                    for (int velocity_region = 0; velocity_region < 2;
+                         ++velocity_region) {
+                        const size_t bin = static_cast<size_t>(2 * x_region +
+                                                               velocity_region);
+                        const VlasovAmpereMidpointSolver::FctMacroBudget& budget =
+                            (*direction_budgets[direction])[bin];
+                        fct_macro_budget_monitor
+                            << step << " " << time / Const::femto << " "
+                            << 1 << " " << midpoint_result.state_advanced << " "
+                            << midpoint_result.soft_unconverged << " "
+                            << direction_names[direction] << " "
+                            << x_region_names[x_region] << " "
+                            << velocity_region_names[velocity_region] << " "
+                            << budget.face_count << " "
+                            << budget.active_face_count << " "
+                            << budget.min_alpha << " " << budget.delta_n << " "
+                            << budget.delta_j << " " << budget.delta_k << " "
+                            << budget.e_dot_j << " " << budget.r_fct_e << "\n";
+                    }
+                }
+            }
+            fct_macro_budget_monitor.flush();
+        }
+        if (mpi_rank == 0 && collect_step_diagnostics &&
+            midpoint_result.state_advanced != 0 && !midpoint_result.failed &&
+            midpoint_result.background_coupling_mode ==
+                VlasovAmpereMidpointSolver::DUAL_U_COUPLING) {
+            const double dual_target_scale = std::max(
+                std::numeric_limits<double>::min(),
+                midpoint_result.final_dual_u_target_linf);
+            const double dual_before_scale = std::max(
+                std::numeric_limits<double>::min(),
+                midpoint_result.final_dual_u_residual_before_linf);
+            final_dual_u_pairing_monitor
+                << step << " " << time / Const::femto << " "
+                << 1 << " " << midpoint_result.state_advanced << " "
+                << midpoint_result.soft_unconverged << " "
+                << midpoint_result.final_dual_u_valid << " "
+                << midpoint_result.final_dual_u_target_linf << " "
+                << midpoint_result.final_dual_u_residual_before_linf << " "
+                << midpoint_result.final_dual_u_residual_after_linf << " "
+                << midpoint_result.final_dual_u_residual_after_linf /
+                    dual_target_scale << " "
+                << 1.0 -
+                    midpoint_result.final_dual_u_residual_after_linf /
+                    dual_before_scale << " "
+                << midpoint_result.final_dual_u_minimum_scale << " "
+                << midpoint_result.final_dual_u_correction_l2 << " "
+                << midpoint_result.final_dual_u_correction_linf << " "
+                << midpoint_result.final_dual_u_candidate_min << " "
+                << midpoint_result.final_dual_u_corrected_cell_count << " "
+                << midpoint_result.final_dual_u_limited_cell_count << " "
+                << midpoint_result.final_dual_u_unresolved_cell_count << " "
+                << midpoint_result.face_pairing_attempted << " "
+                << midpoint_result.face_pairing_accepted << " "
+                << midpoint_result.face_pairing_fallback_to_cell_baseline
+                << " " << midpoint_result.face_pairing_solver_converged
+                << " " << midpoint_result.face_pairing_iterations << " "
+                << midpoint_result.face_pairing_unresolved_mode_count << " "
+                << midpoint_result.face_pairing_residual_before << " "
+                << midpoint_result.face_pairing_residual_after << " "
+                << midpoint_result.face_pairing_core_residual_before << " "
+                << midpoint_result.face_pairing_core_residual_after << " "
+                << midpoint_result.face_pairing_unresolved_mode_l2 << " "
+                << midpoint_result.face_pairing_correction_l2 << " "
+                << midpoint_result.face_pairing_correction_linf << " "
+                << midpoint_result.face_pairing_capacity_active_cells << " "
+                << midpoint_result.face_pairing_trust_region_active_cells
+                << " " << midpoint_result.face_pairing_delta_ke << " "
+                << midpoint_result.face_pairing_delta_work << " "
+                << midpoint_result.face_pairing_candidate_min << " "
+                << midpoint_result.face_pairing_mass_error << " "
+                << midpoint_result.face_pairing_candidate_valid << " "
+                << midpoint_result.face_pairing_mass_relative_error << " "
+                << midpoint_result.face_pairing_cell_mass_error_linf << " "
+                << midpoint_result.face_pairing_cell_mass_relative_linf
+                << " " << midpoint_result.face_pairing_energy_pair_error
+                << " " << midpoint_result.face_pairing_energy_pair_relative
+                << " " << midpoint_result.face_pairing_energy_residual_scale
+                << " " << midpoint_result.face_pairing_energy_residual_ratio
+                << " " << midpoint_result.face_pairing_correction_trust_limit
+                << " " << midpoint_result.face_pairing_correction_trust_ratio
+                << " " << midpoint_result.face_pairing_f_residual_relative_growth
+                << " "
+                << midpoint_result.face_pairing_candidate_residual_after
+                << " "
+                << midpoint_result.face_pairing_candidate_core_residual_after
+                << " "
+                << midpoint_result.face_pairing_candidate_delta_ke << " "
+                << midpoint_result.face_pairing_candidate_delta_work << " "
+                << midpoint_result.face_pairing_candidate_mass_error << " "
+                << midpoint_result.face_pairing_candidate_min_before_fallback
+                << " "
+                << midpoint_result.face_pairing_requested_correction_l2
+                << " "
+                << midpoint_result.face_pairing_requested_correction_linf
+                << " "
+                << midpoint_result.face_pairing_applied_correction_l2 << " "
+                << midpoint_result.face_pairing_applied_correction_linf
+                << " "
+                << midpoint_result.face_pairing_nonzero_capacity_cells
+                << " "
+                << midpoint_result.face_pairing_bound_saturated_cells << " "
+                << midpoint_result.face_pairing_objective_residual << " "
+                << midpoint_result.face_pairing_objective_smoothness << " "
+                << midpoint_result.face_pairing_objective_amplitude << " "
+                << midpoint_result.face_pairing_objective_total << " "
+                << midpoint_result.face_pairing_rejection_mask << " "
+                << midpoint_result.face_pairing_pass_solver << " "
+                << midpoint_result.face_pairing_pass_apply << " "
+                << midpoint_result.face_pairing_pass_global_residual << " "
+                << midpoint_result.face_pairing_pass_core_residual << " "
+                << midpoint_result.face_pairing_pass_correction_trust << " "
+                << midpoint_result.face_pairing_pass_energy_pair << " "
+                << midpoint_result.face_pairing_pass_energy_residual_scale
+                << " "
+                << midpoint_result.face_pairing_pass_candidate_min << " "
+                << midpoint_result.face_pairing_pass_mass << " "
+                << midpoint_result.face_pairing_pass_f_residual << "\n";
+            final_dual_u_pairing_monitor.flush();
+        }
         latest_bkg_energy_current_face =
             midpoint_result.j_bkg_energy_debug_face;
         latest_bkg_energy_current_valid =
@@ -1797,7 +2077,7 @@ int main(int argc, char** argv)
         coupled_residual_J_bkg_step = midpoint_result.residual_J_bkg;
         coupled_residual_J_beam_step = midpoint_result.residual_J_beam;
 
-        if (collect_step_diagnostics) {
+        if (collect_energy_accounting) {
             // The midpoint solver already returns globally reduced current,
             // work, and kinetic-energy diagnostics.  Re-reducing these here
             // would multiply sums by the number of MPI ranks.
@@ -1924,7 +2204,7 @@ int main(int argc, char** argv)
             }
         }
 
-        if (collect_step_diagnostics) {
+        if (collect_energy_accounting) {
             const double bkg_ke_step_end = bkg_e.total_kinetic_energy();
             const double beam_ke_step_end = beam.total_kinetic_energy();
             const double field_energy_step_end = fields.total_energy();
@@ -1939,6 +2219,7 @@ int main(int argc, char** argv)
                 total_energy_delta - E_src_in_step + E_src_out_step
                 - collision_energy_step;
 
+            if (collect_step_diagnostics) {
             diag.write_step_diagnostics(step, time,
                                         midpoint_result.soft_unconverged,
                                         bkg_e, beam, fields,
@@ -2006,6 +2287,15 @@ int main(int argc, char** argv)
                                         f_u_max_x_step,
                                         integral_f_u_gt_8_x_step,
                                         midpoint_result.background_coupling_mode);
+            }
+            if (collect_accepted_energy_audit &&
+                midpoint_result.state_advanced != 0 && !midpoint_result.failed) {
+                cumulative_total_energy_residual_for_audit += E_balance_step;
+                diag.write_accepted_energy_ledger(
+                    physical_step, time, dt, midpoint_result,
+                    E_balance_step, cumulative_total_energy_residual_for_audit,
+                    mpi_rank);
+            }
         }
 
         current_time = time;
@@ -2014,6 +2304,14 @@ int main(int argc, char** argv)
             midpoint_result.nonlinear_iterations;
         performance_total_operator_evaluations +=
             midpoint_result.operator_evaluations;
+        performance_midpoint_predictor_used_steps +=
+            midpoint_result.midpoint_predictor_used;
+        performance_face_pairing_attempted_steps +=
+            midpoint_result.face_pairing_attempted;
+        performance_face_pairing_accepted_steps +=
+            midpoint_result.face_pairing_accepted;
+        performance_face_pairing_fallback_steps +=
+            midpoint_result.face_pairing_fallback_to_cell_baseline;
         performance_acceleration_attempts += midpoint_result.acceleration_attempts;
         performance_acceleration_accepted += midpoint_result.acceleration_accepted;
         performance_acceleration_fallback_evaluations +=
@@ -2067,10 +2365,14 @@ int main(int argc, char** argv)
         if (runtime.checkpoint_enabled && next_checkpoint < runtime.checkpoint_times_fs.size() &&
             current_time / Const::femto >= runtime.checkpoint_times_fs[next_checkpoint]) {
             flush_full_beam_ledger();
-            char checkpoint_name[128];
-            std::sprintf(checkpoint_name, "%s/checkpoints/t_%010.6ffs_step_%08lld",
-                         runtime.output_dir.c_str(), current_time / Const::femto,
-                         physical_step);
+            std::ostringstream checkpoint_name_stream;
+            checkpoint_name_stream << runtime.output_dir
+                << "/checkpoints/t_" << std::fixed << std::setprecision(6)
+                << std::setw(10) << std::setfill('0')
+                << current_time / Const::femto
+                << "fs_step_" << std::setw(8) << std::setfill('0')
+                << physical_step;
+            const std::string checkpoint_name = checkpoint_name_stream.str();
             CheckpointControlState control = { physical_step, current_time, dt, next_snapshot,
                                                 last_snapshot_step, cumulative_collision_energy_delta };
             if (!write_checkpoint(checkpoint_name, control, bkg_e, beam, fields, sgrid,
@@ -2082,7 +2384,9 @@ int main(int argc, char** argv)
                 flush_full_beam_ledger();
                 MPI_Abort(MPI_COMM_WORLD, 12); return 12;
             }
-            if (mpi_rank == 0) std::printf("Checkpoint written: %s\n", checkpoint_name);
+            if (mpi_rank == 0)
+                std::printf("Checkpoint written: %s\n",
+                            checkpoint_name.c_str());
             ++next_checkpoint;
         }
         if (step % stdout_freq == 0) {
@@ -2180,10 +2484,44 @@ int main(int argc, char** argv)
             << performance_total_nonlinear_iterations / accepted_scale << "\n"
             << "mean_operator_evaluations_per_step "
             << performance_total_operator_evaluations / accepted_scale << "\n"
+            << "midpoint_initial_guess_mode "
+            << (runtime.midpoint_initial_guess_mode ==
+                    RUNTIME_MIDPOINT_INITIAL_GUESS_FIELD_LINEAR
+                ? "field-linear" : "none") << "\n"
+            << "midpoint_predictor_used_steps "
+            << performance_midpoint_predictor_used_steps << "\n"
+            << "midpoint_predictor_use_fraction "
+            << performance_midpoint_predictor_used_steps / accepted_scale
+            << "\n"
             << "strict_accepted_steps "
             << performance_strict_accepted_steps << "\n"
             << "soft_accepted_steps "
             << performance_soft_accepted_steps << "\n"
+            << "face_pairing_mode "
+            << (runtime.face_pairing_mode == 1
+                ? "regularized" : "cell-baseline") << "\n"
+            << "face_pairing_sigma_cutoff "
+            << runtime.face_pairing_sigma_cutoff << "\n"
+            << "face_pairing_lambda " << runtime.face_pairing_lambda << "\n"
+            << "face_pairing_eta " << runtime.face_pairing_eta << "\n"
+            << "face_pairing_trust_fraction "
+            << runtime.face_pairing_trust_fraction << "\n"
+            << "face_pairing_correction_trust_fraction "
+            << runtime.face_pairing_correction_trust_fraction << "\n"
+            << "face_pairing_energy_pair_tolerance "
+            << runtime.face_pairing_energy_pair_tolerance << "\n"
+            << "face_pairing_energy_residual_fraction "
+            << runtime.face_pairing_energy_residual_fraction << "\n"
+            << "face_pairing_mass_relative_tolerance "
+            << runtime.face_pairing_mass_relative_tolerance << "\n"
+            << "face_pairing_f_residual_growth_tolerance "
+            << runtime.face_pairing_f_residual_growth_tolerance << "\n"
+            << "face_pairing_attempted_steps "
+            << performance_face_pairing_attempted_steps << "\n"
+            << "face_pairing_accepted_steps "
+            << performance_face_pairing_accepted_steps << "\n"
+            << "face_pairing_fallback_steps "
+            << performance_face_pairing_fallback_steps << "\n"
             << "wall_seconds_internal " << performance_wall_max << "\n"
             << "wall_seconds_per_accepted_step "
             << performance_wall_max / accepted_scale << "\n"

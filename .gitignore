@@ -1,11 +1,7 @@
 submit.pbs
+auto.sh
 results/
 output/
 build/
 docs/
-noCollision_full_fields/
-noCollision_fields/
-noCollision_Beam_denstiy/
-noCollision_Bkgelectron_denstiy/
-noCollision_full_Bkgelectron_denstiy/
-noCollision_current_Jx/
+EPOCH-Compare/

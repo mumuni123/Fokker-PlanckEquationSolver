@@ -82,8 +82,10 @@ bool valid_bundle(const Bundle& bundle, const SpatialGrid& sg)
         bundle.fx_low.size() == xsize && bundle.fx_high.size() == xsize &&
         bundle.fx_final.size() == xsize && bundle.fu_low.size() == usize &&
         bundle.fu_high.size() == usize && bundle.fu_final.size() == usize &&
+        bundle.fu_fct_limited.size() == usize &&
         bundle.cu_low.size() == usize && bundle.cu_high.size() == usize &&
         bundle.cu_final.size() == usize &&
+        bundle.cu_fct_limited.size() == usize &&
         bundle.donor_beta.size() == static_cast<size_t>(sg.nx_local) *
             Param::Nvmu &&
         bundle.donor_low_mass.size() == static_cast<size_t>(sg.nx_local) *
@@ -184,11 +186,15 @@ bool cell_has_limiter(const Bundle& bundle, int ix, int j, int k)
             std::fabs(bundle.fx_final[xfaces[f]] - bundle.fx_high[xfaces[f]]) >
                 tolerance * std::max(1.0, std::fabs(xdelta)))
             return true;
+        const std::vector<double>& limited_u_flux =
+            bundle.fu_fct_limited.size() == bundle.fu_final.size()
+            ? bundle.fu_fct_limited : bundle.fu_final;
         const double udelta = bundle.fu_high[ufaces[f]] - bundle.fu_low[ufaces[f]];
         if (std::fabs(udelta) > tolerance * std::max(1.0,
                 std::max(std::fabs(bundle.fu_high[ufaces[f]]),
                          std::fabs(bundle.fu_low[ufaces[f]]))) &&
-            std::fabs(bundle.fu_final[ufaces[f]] - bundle.fu_high[ufaces[f]]) >
+            std::fabs(limited_u_flux[ufaces[f]] -
+                      bundle.fu_high[ufaces[f]]) >
                 tolerance * std::max(1.0, std::fabs(udelta)))
             return true;
     }
@@ -544,9 +550,9 @@ AlphaAudit audit_u_alpha(const Bundle& bundle, const Species& background,
                     std::fabs(dc) <= 128.0 *
                         std::numeric_limits<double>::epsilon() * cscale)
                     continue;
-                const double alpha_f = (bundle.fu_final[id] -
+                const double alpha_f = (bundle.fu_fct_limited[id] -
                     bundle.fu_low[id]) / df;
-                const double alpha_c = (bundle.cu_final[id] -
+                const double alpha_c = (bundle.cu_fct_limited[id] -
                     bundle.cu_low[id]) / dc;
                 local.shared_alpha_linf = std::max(local.shared_alpha_linf,
                     std::fabs(alpha_f - alpha_c));

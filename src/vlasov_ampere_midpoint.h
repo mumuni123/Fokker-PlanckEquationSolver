@@ -4,6 +4,7 @@
 #include "beam_pic.h"
 #include "grid.h"
 #include "maxwell.h"
+#include "midpoint_field_predictor.h"
 #include "species.h"
 
 #include <array>
@@ -16,10 +17,18 @@ public:
         LEGACY_COUPLING = 0,
         DUAL_U_COUPLING = 1
     };
+    enum FacePairingMode {
+        FACE_PAIRING_CELL_BASELINE = 0,
+        FACE_PAIRING_REGULARIZED = 1
+    };
     enum MidpointAccelerationMode {
         MIDPOINT_ACCELERATION_NONE = 0,
         MIDPOINT_ACCELERATION_AITKEN = 1,
         MIDPOINT_ACCELERATION_ANDERSON = 2
+    };
+    enum MidpointInitialGuessMode {
+        MIDPOINT_INITIAL_GUESS_NONE = 0,
+        MIDPOINT_INITIAL_GUESS_FIELD_LINEAR = 1
     };
     // Dynamic part of the accepted regional closure partition.  A fixed
     // operator audit reuses this layout rather than inferring it from a
@@ -86,6 +95,19 @@ public:
         double max_abs_j_ampere;
         double max_abs_j_charge_minus_ampere;
         double max_abs_j_energy_minus_ampere;
+    };
+
+    // Accepted-state diagnostic only.  Values are derived from the final
+    // conservative FCT fluxes, never from a reconstructed limiter estimate.
+    struct FctMacroBudget {
+        long long face_count;
+        long long active_face_count;
+        double min_alpha;
+        double delta_n;
+        double delta_j;
+        double delta_k;
+        double e_dot_j;
+        double r_fct_e;
     };
 
     // 7.1.6: per-direction flux-positivity diagnostics
@@ -231,6 +253,51 @@ public:
         std::vector<double> fct_weighted_counts;
     };
 
+    // Energy accounting for one accepted physical step.  Every transport
+    // contribution is accumulated from the fluxes actually used by the
+    // candidate over all of its real substeps.  It is diagnostics-only and
+    // never participates in the midpoint, FCT, dual-u, or Ampere update.
+    struct AcceptedEnergyLedger {
+        int valid;
+        int strict_accepted;
+        int soft_accepted;
+        int transport_substeps;
+
+        double delta_ke_bkg_actual;
+        double work_ampere_bkg;
+
+        double delta_ke_after_low;
+        double delta_ke_after_high;
+        double delta_ke_after_final;
+
+        double delta_ke_fct_x;
+        double delta_ke_fct_u;
+        double delta_mass_fct_x;
+        double delta_mass_fct_u;
+        double delta_ppar_fct_x;
+        double delta_ppar_fct_u;
+
+        double upar_boundary_number_lower;
+        double upar_boundary_number_upper;
+        double upar_boundary_ppar_lower;
+        double upar_boundary_ppar_upper;
+        double upar_boundary_energy_lower;
+        double upar_boundary_energy_upper;
+
+        // The current production force operator acts only along u_parallel.
+        // Keep the u_perp boundary slots explicit so a nonzero future term is
+        // visible instead of silently disappearing from the energy account.
+        double uperp_boundary_number_upper;
+        double uperp_boundary_ppar_upper;
+        double uperp_boundary_energy_upper;
+
+        double residual_fv;
+        double residual_coupling;
+        double residual_unexplained;
+        double residual_reconstruction_error;
+        double flux_telescope_error;
+    };
+
     struct Result {
         Species species_np1;
         BeamPIC beam_np1;
@@ -264,11 +331,15 @@ public:
         std::vector<double> center_u_flux;
         std::vector<double> high_u_flux;
         std::vector<double> final_u_flux;
+        // Fixed audit only: final FCT layer before the section-13.3
+        // positivity-bounded dual pairing correction.
+        std::vector<double> fct_limited_u_flux;
         std::vector<double> low_u_coefficient;
         std::vector<double> high_u_coefficient;
         // Fixed-operator audit only: the exact C_u paired with final_u_flux.
         // Production runs do not retain this phase-space array.
         std::vector<double> final_u_coefficient;
+        std::vector<double> fct_limited_u_coefficient;
         // Stage-3 fixed-candidate limiter audit.  These cell arrays are
         // retained only for an explicit fixed operator evaluation so the
         // test harness can distinguish real donor exhaustion from an empty
@@ -300,6 +371,76 @@ public:
         double dual_u_correction_l2;
         double dual_u_correction_linf;
         long long dual_u_corrected_cell_count;
+        int final_dual_u_valid;
+        double final_dual_u_target_linf;
+        double final_dual_u_residual_before_linf;
+        double final_dual_u_residual_after_linf;
+        double final_dual_u_minimum_scale;
+        double final_dual_u_correction_l2;
+        double final_dual_u_correction_linf;
+        double final_dual_u_candidate_min;
+        long long final_dual_u_corrected_cell_count;
+        long long final_dual_u_limited_cell_count;
+        long long final_dual_u_unresolved_cell_count;
+        int face_pairing_attempted;
+        int face_pairing_accepted;
+        int face_pairing_fallback_to_cell_baseline;
+        int face_pairing_solver_converged;
+        int face_pairing_iterations;
+        int face_pairing_unresolved_mode_count;
+        double face_pairing_residual_before;
+        double face_pairing_residual_after;
+        double face_pairing_core_residual_before;
+        double face_pairing_core_residual_after;
+        double face_pairing_unresolved_mode_l2;
+        double face_pairing_correction_l2;
+        double face_pairing_correction_linf;
+        double face_pairing_delta_ke;
+        double face_pairing_delta_work;
+        double face_pairing_candidate_min;
+        double face_pairing_mass_error;
+        double face_pairing_mass_relative_error;
+        double face_pairing_cell_mass_error_linf;
+        double face_pairing_cell_mass_relative_linf;
+        double face_pairing_energy_pair_error;
+        double face_pairing_energy_pair_relative;
+        double face_pairing_energy_residual_scale;
+        double face_pairing_energy_residual_ratio;
+        double face_pairing_correction_trust_limit;
+        double face_pairing_correction_trust_ratio;
+        double face_pairing_f_residual_relative_growth;
+        long long face_pairing_capacity_active_cells;
+        long long face_pairing_trust_region_active_cells;
+        int face_pairing_candidate_valid;
+        double face_pairing_candidate_residual_after;
+        double face_pairing_candidate_core_residual_after;
+        double face_pairing_candidate_delta_ke;
+        double face_pairing_candidate_delta_work;
+        double face_pairing_candidate_mass_error;
+        double face_pairing_candidate_min_before_fallback;
+        double face_pairing_requested_correction_l2;
+        double face_pairing_requested_correction_linf;
+        double face_pairing_applied_correction_l2;
+        double face_pairing_applied_correction_linf;
+        long long face_pairing_nonzero_capacity_cells;
+        long long face_pairing_bound_saturated_cells;
+        double face_pairing_objective_residual;
+        double face_pairing_objective_smoothness;
+        double face_pairing_objective_amplitude;
+        double face_pairing_objective_total;
+        unsigned int face_pairing_rejection_mask;
+        int face_pairing_pass_solver;
+        int face_pairing_pass_apply;
+        int face_pairing_pass_global_residual;
+        int face_pairing_pass_core_residual;
+        int face_pairing_pass_correction_trust;
+        int face_pairing_pass_delta_ke;
+        int face_pairing_pass_delta_work;
+        int face_pairing_pass_candidate_min;
+        int face_pairing_pass_mass;
+        int face_pairing_pass_f_residual;
+        int face_pairing_pass_energy_pair;
+        int face_pairing_pass_energy_residual_scale;
         unsigned long long x_low_state_hash;
         unsigned long long u_low_state_hash;
         unsigned long long x_high_state_hash;
@@ -327,6 +468,7 @@ public:
         EMFields operator_input_fields_end_guess;
         AcceptedTransportSnapshot accepted_transport;
         CurrentDiagnostics current_diag;
+        AcceptedEnergyLedger accepted_energy_ledger;
         double delta_ke_bkg;
         double delta_ke_beam;
         double field_work_bkg;
@@ -509,6 +651,11 @@ public:
         double x_limiter_min_alpha;
         double u_limiter_active_fraction;
         double u_limiter_min_alpha;
+        int fct_macro_budget_valid;
+        // [B_left/core/B_right] x [velocity_core/velocity_tail], separated
+        // by the final x-transport and u-force FCT corrections.
+        std::array<FctMacroBudget, 6> fct_macro_budget_x;
+        std::array<FctMacroBudget, 6> fct_macro_budget_u;
         double limiter_active_fraction_core;
         double limiter_active_fraction_boundary;
         double limiter_min_alpha_core;
@@ -723,6 +870,9 @@ public:
         int f_neg_imu;
         int nonlinear_iterations;
         int operator_evaluations;
+        int midpoint_initial_guess_mode;
+        int midpoint_predictor_used;
+        int midpoint_predictor_history_depth;
         int midpoint_acceleration_mode;
         long long acceleration_attempts;
         long long acceleration_accepted;
@@ -774,9 +924,11 @@ public:
         std::vector<double> fu_center;
         std::vector<double> fu_high;
         std::vector<double> fu_final;
+        std::vector<double> fu_fct_limited;
         std::vector<double> cu_low;
         std::vector<double> cu_high;
         std::vector<double> cu_final;
+        std::vector<double> cu_fct_limited;
         std::vector<double> cu_center;
         std::vector<double> cu_legacy_center;
         std::vector<double> dual_target_jn_cell;
@@ -795,6 +947,17 @@ public:
         double dual_u_correction_l2;
         double dual_u_correction_linf;
         long long dual_u_corrected_cell_count;
+        int final_dual_u_valid;
+        double final_dual_u_target_linf;
+        double final_dual_u_residual_before_linf;
+        double final_dual_u_residual_after_linf;
+        double final_dual_u_minimum_scale;
+        double final_dual_u_correction_l2;
+        double final_dual_u_correction_linf;
+        double final_dual_u_candidate_min;
+        long long final_dual_u_corrected_cell_count;
+        long long final_dual_u_limited_cell_count;
+        long long final_dual_u_unresolved_cell_count;
         std::vector<double> jn_low;
         std::vector<double> jn_high;
         std::vector<double> jn_final;
@@ -896,6 +1059,12 @@ public:
     void set_step_diagnostics_enabled(bool enabled) {
         step_diagnostics_enabled_ = enabled;
     }
+    // Enables accepted-state transport/energy accumulation for one physical
+    // step.  The main program applies cadence and time-window policy; the
+    // solver only records the final accepted candidate.
+    void set_accepted_energy_audit_enabled(bool enabled) {
+        accepted_energy_audit_enabled_ = enabled;
+    }
 
     // Test harnesses can disable the open PIC source while retaining the
     // production background/Vlasov/Ampere implementation.  Normal runs keep
@@ -911,6 +1080,31 @@ public:
     void set_background_coupling_mode(BackgroundCouplingMode mode) {
         background_coupling_mode_ = mode;
     }
+    void set_face_pairing_mode(FacePairingMode mode) {
+        face_pairing_mode_ = mode;
+    }
+    void set_face_pairing_parameters(double sigma_cutoff, double lambda,
+                                     double eta, double trust_fraction) {
+        face_pairing_sigma_cutoff_ = sigma_cutoff;
+        face_pairing_lambda_ = lambda;
+        face_pairing_eta_ = eta;
+        face_pairing_trust_fraction_ = trust_fraction;
+    }
+    void set_face_pairing_acceptance_parameters(
+        double correction_trust_fraction, double energy_pair_tolerance,
+        double energy_residual_fraction, double mass_relative_tolerance,
+        double f_residual_growth_tolerance) {
+        face_pairing_correction_trust_fraction_ =
+            correction_trust_fraction;
+        face_pairing_energy_pair_tolerance_ = energy_pair_tolerance;
+        face_pairing_energy_residual_fraction_ =
+            energy_residual_fraction;
+        face_pairing_mass_relative_tolerance_ =
+            mass_relative_tolerance;
+        face_pairing_f_residual_growth_tolerance_ =
+            f_residual_growth_tolerance;
+    }
+    FacePairingMode face_pairing_mode() const { return face_pairing_mode_; }
     BackgroundCouplingMode background_coupling_mode() const {
         return background_coupling_mode_;
     }
@@ -919,6 +1113,11 @@ public:
     }
     void set_midpoint_acceleration_mode(MidpointAccelerationMode mode) {
         midpoint_acceleration_mode_ = mode;
+    }
+    void set_midpoint_initial_guess_mode(MidpointInitialGuessMode mode) {
+        midpoint_initial_guess_mode_ = mode;
+        midpoint_field_predictor_.set_enabled(
+            mode == MIDPOINT_INITIAL_GUESS_FIELD_LINEAR);
     }
     void set_anderson_depth(int depth) {
         anderson_depth_ = depth == 2 ? 2 : 3;
@@ -943,6 +1142,9 @@ public:
     int max_midpoint_iterations() const { return max_midpoint_iterations_; }
     MidpointAccelerationMode midpoint_acceleration_mode() const {
         return midpoint_acceleration_mode_;
+    }
+    MidpointInitialGuessMode midpoint_initial_guess_mode() const {
+        return midpoint_initial_guess_mode_;
     }
     // Test-only A/B control.  Production always uses the centered high-order
     // candidate at every x; enabling this restores the former boundary
@@ -1297,9 +1499,13 @@ private:
                                                  int substeps_used,
                                                  const Species* fixed_guess_np1 = 0,
                                                  const EMFields* fixed_fields_end = 0,
-                                                 const std::vector<double>* fixed_j_beam_face_mid = 0,
-                                                 const CouplingRegionLayout* fixed_coupling_layout = 0,
-                                                 bool fixed_candidate = false) const;
+                                                 const std::vector<double>*
+                                                     fixed_j_beam_face_mid = 0,
+                                                 const CouplingRegionLayout*
+                                                     fixed_coupling_layout = 0,
+                                                 bool fixed_candidate = false,
+                                                 const std::vector<double>*
+                                                     initial_e_end = 0) const;
     void set_midpoint_field(EMFields& fields_mid,
                             const EMFields& fields_n,
                             const std::vector<double>& ex_mid,
@@ -1315,16 +1521,29 @@ private:
                                       int mpi_rank, int mpi_size) const;
 
     bool step_diagnostics_enabled_;
+    bool accepted_energy_audit_enabled_;
     bool beam_enabled_;
     bool low_order_only_;
     bool nonuniform_high_order_enabled_;
     bool fct_enabled_;
     BackgroundCouplingMode background_coupling_mode_;
+    FacePairingMode face_pairing_mode_;
+    double face_pairing_sigma_cutoff_;
+    double face_pairing_lambda_;
+    double face_pairing_eta_;
+    double face_pairing_trust_fraction_;
+    double face_pairing_correction_trust_fraction_;
+    double face_pairing_energy_pair_tolerance_;
+    double face_pairing_energy_residual_fraction_;
+    double face_pairing_mass_relative_tolerance_;
+    double face_pairing_f_residual_growth_tolerance_;
     bool capture_midpoint_input_;
     bool legacy_boundary_upwind_high_candidate_for_test_;
     bool energy_consistent_x_high_velocity_for_test_;
     int max_midpoint_iterations_;
+    MidpointInitialGuessMode midpoint_initial_guess_mode_;
     MidpointAccelerationMode midpoint_acceleration_mode_;
+    MidpointFieldPredictor midpoint_field_predictor_;
     int anderson_depth_;
     int acceleration_start_iter_;
     double acceleration_accept_ratio_;
@@ -1340,6 +1559,11 @@ private:
     mutable std::vector<double> ghost_send_right_;
     mutable std::vector<double> ghost_recv_left_;
     mutable std::vector<double> ghost_recv_right_;
+    // Persistent storage for the production FV/FCT operator.  The entries
+    // are rebound and cleared at the start of each physical step, avoiding
+    // repeated allocation of the dominant phase-space scratch arrays without
+    // changing their values or lifetimes within an operator evaluation.
+    mutable std::array<std::vector<double>, 64> production_workspace_;
     // Per-step nonlinear-solver scratch.  These are endpoint-field arrays
     // only: the acceleration layer never stores or combines Species::f.
     mutable std::vector<double> acceleration_re_previous_;

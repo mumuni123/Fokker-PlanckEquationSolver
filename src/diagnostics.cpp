@@ -23,7 +23,15 @@ Diagnostics::Diagnostics()
       debug_enabled(false),
       step_enabled(false),
       has_energy_reference(false),
+      has_energy_history_reference(false),
+      has_last_energy_history_record(false),
+      last_energy_history_step(0),
+      last_energy_history_time(0.0),
       energy_reference(0.0),
+      initial_background_ke(0.0),
+      initial_field_energy(0.0),
+      initial_background_plus_field_energy(0.0),
+      initial_total_energy(0.0),
       initial_ke_per_particle_eV(0.0)
 {}
 
@@ -179,7 +187,8 @@ void gather_max_loss_u_high_location(double local_max_loss,
 
 void Diagnostics::init(const std::string& dir, int mpi_rank,
                        bool enable_debug_diagnostics,
-                       bool enable_step_diagnostics)
+                       bool enable_step_diagnostics,
+                       bool enable_accepted_energy_audit)
 {
     output_dir = dir;
     snapshot_count = 0;
@@ -209,6 +218,22 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                     << "J_beam_in_left_step  J_beam_out_step  "
                     << "max_abs_Ex[V/m]  x_at_max_abs_Ex[m]\n";
         scalar_file << std::scientific << std::setprecision(8);
+        energy_history_file.open(
+            (output_dir + "/background_electron_energy_history.dat").c_str());
+        energy_history_file
+            << "# Energies are per transverse area. Background electron "
+            << "quantities exclude Beam macroparticles.\n"
+            << "# Deltas are relative to the first state written in this "
+            << "output directory (initial state for a fresh run, restart "
+            << "state for a continuation).\n"
+            << "# step time_fs N_bkg_e_m-2 KE_bkg_e_J_m-2 "
+            << "mean_KE_bkg_e_J mean_KE_bkg_e_eV "
+            << "E_field_J_m-2 E_bkg_plus_field_J_m-2 "
+            << "KE_beam_J_m-2 E_total_including_beam_J_m-2 "
+            << "delta_KE_bkg_e_J_m-2 delta_E_field_J_m-2 "
+            << "delta_E_bkg_plus_field_J_m-2 "
+            << "delta_E_total_including_beam_J_m-2\n";
+        energy_history_file << std::scientific << std::setprecision(16);
 
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
         if (debug_enabled) {
@@ -290,8 +315,119 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
             step_file << std::scientific << std::setprecision(8);
 
         }
+        if (enable_accepted_energy_audit) {
+            accepted_energy_ledger_file.open(
+                (output_dir + "/accepted_energy_ledger.dat").c_str());
+            accepted_energy_ledger_file
+                << "# physical_step time_fs dt_s strict soft iterations substeps "
+                << "dKE_bkg_actual_J_m2 W_bkg_ampere_J_m2 "
+                << "dKE_low_J_m2 dKE_high_J_m2 dKE_final_J_m2 "
+                << "dKE_fct_x_J_m2 dKE_fct_u_J_m2 "
+                << "dM_fct_x_m2 dM_fct_u_m2 "
+                << "dPpar_fct_x_kg_m_s_m2 dPpar_fct_u_kg_m_s_m2 "
+                << "B_upar_energy_lower_J_m2 B_upar_energy_upper_J_m2 "
+                << "B_uperp_energy_upper_J_m2 "
+                << "R_FV_J_m2 R_couple_J_m2 R_unexplained_J_m2 "
+                << "R_reconstruction_error_J_m2 flux_telescope_error_J_m2 "
+                << "R_total_step_J_m2 R_total_cumulative_J_m2\n";
+            velocity_boundary_flux_ledger_file.open(
+                (output_dir + "/velocity_boundary_flux_ledger.dat").c_str());
+            velocity_boundary_flux_ledger_file
+                << "# physical_step time_fs dt_s strict soft substeps "
+                << "upar_number_lower_m2 upar_number_upper_m2 "
+                << "upar_ppar_lower_kg_m_s_m2 upar_ppar_upper_kg_m_s_m2 "
+                << "upar_energy_lower_J_m2 upar_energy_upper_J_m2 "
+                << "uperp_number_upper_m2 uperp_ppar_upper_kg_m_s_m2 "
+                << "uperp_energy_upper_J_m2\n";
+            midpoint_acceptance_ledger_file.open(
+                (output_dir + "/midpoint_acceptance_ledger.dat").c_str());
+            midpoint_acceptance_ledger_file
+                << "# physical_step time_fs iterations strict soft "
+                << "residual_E residual_J_bkg residual_f "
+                << "last_contraction_E last_contraction_J "
+                << "x_fct_active u_fct_active x_min_alpha u_min_alpha\n";
+            accepted_energy_ledger_file << std::scientific << std::setprecision(16);
+            velocity_boundary_flux_ledger_file << std::scientific << std::setprecision(16);
+            midpoint_acceptance_ledger_file << std::scientific << std::setprecision(16);
+        }
     }
     MPI_Barrier(MPI_COMM_WORLD);
+}
+
+void Diagnostics::write_accepted_energy_ledger(
+    long long physical_step, double time, double dt,
+    const VlasovAmpereMidpointSolver::Result& midpoint_result,
+    double total_energy_residual_step,
+    double total_energy_residual_cumulative,
+    int mpi_rank)
+{
+    if (mpi_rank != 0 || !midpoint_result.accepted_energy_ledger.valid) return;
+    const VlasovAmpereMidpointSolver::AcceptedEnergyLedger& ledger =
+        midpoint_result.accepted_energy_ledger;
+    const auto contraction = [](const std::vector<double>& values) {
+        if (values.size() < 2) return 1.0;
+        const double previous = values[values.size() - 2];
+        const double current = values.back();
+        if (previous == 0.0) return current == 0.0 ? 1.0 :
+            std::numeric_limits<double>::infinity();
+        return current / previous;
+    };
+
+    if (accepted_energy_ledger_file.is_open()) {
+        accepted_energy_ledger_file
+            << physical_step << " " << time / Const::femto << " " << dt << " "
+            << ledger.strict_accepted << " " << ledger.soft_accepted << " "
+            << midpoint_result.nonlinear_iterations << " "
+            << ledger.transport_substeps << " "
+            << ledger.delta_ke_bkg_actual << " " << ledger.work_ampere_bkg << " "
+            << ledger.delta_ke_after_low << " " << ledger.delta_ke_after_high << " "
+            << ledger.delta_ke_after_final << " "
+            << ledger.delta_ke_fct_x << " " << ledger.delta_ke_fct_u << " "
+            << ledger.delta_mass_fct_x << " " << ledger.delta_mass_fct_u << " "
+            << ledger.delta_ppar_fct_x << " " << ledger.delta_ppar_fct_u << " "
+            << ledger.upar_boundary_energy_lower << " "
+            << ledger.upar_boundary_energy_upper << " "
+            << ledger.uperp_boundary_energy_upper << " "
+            << ledger.residual_fv << " " << ledger.residual_coupling << " "
+            << ledger.residual_unexplained << " "
+            << ledger.residual_reconstruction_error << " "
+            << ledger.flux_telescope_error << " "
+            << total_energy_residual_step << " "
+            << total_energy_residual_cumulative << "\n";
+        accepted_energy_ledger_file.flush();
+    }
+    if (velocity_boundary_flux_ledger_file.is_open()) {
+        velocity_boundary_flux_ledger_file
+            << physical_step << " " << time / Const::femto << " " << dt << " "
+            << ledger.strict_accepted << " " << ledger.soft_accepted << " "
+            << ledger.transport_substeps << " "
+            << ledger.upar_boundary_number_lower << " "
+            << ledger.upar_boundary_number_upper << " "
+            << ledger.upar_boundary_ppar_lower << " "
+            << ledger.upar_boundary_ppar_upper << " "
+            << ledger.upar_boundary_energy_lower << " "
+            << ledger.upar_boundary_energy_upper << " "
+            << ledger.uperp_boundary_number_upper << " "
+            << ledger.uperp_boundary_ppar_upper << " "
+            << ledger.uperp_boundary_energy_upper << "\n";
+        velocity_boundary_flux_ledger_file.flush();
+    }
+    if (midpoint_acceptance_ledger_file.is_open()) {
+        midpoint_acceptance_ledger_file
+            << physical_step << " " << time / Const::femto << " "
+            << midpoint_result.nonlinear_iterations << " "
+            << ledger.strict_accepted << " " << ledger.soft_accepted << " "
+            << midpoint_result.residual_E << " "
+            << midpoint_result.residual_J_bkg << " "
+            << midpoint_result.residual_f << " "
+            << contraction(midpoint_result.midpoint_residual_e_history) << " "
+            << contraction(midpoint_result.midpoint_residual_j_bkg_history) << " "
+            << midpoint_result.x_limiter_active_fraction << " "
+            << midpoint_result.u_limiter_active_fraction << " "
+            << midpoint_result.x_limiter_min_alpha << " "
+            << midpoint_result.u_limiter_min_alpha << "\n";
+        midpoint_acceptance_ledger_file.flush();
+    }
 }
 
 void Diagnostics::write_scalars(double time, int step,
@@ -376,6 +512,11 @@ void Diagnostics::write_scalars(double time, int step,
     if (mpi_rank == 0) {
         const double total_energy =
             global_values[1] + global_values[3] + global_values[4];
+        const double background_plus_field_energy =
+            global_values[1] + global_values[4];
+        const double mean_background_ke =
+            global_values[0] > 0.0
+            ? global_values[1] / global_values[0] : 0.0;
         const double accounted_energy =
             total_energy - global_values[5] + global_values[6]
             - global_values[7];
@@ -387,6 +528,14 @@ void Diagnostics::write_scalars(double time, int step,
         if (step == 0 && global_values[0] > 0.0) {
             initial_ke_per_particle_eV =
                 global_values[1] / global_values[0] / Const::eV;
+        }
+        if (!has_energy_history_reference) {
+            initial_background_ke = global_values[1];
+            initial_field_energy = global_values[4];
+            initial_background_plus_field_energy =
+                background_plus_field_energy;
+            initial_total_energy = total_energy;
+            has_energy_history_reference = true;
         }
 
         scalar_file << step << "  "
@@ -420,6 +569,31 @@ void Diagnostics::write_scalars(double time, int step,
                     << global_max_abs_Ex << "  "
                     << global_x_at_max_abs_Ex << "\n";
         scalar_file.flush();
+
+        if (!has_last_energy_history_record ||
+            step != last_energy_history_step ||
+            time != last_energy_history_time) {
+            energy_history_file
+                << step << " "
+                << time / Const::femto << " "
+                << global_values[0] << " "
+                << global_values[1] << " "
+                << mean_background_ke << " "
+                << mean_background_ke / Const::eV << " "
+                << global_values[4] << " "
+                << background_plus_field_energy << " "
+                << global_values[3] << " "
+                << total_energy << " "
+                << global_values[1] - initial_background_ke << " "
+                << global_values[4] - initial_field_energy << " "
+                << background_plus_field_energy -
+                       initial_background_plus_field_energy << " "
+                << total_energy - initial_total_energy << "\n";
+            energy_history_file.flush();
+            has_last_energy_history_record = true;
+            last_energy_history_step = step;
+            last_energy_history_time = time;
+        }
     }
     (void)mpi_size;
 }
@@ -1028,6 +1202,219 @@ void Diagnostics::write_px_distribution(double time,
 {
     int ng = sp.sgrid->nghost;
     int nxl = sp.sgrid->nx_local;
+    (void)mpi_size;
+
+    if (sp.cylindrical_mass_representation) {
+        const int energy_bin_count = 256;
+        std::vector<double> energy_edges(
+            static_cast<size_t>(energy_bin_count + 1), 0.0);
+        double minimum_positive_energy_eV =
+            std::numeric_limits<double>::infinity();
+        double maximum_energy_eV = 0.0;
+        for (size_t velocity = 0;
+             velocity < sp.cgrid.kinetic_energy.size(); ++velocity) {
+            const double energy_eV =
+                sp.cgrid.kinetic_energy[velocity] / Const::eV;
+            if (energy_eV > 0.0)
+                minimum_positive_energy_eV =
+                    std::min(minimum_positive_energy_eV, energy_eV);
+            maximum_energy_eV = std::max(maximum_energy_eV, energy_eV);
+        }
+        if (!std::isfinite(minimum_positive_energy_eV) ||
+            !(maximum_energy_eV > 0.0)) {
+            minimum_positive_energy_eV = 1.0e-12;
+            maximum_energy_eV = 1.0;
+        }
+        const double logarithmic_minimum =
+            std::max(0.5 * minimum_positive_energy_eV,
+                     std::numeric_limits<double>::min());
+        const double logarithmic_maximum =
+            maximum_energy_eV *
+            (1.0 + 64.0 * std::numeric_limits<double>::epsilon());
+        energy_edges[0] = 0.0;
+        for (int edge = 1; edge <= energy_bin_count; ++edge) {
+            const double fraction =
+                static_cast<double>(edge - 1) /
+                static_cast<double>(energy_bin_count - 1);
+            energy_edges[static_cast<size_t>(edge)] =
+                logarithmic_minimum *
+                std::pow(logarithmic_maximum / logarithmic_minimum,
+                         fraction);
+        }
+        std::vector<int> energy_bin_by_velocity(Param::Nvmu, 0);
+        for (int j = 0; j < Param::Nv; ++j) {
+            for (int k = 0; k < Param::Nmu; ++k) {
+                const size_t velocity = idx2(j, k);
+                const double energy_eV =
+                    sp.cgrid.kinetic_energy[velocity] / Const::eV;
+                const std::vector<double>::const_iterator upper =
+                    std::upper_bound(energy_edges.begin(),
+                                     energy_edges.end(), energy_eV);
+                int bin = static_cast<int>(
+                    upper - energy_edges.begin()) - 1;
+                energy_bin_by_velocity[velocity] = std::max(
+                    0, std::min(energy_bin_count - 1, bin));
+            }
+        }
+
+        std::vector<double> local_parallel(
+            static_cast<size_t>(Param::Nv), 0.0);
+        std::vector<double> local_perpendicular(
+            static_cast<size_t>(Param::Nmu), 0.0);
+        std::vector<double> local_energy(
+            static_cast<size_t>(energy_bin_count), 0.0);
+        std::vector<double> local_energy_sum(
+            static_cast<size_t>(energy_bin_count), 0.0);
+        for (int ix = 0; ix < nxl; ++ix) {
+            const int ix_g = ix + ng;
+            for (int j = 0; j < Param::Nv; ++j) {
+                for (int k = 0; k < Param::Nmu; ++k) {
+                    const double particle_number =
+                        sp.f[idx3(ix_g, j, k)];
+                    local_parallel[static_cast<size_t>(j)] +=
+                        particle_number;
+                    local_perpendicular[static_cast<size_t>(k)] +=
+                        particle_number;
+                    const int bin =
+                        energy_bin_by_velocity[idx2(j, k)];
+                    local_energy[static_cast<size_t>(bin)] +=
+                        particle_number;
+                    local_energy_sum[static_cast<size_t>(bin)] +=
+                        particle_number *
+                        sp.cgrid.kinetic_energy[idx2(j, k)];
+                }
+            }
+        }
+
+        std::vector<double> global_parallel(
+            static_cast<size_t>(Param::Nv), 0.0);
+        std::vector<double> global_perpendicular(
+            static_cast<size_t>(Param::Nmu), 0.0);
+        std::vector<double> global_energy(
+            static_cast<size_t>(energy_bin_count), 0.0);
+        std::vector<double> global_energy_sum(
+            static_cast<size_t>(energy_bin_count), 0.0);
+        MPI_Reduce(local_parallel.data(), global_parallel.data(), Param::Nv,
+                   MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(local_perpendicular.data(), global_perpendicular.data(),
+                   Param::Nmu, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(local_energy.data(), global_energy.data(),
+                   energy_bin_count, MPI_DOUBLE, MPI_SUM, 0,
+                   MPI_COMM_WORLD);
+        MPI_Reduce(local_energy_sum.data(), global_energy_sum.data(),
+                   energy_bin_count, MPI_DOUBLE, MPI_SUM, 0,
+                   MPI_COMM_WORLD);
+
+        if (mpi_rank == 0) {
+            double spectrum_number = 0.0;
+            double spectrum_energy = 0.0;
+            for (int bin = 0; bin < energy_bin_count; ++bin) {
+                spectrum_number += global_energy[static_cast<size_t>(bin)];
+                spectrum_energy +=
+                    global_energy_sum[static_cast<size_t>(bin)];
+            }
+
+            std::ostringstream energy_name;
+            energy_name << output_dir << "/energy_spectrum_" << sp.name
+                        << "_" << std::setw(5) << std::setfill('0')
+                        << snapshot_count << ".dat";
+            std::ofstream energy_out(energy_name.str().c_str());
+            energy_out << std::scientific << std::setprecision(16);
+            energy_out << "# time_fs " << time / Const::femto << "\n"
+                       << "# Background-electron kinetic-energy spectrum; "
+                       << "N_bin integrates to N_bkg_e per transverse area.\n"
+                       << "# integrated_N_m-2 " << spectrum_number << "\n"
+                       << "# integrated_exact_kinetic_energy_J_m-2 "
+                       << spectrum_energy << "\n"
+                       << "# E_left_eV E_geometric_center_eV "
+                       << "E_mean_in_bin_eV E_right_eV "
+                       << "N_bin_m-2 dN_dE_m-2_eV-1 fraction\n";
+            for (int bin = 0; bin < energy_bin_count; ++bin) {
+                const double left =
+                    energy_edges[static_cast<size_t>(bin)];
+                const double right =
+                    energy_edges[static_cast<size_t>(bin + 1)];
+                const double center = left > 0.0
+                    ? std::sqrt(left * right) : 0.5 * right;
+                const double width = right - left;
+                const double count =
+                    global_energy[static_cast<size_t>(bin)];
+                const double mean_energy_eV = count > 0.0
+                    ? global_energy_sum[static_cast<size_t>(bin)] /
+                      count / Const::eV : center;
+                energy_out << left << " " << center << " "
+                           << mean_energy_eV << " " << right << " "
+                           << count << " "
+                           << (width > 0.0 ? count / width : 0.0) << " "
+                           << (spectrum_number > 0.0
+                               ? count / spectrum_number : 0.0) << "\n";
+            }
+
+            std::ostringstream parallel_name;
+            parallel_name << output_dir << "/momentum_parallel_" << sp.name
+                          << "_" << std::setw(5) << std::setfill('0')
+                          << snapshot_count << ".dat";
+            std::ofstream parallel_out(parallel_name.str().c_str());
+            parallel_out
+                << "# time_fs " << time / Const::femto << "\n"
+                << "# u_parallel=p_parallel/(m_e*c); N_bin integrates "
+                << "to N_bkg_e per transverse area.\n"
+                << "# u_left u_center u_right p_center_kg_m_s-1 "
+                << "N_bin_m-2 dN_du_m-2 "
+                << "dN_dp_m-2_per_kg_m_s\n";
+            parallel_out << std::scientific << std::setprecision(16);
+            for (int j = 0; j < Param::Nv; ++j) {
+                const double left = sp.cgrid.upar_faces[j];
+                const double right = sp.cgrid.upar_faces[j + 1];
+                const double width = right - left;
+                const double count =
+                    global_parallel[static_cast<size_t>(j)];
+                parallel_out
+                    << left << " " << sp.cgrid.upar_cells[j] << " "
+                    << right << " "
+                    << sp.mass * Const::c * sp.cgrid.upar_cells[j] << " "
+                    << count << " "
+                    << (width > 0.0 ? count / width : 0.0) << " "
+                    << (width > 0.0
+                        ? count / (sp.mass * Const::c * width) : 0.0)
+                    << "\n";
+            }
+
+            std::ostringstream perpendicular_name;
+            perpendicular_name
+                << output_dir << "/momentum_perpendicular_" << sp.name
+                << "_" << std::setw(5) << std::setfill('0')
+                << snapshot_count << ".dat";
+            std::ofstream perpendicular_out(
+                perpendicular_name.str().c_str());
+            perpendicular_out
+                << "# time_fs " << time / Const::femto << "\n"
+                << "# u_perp=p_perp/(m_e*c); cylindrical ring measure is "
+                << "already integrated into N_bin.\n"
+                << "# u_left u_center u_right p_center_kg_m_s-1 "
+                << "N_bin_m-2 dN_du_m-2 "
+                << "dN_dp_m-2_per_kg_m_s\n";
+            perpendicular_out << std::scientific
+                              << std::setprecision(16);
+            for (int k = 0; k < Param::Nmu; ++k) {
+                const double left = sp.cgrid.uperp_faces[k];
+                const double right = sp.cgrid.uperp_faces[k + 1];
+                const double width = right - left;
+                const double count =
+                    global_perpendicular[static_cast<size_t>(k)];
+                perpendicular_out
+                    << left << " " << sp.cgrid.uperp_cells[k] << " "
+                    << right << " "
+                    << sp.mass * Const::c * sp.cgrid.uperp_cells[k] << " "
+                    << count << " "
+                    << (width > 0.0 ? count / width : 0.0) << " "
+                    << (width > 0.0
+                        ? count / (sp.mass * Const::c * width) : 0.0)
+                    << "\n";
+            }
+        }
+        return;
+    }
 
     std::vector<double> local_Fu(Param::Nv, 0.0);
     for (int ix = 0; ix < nxl; ++ix) {

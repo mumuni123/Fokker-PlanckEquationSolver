@@ -232,6 +232,89 @@ def files_for_prefix(output_dir: Path, prefix: str) -> list[Path]:
     return files
 
 
+def resolve_input_files(
+    files_config: object,
+    config_name: str,
+) -> list[Path]:
+    """Resolve one path, a path list, or non-recursive glob patterns.
+
+    Examples accepted by all spatial-profile scripts::
+
+        DATA_DIR / "density_00010.dat"
+        [DATA_DIR / "density_00010.dat", DATA_DIR / "density_00020.dat"]
+        DATA_DIR / "density_*.dat"
+    """
+    if isinstance(files_config, (str, Path)):
+        entries = [files_config]
+    else:
+        try:
+            entries = list(files_config)
+        except TypeError as error:
+            raise TypeError(
+                f"{config_name} must be a path, glob pattern, or iterable of paths"
+            ) from error
+
+    if not entries:
+        raise ValueError(f"{config_name} is empty")
+
+    resolved: list[Path] = []
+    for entry in entries:
+        path = Path(entry)
+        if any(character in path.name for character in "*?["):
+            matches = sorted(path.parent.glob(path.name))
+            if not matches:
+                raise FileNotFoundError(
+                    f"{config_name} pattern {str(path)!r} matched no files"
+                )
+            resolved.extend(match for match in matches if match.is_file())
+        else:
+            if not path.is_file():
+                raise FileNotFoundError(f"{config_name} file does not exist: {path}")
+            resolved.append(path)
+
+    unique = sorted(dict.fromkeys(resolved), key=lambda item: item.name)
+    if not unique:
+        raise FileNotFoundError(f"{config_name} did not resolve to any files")
+    return unique
+
+
+def read_snapshot_table(
+    path: Path,
+) -> tuple[float | None, list[str], np.ndarray]:
+    """Read a profile table with an optional ``# time[fs] = ...`` line."""
+    comment_lines: list[str] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                comment_lines.append(stripped)
+            elif stripped:
+                break
+
+    data = np.loadtxt(path, comments="#")
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+
+    labels: list[str] | None = None
+    for line in reversed(comment_lines):
+        candidate = parse_header_labels(line)
+        if len(candidate) == data.shape[1]:
+            labels = candidate
+            break
+    if labels is None:
+        raise ValueError(
+            f"{path} has {data.shape[1]} data columns but no matching header line"
+        )
+
+    time_fs: float | None = None
+    for line in comment_lines:
+        match = re.search(r"time\[fs\]\s*=\s*([0-9.+\-eE]+)", line)
+        if match:
+            time_fs = float(match.group(1))
+            break
+    return time_fs, labels, data
+
+
 def parse_first_float_expression(source: str, name: str) -> float | None:
     pattern = re.compile(
         rf"const\s+double\s+{re.escape(name)}\s*=\s*([0-9.+\-eE]+)\s*\*\s*Const::(\w+)"

@@ -11,6 +11,9 @@
 #include <mpi.h>
 #include <sstream>
 #include <sys/stat.h>
+#if defined(_WIN32)
+#include <direct.h>
+#endif
 
 namespace {
 RuntimeOptions defaults()
@@ -24,6 +27,10 @@ RuntimeOptions defaults()
     o.midpoint_trace_end_fs = -1.0;
     o.midpoint_max_iters = 40;
     o.diagnostic_level = 1;
+    o.accepted_energy_audit_cadence = 500;
+    o.accepted_energy_audit_start_fs = -1.0;
+    o.accepted_energy_audit_end_fs = -1.0;
+    o.midpoint_initial_guess_mode = RUNTIME_MIDPOINT_INITIAL_GUESS_NONE;
     o.midpoint_acceleration_mode = RUNTIME_MIDPOINT_ACCELERATION_NONE;
     o.anderson_depth = 3;
     o.acceleration_start_iter = 3;
@@ -31,6 +38,16 @@ RuntimeOptions defaults()
     o.acceleration_max_coefficient = 2.0;
     o.beam_ledger_mode = BEAM_LEDGER_SUMMARY;
     o.background_coupling_mode = 1;
+    o.face_pairing_mode = 0;
+    o.face_pairing_sigma_cutoff = 1.0e-8;
+    o.face_pairing_lambda = 1.0e-3;
+    o.face_pairing_eta = 1.0e-8;
+    o.face_pairing_trust_fraction = 0.1;
+    o.face_pairing_correction_trust_fraction = 1.0;
+    o.face_pairing_energy_pair_tolerance = 1.0e-8;
+    o.face_pairing_energy_residual_fraction = 1.0;
+    o.face_pairing_mass_relative_tolerance = 1.0e-10;
+    o.face_pairing_f_residual_growth_tolerance = 0.1;
     o.dump_final_midpoint = false;
     o.overwrite_output = false;
     o.checkpoint_enabled = false;
@@ -128,6 +145,19 @@ RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,
                 ++i;
             } else if (arg == "--midpoint-max-iters" && has_value) {
                 options.midpoint_max_iters = std::atoi(value); ++i;
+            } else if (arg == "--midpoint-initial-guess" && has_value) {
+                const std::string mode(value);
+                if (mode == "none") {
+                    options.midpoint_initial_guess_mode =
+                        RUNTIME_MIDPOINT_INITIAL_GUESS_NONE;
+                } else if (mode == "field-linear") {
+                    options.midpoint_initial_guess_mode =
+                        RUNTIME_MIDPOINT_INITIAL_GUESS_FIELD_LINEAR;
+                } else {
+                    error = "invalid --midpoint-initial-guess "
+                            "(use none or field-linear)";
+                }
+                ++i;
             } else if (arg == "--midpoint-acceleration" && has_value) {
                 const std::string mode(value);
                 if (mode == "none") {
@@ -150,6 +180,17 @@ RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,
                 options.acceleration_max_coefficient = std::strtod(value, 0); ++i;
             } else if (arg == "--diagnostic-level" && has_value) {
                 options.diagnostic_level = std::atoi(value); ++i;
+            } else if (arg == "--accepted-energy-audit-cadence" && has_value) {
+                options.accepted_energy_audit_cadence = std::atoi(value); ++i;
+            } else if (arg == "--accepted-energy-audit-window-fs" && has_value) {
+                std::vector<double> window;
+                if (!parse_times(value, window) || window.size() != 2) {
+                    error = "invalid --accepted-energy-audit-window-fs (use start,end)";
+                } else {
+                    options.accepted_energy_audit_start_fs = window[0];
+                    options.accepted_energy_audit_end_fs = window[1];
+                }
+                ++i;
             } else if (arg == "--background-coupling-mode" && has_value) {
                 const std::string mode(value);
                 if (mode == "legacy") options.background_coupling_mode = 0;
@@ -157,14 +198,71 @@ RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,
                     options.background_coupling_mode = 1;
                 else error = "invalid --background-coupling-mode (use legacy or dual-u)";
                 ++i;
+            } else if (arg == "--face-pairing-mode" && has_value) {
+                const std::string mode(value);
+                if (mode == "cell-baseline")
+                    options.face_pairing_mode = 0;
+                else if (mode == "regularized")
+                    options.face_pairing_mode = 1;
+                else
+                    error = "invalid --face-pairing-mode "
+                            "(use cell-baseline or regularized)";
+                ++i;
+            } else if (arg == "--face-pairing-sigma-cutoff" && has_value) {
+                options.face_pairing_sigma_cutoff = std::strtod(value, 0);
+                ++i;
+            } else if (arg == "--face-pairing-lambda" && has_value) {
+                options.face_pairing_lambda = std::strtod(value, 0);
+                ++i;
+            } else if (arg == "--face-pairing-eta" && has_value) {
+                options.face_pairing_eta = std::strtod(value, 0);
+                ++i;
+            } else if (arg == "--face-pairing-trust-fraction" && has_value) {
+                options.face_pairing_trust_fraction = std::strtod(value, 0);
+                ++i;
+            } else if (arg == "--face-pairing-correction-trust-fraction" &&
+                       has_value) {
+                options.face_pairing_correction_trust_fraction =
+                    std::strtod(value, 0);
+                ++i;
+            } else if (arg == "--face-pairing-energy-pair-tolerance" &&
+                       has_value) {
+                options.face_pairing_energy_pair_tolerance =
+                    std::strtod(value, 0);
+                ++i;
+            } else if (arg == "--face-pairing-energy-residual-fraction" &&
+                       has_value) {
+                options.face_pairing_energy_residual_fraction =
+                    std::strtod(value, 0);
+                ++i;
+            } else if (arg == "--face-pairing-mass-relative-tolerance" &&
+                       has_value) {
+                options.face_pairing_mass_relative_tolerance =
+                    std::strtod(value, 0);
+                ++i;
+            } else if (arg == "--face-pairing-f-residual-growth-tolerance" &&
+                       has_value) {
+                options.face_pairing_f_residual_growth_tolerance =
+                    std::strtod(value, 0);
+                ++i;
             } else if (arg == "--output-dir" && has_value) {
                 options.output_dir = value; ++i;
             } else error = "unknown or incomplete runtime option: " + arg;
         }
         if (options.dt_scale <= 0.0 || options.midpoint_max_iters < 1 ||
             options.diagnostic_level < 0 || options.diagnostic_level > 2 ||
+            options.accepted_energy_audit_cadence < 1 ||
+            ((options.accepted_energy_audit_start_fs >= 0.0 ||
+              options.accepted_energy_audit_end_fs >= 0.0) &&
+             (!(options.accepted_energy_audit_start_fs >= 0.0) ||
+              options.accepted_energy_audit_end_fs <
+                  options.accepted_energy_audit_start_fs)) ||
             options.midpoint_acceleration_mode < RUNTIME_MIDPOINT_ACCELERATION_NONE ||
             options.midpoint_acceleration_mode > RUNTIME_MIDPOINT_ACCELERATION_ANDERSON ||
+            options.midpoint_initial_guess_mode <
+                RUNTIME_MIDPOINT_INITIAL_GUESS_NONE ||
+            options.midpoint_initial_guess_mode >
+                RUNTIME_MIDPOINT_INITIAL_GUESS_FIELD_LINEAR ||
             (options.anderson_depth != 2 && options.anderson_depth != 3) ||
             options.acceleration_start_iter < 1 ||
             !(options.acceleration_accept_ratio > 0.0 &&
@@ -177,6 +275,21 @@ RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,
               options.midpoint_trace_end_fs < options.midpoint_trace_start_fs)) ||
             options.background_coupling_mode < 0 ||
             options.background_coupling_mode > 1 ||
+            options.face_pairing_mode < 0 ||
+            options.face_pairing_mode > 1 ||
+            (options.face_pairing_mode == 1 &&
+             options.background_coupling_mode != 1) ||
+            !(options.face_pairing_sigma_cutoff >= 0.0 &&
+              options.face_pairing_sigma_cutoff < 1.0) ||
+            !(options.face_pairing_lambda >= 0.0) ||
+            !(options.face_pairing_eta > 0.0) ||
+            !(options.face_pairing_trust_fraction > 0.0 &&
+              options.face_pairing_trust_fraction <= 1.0) ||
+            !(options.face_pairing_correction_trust_fraction > 0.0) ||
+            !(options.face_pairing_energy_pair_tolerance > 0.0) ||
+            !(options.face_pairing_energy_residual_fraction > 0.0) ||
+            !(options.face_pairing_mass_relative_tolerance > 0.0) ||
+            !(options.face_pairing_f_residual_growth_tolerance >= 0.0) ||
             options.beam_ledger_mode < BEAM_LEDGER_OFF ||
             options.beam_ledger_mode > BEAM_LEDGER_FULL)
             error = "invalid runtime option value";
@@ -205,24 +318,38 @@ RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,
     broadcast_string(options.restart_dir, 0);
     broadcast_string(options.operator_audit_dir, 0);
     broadcast_string(options.beam_ledger_reference, 0);
-    double numbers[6] = {
+    double numbers[17] = {
         options.stop_time_fs,
         options.dt_scale,
         options.midpoint_trace_start_fs,
         options.midpoint_trace_end_fs,
+        options.accepted_energy_audit_start_fs,
+        options.accepted_energy_audit_end_fs,
         options.acceleration_accept_ratio,
-        options.acceleration_max_coefficient
+        options.acceleration_max_coefficient,
+        options.face_pairing_sigma_cutoff,
+        options.face_pairing_lambda,
+        options.face_pairing_eta,
+        options.face_pairing_trust_fraction,
+        options.face_pairing_correction_trust_fraction,
+        options.face_pairing_energy_pair_tolerance,
+        options.face_pairing_energy_residual_fraction,
+        options.face_pairing_mass_relative_tolerance,
+        options.face_pairing_f_residual_growth_tolerance
     };
     long long accepted = options.stop_after_accepted_steps;
-    int ints[11] = {options.midpoint_max_iters, options.diagnostic_level,
+    int ints[14] = {options.midpoint_max_iters, options.diagnostic_level,
+                   options.accepted_energy_audit_cadence,
                    options.dump_final_midpoint ? 1 : 0, options.overwrite_output ? 1 : 0,
                    options.checkpoint_enabled ? 1 : 0, options.restart_enabled ? 1 : 0,
                    options.background_coupling_mode, static_cast<int>(options.beam_ledger_mode),
                    static_cast<int>(options.midpoint_acceleration_mode),
-                   options.anderson_depth, options.acceleration_start_iter};
-    MPI_Bcast(numbers, 6, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+                   options.anderson_depth, options.acceleration_start_iter,
+                   options.face_pairing_mode,
+                   static_cast<int>(options.midpoint_initial_guess_mode)};
+    MPI_Bcast(numbers, 17, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(&accepted, 1, MPI_LONG_LONG_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(ints, 11, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(ints, 14, MPI_INT, 0, MPI_COMM_WORLD);
     int audit = options.operator_audit_mode ? 1 : 0;
     MPI_Bcast(&audit, 1, MPI_INT, 0, MPI_COMM_WORLD);
     int beam_ledger_reference = options.beam_ledger_reference_enabled ? 1 : 0;
@@ -234,18 +361,34 @@ RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,
     options.stop_time_fs = numbers[0]; options.dt_scale = numbers[1];
     options.midpoint_trace_start_fs = numbers[2];
     options.midpoint_trace_end_fs = numbers[3];
-    options.acceleration_accept_ratio = numbers[4];
-    options.acceleration_max_coefficient = numbers[5];
+    options.accepted_energy_audit_start_fs = numbers[4];
+    options.accepted_energy_audit_end_fs = numbers[5];
+    options.acceleration_accept_ratio = numbers[6];
+    options.acceleration_max_coefficient = numbers[7];
+    options.face_pairing_sigma_cutoff = numbers[8];
+    options.face_pairing_lambda = numbers[9];
+    options.face_pairing_eta = numbers[10];
+    options.face_pairing_trust_fraction = numbers[11];
+    options.face_pairing_correction_trust_fraction = numbers[12];
+    options.face_pairing_energy_pair_tolerance = numbers[13];
+    options.face_pairing_energy_residual_fraction = numbers[14];
+    options.face_pairing_mass_relative_tolerance = numbers[15];
+    options.face_pairing_f_residual_growth_tolerance = numbers[16];
     options.stop_after_accepted_steps = accepted; options.midpoint_max_iters = ints[0];
-    options.diagnostic_level = ints[1]; options.dump_final_midpoint = ints[2] != 0;
-    options.overwrite_output = ints[3] != 0; options.checkpoint_enabled = ints[4] != 0;
-    options.restart_enabled = ints[5] != 0; options.operator_audit_mode = audit != 0;
-    options.background_coupling_mode = ints[6];
-    options.beam_ledger_mode = static_cast<BeamLedgerMode>(ints[7]);
+    options.diagnostic_level = ints[1];
+    options.accepted_energy_audit_cadence = ints[2];
+    options.dump_final_midpoint = ints[3] != 0;
+    options.overwrite_output = ints[4] != 0; options.checkpoint_enabled = ints[5] != 0;
+    options.restart_enabled = ints[6] != 0; options.operator_audit_mode = audit != 0;
+    options.background_coupling_mode = ints[7];
+    options.beam_ledger_mode = static_cast<BeamLedgerMode>(ints[8]);
     options.midpoint_acceleration_mode =
-        static_cast<RuntimeMidpointAccelerationMode>(ints[8]);
-    options.anderson_depth = ints[9];
-    options.acceleration_start_iter = ints[10];
+        static_cast<RuntimeMidpointAccelerationMode>(ints[9]);
+    options.anderson_depth = ints[10];
+    options.acceleration_start_iter = ints[11];
+    options.face_pairing_mode = ints[12];
+    options.midpoint_initial_guess_mode =
+        static_cast<RuntimeMidpointInitialGuessMode>(ints[13]);
     options.beam_ledger_reference_enabled = beam_ledger_reference != 0;
     (void)mpi_size;
     return options;
@@ -261,7 +404,12 @@ bool prepare_output_directory(const RuntimeOptions& options, int mpi_rank,
 {
     int ok = 1;
     if (mpi_rank == 0) {
-        if (mkdir(options.output_dir.c_str(), 0777) != 0 && errno != EEXIST) {
+#if defined(_WIN32)
+        const int mkdir_status = _mkdir(options.output_dir.c_str());
+#else
+        const int mkdir_status = mkdir(options.output_dir.c_str(), 0777);
+#endif
+        if (mkdir_status != 0 && errno != EEXIST) {
             error = "cannot create output directory: " + options.output_dir;
             ok = 0;
         } else if (!options.overwrite_output && directory_has_entries(options.output_dir)) {

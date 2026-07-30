@@ -19,6 +19,8 @@ option(FP_BUILD_PERIODIC_STAGGERED_TESTS
        "Build periodic G/G* adjoint and x-face topology tests" OFF)
 option(FP_BUILD_BACKGROUND_COUPLING_TESTS
        "Build section-11 production-kernel background coupling audits" OFF)
+option(FP_BUILD_MIDPOINT_PREDICTOR_TEST
+       "Build the standalone protected midpoint field predictor test" OFF)
 set(FP_VELOCITY_GRID_UPAR_STRETCH "6.2" CACHE STRING
     "Smooth cylindrical u_parallel sinh mapping parameter")
 set(FP_VELOCITY_GRID_UPERP_STRETCH "5.9" CACHE STRING
@@ -34,6 +36,12 @@ set(FP_LANGMUIR_RESULT_DIR "output/production_langmuir_7_3_${FP_TEST_RUN_ID}")
 add_definitions(
     -DFP_VELOCITY_GRID_UPAR_STRETCH=${FP_VELOCITY_GRID_UPAR_STRETCH}
     -DFP_VELOCITY_GRID_UPERP_STRETCH=${FP_VELOCITY_GRID_UPERP_STRETCH})
+
+if(FP_BUILD_MIDPOINT_PREDICTOR_TEST)
+    add_executable(midpoint_field_predictor_test
+        tests/midpoint_field_predictor_test.cpp)
+    target_include_directories(midpoint_field_predictor_test PRIVATE src)
+endif()
 
 # MPI: 通过 mpicxx 封装器自动处理（在 PBS 脚本中通过
 # -DCMAKE_CXX_COMPILER=mpicxx 指定）。
@@ -311,6 +319,20 @@ if(FP_BUILD_BACKGROUND_COUPLING_TESTS)
     # operator test audits all six required low/high/final layers.
     add_background_coupling_kernel_test(background_coupling_dual_u_muscl_fct_test
         tests/background_coupling_dual_u_stage3_test.cpp 800 96 64)
+    # Section 13.3: unit-level conservation, boundary and positivity-budget
+    # checks for the final limited dual-u pairing correction.
+    add_executable(final_dual_u_limited_pairing_test
+        tests/final_dual_u_limited_pairing_test.cpp)
+    target_include_directories(final_dual_u_limited_pairing_test PRIVATE src)
+    target_compile_definitions(final_dual_u_limited_pairing_test PRIVATE
+        FP_SPATIAL_GRID_NX=8
+        FP_VELOCITY_GRID_NV=16
+        FP_VELOCITY_GRID_NMU=8)
+    add_executable(face_pairing_regularized_unit_test
+        tests/face_pairing_regularized_unit_test.cpp)
+    target_include_directories(face_pairing_regularized_unit_test PRIVATE src)
+    add_background_coupling_kernel_test(face_pairing_checkpoint_audit
+        tests/face_pairing_checkpoint_audit.cpp 4000 96 64)
     # Section 15.5 stage-4: compare accepted legacy/dual production midpoint
     # dumps.  It reads dumps only and never changes the production solver.
     add_background_coupling_kernel_test(background_coupling_stage4_ab_compare

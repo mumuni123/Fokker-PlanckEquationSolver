@@ -27,13 +27,24 @@ void fill_periodic_ghosts(Species& sp, const SpatialGrid& sg)
 }
 
 VlasovAmpereMidpointSolver::VlasovAmpereMidpointSolver()
-    : step_diagnostics_enabled_(false), beam_enabled_(true),
+    : step_diagnostics_enabled_(false), accepted_energy_audit_enabled_(false),
+      beam_enabled_(true),
       low_order_only_(false), nonuniform_high_order_enabled_(false),
       fct_enabled_(true), background_coupling_mode_(DUAL_U_COUPLING),
+      face_pairing_mode_(FACE_PAIRING_CELL_BASELINE),
+      face_pairing_sigma_cutoff_(1.0e-8),
+      face_pairing_lambda_(1.0e-3), face_pairing_eta_(1.0e-8),
+      face_pairing_trust_fraction_(0.1),
+      face_pairing_correction_trust_fraction_(1.0),
+      face_pairing_energy_pair_tolerance_(1.0e-8),
+      face_pairing_energy_residual_fraction_(1.0),
+      face_pairing_mass_relative_tolerance_(1.0e-10),
+      face_pairing_f_residual_growth_tolerance_(0.1),
       capture_midpoint_input_(false),
       legacy_boundary_upwind_high_candidate_for_test_(false),
       energy_consistent_x_high_velocity_for_test_(false),
       max_midpoint_iterations_(20),
+      midpoint_initial_guess_mode_(MIDPOINT_INITIAL_GUESS_NONE),
       midpoint_acceleration_mode_(MIDPOINT_ACCELERATION_NONE),
       anderson_depth_(3), acceleration_start_iter_(3),
       acceleration_accept_ratio_(0.95), acceleration_max_coefficient_(2.0),
@@ -55,6 +66,11 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
 {
     result = Result();
     result.operator_evaluations = 0;
+    result.midpoint_initial_guess_mode =
+        static_cast<int>(midpoint_initial_guess_mode_);
+    result.midpoint_predictor_used = 0;
+    result.midpoint_predictor_history_depth =
+        midpoint_field_predictor_.history_depth();
     result.midpoint_acceleration_mode = MIDPOINT_ACCELERATION_NONE;
     result.acceleration_attempts = 0;
     result.acceleration_accepted = 0;
@@ -67,6 +83,99 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
     result.max_residual_E = 0.0;
     result.max_residual_J_bkg = 0.0;
     result.max_residual_f = 0.0;
+    result.final_dual_u_valid = 1;
+    result.final_dual_u_target_linf = 0.0;
+    result.final_dual_u_residual_before_linf = 0.0;
+    result.final_dual_u_residual_after_linf = 0.0;
+    result.final_dual_u_minimum_scale = 1.0;
+    result.final_dual_u_correction_l2 = 0.0;
+    result.final_dual_u_correction_linf = 0.0;
+    result.final_dual_u_candidate_min =
+        std::numeric_limits<double>::infinity();
+    result.final_dual_u_corrected_cell_count = 0;
+    result.final_dual_u_limited_cell_count = 0;
+    result.final_dual_u_unresolved_cell_count = 0;
+    result.face_pairing_attempted = 0;
+    result.face_pairing_accepted = 0;
+    result.face_pairing_fallback_to_cell_baseline = 0;
+    result.face_pairing_solver_converged = 0;
+    result.face_pairing_iterations = 0;
+    result.face_pairing_unresolved_mode_count = 0;
+    result.face_pairing_residual_before = 0.0;
+    result.face_pairing_residual_after = 0.0;
+    result.face_pairing_core_residual_before = 0.0;
+    result.face_pairing_core_residual_after = 0.0;
+    result.face_pairing_unresolved_mode_l2 = 0.0;
+    result.face_pairing_correction_l2 = 0.0;
+    result.face_pairing_correction_linf = 0.0;
+    result.face_pairing_delta_ke = 0.0;
+    result.face_pairing_delta_work = 0.0;
+    result.face_pairing_candidate_min =
+        std::numeric_limits<double>::infinity();
+    result.face_pairing_mass_error = 0.0;
+    result.face_pairing_mass_relative_error = 0.0;
+    result.face_pairing_cell_mass_error_linf = 0.0;
+    result.face_pairing_cell_mass_relative_linf = 0.0;
+    result.face_pairing_energy_pair_error = 0.0;
+    result.face_pairing_energy_pair_relative = 0.0;
+    result.face_pairing_energy_residual_scale = 0.0;
+    result.face_pairing_energy_residual_ratio = 0.0;
+    result.face_pairing_correction_trust_limit = 0.0;
+    result.face_pairing_correction_trust_ratio = 0.0;
+    result.face_pairing_f_residual_relative_growth = 0.0;
+    result.face_pairing_capacity_active_cells = 0;
+    result.face_pairing_trust_region_active_cells = 0;
+    result.face_pairing_candidate_valid = 0;
+    result.face_pairing_candidate_residual_after =
+        std::numeric_limits<double>::quiet_NaN();
+    result.face_pairing_candidate_core_residual_after =
+        std::numeric_limits<double>::quiet_NaN();
+    result.face_pairing_candidate_delta_ke =
+        std::numeric_limits<double>::quiet_NaN();
+    result.face_pairing_candidate_delta_work =
+        std::numeric_limits<double>::quiet_NaN();
+    result.face_pairing_candidate_mass_error =
+        std::numeric_limits<double>::quiet_NaN();
+    result.face_pairing_candidate_min_before_fallback =
+        std::numeric_limits<double>::quiet_NaN();
+    result.face_pairing_requested_correction_l2 = 0.0;
+    result.face_pairing_requested_correction_linf = 0.0;
+    result.face_pairing_applied_correction_l2 = 0.0;
+    result.face_pairing_applied_correction_linf = 0.0;
+    result.face_pairing_nonzero_capacity_cells = 0;
+    result.face_pairing_bound_saturated_cells = 0;
+    result.face_pairing_objective_residual = 0.0;
+    result.face_pairing_objective_smoothness = 0.0;
+    result.face_pairing_objective_amplitude = 0.0;
+    result.face_pairing_objective_total = 0.0;
+    result.face_pairing_rejection_mask = 0u;
+    result.face_pairing_pass_solver = 0;
+    result.face_pairing_pass_apply = 0;
+    result.face_pairing_pass_global_residual = 0;
+    result.face_pairing_pass_core_residual = 0;
+    result.face_pairing_pass_correction_trust = 0;
+    result.face_pairing_pass_delta_ke = 0;
+    result.face_pairing_pass_delta_work = 0;
+    result.face_pairing_pass_candidate_min = 0;
+    result.face_pairing_pass_mass = 0;
+    result.face_pairing_pass_f_residual = 0;
+    result.face_pairing_pass_energy_pair = 0;
+    result.face_pairing_pass_energy_residual_scale = 0;
+    result.fct_macro_budget_valid = 0;
+    for (size_t i = 0; i < result.fct_macro_budget_x.size(); ++i) {
+        FctMacroBudget* budgets[2] = {
+            &result.fct_macro_budget_x[i], &result.fct_macro_budget_u[i]};
+        for (int direction = 0; direction < 2; ++direction) {
+            budgets[direction]->face_count = 0;
+            budgets[direction]->active_face_count = 0;
+            budgets[direction]->min_alpha = 1.0;
+            budgets[direction]->delta_n = 0.0;
+            budgets[direction]->delta_j = 0.0;
+            budgets[direction]->delta_k = 0.0;
+            budgets[direction]->e_dot_j = 0.0;
+            budgets[direction]->r_fct_e = 0.0;
+        }
+    }
     result.limiter_min_alpha = 1.0;
     result.x_limiter_min_alpha = 1.0;
     result.u_limiter_min_alpha = 1.0;
@@ -96,6 +205,11 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
     result.low_order_roundoff_zeroed_mass = 0.0;
     result.fct_roundoff_zeroed_count = 0;
     result.fct_roundoff_zeroed_mass = 0.0;
+    result.accepted_energy_ledger = AcceptedEnergyLedger();
+    result.accepted_energy_ledger.valid = 0;
+    result.accepted_energy_ledger.strict_accepted = 0;
+    result.accepted_energy_ledger.soft_accepted = 0;
+    result.accepted_energy_ledger.transport_substeps = 0;
     result.beam_continuity_valid = 1;
     result.stage5_r_couple_centered = 0.0;
     result.stage5_r_couple_upwind_stabilization = 0.0;
@@ -234,8 +348,19 @@ VlasovAmpereMidpointSolver::advance_background_and_fields(
         }
         return failed;
     }
+    std::vector<double> owned_field(
+        fields_n.Ex_face.begin(),
+        fields_n.Ex_face.begin() +
+            std::min(fields_n.Ex_face.size(),
+                     static_cast<size_t>(std::max(0, sg.nx_local))));
+    std::vector<double> predicted_e_end;
+    const bool predictor_used = midpoint_field_predictor_.propose(
+        owned_field, dt, predicted_e_end);
     Result result = evaluate_production_midpoint_operator(
-        bkg_n, beam_n, fields_n, sg, dt, time, mpi_rank, mpi_size, 1);
+        bkg_n, beam_n, fields_n, sg, dt, time, mpi_rank, mpi_size, 1,
+        0, 0, 0, 0, false,
+        predictor_used ? &predicted_e_end : 0);
+    result.midpoint_predictor_used = predictor_used ? 1 : 0;
     if (result.state_advanced && !result.failed) {
         const bool core_macro_debt =
             result.neg_mass_core_fraction > 1.0e-6 ||
@@ -248,6 +373,18 @@ VlasovAmpereMidpointSolver::advance_background_and_fields(
             result.state_advanced = 0;
         }
     }
+    const bool strict_accepted =
+        result.state_advanced && !result.failed && result.converged &&
+        !result.soft_unconverged;
+    if (strict_accepted) {
+        midpoint_field_predictor_.commit_strict(
+            result.fields_np1.Ex_face,
+            static_cast<size_t>(std::max(0, sg.nx_local)), dt);
+    } else {
+        midpoint_field_predictor_.clear();
+    }
+    result.midpoint_predictor_history_depth =
+        midpoint_field_predictor_.history_depth();
     return result;
 }
 
@@ -287,9 +424,11 @@ VlasovAmpereMidpointSolver::evaluate_background_coupling_flux_bundle(
     bundle.fu_center = evaluation.center_u_flux;
     bundle.fu_high = evaluation.high_u_flux;
     bundle.fu_final = evaluation.final_u_flux;
+    bundle.fu_fct_limited = evaluation.fct_limited_u_flux;
     bundle.cu_low = evaluation.low_u_coefficient;
     bundle.cu_high = evaluation.high_u_coefficient;
     bundle.cu_final = evaluation.final_u_coefficient;
+    bundle.cu_fct_limited = evaluation.fct_limited_u_coefficient;
     bundle.donor_beta = evaluation.fct_donor_beta;
     bundle.donor_low_mass = evaluation.fct_donor_low_mass;
     bundle.donor_limited_outflow = evaluation.fct_donor_limited_outflow;
@@ -316,6 +455,27 @@ VlasovAmpereMidpointSolver::evaluate_background_coupling_flux_bundle(
     bundle.dual_u_correction_linf = evaluation.dual_u_correction_linf;
     bundle.dual_u_corrected_cell_count =
         evaluation.dual_u_corrected_cell_count;
+    bundle.final_dual_u_valid = evaluation.final_dual_u_valid;
+    bundle.final_dual_u_target_linf =
+        evaluation.final_dual_u_target_linf;
+    bundle.final_dual_u_residual_before_linf =
+        evaluation.final_dual_u_residual_before_linf;
+    bundle.final_dual_u_residual_after_linf =
+        evaluation.final_dual_u_residual_after_linf;
+    bundle.final_dual_u_minimum_scale =
+        evaluation.final_dual_u_minimum_scale;
+    bundle.final_dual_u_correction_l2 =
+        evaluation.final_dual_u_correction_l2;
+    bundle.final_dual_u_correction_linf =
+        evaluation.final_dual_u_correction_linf;
+    bundle.final_dual_u_candidate_min =
+        evaluation.final_dual_u_candidate_min;
+    bundle.final_dual_u_corrected_cell_count =
+        evaluation.final_dual_u_corrected_cell_count;
+    bundle.final_dual_u_limited_cell_count =
+        evaluation.final_dual_u_limited_cell_count;
+    bundle.final_dual_u_unresolved_cell_count =
+        evaluation.final_dual_u_unresolved_cell_count;
     bundle.jn_low = evaluation.j_bkg_face_low_mid;
     bundle.jn_high = evaluation.j_bkg_face_high_mid;
     bundle.jn_final = evaluation.j_bkg_face_mid;

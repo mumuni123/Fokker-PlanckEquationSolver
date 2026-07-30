@@ -4,6 +4,7 @@
 #include "grid.h"
 #include "maxwell.h"
 #include "species.h"
+#include "vlasov_ampere_midpoint.h"
 #include <fstream>
 #include <string>
 #include <vector>
@@ -19,7 +20,15 @@ public:
 
     void init(const std::string& dir, int mpi_rank,
               bool enable_debug_diagnostics,
-              bool enable_step_diagnostics);
+              bool enable_step_diagnostics,
+              bool enable_accepted_energy_audit = false);
+
+    void write_accepted_energy_ledger(
+        long long physical_step, double time, double dt,
+        const VlasovAmpereMidpointSolver::Result& midpoint_result,
+        double total_energy_residual_step,
+        double total_energy_residual_cumulative,
+        int mpi_rank);
 
     void write_scalars(double time, int step,
                        const Species& electrons,
@@ -154,14 +163,26 @@ public:
 
 private:
     std::ofstream scalar_file;
+    std::ofstream energy_history_file;
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
     std::ofstream debug_file;
 #endif
     std::ofstream step_file;
+    std::ofstream accepted_energy_ledger_file;
+    std::ofstream velocity_boundary_flux_ledger_file;
+    std::ofstream midpoint_acceptance_ledger_file;
     bool debug_enabled;
     bool step_enabled;
     bool has_energy_reference;
+    bool has_energy_history_reference;
+    bool has_last_energy_history_record;
+    int last_energy_history_step;
+    double last_energy_history_time;
     double energy_reference;
+    double initial_background_ke;
+    double initial_field_energy;
+    double initial_background_plus_field_energy;
+    double initial_total_energy;
     double initial_ke_per_particle_eV;
 };
 

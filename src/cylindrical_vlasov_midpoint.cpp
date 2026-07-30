@@ -3,6 +3,7 @@
 #include "nonuniform_reconstruction.h"
 #include "discrete_moment_operators.h"
 #include "periodic_staggered_operators.h"
+#include "regularized_face_pairing.h"
 
 #include <algorithm>
 #include <cmath>
@@ -32,16 +33,22 @@ inline size_t uface_index(int ix, int jface, int k)
            Param::Nmu + k;
 }
 
-inline double candidate_roundoff_tolerance(double m_low, double ax_left,
-                                           double ax_right, double au_lower,
-                                           double au_upper)
+inline double candidate_roundoff_tolerance(
+    double m_old, const double low_transfer[4], double m_low,
+    const double raw_antidiffusive_transfer[4],
+    const double final_antidiffusive_transfer[4])
 {
-    // Local final-scratch summation bound.  The subnormal term is explicit:
-    // in an empty tail cell all visible transport terms can underflow to zero,
-    // while the reconstructed value can still be a few denormals negative.
-    const double local_sum = std::fabs(m_low) + std::fabs(ax_left) +
-        std::fabs(ax_right) + std::fabs(au_lower) + std::fabs(au_upper);
-    return 64.0 * std::numeric_limits<double>::epsilon() * local_sum +
+    // The final candidate inherits roundoff from three local constructions:
+    // donor-cell low mass, raw high-low transfers, and alpha/beta-limited
+    // final transfers.  Using only the last five terms underestimates the
+    // bound after a nearly cancelled limiter reconstruction.
+    double local_sum = std::fabs(m_old) + std::fabs(m_low);
+    for (int face = 0; face < 4; ++face) {
+        local_sum += std::fabs(low_transfer[face]);
+        local_sum += std::fabs(raw_antidiffusive_transfer[face]);
+        local_sum += std::fabs(final_antidiffusive_transfer[face]);
+    }
+    return 512.0 * std::numeric_limits<double>::epsilon() * local_sum +
         64.0 * std::numeric_limits<double>::denorm_min();
 }
 
@@ -66,6 +73,28 @@ inline bool normalize_roundoff_negative_candidate(double& candidate,
     normalized_mass = -candidate;
     candidate = 0.0; // Canonical positive zero, not a global distribution clip.
     return true;
+}
+
+inline void allgather_spatial_cells(const std::vector<double>& local,
+                                    int nx_global, int mpi_size,
+                                    std::vector<double>& global)
+{
+    const int local_count = static_cast<int>(local.size());
+    std::vector<int> counts(static_cast<size_t>(mpi_size), 0);
+    MPI_Allgather(&local_count, 1, MPI_INT, counts.data(), 1, MPI_INT,
+                  MPI_COMM_WORLD);
+    std::vector<int> displacements(static_cast<size_t>(mpi_size), 0);
+    int total = 0;
+    for (int rank = 0; rank < mpi_size; ++rank) {
+        displacements[static_cast<size_t>(rank)] = total;
+        total += counts[static_cast<size_t>(rank)];
+    }
+    global.assign(static_cast<size_t>(std::max(0, total)), 0.0);
+    MPI_Allgatherv(local.empty() ? 0 : local.data(), local_count, MPI_DOUBLE,
+                   global.empty() ? 0 : global.data(), counts.data(),
+                   displacements.data(), MPI_DOUBLE, MPI_COMM_WORLD);
+    if (total != nx_global)
+        global.clear();
 }
 
 const double kFctCoreBoundaryWidth = 0.1 * Const::micro;
@@ -166,7 +195,8 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
     const EMFields* fixed_fields_end,
     const std::vector<double>* fixed_j_beam_face_mid,
     const CouplingRegionLayout* fixed_coupling_layout,
-    bool fixed_candidate) const
+    bool fixed_candidate,
+    const std::vector<double>* initial_e_end) const
 {
     low_order_solver_checkpoint(low_order_only_, "entry", mpi_rank);
     Result result;
@@ -231,21 +261,32 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
             (result.failure_worst_iv >= 3 * Param::Nv / 4 ||
              result.failure_worst_imu >= 3 * Param::Nmu / 4) ? 1 : 0;
     };
-    // Reused across nonlinear iterations/substeps.  These are the dominant
-    // transient allocations in the new FV/FCT kernel.
-    std::vector<double> fx_low(xflux_size, 0.0);
-    std::vector<double> fu_low(uflux_size, 0.0);
-    std::vector<double> cu_low(uflux_size, 0.0);
+    // Reuse the dominant FV/FCT storage across physical steps as well as
+    // nonlinear iterations.  Resizing retains capacity, while fill preserves
+    // the exact initialization previously provided by vector(size, value).
+    size_t workspace_slot = 0;
+    const auto workspace =
+        [&](size_t size, double value) -> std::vector<double>& {
+            std::vector<double>& buffer =
+                production_workspace_[workspace_slot++];
+            buffer.resize(size);
+            std::fill(buffer.begin(), buffer.end(), value);
+            return buffer;
+        };
+    std::vector<double>& fx_low = workspace(xflux_size, 0.0);
+    std::vector<double>& fu_low = workspace(uflux_size, 0.0);
+    std::vector<double>& cu_low = workspace(uflux_size, 0.0);
     const size_t high_local_cell_count = low_order_only_
         ? 0 : static_cast<size_t>(nxl) * Param::Nvmu;
     const size_t high_xflux_size = low_order_only_ ? 0 : xflux_size;
     const size_t high_uflux_size = low_order_only_ ? 0 : uflux_size;
-    std::vector<double> fx_high(high_xflux_size, 0.0);
-    std::vector<double> fu_high(high_uflux_size, 0.0);
-    std::vector<double> cu_high(high_uflux_size, 0.0);
+    std::vector<double>& fx_high = workspace(high_xflux_size, 0.0);
+    std::vector<double>& fu_high = workspace(high_uflux_size, 0.0);
+    std::vector<double>& cu_high = workspace(high_uflux_size, 0.0);
     // Centered u-force candidate is kept separately from the selected high
     // flux so the closure audit can isolate boundary/upwind stabilization.
-    std::vector<double> cu_high_center(high_uflux_size, 0.0);
+    std::vector<double>& cu_high_center =
+        workspace(high_uflux_size, 0.0);
     const bool dual_u_enabled =
         background_coupling_mode_ == DUAL_U_COUPLING;
     // Replaying the x and u reconstruction operators is a fixed-state/audit
@@ -259,7 +300,8 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
     // production steps do not need MAXLOC/Bcast traffic for this metadata.
     const bool detailed_operator_diagnostics =
         step_diagnostics_enabled_ || fixed_candidate;
-    std::vector<double> inv_cell_volume(low_order_only_ ? 0 : Param::Nvmu, 0.0);
+    std::vector<double>& inv_cell_volume =
+        workspace(low_order_only_ ? 0 : Param::Nvmu, 0.0);
     if (!low_order_only_) {
         for (int j = 0; j < Param::Nv; ++j) {
             for (int k = 0; k < Param::Nmu; ++k) {
@@ -268,66 +310,119 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
             }
         }
     }
-    std::vector<double> alpha_x_left(high_local_cell_count, 1.0);
-    std::vector<double> alpha_x_right(high_local_cell_count, 1.0);
-    std::vector<double> alpha_u_lower(high_local_cell_count, 1.0);
-    std::vector<double> alpha_u_upper(high_local_cell_count, 1.0);
-    std::vector<double> left_alpha_x_right(
-        low_order_only_ ? 0 : Param::Nvmu, 1.0);
-    std::vector<double> fx_final(high_xflux_size, 0.0),
-        fu_final(high_uflux_size, 0.0);
-    std::vector<double> cu_final(high_uflux_size, 0.0);
-    std::vector<double> candidate_mass(high_local_cell_count, 0.0);
-    std::vector<double> donor_beta(high_local_cell_count, 1.0);
-    std::vector<double> donor_low_mass(high_local_cell_count, 0.0);
-    std::vector<double> donor_limited_outflow(high_local_cell_count, 0.0);
+    std::vector<double>& alpha_x_left =
+        workspace(high_local_cell_count, 1.0);
+    std::vector<double>& alpha_x_right =
+        workspace(high_local_cell_count, 1.0);
+    std::vector<double>& alpha_u_lower =
+        workspace(high_local_cell_count, 1.0);
+    std::vector<double>& alpha_u_upper =
+        workspace(high_local_cell_count, 1.0);
+    std::vector<double>& left_alpha_x_right =
+        workspace(low_order_only_ ? 0 : Param::Nvmu, 1.0);
+    std::vector<double>& fx_final = workspace(high_xflux_size, 0.0);
+    std::vector<double>& fu_final = workspace(high_uflux_size, 0.0);
+    std::vector<double>& cu_final = workspace(high_uflux_size, 0.0);
+    std::vector<double>& candidate_mass =
+        workspace(high_local_cell_count, 0.0);
+    std::vector<double>& donor_beta =
+        workspace(high_local_cell_count, 1.0);
+    std::vector<double>& donor_low_mass =
+        workspace(high_local_cell_count, 0.0);
+    std::vector<double>& donor_limited_outflow =
+        workspace(high_local_cell_count, 0.0);
     Species low_state_buffer = bkg_n;
-    std::vector<double> e_mid_buffer(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> next_e_buffer(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> integrated_jn_buffer(nface, 0.0);
-    std::vector<double> integrated_jn_low_buffer(nface, 0.0);
-    std::vector<double> integrated_jn_high_buffer(nface, 0.0);
-    std::vector<double> integrated_je_buffer(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> integrated_je_low_buffer(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> integrated_je_high_buffer(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> integrated_je_center_buffer(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> je_cell_buffer(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> je_low_cell_buffer(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> je_high_cell_buffer(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> je_center_cell_buffer(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> initial_ke_cell(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> initial_p_cell(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> final_ke_cell(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> final_p_cell(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> delta_ke_cell(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> delta_p_cell(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> local_energy_residual(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> local_momentum_residual(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> psi_k_x(nface, 0.0), psi_p_x(nface, 0.0);
+    std::vector<double>& e_mid_buffer =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& next_e_buffer =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& integrated_jn_buffer = workspace(nface, 0.0);
+    std::vector<double>& integrated_jn_low_buffer = workspace(nface, 0.0);
+    std::vector<double>& integrated_jn_high_buffer = workspace(nface, 0.0);
+    std::vector<double>& integrated_je_buffer =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& integrated_je_low_buffer =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& integrated_je_high_buffer =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& integrated_je_center_buffer =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& je_cell_buffer =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& je_low_cell_buffer =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& je_high_cell_buffer =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& je_center_cell_buffer =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& initial_ke_cell =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& initial_p_cell =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& final_ke_cell =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& final_p_cell =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& delta_ke_cell =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& delta_p_cell =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& local_energy_residual =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& local_momentum_residual =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& psi_k_x = workspace(nface, 0.0);
+    std::vector<double>& psi_p_x = workspace(nface, 0.0);
     // Dual-u scratch is allocated once per outer solve and reused by every
     // midpoint iteration/substep.  Do not store these in Result unless an
     // explicit audit requests them.
-    std::vector<double> dual_jn_high_face(dual_u_enabled ? nface : 0, 0.0);
-    std::vector<double> dual_target_jn_cell(dual_u_enabled ?
-        static_cast<size_t>(nxl) : 0, 0.0);
-    std::vector<double> dual_target_jn_replay_cell(dual_u_enabled ?
-        static_cast<size_t>(nxl) : 0, 0.0);
-    std::vector<double> dual_replay_jn_face(dual_u_replay_audit ? nface : 0,
-                                             0.0);
-    std::vector<double> dual_legacy_je_cell(dual_u_enabled ?
-        static_cast<size_t>(nxl) : 0, 0.0);
-    std::vector<double> dual_je_cell(dual_u_enabled ?
-        static_cast<size_t>(nxl) : 0, 0.0);
-    std::vector<double> u_energy_cell(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> u_momentum_cell(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> u_boundary_energy_cell(static_cast<size_t>(nxl), 0.0);
-    std::vector<double> u_boundary_momentum_cell(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& dual_jn_high_face =
+        workspace(dual_u_enabled ? nface : 0, 0.0);
+    std::vector<double>& dual_target_jn_cell = workspace(
+        dual_u_enabled ? static_cast<size_t>(nxl) : 0, 0.0);
+    std::vector<double>& dual_target_jn_replay_cell = workspace(
+        dual_u_enabled ? static_cast<size_t>(nxl) : 0, 0.0);
+    std::vector<double>& dual_replay_jn_face =
+        workspace(dual_u_replay_audit ? nface : 0, 0.0);
+    std::vector<double>& dual_legacy_je_cell = workspace(
+        dual_u_enabled ? static_cast<size_t>(nxl) : 0, 0.0);
+    std::vector<double>& dual_je_cell = workspace(
+        dual_u_enabled ? static_cast<size_t>(nxl) : 0, 0.0);
+    std::vector<double>& final_dual_acceleration = workspace(
+        dual_u_enabled ? static_cast<size_t>(nxl) : 0, 0.0);
+    std::vector<double>& u_energy_cell =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& u_momentum_cell =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& u_boundary_energy_cell =
+        workspace(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& u_boundary_momentum_cell =
+        workspace(static_cast<size_t>(nxl), 0.0);
     // These u_parallel-face factors depend only on the immutable velocity
     // grid and species constants for this solve.  Reusing them removes the
     // same scalar divisions/products from every x cell and force substep.
-    std::vector<double> u_face_energy_delta(Param::Nvmu, 0.0);
-    std::vector<double> u_face_momentum_delta(Param::Nvmu, 0.0);
-    std::vector<double> u_face_energy_current_weight(Param::Nvmu, 0.0);
+    std::vector<double>& u_face_energy_delta =
+        workspace(Param::Nvmu, 0.0);
+    std::vector<double>& u_face_momentum_delta =
+        workspace(Param::Nvmu, 0.0);
+    std::vector<double>& u_face_energy_current_weight =
+        workspace(Param::Nvmu, 0.0);
+    // The x part of the combined CFL depends only on the immutable velocity
+    // grid and this physical step's dt/dx.  Collapse the u_perp maximum once
+    // here instead of rescanning every x-u_parallel-u_perp cell in every
+    // nonlinear iteration.  The force CFL below is independent of u_perp,
+    // so max_k(cx(j,k) + cu(ix,j)) = max_k(cx(j,k)) + cu(ix,j).
+    std::vector<double>& max_x_cfl_by_upar =
+        workspace(static_cast<size_t>(Param::Nv), 0.0);
+    for (int j = 0; j < Param::Nv; ++j) {
+        double maximum = 0.0;
+        for (int k = 0; k < Param::Nmu; ++k) {
+            maximum = std::max(
+                maximum,
+                dt * std::fabs(bkg_n.cgrid.vx[idx2(j, k)]) / sg.dx);
+        }
+        max_x_cfl_by_upar[static_cast<size_t>(j)] = maximum;
+    }
     const double energy_current_factor =
         bkg_n.charge / (bkg_n.mass * Const::c * sg.dx);
     for (int jf = 1; jf < Param::Nv; ++jf) {
@@ -389,15 +484,21 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
     low_order_solver_checkpoint(low_order_only_, "work_arrays_initialized",
                                 mpi_rank);
 
-    std::vector<double> e_end(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& e_end =
+        workspace(static_cast<size_t>(nxl), 0.0);
     for (int iface = 0; iface < nxl; ++iface) {
         e_end[static_cast<size_t>(iface)] = fixed_fields_end
-            ? fixed_fields_end->Ex_face[iface] : fields_n.Ex_face[iface];
+            ? fixed_fields_end->Ex_face[iface]
+            : initial_e_end &&
+              initial_e_end->size() == static_cast<size_t>(nxl)
+            ? (*initial_e_end)[static_cast<size_t>(iface)]
+            : fields_n.Ex_face[iface];
     }
     Species guess = fixed_guess_np1 ? *fixed_guess_np1 : bkg_n;
     Species last_work = bkg_n;
     EMFields last_fields = fields_n;
-    std::vector<double> previous_j(static_cast<size_t>(nxl), 0.0);
+    std::vector<double>& previous_j =
+        workspace(static_cast<size_t>(nxl), 0.0);
     bool have_previous = false;
 
     // Acceleration is deliberately field-only.  The distribution guess keeps
@@ -480,7 +581,7 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
     }
     low_order_solver_checkpoint(low_order_only_, "beam_predictor_ready",
                                 mpi_rank);
-    std::vector<double> jbeam(nface, 0.0);
+    std::vector<double>& jbeam = workspace(nface, 0.0);
     if (fixed_j_beam_face_mid) {
         for (size_t i = 0; i < std::min(jbeam.size(),
                                         fixed_j_beam_face_mid->size()); ++i) {
@@ -571,6 +672,26 @@ VlasovAmpereMidpointSolver::evaluate_production_midpoint_operator(
     const double field_tol = 1.0e-6;
     const double current_tol = 1.0e-5;
     const double omega = 0.55;
+    enum AcceptedEnergyLedgerSlot {
+        LEDGER_DKE_LOW = 0,
+        LEDGER_DKE_HIGH,
+        LEDGER_DKE_FINAL,
+        LEDGER_DKE_FCT_X,
+        LEDGER_DKE_FCT_U,
+        LEDGER_DMASS_FCT_X,
+        LEDGER_DMASS_FCT_U,
+        LEDGER_DPPAR_FCT_X,
+        LEDGER_DPPAR_FCT_U,
+        LEDGER_BNUM_LOWER,
+        LEDGER_BNUM_UPPER,
+        LEDGER_BPPAR_LOWER,
+        LEDGER_BPPAR_UPPER,
+        LEDGER_BENERGY_LOWER,
+        LEDGER_BENERGY_UPPER,
+        LEDGER_SLOT_COUNT
+    };
+    std::array<long double, LEDGER_SLOT_COUNT> accepted_energy_ledger_local = {};
+    long double accepted_energy_actual_delta_ke_local = 0.0L;
     for (int iter = 0; iter < max_iters; ++iter) {
 midpoint_iteration_retry:
         ++result.operator_evaluations;
@@ -606,11 +727,9 @@ midpoint_iteration_retry:
                 const double cu = dt * std::fabs(a) /
                     std::max(bkg_n.cgrid.upar_widths[j],
                              std::numeric_limits<double>::min());
-                for (int k = 0; k < Param::Nmu; ++k) {
-                    const double cx = dt * std::fabs(bkg_n.cgrid.vx[idx2(j, k)]) /
-                                      sg.dx;
-                    local_cfl = std::max(local_cfl, cx + cu);
-                }
+                local_cfl = std::max(
+                    local_cfl,
+                    max_x_cfl_by_upar[static_cast<size_t>(j)] + cu);
             }
         }
         double global_cfl = local_cfl;
@@ -721,6 +840,8 @@ midpoint_iteration_retry:
         double u_boundary_energy_upper = 0.0;
         double u_boundary_particle = 0.0;
         double u_boundary_momentum = 0.0;
+        std::array<long double, LEDGER_SLOT_COUNT> trial_energy_ledger_local = {};
+        long double trial_actual_delta_ke_local = 0.0L;
         double limiter_faces = 0.0;
         double limiter_active = 0.0;
         double limiter_min = 1.0;
@@ -737,8 +858,215 @@ midpoint_iteration_retry:
         double limiter_min_core = 1.0;
         double limiter_min_boundary = 1.0;
         double fct_budget_violation = 0.0;
+        DualUCoupling::FinalLimitedDiagnostics
+            final_dual_iteration_diagnostics;
 
         const double h = dt / nsub;
+        const bool fct_macro_budget_enabled = step_diagnostics_enabled_ &&
+            fct_enabled_ && !low_order_only_;
+        std::array<FctMacroBudget, 6> fct_macro_budget_x_local;
+        std::array<FctMacroBudget, 6> fct_macro_budget_u_local;
+        const auto reset_fct_macro_budget = [](std::array<FctMacroBudget, 6>& budget) {
+            for (size_t bin = 0; bin < budget.size(); ++bin) {
+                budget[bin].face_count = 0;
+                budget[bin].active_face_count = 0;
+                budget[bin].min_alpha = 1.0;
+                budget[bin].delta_n = 0.0;
+                budget[bin].delta_j = 0.0;
+                budget[bin].delta_k = 0.0;
+                budget[bin].e_dot_j = 0.0;
+                budget[bin].r_fct_e = 0.0;
+            }
+        };
+        reset_fct_macro_budget(fct_macro_budget_x_local);
+        reset_fct_macro_budget(fct_macro_budget_u_local);
+        std::vector<double> fct_macro_fmax;
+        if (fct_macro_budget_enabled) {
+            fct_macro_fmax.assign(static_cast<size_t>(sg.nx_total), 0.0);
+            for (int cell = 0; cell < sg.nx_total; ++cell) {
+                double maximum = 0.0;
+                for (int j = 0; j < Param::Nv; ++j)
+                    for (int k = 0; k < Param::Nmu; ++k)
+                        maximum = std::max(maximum,
+                            midpoint_state.f[mass_index(cell, j, k)]);
+                fct_macro_fmax[static_cast<size_t>(cell)] = maximum;
+            }
+        }
+        const auto fct_macro_bin = [&](int cell, int j, int k) {
+            int global_ix = sg.ix_start + cell - ng;
+            global_ix %= sg.nx_global;
+            if (global_ix < 0) global_ix += sg.nx_global;
+            const double x = sg.x_min + (static_cast<double>(global_ix) + 0.5) * sg.dx;
+            const double x_max = sg.x_min + sg.nx_global * sg.dx;
+            const int x_region = x < sg.x_min + 0.2e-6 ? 0 :
+                (x > x_max - 0.2e-6 ? 2 : 1);
+            const double fmax = fct_macro_fmax[static_cast<size_t>(cell)];
+            const bool velocity_core = fmax > 0.0 &&
+                midpoint_state.f[mass_index(cell, j, k)] >= 1.0e-8 * fmax;
+            return 2 * x_region + (velocity_core ? 0 : 1);
+        };
+        const auto add_fct_macro_cell = [&](std::array<FctMacroBudget, 6>& budgets,
+                                            int cell, int j, int k,
+                                            double delta_mass) {
+            const int bin = fct_macro_bin(cell, j, k);
+            FctMacroBudget& budget = budgets[
+                static_cast<size_t>(bin)];
+            budget.delta_n += delta_mass;
+            budget.delta_j += bkg_n.charge * bkg_n.cgrid.vx[idx2(j, k)] *
+                delta_mass;
+            budget.delta_k += bkg_n.cgrid.kinetic_energy[idx2(j, k)] *
+                delta_mass;
+        };
+        const auto accumulate_final_fct_macro_budget = [&]() {
+            if (!fct_macro_budget_enabled) return;
+            // Each owned x face is visited once.  Its conservative update is
+            // split between its two neighbouring cells for region/velocity
+            // attribution, while the global sum remains exact.
+            for (int iface = 0; iface < nxl; ++iface) {
+                const int left_cell = ng + iface - 1;
+                const int right_cell = ng + iface;
+                for (int j = 0; j < Param::Nv; ++j) {
+                    for (int k = 0; k < Param::Nmu; ++k) {
+                        const size_t id = xface_index(iface, j, k);
+                        const double anti = fx_high[id] - fx_low[id];
+                        if (anti == 0.0) continue;
+                        const double alpha = (fx_final[id] - fx_low[id]) / anti;
+                        const double delta_flux = fx_final[id] - fx_high[id];
+                        const bool active = alpha < 1.0 - 1.0e-14;
+                        const int face_bin = fct_macro_bin(right_cell, j, k);
+                        FctMacroBudget& face_budget = fct_macro_budget_x_local[
+                            static_cast<size_t>(face_bin)];
+                        ++face_budget.face_count;
+                        if (active) ++face_budget.active_face_count;
+                        face_budget.min_alpha = std::min(face_budget.min_alpha,
+                                                         alpha);
+                        add_fct_macro_cell(fct_macro_budget_x_local,
+                                           left_cell, j, k, -h * delta_flux);
+                        add_fct_macro_cell(fct_macro_budget_x_local,
+                                           right_cell, j, k, h * delta_flux);
+                        const double face_work = h * sg.dx *
+                            fields_mid.Ex_face[iface] * bkg_n.charge * delta_flux;
+                        fct_macro_budget_x_local[static_cast<size_t>(
+                            fct_macro_bin(left_cell, j, k))].e_dot_j +=
+                            0.5 * face_work;
+                        fct_macro_budget_x_local[static_cast<size_t>(
+                            fct_macro_bin(right_cell, j, k))].e_dot_j +=
+                            0.5 * face_work;
+                    }
+                }
+            }
+            for (int ix = 0; ix < nxl; ++ix) {
+                const int cell = ng + ix;
+                for (int jf = 1; jf < Param::Nv; ++jf) {
+                    for (int k = 0; k < Param::Nmu; ++k) {
+                        const size_t id = uface_index(ix, jf, k);
+                        const double anti = fu_high[id] - fu_low[id];
+                        if (anti == 0.0) continue;
+                        const double alpha = (fu_final[id] - fu_low[id]) / anti;
+                        const double delta_flux = fu_final[id] - fu_high[id];
+                        FctMacroBudget& face_budget = fct_macro_budget_u_local[
+                            static_cast<size_t>(fct_macro_bin(cell, jf - 1, k))];
+                        ++face_budget.face_count;
+                        if (alpha < 1.0 - 1.0e-14)
+                            ++face_budget.active_face_count;
+                        face_budget.min_alpha = std::min(face_budget.min_alpha,
+                                                         alpha);
+                        add_fct_macro_cell(fct_macro_budget_u_local,
+                                           cell, jf - 1, k, -h * delta_flux);
+                        add_fct_macro_cell(fct_macro_budget_u_local,
+                                           cell, jf, k, h * delta_flux);
+                        const double delta_je = u_face_energy_current_weight[
+                            idx2(jf, k)] * (cu_final[id] - cu_high[id]);
+                        const double face_work = h * sg.dx *
+                            fields_mid.Ex[cell] * delta_je;
+                        fct_macro_budget_u_local[static_cast<size_t>(
+                            fct_macro_bin(cell, jf - 1, k))].e_dot_j +=
+                            0.5 * face_work;
+                        fct_macro_budget_u_local[static_cast<size_t>(
+                            fct_macro_bin(cell, jf, k))].e_dot_j +=
+                            0.5 * face_work;
+                    }
+                }
+            }
+        };
+        const auto finalize_fct_macro_budget = [&]() {
+            if (!fct_macro_budget_enabled) return;
+            long long counts[24] = {0};
+            double sums[48] = {0.0};
+            double minima[12] = {
+                1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+                1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+            std::array<FctMacroBudget, 6>* local_budgets[2] = {
+                &fct_macro_budget_x_local, &fct_macro_budget_u_local};
+            for (int direction = 0; direction < 2; ++direction) {
+                for (int bin = 0; bin < 6; ++bin) {
+                    const int offset = 6 * direction + bin;
+                    const FctMacroBudget& local = (*local_budgets[direction])[bin];
+                    counts[2 * offset] = local.face_count;
+                    counts[2 * offset + 1] = local.active_face_count;
+                    sums[4 * offset] = local.delta_n;
+                    sums[4 * offset + 1] = local.delta_j;
+                    sums[4 * offset + 2] = local.delta_k;
+                    sums[4 * offset + 3] = local.e_dot_j;
+                    minima[offset] = local.min_alpha;
+                }
+            }
+            MPI_Allreduce(MPI_IN_PLACE, counts, 24, MPI_LONG_LONG_INT,
+                          MPI_SUM, MPI_COMM_WORLD);
+            MPI_Allreduce(MPI_IN_PLACE, sums, 48, MPI_DOUBLE, MPI_SUM,
+                          MPI_COMM_WORLD);
+            MPI_Allreduce(MPI_IN_PLACE, minima, 12, MPI_DOUBLE, MPI_MIN,
+                          MPI_COMM_WORLD);
+            result.fct_macro_budget_valid = 1;
+            std::array<FctMacroBudget, 6>* result_budgets[2] = {
+                &result.fct_macro_budget_x, &result.fct_macro_budget_u};
+            for (int direction = 0; direction < 2; ++direction) {
+                for (int bin = 0; bin < 6; ++bin) {
+                    const int offset = 6 * direction + bin;
+                    FctMacroBudget& global = (*result_budgets[direction])[bin];
+                    global.face_count = counts[2 * offset];
+                    global.active_face_count = counts[2 * offset + 1];
+                    global.min_alpha = minima[offset];
+                    global.delta_n = sums[4 * offset];
+                    global.delta_j = sums[4 * offset + 1];
+                    global.delta_k = sums[4 * offset + 2];
+                    global.e_dot_j = sums[4 * offset + 3];
+                    global.r_fct_e = global.delta_k - global.e_dot_j;
+                }
+            }
+        };
+        const auto finalize_directional_limiter_statistics = [&]() {
+            if (low_order_only_) {
+                result.x_limiter_active_fraction = 0.0;
+                result.x_limiter_min_alpha = 1.0;
+                result.u_limiter_active_fraction = 0.0;
+                result.u_limiter_min_alpha = 1.0;
+                return;
+            }
+            double x_sum[2] = {x_limiter_faces, x_limiter_active};
+            MPI_Allreduce(MPI_IN_PLACE, x_sum, 2, MPI_DOUBLE,
+                          MPI_SUM, MPI_COMM_WORLD);
+            double x_min = x_limiter_min;
+            MPI_Allreduce(MPI_IN_PLACE, &x_min, 1, MPI_DOUBLE,
+                          MPI_MIN, MPI_COMM_WORLD);
+            result.x_limiter_active_fraction = x_sum[0] > 0.0
+                ? x_sum[1] / x_sum[0] : 0.0;
+            result.x_limiter_min_alpha = x_min;
+            if (fixed_candidate || step_diagnostics_enabled_) {
+                double u_sum[2] = {u_limiter_faces, u_limiter_active};
+                MPI_Allreduce(MPI_IN_PLACE, u_sum, 2, MPI_DOUBLE,
+                              MPI_SUM, MPI_COMM_WORLD);
+                double u_min = u_limiter_min;
+                MPI_Allreduce(MPI_IN_PLACE, &u_min, 1, MPI_DOUBLE,
+                              MPI_MIN, MPI_COMM_WORLD);
+                result.u_limiter_active_fraction = u_sum[0] > 0.0
+                    ? u_sum[1] / u_sum[0] : 0.0;
+                result.u_limiter_min_alpha = u_min;
+            } else {
+                result.u_limiter_active_fraction = 0.0;
+                result.u_limiter_min_alpha = 1.0;
+            }
+        };
         const auto capture_accepted_transport =
             [&](const Species& committed) {
                 // low_order_only_ intentionally leaves high/FCT work arrays
@@ -1798,6 +2126,10 @@ midpoint_iteration_retry:
                 fx_final = fx_high;
                 fu_final = fu_high;
                 cu_final = cu_high;
+                if (fixed_candidate) {
+                    result.fct_limited_u_flux = fu_final;
+                    result.fct_limited_u_coefficient = cu_final;
+                }
                 if (fixed_candidate)
                     substep_audit.jn_final_pre_sync =
                         substep_audit.jn_high_pre_sync;
@@ -2120,8 +2452,18 @@ midpoint_iteration_retry:
                         static_cast<long double>(au_upper);
                     double candidate =
                         static_cast<double>(candidate_ld);
+                    const double low_transfer[4] = {
+                        h * fx_low[xface_index(ix, j, k)],
+                        h * fx_low[xface_index(ix + 1, j, k)],
+                        h * fu_low[uface_index(ix, j, k)],
+                        h * fu_low[uface_index(ix, j + 1, k)]};
+                    const double face_transfer[4] = {
+                        ax_left, ax_right, au_lower, au_upper};
+                    const double face_raw_transfer[4] = {
+                        ax_left_raw, ax_right_raw, au_lower_raw, au_upper_raw};
                     const double final_tolerance = candidate_roundoff_tolerance(
-                        m_low, ax_left, ax_right, au_lower, au_upper);
+                        work.f[mass_index(ng + ix, j, k)], low_transfer,
+                        m_low, face_raw_transfer, face_transfer);
                     double normalized_mass = 0.0;
                     if (normalize_roundoff_negative_candidate(
                             candidate, final_tolerance, normalized_mass)) {
@@ -2155,10 +2497,6 @@ midpoint_iteration_retry:
                         : 0.0;
                     const double donor_roundoff_tolerance = 4096.0 *
                         std::numeric_limits<double>::epsilon();
-                    const double face_transfer[4] = {
-                        ax_left, ax_right, au_lower, au_upper};
-                    const double face_raw_transfer[4] = {
-                        ax_left_raw, ax_right_raw, au_lower_raw, au_upper_raw};
                     if (fct_activation_audit_enabled_) {
                         const long double high_outflow_ld =
                             std::max(0.0L, -static_cast<long double>(ax_left_raw)) +
@@ -2507,10 +2845,27 @@ midpoint_iteration_retry:
                             donor_capacity_violation = std::max(
                                 donor_capacity_violation, relative -
                                 4096.0 * std::numeric_limits<double>::epsilon());
+                            const double low_transfer[4] = {
+                                h * fx_low[xface_index(ix, j, k)],
+                                h * fx_low[xface_index(ix + 1, j, k)],
+                                h * fu_low[uface_index(ix, j, k)],
+                                h * fu_low[uface_index(ix, j + 1, k)]};
+                            const double raw_transfer[4] = {
+                                h * (fx_high[xface_index(ix, j, k)] -
+                                     fx_low[xface_index(ix, j, k)]),
+                                h * (fx_high[xface_index(ix + 1, j, k)] -
+                                     fx_low[xface_index(ix + 1, j, k)]),
+                                h * (fu_high[uface_index(ix, j, k)] -
+                                     fu_low[uface_index(ix, j, k)]),
+                                h * (fu_high[uface_index(ix, j + 1, k)] -
+                                     fu_low[uface_index(ix, j + 1, k)])};
+                            const double final_transfer[4] = {
+                                ax_left, ax_right, au_lower, au_upper};
                             const double tolerance =
                                 candidate_roundoff_tolerance(
-                                    m_low, ax_left, ax_right, au_lower,
-                                    au_upper);
+                                    work.f[mass_index(ng + ix, j, k)],
+                                    low_transfer, m_low, raw_transfer,
+                                    final_transfer);
                             double normalized_mass = 0.0;
                             if (normalize_roundoff_negative_candidate(
                                     candidate, tolerance, normalized_mass)) {
@@ -2610,10 +2965,12 @@ midpoint_iteration_retry:
             };
             MPI_Allreduce(MPI_IN_PLACE, invariant_max, 9, MPI_DOUBLE, MPI_MAX,
                           MPI_COMM_WORLD);
-            MPI_Allreduce(MPI_IN_PLACE, &candidate_min, 1, MPI_DOUBLE, MPI_MIN,
+            double invariant_min[2] = {
+                candidate_min, high_candidate_min};
+            MPI_Allreduce(MPI_IN_PLACE, invariant_min, 2, MPI_DOUBLE, MPI_MIN,
                           MPI_COMM_WORLD);
-            MPI_Allreduce(MPI_IN_PLACE, &high_candidate_min, 1, MPI_DOUBLE,
-                          MPI_MIN, MPI_COMM_WORLD);
+            candidate_min = invariant_min[0];
+            high_candidate_min = invariant_min[1];
             result.fct_high_low_identity_linf = std::max(
                 result.fct_high_low_identity_linf, invariant_max[0]);
             result.fct_high_low_identity_violation = std::max(
@@ -2671,8 +3028,9 @@ midpoint_iteration_retry:
                 return result;
             }
 
-            // Account for the final, possibly beta-corrected u transfer only
-            // after it has passed the scratch audit.
+            // The FCT energy ledger and macro budget are defined before the
+            // final dual correction so limiter effects remain distinct from
+            // the pairing repair.
             #pragma omp parallel for schedule(static) reduction(+:limiter_energy_change,limiter_energy_positive,limiter_energy_negative,limiter_energy_core,limiter_energy_boundary)
             for (int ix = 0; ix < nxl; ++ix)
                 for (int jf = 1; jf < Param::Nv; ++jf)
@@ -2691,47 +3049,663 @@ midpoint_iteration_retry:
                         else
                             limiter_energy_boundary += dlim;
                     }
-
-            // Direction-separated limiter rates are needed only by the
-            // fixed-candidate stage-3 audit.  Keep this extra alpha scan out
-            // of the production stepping path.
+            accumulate_final_fct_macro_budget();
             if (fixed_candidate) {
-                #pragma omp parallel for schedule(static) reduction(+:x_limiter_faces,x_limiter_active) reduction(min:x_limiter_min)
-                for (int iface = 0; iface < nxl; ++iface)
-                    for (int j = 0; j < Param::Nv; ++j)
-                        for (int k = 0; k < Param::Nmu; ++k) {
-                            const size_t id = xface_index(iface, j, k);
-                            const double anti = fx_high[id] - fx_low[id];
-                            const size_t p = idx2(j, k);
-                            const double alpha = anti >= 0.0
-                                ? (iface == 0 ? left_alpha_x_right[p] :
-                                   alpha_x_right[
-                                       static_cast<size_t>(iface - 1) *
-                                       Param::Nvmu + p])
-                                : alpha_x_left[
-                                      static_cast<size_t>(iface) *
-                                      Param::Nvmu + p];
-                            x_limiter_faces += 1.0;
-                            if (alpha < 1.0 - 1.0e-14)
-                                x_limiter_active += 1.0;
-                            x_limiter_min = std::min(x_limiter_min, alpha);
+                result.fct_limited_u_flux = fu_final;
+                result.fct_limited_u_coefficient = cu_final;
+            }
+
+            if (dual_u_enabled) {
+                current_moment_from_x_flux(fx_final, dual_jn_high_face);
+                #pragma omp parallel for schedule(static)
+                for (int ix = 0; ix < nxl; ++ix) {
+                    dual_target_jn_cell[static_cast<size_t>(ix)] = 0.5 * (
+                        dual_jn_high_face[static_cast<size_t>(ix)] +
+                        dual_jn_high_face[static_cast<size_t>(ix + 1)]);
+                    final_dual_acceleration[static_cast<size_t>(ix)] =
+                        bkg_n.charge * fields_mid.Ex[ng + ix] /
+                        (bkg_n.mass * Const::c);
+                }
+
+                double pre_baseline_ke = 0.0;
+                double pre_baseline_work = 0.0;
+                if (face_pairing_mode_ == FACE_PAIRING_REGULARIZED) {
+                    #pragma omp parallel for schedule(static) reduction(+:pre_baseline_ke,pre_baseline_work)
+                    for (int ix = 0; ix < nxl; ++ix) {
+                        double je = 0.0;
+                        for (int j = 0; j < Param::Nv; ++j)
+                            for (int k = 0; k < Param::Nmu; ++k)
+                                pre_baseline_ke +=
+                                    candidate_mass[
+                                        static_cast<size_t>(ix) *
+                                            Param::Nvmu + idx2(j, k)] *
+                                    bkg_n.cgrid.kinetic_energy[idx2(j, k)];
+                        for (int jf = 1; jf < Param::Nv; ++jf)
+                            for (int k = 0; k < Param::Nmu; ++k)
+                                je += u_face_energy_current_weight[
+                                    idx2(jf, k)] *
+                                    cu_final[uface_index(ix, jf, k)];
+                        pre_baseline_work += h * sg.dx *
+                            fields_mid.Ex[ng + ix] * je;
+                    }
+                }
+
+                DualUCoupling::FinalLimitedDiagnostics final_dual =
+                    DualUCoupling::apply_final_limited_capacity_pairing(
+                        nxl, h, dual_target_jn_cell,
+                        final_dual_acceleration,
+                        u_face_energy_current_weight,
+                        bkg_n.cgrid.upar_widths,
+                        candidate_mass, cu_final, fu_final);
+
+                // The correction is local in x.  Trial iterations need only a
+                // single collective validity decision; global norms and counts
+                // are reduced once below, for the candidate that is accepted
+                // or emitted.
+                int final_dual_valid = final_dual.valid;
+                MPI_Allreduce(MPI_IN_PLACE, &final_dual_valid, 1, MPI_INT,
+                              MPI_MIN, MPI_COMM_WORLD);
+                final_dual_iteration_diagnostics.valid =
+                    std::min(final_dual_iteration_diagnostics.valid,
+                             final_dual_valid);
+                final_dual_iteration_diagnostics.target_linf = std::max(
+                    final_dual_iteration_diagnostics.target_linf,
+                    final_dual.target_linf);
+                final_dual_iteration_diagnostics.residual_before_linf =
+                    std::max(
+                        final_dual_iteration_diagnostics.residual_before_linf,
+                        final_dual.residual_before_linf);
+                final_dual_iteration_diagnostics.residual_after_linf =
+                    std::max(
+                        final_dual_iteration_diagnostics.residual_after_linf,
+                        final_dual.residual_after_linf);
+                final_dual_iteration_diagnostics.minimum_scale = std::min(
+                    final_dual_iteration_diagnostics.minimum_scale,
+                    final_dual.minimum_scale);
+                final_dual_iteration_diagnostics.correction_l2 =
+                    std::hypot(
+                        final_dual_iteration_diagnostics.correction_l2,
+                        final_dual.correction_l2);
+                final_dual_iteration_diagnostics.correction_linf = std::max(
+                    final_dual_iteration_diagnostics.correction_linf,
+                    final_dual.correction_linf);
+                final_dual_iteration_diagnostics.candidate_min = std::min(
+                    final_dual_iteration_diagnostics.candidate_min,
+                    final_dual.candidate_min);
+                final_dual_iteration_diagnostics.corrected_cell_count +=
+                    final_dual.corrected_cell_count;
+                final_dual_iteration_diagnostics.limited_cell_count +=
+                    final_dual.limited_cell_count;
+                final_dual_iteration_diagnostics.unresolved_cell_count +=
+                    final_dual.unresolved_cell_count;
+                final_dual_iteration_diagnostics.roundoff_zeroed_count +=
+                    final_dual.roundoff_zeroed_count;
+                final_dual_iteration_diagnostics.roundoff_zeroed_mass +=
+                    final_dual.roundoff_zeroed_mass;
+
+                if (!final_dual_valid ||
+                    !std::isfinite(final_dual.candidate_min)) {
+                    result.failed = true;
+                    result.state_advanced = 0;
+                    result.failure_reason = 15;
+                    result.failure_iteration = iter;
+                    result.failure_substep = sub;
+                    result.failure_global_cfl = global_cfl;
+                    if (reject_accelerated_trial_before_residual())
+                        goto midpoint_iteration_retry;
+                    return result;
+                }
+
+                if (face_pairing_mode_ == FACE_PAIRING_REGULARIZED) {
+                    result.face_pairing_attempted = 1;
+
+                    // This is the complete stable state to restore on every
+                    // regularized-solver or trust-region rejection.
+                    const std::vector<double> baseline_mass(candidate_mass);
+                    const std::vector<double> baseline_coefficient(cu_final);
+                    const std::vector<double> baseline_flux(fu_final);
+
+                    std::vector<double> baseline_je(
+                        static_cast<size_t>(nxl), 0.0);
+                    double baseline_ke = 0.0;
+                    double baseline_work = 0.0;
+                    double baseline_candidate_min =
+                        std::numeric_limits<double>::infinity();
+                    double baseline_f_residual_square = 0.0;
+                    #pragma omp parallel for schedule(static) reduction(+:baseline_ke,baseline_work,baseline_f_residual_square) reduction(min:baseline_candidate_min)
+                    for (int ix = 0; ix < nxl; ++ix) {
+                        double je = 0.0;
+                        for (int j = 0; j < Param::Nv; ++j) {
+                            for (int k = 0; k < Param::Nmu; ++k) {
+                                const size_t local_cell =
+                                    static_cast<size_t>(ix) * Param::Nvmu +
+                                    idx2(j, k);
+                                const double mass = baseline_mass[local_cell];
+                                baseline_ke += mass *
+                                    bkg_n.cgrid.kinetic_energy[idx2(j, k)];
+                                baseline_candidate_min = std::min(
+                                    baseline_candidate_min, mass);
+                                const double difference = mass -
+                                    guess.f[
+                                        mass_index(ng + ix, j, k)];
+                                baseline_f_residual_square +=
+                                    difference * difference;
+                            }
                         }
-                #pragma omp parallel for schedule(static) reduction(+:u_limiter_faces,u_limiter_active) reduction(min:u_limiter_min)
-                for (int ix = 0; ix < nxl; ++ix)
-                    for (int jf = 1; jf < Param::Nv; ++jf)
-                        for (int k = 0; k < Param::Nmu; ++k) {
-                            const size_t id = uface_index(ix, jf, k);
-                            const double anti = fu_high[id] - fu_low[id];
-                            const size_t base = static_cast<size_t>(ix) *
-                                                Param::Nvmu;
-                            const double alpha = anti >= 0.0
-                                ? alpha_u_upper[base + idx2(jf - 1, k)]
-                                : alpha_u_lower[base + idx2(jf, k)];
-                            u_limiter_faces += 1.0;
-                            if (alpha < 1.0 - 1.0e-14)
-                                u_limiter_active += 1.0;
-                            u_limiter_min = std::min(u_limiter_min, alpha);
+                        for (int jf = 1; jf < Param::Nv; ++jf)
+                            for (int k = 0; k < Param::Nmu; ++k)
+                                je += u_face_energy_current_weight[
+                                    idx2(jf, k)] *
+                                    baseline_coefficient[
+                                        uface_index(ix, jf, k)];
+                        baseline_je[static_cast<size_t>(ix)] = je;
+                        baseline_work += h * sg.dx *
+                            fields_mid.Ex[ng + ix] * je;
+                    }
+
+                    std::vector<double> baseline_gstar;
+                    PeriodicStaggered::apply_cell_to_face_Gstar(
+                        baseline_je, baseline_gstar, nxl, mpi_rank,
+                        mpi_size, 972);
+                    std::vector<double> local_face_residual(
+                        static_cast<size_t>(nxl), 0.0);
+                    for (int iface = 0; iface < nxl; ++iface)
+                        local_face_residual[static_cast<size_t>(iface)] =
+                            dual_jn_high_face[static_cast<size_t>(iface)] -
+                            baseline_gstar[static_cast<size_t>(iface)];
+
+                    std::vector<double> lower_capacity;
+                    std::vector<double> upper_capacity;
+                    int capacity_valid =
+                        DualUCoupling::compute_final_pairing_current_bounds(
+                            nxl, h, final_dual_acceleration,
+                            u_face_energy_current_weight,
+                            bkg_n.cgrid.upar_widths, baseline_mass,
+                            lower_capacity, upper_capacity) ? 1 : 0;
+                    MPI_Allreduce(MPI_IN_PLACE, &capacity_valid, 1, MPI_INT,
+                                  MPI_MIN, MPI_COMM_WORLD);
+
+                    std::vector<double> global_residual;
+                    std::vector<double> global_lower;
+                    std::vector<double> global_upper;
+                    allgather_spatial_cells(
+                        local_face_residual, sg.nx_global, mpi_size,
+                        global_residual);
+                    allgather_spatial_cells(
+                        lower_capacity, sg.nx_global, mpi_size, global_lower);
+                    allgather_spatial_cells(
+                        upper_capacity, sg.nx_global, mpi_size, global_upper);
+                    if (global_residual.size() !=
+                            static_cast<size_t>(sg.nx_global) ||
+                        global_lower.size() != global_residual.size() ||
+                        global_upper.size() != global_residual.size())
+                        capacity_valid = 0;
+
+                    RegularizedFacePairing::Config pairing_config;
+                    pairing_config.sigma_cutoff =
+                        face_pairing_sigma_cutoff_;
+                    pairing_config.lambda = face_pairing_lambda_;
+                    pairing_config.eta = face_pairing_eta_;
+                    pairing_config.trust_fraction =
+                        face_pairing_trust_fraction_;
+                    std::vector<double> global_weight(
+                        global_residual.size(), 1.0);
+                    for (size_t i = 0; i < global_lower.size(); ++i) {
+                        global_lower[i] *= face_pairing_trust_fraction_;
+                        global_upper[i] *= face_pairing_trust_fraction_;
+                    }
+                    std::vector<double> global_correction;
+                    std::vector<double> unresolved_residual;
+                    RegularizedFacePairing::Diagnostics pairing_diagnostics;
+                    const bool solved = capacity_valid &&
+                        RegularizedFacePairing::solve(
+                            global_residual, global_weight, global_lower,
+                            global_upper, pairing_config, global_correction,
+                            unresolved_residual, pairing_diagnostics);
+
+                    result.face_pairing_solver_converged =
+                        pairing_diagnostics.converged;
+                    result.face_pairing_iterations =
+                        pairing_diagnostics.iterations;
+                    result.face_pairing_unresolved_mode_count =
+                        pairing_diagnostics.unresolved_mode_count;
+                    result.face_pairing_unresolved_mode_l2 =
+                        pairing_diagnostics.unresolved_mode_l2;
+                    result.face_pairing_correction_l2 =
+                        pairing_diagnostics.correction_l2;
+                    result.face_pairing_correction_linf =
+                        pairing_diagnostics.correction_linf;
+                    result.face_pairing_requested_correction_l2 =
+                        pairing_diagnostics.correction_l2;
+                    result.face_pairing_requested_correction_linf =
+                        pairing_diagnostics.correction_linf;
+                    result.face_pairing_capacity_active_cells =
+                        pairing_diagnostics.capacity_active_cells;
+                    result.face_pairing_trust_region_active_cells =
+                        pairing_diagnostics.trust_region_active_cells;
+                    result.face_pairing_nonzero_capacity_cells =
+                        pairing_diagnostics.nonzero_capacity_cells;
+                    result.face_pairing_bound_saturated_cells =
+                        pairing_diagnostics.bound_saturated_cells;
+                    result.face_pairing_objective_residual =
+                        pairing_diagnostics.objective_residual;
+                    result.face_pairing_objective_smoothness =
+                        pairing_diagnostics.objective_smoothness;
+                    result.face_pairing_objective_amplitude =
+                        pairing_diagnostics.objective_amplitude;
+                    result.face_pairing_objective_total =
+                        pairing_diagnostics.objective_total;
+                    result.face_pairing_pass_solver = solved ? 1 : 0;
+
+                    bool accept_pairing = solved;
+                    if (accept_pairing) {
+                        std::vector<double> requested_je(baseline_je);
+                        for (int ix = 0; ix < nxl; ++ix)
+                            requested_je[static_cast<size_t>(ix)] +=
+                                global_correction[
+                                    static_cast<size_t>(sg.ix_start + ix)];
+                        const DualUCoupling::FinalLimitedDiagnostics applied =
+                            DualUCoupling::apply_final_limited_capacity_pairing(
+                                nxl, h, requested_je,
+                                final_dual_acceleration,
+                                u_face_energy_current_weight,
+                                bkg_n.cgrid.upar_widths,
+                                candidate_mass, cu_final, fu_final);
+                        int applied_valid = applied.valid;
+                        MPI_Allreduce(MPI_IN_PLACE, &applied_valid, 1,
+                                      MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+                        accept_pairing = applied_valid != 0;
+                    }
+                    result.face_pairing_pass_apply =
+                        accept_pairing ? 1 : 0;
+                    result.face_pairing_candidate_valid =
+                        accept_pairing ? 1 : 0;
+
+                    std::vector<double> corrected_je(baseline_je);
+                    double corrected_ke = baseline_ke;
+                    double corrected_work = baseline_work;
+                    double corrected_candidate_min =
+                        baseline_candidate_min;
+                    double corrected_f_residual_square =
+                        baseline_f_residual_square;
+                    long double local_mass_error_stable = 0.0L;
+                    long double local_baseline_mass_stable = 0.0L;
+                    double local_cell_mass_error_linf = 0.0;
+                    double local_cell_mass_relative_linf = 0.0;
+                    if (accept_pairing) {
+                        std::fill(corrected_je.begin(), corrected_je.end(),
+                                  0.0);
+                        corrected_ke = 0.0;
+                        corrected_work = 0.0;
+                        corrected_candidate_min =
+                            std::numeric_limits<double>::infinity();
+                        corrected_f_residual_square = 0.0;
+                        #pragma omp parallel for schedule(static) reduction(+:corrected_ke,corrected_work,corrected_f_residual_square,local_mass_error_stable,local_baseline_mass_stable) reduction(min:corrected_candidate_min) reduction(max:local_cell_mass_error_linf,local_cell_mass_relative_linf)
+                        for (int ix = 0; ix < nxl; ++ix) {
+                            double je = 0.0;
+                            long double cell_mass_error = 0.0L;
+                            long double cell_baseline_mass = 0.0L;
+                            for (int j = 0; j < Param::Nv; ++j)
+                                for (int k = 0; k < Param::Nmu; ++k) {
+                                    const size_t local_cell =
+                                        static_cast<size_t>(ix) *
+                                            Param::Nvmu + idx2(j, k);
+                                    const double mass =
+                                        candidate_mass[local_cell];
+                                    corrected_ke += mass *
+                                        bkg_n.cgrid.kinetic_energy[
+                                            idx2(j, k)];
+                                    corrected_candidate_min = std::min(
+                                        corrected_candidate_min, mass);
+                                    const double mass_difference = mass -
+                                        baseline_mass[local_cell];
+                                    cell_mass_error +=
+                                        static_cast<long double>(mass_difference);
+                                    cell_baseline_mass += static_cast<long double>(
+                                        baseline_mass[local_cell]);
+                                    const double difference = mass -
+                                        guess.f[
+                                            mass_index(ng + ix, j, k)];
+                                    corrected_f_residual_square +=
+                                        difference * difference;
+                                }
+                            for (int jf = 1; jf < Param::Nv; ++jf)
+                                for (int k = 0; k < Param::Nmu; ++k)
+                                    je += u_face_energy_current_weight[
+                                        idx2(jf, k)] *
+                                        cu_final[uface_index(ix, jf, k)];
+                            corrected_je[static_cast<size_t>(ix)] = je;
+                            corrected_work += h * sg.dx *
+                                fields_mid.Ex[ng + ix] * je;
+                            local_mass_error_stable += cell_mass_error;
+                            local_baseline_mass_stable += cell_baseline_mass;
+                            const double cell_error = std::fabs(
+                                static_cast<double>(cell_mass_error));
+                            const double cell_scale = std::max(
+                                std::fabs(static_cast<double>(cell_baseline_mass)),
+                                std::numeric_limits<double>::min());
+                            local_cell_mass_error_linf = std::max(
+                                local_cell_mass_error_linf, cell_error);
+                            local_cell_mass_relative_linf = std::max(
+                                local_cell_mass_relative_linf,
+                                cell_error / cell_scale);
                         }
+                    }
+
+                    long double global_mass_terms[2] = {
+                        local_mass_error_stable, local_baseline_mass_stable};
+                    MPI_Allreduce(MPI_IN_PLACE, global_mass_terms, 2,
+                                  MPI_LONG_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+                    const double global_mass_error =
+                        static_cast<double>(global_mass_terms[0]);
+                    const double global_mass_scale = std::max(
+                        std::fabs(static_cast<double>(global_mass_terms[1])),
+                        std::numeric_limits<double>::min());
+                    const double global_mass_relative_error =
+                        std::fabs(global_mass_error) / global_mass_scale;
+                    MPI_Allreduce(MPI_IN_PLACE, &local_cell_mass_error_linf,
+                                  1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+                    MPI_Allreduce(MPI_IN_PLACE,
+                                  &local_cell_mass_relative_linf, 1,
+                                  MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+                    MPI_Allreduce(MPI_IN_PLACE, &corrected_candidate_min, 1,
+                                  MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+                    result.face_pairing_mass_error = global_mass_error;
+                    result.face_pairing_mass_relative_error =
+                        global_mass_relative_error;
+                    result.face_pairing_cell_mass_error_linf =
+                        local_cell_mass_error_linf;
+                    result.face_pairing_cell_mass_relative_linf =
+                        local_cell_mass_relative_linf;
+                    result.face_pairing_candidate_min =
+                        corrected_candidate_min;
+                    if (result.face_pairing_candidate_valid) {
+                        result.face_pairing_candidate_mass_error =
+                            global_mass_error;
+                        result.face_pairing_candidate_min_before_fallback =
+                            corrected_candidate_min;
+                    }
+
+                    std::vector<double> corrected_gstar;
+                    if (accept_pairing)
+                        PeriodicStaggered::apply_cell_to_face_Gstar(
+                            corrected_je, corrected_gstar, nxl, mpi_rank,
+                            mpi_size, 974);
+                    long double local_before = 0.0L;
+                    long double local_after = 0.0L;
+                    long double local_core_before = 0.0L;
+                    long double local_core_after = 0.0L;
+                    long double local_energy_residual_scale = 0.0L;
+                    long double local_face_work_scale = 0.0L;
+                    double local_j_scale = 0.0;
+                    for (int iface = 0; iface < nxl; ++iface) {
+                        const double before =
+                            local_face_residual[
+                                static_cast<size_t>(iface)];
+                        const double after = accept_pairing
+                            ? dual_jn_high_face[
+                                  static_cast<size_t>(iface)] -
+                                  corrected_gstar[
+                                      static_cast<size_t>(iface)]
+                            : before;
+                        local_before +=
+                            static_cast<long double>(before) * before;
+                        local_after +=
+                            static_cast<long double>(after) * after;
+                        const double eface = fields_mid.Ex_face[
+                            static_cast<size_t>(iface)];
+                        local_energy_residual_scale +=
+                            std::fabs(static_cast<long double>(h * sg.dx) *
+                                      eface * before);
+                        local_face_work_scale +=
+                            std::fabs(static_cast<long double>(h * sg.dx) *
+                                      eface * baseline_gstar[
+                                          static_cast<size_t>(iface)]);
+                        const int global_face = sg.ix_start + iface;
+                        const double x = global_face * sg.dx;
+                        if (x >= kFctCoreBoundaryWidth &&
+                            x <= Param::Lx - kFctCoreBoundaryWidth) {
+                            local_core_before +=
+                                static_cast<long double>(before) * before;
+                            local_core_after +=
+                                static_cast<long double>(after) * after;
+                        }
+                        local_j_scale = std::max(
+                            local_j_scale,
+                            std::max(std::fabs(
+                                dual_jn_high_face[
+                                    static_cast<size_t>(iface)]),
+                                     std::fabs(baseline_gstar[
+                                         static_cast<size_t>(iface)])));
+                    }
+                    double norm_squares[6] = {
+                        static_cast<double>(local_before),
+                        static_cast<double>(local_after),
+                        static_cast<double>(local_core_before),
+                        static_cast<double>(local_core_after),
+                        static_cast<double>(local_energy_residual_scale),
+                        static_cast<double>(local_face_work_scale)};
+                    MPI_Allreduce(MPI_IN_PLACE, norm_squares, 6, MPI_DOUBLE,
+                                  MPI_SUM, MPI_COMM_WORLD);
+                    MPI_Allreduce(MPI_IN_PLACE, &local_j_scale, 1,
+                                  MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+                    result.face_pairing_residual_before =
+                        std::sqrt(std::max(0.0, norm_squares[0]));
+                    result.face_pairing_residual_after =
+                        std::sqrt(std::max(0.0, norm_squares[1]));
+                    result.face_pairing_core_residual_before =
+                        std::sqrt(std::max(0.0, norm_squares[2]));
+                    result.face_pairing_core_residual_after =
+                        std::sqrt(std::max(0.0, norm_squares[3]));
+                    result.face_pairing_energy_residual_scale =
+                        norm_squares[4];
+                    if (result.face_pairing_candidate_valid) {
+                        result.face_pairing_candidate_residual_after =
+                            result.face_pairing_residual_after;
+                        result.face_pairing_candidate_core_residual_after =
+                            result.face_pairing_core_residual_after;
+                    }
+
+                    double energy_terms[4] = {
+                        pre_baseline_ke, baseline_ke,
+                        pre_baseline_work, baseline_work};
+                    MPI_Allreduce(MPI_IN_PLACE, energy_terms, 4, MPI_DOUBLE,
+                                  MPI_SUM, MPI_COMM_WORLD);
+                    MPI_Allreduce(MPI_IN_PLACE, &baseline_candidate_min, 1,
+                                  MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+                    double corrected_terms[4] = {
+                        corrected_ke, corrected_work,
+                        baseline_f_residual_square,
+                        corrected_f_residual_square};
+                    MPI_Allreduce(MPI_IN_PLACE, corrected_terms, 4,
+                                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+                    result.face_pairing_delta_ke =
+                        corrected_terms[0] - energy_terms[1];
+                    result.face_pairing_delta_work =
+                        corrected_terms[1] - energy_terms[3];
+                    if (result.face_pairing_candidate_valid) {
+                        result.face_pairing_candidate_delta_ke =
+                            result.face_pairing_delta_ke;
+                        result.face_pairing_candidate_delta_work =
+                            result.face_pairing_delta_work;
+                    }
+                    double actual_correction_norms[2] = {0.0, 0.0};
+                    if (accept_pairing) {
+                        for (int ix = 0; ix < nxl; ++ix) {
+                            const double delta =
+                                corrected_je[static_cast<size_t>(ix)] -
+                                baseline_je[static_cast<size_t>(ix)];
+                            actual_correction_norms[0] += delta * delta;
+                            actual_correction_norms[1] = std::max(
+                                actual_correction_norms[1],
+                                std::fabs(delta));
+                        }
+                    }
+                    MPI_Allreduce(MPI_IN_PLACE, actual_correction_norms, 1,
+                                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+                    MPI_Allreduce(MPI_IN_PLACE,
+                                  actual_correction_norms + 1, 1,
+                                  MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+                    result.face_pairing_correction_l2 = std::sqrt(
+                        std::max(0.0, actual_correction_norms[0]));
+                    result.face_pairing_correction_linf =
+                        actual_correction_norms[1];
+                    result.face_pairing_applied_correction_l2 =
+                        result.face_pairing_candidate_valid
+                        ? result.face_pairing_correction_l2 : 0.0;
+                    result.face_pairing_applied_correction_linf =
+                        result.face_pairing_candidate_valid
+                        ? result.face_pairing_correction_linf : 0.0;
+                    const double correction_scale =
+                        std::max(1.0, local_j_scale);
+                    const double correction_trust_limit =
+                        face_pairing_correction_trust_fraction_ *
+                        correction_scale;
+                    const double face_work_roundoff_floor = 4096.0 *
+                        std::numeric_limits<double>::epsilon() *
+                        std::max(1.0, norm_squares[5]);
+                    const double energy_residual_scale = std::max(
+                        result.face_pairing_energy_residual_scale,
+                        face_work_roundoff_floor);
+                    const double correction_energy_scale = std::max(
+                        std::fabs(result.face_pairing_delta_ke),
+                        std::fabs(result.face_pairing_delta_work));
+                    const double energy_pair_scale = std::max(
+                        correction_energy_scale, face_work_roundoff_floor);
+                    const double energy_pair_error = std::fabs(
+                        result.face_pairing_delta_ke -
+                        result.face_pairing_delta_work);
+                    const double baseline_f_residual = std::sqrt(
+                        std::max(0.0, corrected_terms[2]));
+                    const double corrected_f_residual = std::sqrt(
+                        std::max(0.0, corrected_terms[3]));
+                    const double f_residual_floor = 4096.0 *
+                        std::numeric_limits<double>::epsilon() *
+                        std::max(1.0, baseline_f_residual);
+                    const double candidate_tolerance =
+                        4096.0 * std::numeric_limits<double>::epsilon() *
+                        std::max(1.0, std::fabs(
+                            baseline_candidate_min));
+
+                    const bool pass_global_residual =
+                        result.face_pairing_candidate_valid &&
+                        result.face_pairing_residual_after <
+                            result.face_pairing_residual_before;
+                    const bool pass_core_residual =
+                        result.face_pairing_candidate_valid &&
+                        result.face_pairing_core_residual_after <
+                            result.face_pairing_core_residual_before;
+                    const bool pass_correction_trust =
+                        result.face_pairing_candidate_valid &&
+                        result.face_pairing_correction_linf <=
+                            correction_trust_limit;
+                    const bool pass_energy_pair =
+                        result.face_pairing_candidate_valid &&
+                        energy_pair_error <=
+                            face_pairing_energy_pair_tolerance_ *
+                            energy_pair_scale;
+                    const bool pass_energy_residual_scale =
+                        result.face_pairing_candidate_valid &&
+                        correction_energy_scale <=
+                            face_pairing_energy_residual_fraction_ *
+                            energy_residual_scale;
+                    const bool pass_candidate_min =
+                        result.face_pairing_candidate_valid &&
+                        corrected_candidate_min + candidate_tolerance >=
+                            baseline_candidate_min;
+                    const bool pass_mass =
+                        result.face_pairing_candidate_valid &&
+                        global_mass_relative_error <=
+                            face_pairing_mass_relative_tolerance_ &&
+                        local_cell_mass_relative_linf <=
+                            face_pairing_mass_relative_tolerance_;
+                    const bool pass_f_residual =
+                        result.face_pairing_candidate_valid &&
+                        // The next Picard evaluation supplies the full
+                        // nonlinear residual.  At this point bound the
+                        // correction-induced growth against the same guess.
+                        corrected_f_residual <= baseline_f_residual *
+                            (1.0 +
+                             face_pairing_f_residual_growth_tolerance_) +
+                            f_residual_floor;
+                    result.face_pairing_correction_trust_limit =
+                        correction_trust_limit;
+                    result.face_pairing_correction_trust_ratio =
+                        result.face_pairing_correction_linf /
+                        std::max(correction_trust_limit,
+                                 std::numeric_limits<double>::min());
+                    result.face_pairing_energy_pair_error = energy_pair_error;
+                    result.face_pairing_energy_pair_relative =
+                        energy_pair_error / energy_pair_scale;
+                    result.face_pairing_energy_residual_ratio =
+                        correction_energy_scale / energy_residual_scale;
+                    result.face_pairing_f_residual_relative_growth =
+                        (corrected_f_residual - baseline_f_residual) /
+                        std::max(baseline_f_residual,
+                                 std::numeric_limits<double>::min());
+                    result.face_pairing_pass_global_residual =
+                        pass_global_residual ? 1 : 0;
+                    result.face_pairing_pass_core_residual =
+                        pass_core_residual ? 1 : 0;
+                    result.face_pairing_pass_correction_trust =
+                        pass_correction_trust ? 1 : 0;
+                    result.face_pairing_pass_delta_ke =
+                        pass_energy_pair ? 1 : 0;
+                    result.face_pairing_pass_delta_work =
+                        pass_energy_residual_scale ? 1 : 0;
+                    result.face_pairing_pass_candidate_min =
+                        pass_candidate_min ? 1 : 0;
+                    result.face_pairing_pass_mass = pass_mass ? 1 : 0;
+                    result.face_pairing_pass_f_residual =
+                        pass_f_residual ? 1 : 0;
+                    result.face_pairing_pass_energy_pair =
+                        pass_energy_pair ? 1 : 0;
+                    result.face_pairing_pass_energy_residual_scale =
+                        pass_energy_residual_scale ? 1 : 0;
+
+                    unsigned int rejection_mask = 0u;
+                    if (!result.face_pairing_pass_solver)
+                        rejection_mask |= 1u << 0;
+                    if (!result.face_pairing_pass_apply)
+                        rejection_mask |= 1u << 1;
+                    if (!pass_global_residual)
+                        rejection_mask |= 1u << 2;
+                    if (!pass_core_residual)
+                        rejection_mask |= 1u << 3;
+                    if (!pass_correction_trust)
+                        rejection_mask |= 1u << 4;
+                    if (!pass_energy_pair)
+                        rejection_mask |= 1u << 5;
+                    if (!pass_energy_residual_scale)
+                        rejection_mask |= 1u << 6;
+                    if (!pass_candidate_min)
+                        rejection_mask |= 1u << 7;
+                    if (!pass_mass)
+                        rejection_mask |= 1u << 8;
+                    if (!pass_f_residual)
+                        rejection_mask |= 1u << 9;
+                    result.face_pairing_rejection_mask = rejection_mask;
+
+                    accept_pairing =
+                        result.face_pairing_candidate_valid &&
+                        rejection_mask == 0u;
+
+                    int globally_accepted = accept_pairing ? 1 : 0;
+                    MPI_Allreduce(MPI_IN_PLACE, &globally_accepted, 1,
+                                  MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+                    accept_pairing = globally_accepted != 0;
+                    if (accept_pairing) {
+                        result.face_pairing_accepted = 1;
+                    } else {
+                        candidate_mass = baseline_mass;
+                        cu_final = baseline_coefficient;
+                        fu_final = baseline_flux;
+                        result.face_pairing_fallback_to_cell_baseline = 1;
+                    }
+                }
+                result.fct_final_scratch_min = std::min(
+                    result.fct_final_scratch_min,
+                    final_dual.candidate_min);
             }
 
             #pragma omp parallel for schedule(static)
@@ -2745,6 +3719,39 @@ midpoint_iteration_retry:
                     goto midpoint_iteration_retry;
                 return result;
             }
+
+            // Directional limiter statistics must describe the committed
+            // fluxes after donor-beta closure, not the provisional FCT alpha
+            // arrays.  This scan is intentionally local; its single global
+            // reduction is deferred until a candidate is accepted.
+            #pragma omp parallel for schedule(static) reduction(+:x_limiter_faces,x_limiter_active) reduction(min:x_limiter_min)
+            for (int iface = 0; iface < nxl; ++iface)
+                for (int j = 0; j < Param::Nv; ++j)
+                    for (int k = 0; k < Param::Nmu; ++k) {
+                        const size_t id = xface_index(iface, j, k);
+                        const double anti = fx_high[id] - fx_low[id];
+                        const double alpha = anti != 0.0
+                            ? (fx_final[id] - fx_low[id]) / anti : 1.0;
+                        x_limiter_faces += 1.0;
+                        if (alpha < 1.0 - 1.0e-14)
+                            x_limiter_active += 1.0;
+                        x_limiter_min = std::min(x_limiter_min, alpha);
+                    }
+            if (fixed_candidate || step_diagnostics_enabled_) {
+                #pragma omp parallel for schedule(static) reduction(+:u_limiter_faces,u_limiter_active) reduction(min:u_limiter_min)
+                for (int ix = 0; ix < nxl; ++ix)
+                    for (int jf = 1; jf < Param::Nv; ++jf)
+                        for (int k = 0; k < Param::Nmu; ++k) {
+                            const size_t id = uface_index(ix, jf, k);
+                            const double anti = fu_high[id] - fu_low[id];
+                            const double alpha = anti != 0.0
+                                ? (fu_final[id] - fu_low[id]) / anti : 1.0;
+                            u_limiter_faces += 1.0;
+                            if (alpha < 1.0 - 1.0e-14)
+                                u_limiter_active += 1.0;
+                            u_limiter_min = std::min(u_limiter_min, alpha);
+                        }
+            }
             } // high-order/FCT donor-capacity closure
 
             const std::vector<double>& cu_high_used = low_order_only_
@@ -2756,10 +3763,103 @@ midpoint_iteration_retry:
                 ? fx_low : fx_high;
             const std::vector<double>& fx_final_used = low_order_only_
                 ? fx_low : fx_final;
+            const std::vector<double>& fu_high_used = low_order_only_
+                ? fu_low : fu_high;
             const std::vector<double>& fu_final_used = low_order_only_
                 ? fu_low : fu_final;
             const std::vector<double>& cu_final_used = low_order_only_
                 ? cu_low : cu_final;
+
+            if (accepted_energy_audit_enabled_) {
+                // This is a flux-form diagnostic of this real transport
+                // substep.  It intentionally uses no reconstructed state and
+                // no operator replay: all three layers are the actual
+                // low/high/final face fluxes just committed for this trial.
+                #pragma omp parallel
+                {
+                    std::array<long double, LEDGER_SLOT_COUNT> partial = {};
+                    #pragma omp for nowait schedule(static)
+                    for (int ix = 0; ix < nxl; ++ix) {
+                        for (int j = 0; j < Param::Nv; ++j) {
+                            for (int k = 0; k < Param::Nmu; ++k) {
+                                const double kinetic = bkg_n.cgrid.kinetic_energy[
+                                    idx2(j, k)];
+                                const double ppar = bkg_n.mass * Const::c *
+                                    bkg_n.cgrid.upar_cells[j];
+                                const double low_x = -h * (
+                                    fx_low_used[xface_index(ix + 1, j, k)] -
+                                    fx_low_used[xface_index(ix, j, k)]);
+                                const double high_x = -h * (
+                                    fx_high_used[xface_index(ix + 1, j, k)] -
+                                    fx_high_used[xface_index(ix, j, k)]);
+                                const double final_x = -h * (
+                                    fx_final_used[xface_index(ix + 1, j, k)] -
+                                    fx_final_used[xface_index(ix, j, k)]);
+                                const double low_u = -h * (
+                                    fu_low[uface_index(ix, j + 1, k)] -
+                                    fu_low[uface_index(ix, j, k)]);
+                                const double high_u = -h * (
+                                    fu_high_used[uface_index(ix, j + 1, k)] -
+                                    fu_high_used[uface_index(ix, j, k)]);
+                                const double final_u = -h * (
+                                    fu_final_used[uface_index(ix, j + 1, k)] -
+                                    fu_final_used[uface_index(ix, j, k)]);
+                                const double low_delta = low_x + low_u;
+                                const double high_delta = high_x + high_u;
+                                const double final_delta = final_x + final_u;
+                                partial[LEDGER_DKE_LOW] +=
+                                    static_cast<long double>(kinetic) * low_delta;
+                                partial[LEDGER_DKE_HIGH] +=
+                                    static_cast<long double>(kinetic) * high_delta;
+                                partial[LEDGER_DKE_FINAL] +=
+                                    static_cast<long double>(kinetic) * final_delta;
+                                partial[LEDGER_DKE_FCT_X] +=
+                                    static_cast<long double>(kinetic) *
+                                    (final_x - high_x);
+                                partial[LEDGER_DKE_FCT_U] +=
+                                    static_cast<long double>(kinetic) *
+                                    (final_u - high_u);
+                                partial[LEDGER_DMASS_FCT_X] += final_x - high_x;
+                                partial[LEDGER_DMASS_FCT_U] += final_u - high_u;
+                                partial[LEDGER_DPPAR_FCT_X] +=
+                                    static_cast<long double>(ppar) *
+                                    (final_x - high_x);
+                                partial[LEDGER_DPPAR_FCT_U] +=
+                                    static_cast<long double>(ppar) *
+                                    (final_u - high_u);
+                            }
+                        }
+                        for (int k = 0; k < Param::Nmu; ++k) {
+                            const double flux_lower =
+                                fu_final_used[uface_index(ix, 0, k)];
+                            const double flux_upper = fu_final_used[
+                                uface_index(ix, Param::Nv, k)];
+                            const double ppar_lower = bkg_n.mass * Const::c *
+                                bkg_n.cgrid.upar_cells[0];
+                            const double ppar_upper = bkg_n.mass * Const::c *
+                                bkg_n.cgrid.upar_cells[Param::Nv - 1];
+                            partial[LEDGER_BNUM_LOWER] += -h * flux_lower;
+                            partial[LEDGER_BNUM_UPPER] += h * flux_upper;
+                            partial[LEDGER_BPPAR_LOWER] +=
+                                -h * ppar_lower * flux_lower;
+                            partial[LEDGER_BPPAR_UPPER] +=
+                                h * ppar_upper * flux_upper;
+                            partial[LEDGER_BENERGY_LOWER] += -h *
+                                bkg_n.cgrid.kinetic_energy[idx2(0, k)] *
+                                flux_lower;
+                            partial[LEDGER_BENERGY_UPPER] += h *
+                                bkg_n.cgrid.kinetic_energy[
+                                    idx2(Param::Nv - 1, k)] * flux_upper;
+                        }
+                    }
+                    #pragma omp critical(accepted_energy_ledger_accumulate)
+                    {
+                        for (int q = 0; q < LEDGER_SLOT_COUNT; ++q)
+                            trial_energy_ledger_local[static_cast<size_t>(q)] +=
+                                partial[static_cast<size_t>(q)];
+                    }
+                }
+            }
             std::vector<double> sub_je_low_cell;
             std::vector<double> sub_je_high_cell;
             std::vector<double> sub_je_final_cell;
@@ -3059,6 +4159,16 @@ midpoint_iteration_retry:
                 psi_p_x[ix + 1] - psi_p_x[ix] - u_momentum_cell[ix] -
                 u_boundary_momentum_cell[ix];
         }
+        if (accepted_energy_audit_enabled_) {
+            // delta_ke_cell is formed from the actual endpoint state rather
+            // than from an independently reconstructed flux state.  Keep the
+            // local sum in long double so the accepted ledger can expose any
+            // FV/state mismatch instead of hiding it in cancellation noise.
+            for (int ix = 0; ix < nxl; ++ix) {
+                trial_actual_delta_ke_local +=
+                    static_cast<long double>(delta_ke_cell[ix]);
+            }
+        }
 
         for (size_t i = 0; i < nface; ++i) {
             result.j_bkg_face_low_mid[i] = integrated_jn_low[i] / dt;
@@ -3321,11 +4431,71 @@ midpoint_iteration_retry:
         }
         const bool final_candidate = fixed_candidate ||
             iter + 1 == max_iters;
+        if (strict_candidate || final_candidate) {
+            if (dual_u_enabled && fct_enabled_) {
+                double final_dual_max[4] = {
+                    final_dual_iteration_diagnostics.target_linf,
+                    final_dual_iteration_diagnostics.residual_before_linf,
+                    final_dual_iteration_diagnostics.residual_after_linf,
+                    final_dual_iteration_diagnostics.correction_linf};
+                MPI_Allreduce(MPI_IN_PLACE, final_dual_max, 4, MPI_DOUBLE,
+                              MPI_MAX, MPI_COMM_WORLD);
+                double final_dual_min[2] = {
+                    final_dual_iteration_diagnostics.minimum_scale,
+                    final_dual_iteration_diagnostics.candidate_min};
+                MPI_Allreduce(MPI_IN_PLACE, final_dual_min, 2, MPI_DOUBLE,
+                              MPI_MIN, MPI_COMM_WORLD);
+                // Counts remain far below the exact-integer range of double,
+                // so they can share the sum collective with the two norms.
+                double final_dual_sum[6] = {
+                    final_dual_iteration_diagnostics.correction_l2 *
+                        final_dual_iteration_diagnostics.correction_l2,
+                    final_dual_iteration_diagnostics.roundoff_zeroed_mass,
+                    static_cast<double>(
+                        final_dual_iteration_diagnostics.corrected_cell_count),
+                    static_cast<double>(
+                        final_dual_iteration_diagnostics.limited_cell_count),
+                    static_cast<double>(
+                        final_dual_iteration_diagnostics.unresolved_cell_count),
+                    static_cast<double>(
+                        final_dual_iteration_diagnostics.roundoff_zeroed_count)};
+                MPI_Allreduce(MPI_IN_PLACE, final_dual_sum, 6, MPI_DOUBLE,
+                              MPI_SUM, MPI_COMM_WORLD);
+
+                result.final_dual_u_valid =
+                    final_dual_iteration_diagnostics.valid;
+                result.final_dual_u_target_linf =
+                    final_dual_max[0];
+                result.final_dual_u_residual_before_linf =
+                    final_dual_max[1];
+                result.final_dual_u_residual_after_linf =
+                    final_dual_max[2];
+                result.final_dual_u_minimum_scale =
+                    final_dual_min[0];
+                result.final_dual_u_correction_l2 =
+                    std::sqrt(std::max(0.0, final_dual_sum[0]));
+                result.final_dual_u_correction_linf =
+                    final_dual_max[3];
+                result.final_dual_u_candidate_min =
+                    final_dual_min[1];
+                result.final_dual_u_corrected_cell_count =
+                    static_cast<long long>(std::llround(final_dual_sum[2]));
+                result.final_dual_u_limited_cell_count =
+                    static_cast<long long>(std::llround(final_dual_sum[3]));
+                result.final_dual_u_unresolved_cell_count =
+                    static_cast<long long>(std::llround(final_dual_sum[4]));
+                result.fct_roundoff_zeroed_count +=
+                    static_cast<long long>(std::llround(final_dual_sum[5]));
+                result.fct_roundoff_zeroed_mass += final_dual_sum[1];
+            }
+            finalize_directional_limiter_statistics();
+            finalize_fct_macro_budget();
+        }
         // Emit expensive closure data once, for the candidate that will be
         // committed.  Earlier Picard trials need only transport, Ampere and
         // the convergence/finite checks above.
         const bool collect_expensive_iteration_audit = fixed_candidate ||
-            (step_diagnostics_enabled_ &&
+            ((step_diagnostics_enabled_ || accepted_energy_audit_enabled_) &&
              (strict_candidate || final_candidate));
         if (collect_expensive_iteration_audit) {
             trace_live("expensive_audit_begin", iter + 1, -1);
@@ -3402,9 +4572,6 @@ midpoint_iteration_retry:
         energy_pair[1] = local_face_work;
         energy_pair[2] = local_high_cell_work;
         energy_pair[3] = local_center_cell_work;
-        MPI_Allreduce(MPI_IN_PLACE, energy_pair, 4, MPI_DOUBLE, MPI_SUM,
-                      MPI_COMM_WORLD);
-        result.energy_residual_bkg = dt * (energy_pair[0] - energy_pair[1]);
 
         local_stage5[4] = psi_k_x[nxl] - psi_k_x[0];
         local_stage5[5] = psi_p_x[nxl] - psi_p_x[0];
@@ -3429,20 +4596,33 @@ midpoint_iteration_retry:
             local_momentum_scale += std::fabs(initial_p_cell[ix]) +
                                     std::fabs(final_p_cell[ix]);
         }
-        MPI_Allreduce(MPI_IN_PLACE, local_stage5, 7, MPI_DOUBLE, MPI_SUM,
-                      MPI_COMM_WORLD);
-        MPI_Allreduce(MPI_IN_PLACE, &local_mass_change, 1, MPI_DOUBLE, MPI_SUM,
-                      MPI_COMM_WORLD);
-        MPI_Allreduce(MPI_IN_PLACE, &local_mass_scale, 1, MPI_DOUBLE, MPI_SUM,
-                      MPI_COMM_WORLD);
-        MPI_Allreduce(MPI_IN_PLACE, &local_momentum_scale, 1, MPI_DOUBLE,
-                      MPI_SUM, MPI_COMM_WORLD);
         double u_boundary_global[5] = {u_boundary_particle, u_boundary_momentum,
                                        u_boundary_energy,
                                        u_boundary_energy_lower,
                                        u_boundary_energy_upper};
-        MPI_Allreduce(MPI_IN_PLACE, u_boundary_global, 5, MPI_DOUBLE, MPI_SUM,
+        // All quantities below use the same communicator, datatype and SUM
+        // operation.  A single packed collective preserves each scalar
+        // reduction while removing five latency-dominated synchronization
+        // points from diagnostic iterations.
+        double stage5_sum[19];
+        for (int i = 0; i < 4; ++i) stage5_sum[i] = energy_pair[i];
+        for (int i = 0; i < 7; ++i) stage5_sum[4 + i] = local_stage5[i];
+        stage5_sum[11] = local_mass_change;
+        stage5_sum[12] = local_mass_scale;
+        stage5_sum[13] = local_momentum_scale;
+        for (int i = 0; i < 5; ++i)
+            stage5_sum[14 + i] = u_boundary_global[i];
+        MPI_Allreduce(MPI_IN_PLACE, stage5_sum, 19, MPI_DOUBLE, MPI_SUM,
                       MPI_COMM_WORLD);
+        for (int i = 0; i < 4; ++i) energy_pair[i] = stage5_sum[i];
+        for (int i = 0; i < 7; ++i) local_stage5[i] = stage5_sum[4 + i];
+        local_mass_change = stage5_sum[11];
+        local_mass_scale = stage5_sum[12];
+        local_momentum_scale = stage5_sum[13];
+        for (int i = 0; i < 5; ++i)
+            u_boundary_global[i] = stage5_sum[14 + i];
+        result.energy_residual_bkg =
+            dt * (energy_pair[0] - energy_pair[1]);
         double global_fct_budget_violation = fct_budget_violation;
         MPI_Allreduce(MPI_IN_PLACE, &global_fct_budget_violation, 1, MPI_DOUBLE,
                       MPI_MAX, MPI_COMM_WORLD);
@@ -3559,15 +4739,6 @@ midpoint_iteration_retry:
             limiter_min, limiter_min_core, limiter_min_boundary};
         MPI_Allreduce(MPI_IN_PLACE, limiter_alpha_global, 3, MPI_DOUBLE,
                       MPI_MIN, MPI_COMM_WORLD);
-        double directional_limiter_sum[4] = {
-            x_limiter_faces, x_limiter_active,
-            u_limiter_faces, u_limiter_active};
-        MPI_Allreduce(MPI_IN_PLACE, directional_limiter_sum, 4, MPI_DOUBLE,
-                      MPI_SUM, MPI_COMM_WORLD);
-        double directional_limiter_min[2] = {
-            x_limiter_min, u_limiter_min};
-        MPI_Allreduce(MPI_IN_PLACE, directional_limiter_min, 2, MPI_DOUBLE,
-                      MPI_MIN, MPI_COMM_WORLD);
         trace_live("limiter_reduce_end", iter + 1, -1);
         result.limiter_energy_defect = limiter_sum[0];
         result.limiter_energy_defect_positive = limiter_sum[4];
@@ -3584,12 +4755,6 @@ midpoint_iteration_retry:
         result.limiter_min_alpha = limiter_alpha_global[0];
         result.limiter_min_alpha_core = limiter_alpha_global[1];
         result.limiter_min_alpha_boundary = limiter_alpha_global[2];
-        result.x_limiter_active_fraction = directional_limiter_sum[0] > 0.0
-            ? directional_limiter_sum[1] / directional_limiter_sum[0] : 0.0;
-        result.x_limiter_min_alpha = directional_limiter_min[0];
-        result.u_limiter_active_fraction = directional_limiter_sum[2] > 0.0
-            ? directional_limiter_sum[3] / directional_limiter_sum[2] : 0.0;
-        result.u_limiter_min_alpha = directional_limiter_min[1];
         result.flux_pos[0].alpha_active_fraction = result.limiter_active_fraction;
         result.flux_pos[1].alpha_active_fraction = result.limiter_active_fraction;
         result.flux_pos[0].alpha_min = limiter_alpha_global[0];
@@ -3605,6 +4770,76 @@ midpoint_iteration_retry:
         result.beam_lag_energy_residual =
             -integrate_face_work(jbeam, fields_mid, sg, dt) - result.field_work_beam;
         result.nonlinear_iterations = iter + 1;
+        const auto commit_accepted_energy_ledger =
+            [&](const std::array<long double, LEDGER_SLOT_COUNT>& local_ledger,
+                long double local_actual_delta_ke, bool strict) {
+                if (!accepted_energy_audit_enabled_) return;
+
+                // One packed SUM is deliberately deferred until this final
+                // candidate.  Rejected Picard trials never enter the ledger.
+                double packed[LEDGER_SLOT_COUNT + 2] = {};
+                for (int q = 0; q < LEDGER_SLOT_COUNT; ++q) {
+                    packed[q] = static_cast<double>(
+                        local_ledger[static_cast<size_t>(q)]);
+                }
+                packed[LEDGER_SLOT_COUNT] =
+                    static_cast<double>(local_actual_delta_ke);
+                long double local_work = 0.0L;
+                for (int iface = 0; iface < nxl; ++iface) {
+                    local_work += -static_cast<long double>(dt) * sg.dx *
+                        fields_mid.Ex_face[static_cast<size_t>(iface)] *
+                        result.j_bkg_face_mid[static_cast<size_t>(iface)];
+                }
+                packed[LEDGER_SLOT_COUNT + 1] =
+                    static_cast<double>(local_work);
+                MPI_Allreduce(MPI_IN_PLACE, packed,
+                              LEDGER_SLOT_COUNT + 2, MPI_DOUBLE, MPI_SUM,
+                              MPI_COMM_WORLD);
+
+                AcceptedEnergyLedger& ledger = result.accepted_energy_ledger;
+                ledger.valid = 1;
+                ledger.strict_accepted = strict ? 1 : 0;
+                ledger.soft_accepted = strict ? 0 : 1;
+                ledger.transport_substeps = nsub;
+                ledger.delta_ke_after_low = packed[LEDGER_DKE_LOW];
+                ledger.delta_ke_after_high = packed[LEDGER_DKE_HIGH];
+                ledger.delta_ke_after_final = packed[LEDGER_DKE_FINAL];
+                ledger.delta_ke_fct_x = packed[LEDGER_DKE_FCT_X];
+                ledger.delta_ke_fct_u = packed[LEDGER_DKE_FCT_U];
+                ledger.delta_mass_fct_x = packed[LEDGER_DMASS_FCT_X];
+                ledger.delta_mass_fct_u = packed[LEDGER_DMASS_FCT_U];
+                ledger.delta_ppar_fct_x = packed[LEDGER_DPPAR_FCT_X];
+                ledger.delta_ppar_fct_u = packed[LEDGER_DPPAR_FCT_U];
+                ledger.upar_boundary_number_lower = packed[LEDGER_BNUM_LOWER];
+                ledger.upar_boundary_number_upper = packed[LEDGER_BNUM_UPPER];
+                ledger.upar_boundary_ppar_lower = packed[LEDGER_BPPAR_LOWER];
+                ledger.upar_boundary_ppar_upper = packed[LEDGER_BPPAR_UPPER];
+                ledger.upar_boundary_energy_lower =
+                    packed[LEDGER_BENERGY_LOWER];
+                ledger.upar_boundary_energy_upper =
+                    packed[LEDGER_BENERGY_UPPER];
+                ledger.uperp_boundary_number_upper = 0.0;
+                ledger.uperp_boundary_ppar_upper = 0.0;
+                ledger.uperp_boundary_energy_upper = 0.0;
+                ledger.delta_ke_bkg_actual = packed[LEDGER_SLOT_COUNT];
+                ledger.work_ampere_bkg = packed[LEDGER_SLOT_COUNT + 1];
+                ledger.residual_fv = result.stage5_r_fv;
+                ledger.residual_coupling = result.stage5_r_couple;
+                ledger.residual_unexplained = ledger.delta_ke_bkg_actual +
+                    ledger.work_ampere_bkg +
+                    ledger.upar_boundary_energy_lower +
+                    ledger.upar_boundary_energy_upper +
+                    ledger.uperp_boundary_energy_upper;
+                // Independent stage-5 components use the same final fluxes:
+                // R_FV - R_couple must reconstruct the physical background
+                // energy balance with the program's established signs.
+                ledger.residual_reconstruction_error =
+                    ledger.residual_unexplained -
+                    (ledger.residual_fv - ledger.residual_coupling);
+                ledger.flux_telescope_error = ledger.delta_ke_after_final -
+                    (ledger.delta_ke_after_high + ledger.delta_ke_fct_x +
+                     ledger.delta_ke_fct_u);
+            };
         const auto finalize_coupling_regions = [&]() {
             trace_live("regional_audit_begin", iter + 1, -1);
             if (fixed_coupling_layout) {
@@ -3772,6 +5007,14 @@ midpoint_iteration_retry:
                 result.stage5_r_couple_fct_stabilization;
             trace_live("regional_audit_end", iter + 1, -1);
         };
+        if (strict_candidate || final_candidate) {
+            accepted_energy_ledger_local = trial_energy_ledger_local;
+            accepted_energy_actual_delta_ke_local =
+                trial_actual_delta_ke_local;
+            commit_accepted_energy_ledger(accepted_energy_ledger_local,
+                                          accepted_energy_actual_delta_ke_local,
+                                          strict_candidate || fixed_candidate);
+        }
         if (fixed_candidate) {
             capture_accepted_transport(work);
             result.species_np1 = work;
