@@ -26,7 +26,14 @@ public:
     void write_accepted_energy_ledger(
         long long physical_step, double time, double dt,
         const VlasovAmpereMidpointSolver::Result& midpoint_result,
+        double total_delta_ke_bkg,
+        double total_delta_ke_beam,
+        double total_delta_field_energy,
+        double total_source_energy_in,
+        double total_source_energy_out,
+        double total_collision_energy_delta,
         double total_energy_residual_step,
+        double total_energy_reconstruction_error,
         double total_energy_residual_cumulative,
         int mpi_rank);
 

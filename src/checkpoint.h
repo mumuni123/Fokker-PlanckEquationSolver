@@ -44,6 +44,21 @@ struct CheckpointStateHashes {
     unsigned long long beam;
 };
 
+// Filled only by the explicit baseline-core -> nested-tail conversion mode.
+// Values are global after MPI reduction and are persisted with the converted
+// checkpoint so a zero-tail A/B restart is never mistaken for production data.
+struct CheckpointVelocityRemapAudit {
+    bool applied;
+    double mass_before;
+    double mass_after;
+    double parallel_momentum_before;
+    double parallel_momentum_after;
+    double kinetic_energy_before;
+    double kinetic_energy_after;
+    unsigned long long core_hash_before;
+    unsigned long long core_hash_after;
+};
+
 unsigned long long checkpoint_hash64(const void* data, size_t bytes,
                                      unsigned long long seed = 1469598103934665603ULL);
 unsigned long long checkpoint_configuration_hash();
@@ -63,12 +78,19 @@ bool write_checkpoint(const std::string& directory, const CheckpointControlState
                       const Species& bkg, const BeamPIC& beam, const EMFields& fields,
                       const SpatialGrid& sg, int mpi_rank, int mpi_size,
                       std::string& error, bool low_order_only = false,
-                      bool high_order_enabled = true, bool fct_enabled = true);
+                       bool high_order_enabled = true, bool fct_enabled = true,
+                       const CheckpointVelocityRemapAudit* remap_audit = 0);
 bool read_checkpoint(const std::string& directory, CheckpointControlState& control,
                      Species& bkg, BeamPIC& beam, EMFields& fields,
                      const SpatialGrid& sg, int mpi_rank, int mpi_size,
                      std::string& error, bool low_order_only = false,
-                     bool high_order_enabled = true, bool fct_enabled = true);
+                      bool high_order_enabled = true, bool fct_enabled = true,
+                      bool allow_velocity_grid_remap = false,
+                      CheckpointVelocityRemapAudit* remap_audit = 0);
+bool write_checkpoint_velocity_remap_audit(const std::string& directory,
+                                           const CheckpointVelocityRemapAudit& audit,
+                                           int mpi_rank, int mpi_size,
+                                           std::string& error);
 bool write_midpoint_audit_state(const std::string& directory,
                                 const VlasovAmpereMidpointSolver::MidpointAuditState& state,
                                 const SpatialGrid& sg, int mpi_rank, int mpi_size,

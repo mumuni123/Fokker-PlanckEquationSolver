@@ -26,6 +26,8 @@ struct RuntimeOptions {
     std::string restart_dir;
     std::string operator_audit_dir;
     std::string beam_ledger_reference;
+    std::string remap_checkpoint_source;
+    std::string remap_checkpoint_destination;
     std::vector<double> checkpoint_times_fs;
     double stop_time_fs;
     long long stop_after_accepted_steps;
@@ -39,6 +41,12 @@ struct RuntimeOptions {
     int accepted_energy_audit_cadence;
     double accepted_energy_audit_start_fs;
     double accepted_energy_audit_end_fs;
+    // Calibration values for the transactional soft-candidate gate.  These
+    // are runtime controls rather than hidden production constants.
+    double soft_candidate_field_tolerance;
+    double soft_candidate_current_tolerance;
+    double soft_candidate_energy_p99_reference;
+    double soft_candidate_energy_absolute_limit;
     RuntimeMidpointInitialGuessMode midpoint_initial_guess_mode;
     RuntimeMidpointAccelerationMode midpoint_acceleration_mode;
     int anderson_depth;
@@ -69,6 +77,7 @@ struct RuntimeOptions {
     bool restart_enabled;
     bool operator_audit_mode;
     bool beam_ledger_reference_enabled;
+    bool velocity_grid_remap_enabled;
 };
 
 RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,

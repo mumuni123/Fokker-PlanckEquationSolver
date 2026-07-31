@@ -15,6 +15,25 @@
 #define FP_VELOCITY_GRID_NV 96
 #endif
 
+// The cylindrical u_parallel grid keeps this legacy resolution as an
+// immutable core.  Optional cells are appended outside that core; they never
+// stretch or otherwise modify the original [-10, 10] mesh.
+#ifndef FP_VELOCITY_GRID_UPAR_CORE_NV
+#define FP_VELOCITY_GRID_UPAR_CORE_NV FP_VELOCITY_GRID_NV
+#endif
+
+#ifndef FP_VELOCITY_GRID_UPAR_TAIL_CELLS_PER_SIDE
+#define FP_VELOCITY_GRID_UPAR_TAIL_CELLS_PER_SIDE 0
+#endif
+
+#ifndef FP_VELOCITY_GRID_UPAR_CORE_MAX
+#define FP_VELOCITY_GRID_UPAR_CORE_MAX 10.0
+#endif
+
+#ifndef FP_VELOCITY_GRID_UPAR_EXTENDED_MAX
+#define FP_VELOCITY_GRID_UPAR_EXTENDED_MAX FP_VELOCITY_GRID_UPAR_CORE_MAX
+#endif
+
 #ifndef FP_VELOCITY_GRID_NMU
 #define FP_VELOCITY_GRID_NMU 64
 #endif
@@ -109,12 +128,18 @@ namespace Param {
 
     // Axisymmetric spherical momentum grid: (u, mu), u = p / (m c).
     // The distribution is normalized with d3u = 2*pi*u^2 du dmu.
-    const int Nv  = FP_VELOCITY_GRID_NV;
+    const int Nv_core = FP_VELOCITY_GRID_UPAR_CORE_NV;
+    const int Nv_tail = FP_VELOCITY_GRID_UPAR_TAIL_CELLS_PER_SIDE;
+    const int Nv  = Nv_core + 2 * Nv_tail;
     const int Nmu = FP_VELOCITY_GRID_NMU;
     const size_t Nvmu = static_cast<size_t>(Nv) * Nmu;
 
     const double Nsigma = 80.0;
-    const double momentum_umax = 10.0;
+    // momentum_umax remains the historical u_perp and u_parallel-core bound.
+    // The optional u_parallel extension is represented separately below.
+    const double momentum_umax = FP_VELOCITY_GRID_UPAR_CORE_MAX;
+    const double momentum_upar_core_max = FP_VELOCITY_GRID_UPAR_CORE_MAX;
+    const double momentum_upar_extended_max = FP_VELOCITY_GRID_UPAR_EXTENDED_MAX;
     const double momentum_refined_u = 0.2;
     // Deprecated: retained only so external builds that reference the old
     // name still compile.  It does not control CylindricalVelocityGrid.

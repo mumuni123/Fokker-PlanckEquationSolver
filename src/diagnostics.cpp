@@ -329,7 +329,11 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
                 << "B_uperp_energy_upper_J_m2 "
                 << "R_FV_J_m2 R_couple_J_m2 R_unexplained_J_m2 "
                 << "R_reconstruction_error_J_m2 flux_telescope_error_J_m2 "
-                << "R_total_step_J_m2 R_total_cumulative_J_m2\n";
+                << "dKE_bkg_total_global_J_m2 dKE_beam_total_global_J_m2 "
+                << "dE_field_total_global_J_m2 E_src_in_global_J_m2 "
+                << "E_src_out_global_J_m2 E_collision_global_J_m2 "
+                << "R_total_step_J_m2 R_total_reconstruction_error_J_m2 "
+                << "R_total_cumulative_J_m2\n";
             velocity_boundary_flux_ledger_file.open(
                 (output_dir + "/velocity_boundary_flux_ledger.dat").c_str());
             velocity_boundary_flux_ledger_file
@@ -357,7 +361,14 @@ void Diagnostics::init(const std::string& dir, int mpi_rank,
 void Diagnostics::write_accepted_energy_ledger(
     long long physical_step, double time, double dt,
     const VlasovAmpereMidpointSolver::Result& midpoint_result,
+    double total_delta_ke_bkg,
+    double total_delta_ke_beam,
+    double total_delta_field_energy,
+    double total_source_energy_in,
+    double total_source_energy_out,
+    double total_collision_energy_delta,
     double total_energy_residual_step,
+    double total_energy_reconstruction_error,
     double total_energy_residual_cumulative,
     int mpi_rank)
 {
@@ -392,7 +403,14 @@ void Diagnostics::write_accepted_energy_ledger(
             << ledger.residual_unexplained << " "
             << ledger.residual_reconstruction_error << " "
             << ledger.flux_telescope_error << " "
+            << total_delta_ke_bkg << " "
+            << total_delta_ke_beam << " "
+            << total_delta_field_energy << " "
+            << total_source_energy_in << " "
+            << total_source_energy_out << " "
+            << total_collision_energy_delta << " "
             << total_energy_residual_step << " "
+            << total_energy_reconstruction_error << " "
             << total_energy_residual_cumulative << "\n";
         accepted_energy_ledger_file.flush();
     }

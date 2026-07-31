@@ -30,6 +30,14 @@ public:
         MIDPOINT_INITIAL_GUESS_NONE = 0,
         MIDPOINT_INITIAL_GUESS_FIELD_LINEAR = 1
     };
+    // The nonlinear kernel returns a candidate; only the time-interval
+    // controller in main.cpp may turn a soft candidate into committed state.
+    enum AcceptanceKind {
+        STRICT_ACCEPTED = 0,
+        SOFT_CANDIDATE = 1,
+        RETRY_REQUIRED = 2,
+        HARD_FAILURE = 3
+    };
     // Dynamic part of the accepted regional closure partition.  A fixed
     // operator audit reuses this layout rather than inferring it from a
     // frozen Beam state/current.
@@ -103,12 +111,37 @@ public:
         long long face_count;
         long long active_face_count;
         double min_alpha;
+        // The raw and rejected quantities refer exclusively to the
+        // anti-diffusive transfer A=h(F_high-F_low), never to F_high itself.
+        // They make the limiter coverage physically interpretable.
+        long double raw_abs_mass;
+        long double rejected_abs_mass;
+        long double raw_abs_current;
+        long double rejected_abs_current;
+        long double raw_abs_energy;
+        long double rejected_abs_energy;
         double delta_n;
         double delta_j;
         double delta_k;
         double e_dot_j;
         double r_fct_e;
     };
+
+    struct HighOrderCandidateAudit {
+        long long reconstructed_face_count;
+        long long negative_reconstructed_face_count;
+        double negative_reconstructed_mass_weight;
+        double negative_reconstructed_current_weight;
+        double negative_reconstructed_energy_weight;
+        long long high_candidate_negative_cell_count;
+        double high_candidate_negative_mass;
+        double high_candidate_negative_current_weight;
+        double high_candidate_negative_energy_weight;
+        long long low_order_negative_cell_count;
+        double low_order_negative_mass;
+    };
+
+    enum { FCT_MACRO_REGION_COUNT = 9 };
 
     // 7.1.6: per-direction flux-positivity diagnostics
     struct FluxPositivityDiag {
@@ -652,10 +685,13 @@ public:
         double u_limiter_active_fraction;
         double u_limiter_min_alpha;
         int fct_macro_budget_valid;
-        // [B_left/core/B_right] x [velocity_core/velocity_tail], separated
-        // by the final x-transport and u-force FCT corrections.
-        std::array<FctMacroBudget, 6> fct_macro_budget_x;
-        std::array<FctMacroBudget, 6> fct_macro_budget_u;
+        // [B_left/core/B_right] x [|u_parallel|<=8, 8<|u_parallel|<=10,
+        // |u_parallel|>10], separated by x transport and u-force FCT.
+        std::array<FctMacroBudget, FCT_MACRO_REGION_COUNT> fct_macro_budget_x;
+        std::array<FctMacroBudget, FCT_MACRO_REGION_COUNT> fct_macro_budget_u;
+        // Pure diagnostic of the raw high-order reconstruction/candidate.
+        // It never alters FCT, the accepted state, or any failure decision.
+        HighOrderCandidateAudit high_order_candidate_audit;
         double limiter_active_fraction_core;
         double limiter_active_fraction_boundary;
         double limiter_min_alpha_core;
@@ -784,6 +820,13 @@ public:
         int trial_failure_downgraded;
         int accepted_with_negative_debt;
         int state_advanced;
+        AcceptanceKind acceptance_kind;
+        // These are candidate properties, not commit decisions.  They make
+        // the soft-acceptance transaction auditable without rerunning an
+        // operator evaluation.
+        int transport_safe;
+        std::array<double, 4> last_4_contraction_E;
+        std::array<double, 4> last_4_contraction_J_bkg;
         double positivity_energy_defect;
         double positivity_mass_defect;
         double u_force_alpha_min;

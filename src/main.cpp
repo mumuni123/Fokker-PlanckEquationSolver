@@ -549,7 +549,8 @@ int main(int argc, char** argv)
     RuntimeConfig config = load_runtime_config();
     RuntimeOptions runtime = parse_runtime_options(argc, argv, mpi_rank, mpi_size);
     std::string runtime_error;
-    if (!prepare_output_directory(runtime, mpi_rank, mpi_size, runtime_error)) {
+    if (!runtime.velocity_grid_remap_enabled &&
+        !prepare_output_directory(runtime, mpi_rank, mpi_size, runtime_error)) {
         if (mpi_rank == 0) std::fprintf(stderr, "Runtime setup error: %s\n", runtime_error.c_str());
         MPI_Finalize();
         return 2;
@@ -558,7 +559,7 @@ int main(int argc, char** argv)
     if (mpi_rank == 0) {
         printf("============================================================\n");
         printf("  Background-electron VFP + fixed ions + PIC beam solver\n");
-        printf("  Spherical electron momentum grid: (u, mu), u = p / (m c)\n");
+        printf("  Cylindrical electron momentum grid: (u_parallel, u_perp)\n");
         printf("============================================================\n");
         printf("MPI ranks: %d\n", mpi_size);
         #pragma omp parallel
@@ -570,10 +571,11 @@ int main(int argc, char** argv)
                Param::nx, Param::dx, Param::Lx);
         printf("Density profile: uniform plasma over full domain, n0 = %.3e /m^3\n",
                Param::dens);
-        printf("Electron momentum grid: Nu_parallel x Nu_perp = %d x %d, conservative cylindrical mass M\n",
-               Param::Nv, Param::Nmu);
-        printf("Electron momentum domain: |u_parallel| <= %.3f, 0 <= u_perp <= %.3f, vx = c u_parallel / gamma\n",
-               Param::momentum_umax, Param::momentum_umax);
+        printf("Electron momentum grid: Nu_parallel x Nu_perp = %d x %d (core=%d, tail/side=%d), conservative cylindrical mass M\n",
+               Param::Nv, Param::Nmu, Param::Nv_core, Param::Nv_tail);
+        printf("Electron momentum domain: core |u_parallel| <= %.3f, extended |u_parallel| <= %.3f, 0 <= u_perp <= %.3f\n",
+               Param::momentum_upar_core_max, Param::momentum_upar_extended_max,
+               Param::momentum_umax);
         printf("Spatial boundary: periodic in x for background electrons and electrostatic field; beam is open\n");
         printf("Electrostatic update: face-centered dE/dt = -J_total/eps0; zero mode evolves explicitly\n");
         printf("Field solver: %s\n", field_solver_name());
@@ -621,6 +623,31 @@ int main(int argc, char** argv)
     EMFields fields;
     fields.init(sgrid);
 
+    if (mpi_rank == 0 && !runtime.velocity_grid_remap_enabled) {
+        const CylindricalVelocityGrid::NestedGridAudit& grid_audit =
+            bkg_e.cgrid.nested_audit;
+        std::ofstream out(output_path(runtime, "velocity_grid_audit.result").c_str(),
+                          std::ios::out | std::ios::trunc);
+        out << std::scientific << std::setprecision(17)
+            << "Nv_core " << Param::Nv_core << "\n"
+            << "Nv_tail_per_side " << Param::Nv_tail << "\n"
+            << "Nv_total " << Param::Nv << "\n"
+            << "upar_core_max " << Param::momentum_upar_core_max << "\n"
+            << "upar_extended_max " << Param::momentum_upar_extended_max << "\n"
+            << "core_face_identity_linf "
+            << grid_audit.core_face_identity_linf << "\n"
+            << "core_cell_identity_linf "
+            << grid_audit.core_cell_identity_linf << "\n"
+            << "core_vx_identity_linf " << grid_audit.core_vx_identity_linf << "\n"
+            << "core_kinetic_energy_identity_linf "
+            << grid_audit.core_kinetic_energy_identity_linf << "\n"
+            << "symmetry_linf " << grid_audit.symmetry_linf << "\n"
+            << "max_adjacent_width_ratio "
+            << grid_audit.max_adjacent_width_ratio << "\n"
+            << "phase_volume_relative_error "
+            << grid_audit.phase_volume_relative_error << "\n";
+    }
+
     VlasovAmpereMidpointSolver midpoint_solver;
     midpoint_solver.set_step_diagnostics_enabled(false);
     midpoint_solver.set_accepted_energy_audit_enabled(false);
@@ -664,6 +691,50 @@ int main(int argc, char** argv)
     midpoint_solver.set_midpoint_iteration_trace(runtime.diagnostic_level >= 2);
     midpoint_solver.set_progress_trace_window_fs(
         runtime.midpoint_trace_start_fs, runtime.midpoint_trace_end_fs);
+
+    if (runtime.velocity_grid_remap_enabled) {
+        CheckpointControlState control = {};
+        CheckpointVelocityRemapAudit remap_audit = {};
+        const bool read_ok = read_checkpoint(
+            runtime.remap_checkpoint_source, control, bkg_e, beam, fields,
+            sgrid, mpi_rank, mpi_size, runtime_error,
+            midpoint_solver.low_order_only(),
+            midpoint_solver.nonuniform_high_order_enabled(),
+            midpoint_solver.fct_enabled(), true, &remap_audit);
+        if (!read_ok) {
+            if (mpi_rank == 0) {
+                std::fprintf(stderr, "Velocity-grid remap input error: %s\n",
+                             runtime_error.c_str());
+            }
+            MPI_Finalize();
+            return 3;
+        }
+        const bool write_ok = write_checkpoint(
+            runtime.remap_checkpoint_destination, control, bkg_e, beam, fields,
+            sgrid, mpi_rank, mpi_size, runtime_error,
+            midpoint_solver.low_order_only(),
+            midpoint_solver.nonuniform_high_order_enabled(),
+            midpoint_solver.fct_enabled(), &remap_audit);
+        const bool audit_ok = write_ok && write_checkpoint_velocity_remap_audit(
+            runtime.remap_checkpoint_destination, remap_audit,
+            mpi_rank, mpi_size, runtime_error);
+        if (!audit_ok) {
+            if (mpi_rank == 0) {
+                std::fprintf(stderr, "Velocity-grid remap output error: %s\n",
+                             runtime_error.c_str());
+            }
+            MPI_Finalize();
+            return 4;
+        }
+        if (mpi_rank == 0) {
+            std::printf("Velocity-grid checkpoint remap completed: %s -> %s\n",
+                        runtime.remap_checkpoint_source.c_str(),
+                        runtime.remap_checkpoint_destination.c_str());
+        }
+        MPI_Finalize();
+        return 0;
+    }
+
     if (mpi_rank == 0) {
         const char* const beam_ledger_mode = runtime.beam_ledger_mode == BEAM_LEDGER_FULL
             ? "full" : runtime.beam_ledger_mode == BEAM_LEDGER_SUMMARY ? "summary" : "off";
@@ -713,6 +784,13 @@ int main(int argc, char** argv)
                 runtime.accepted_energy_audit_cadence,
                 runtime.accepted_energy_audit_start_fs,
                 runtime.accepted_energy_audit_end_fs);
+        printf("Soft-candidate transaction: field_tol=%.3e, current_tol=%.3e, "
+               "energy_p99_reference=%.3e, energy_absolute_limit=%.3e, "
+               "predictor_retry_max=1, physical_split_depth_max=1\n",
+               runtime.soft_candidate_field_tolerance,
+               runtime.soft_candidate_current_tolerance,
+               runtime.soft_candidate_energy_p99_reference,
+               runtime.soft_candidate_energy_absolute_limit);
         std::ofstream pairing_configuration(
             output_path(runtime, "face_pairing_configuration.result").c_str());
         pairing_configuration << std::scientific << std::setprecision(16)
@@ -1185,8 +1263,11 @@ int main(int argc, char** argv)
     double cumulative_total_energy_residual_for_audit = 0.0;
     std::ofstream accepted_coupling_region_monitor;
     std::ofstream fct_macro_budget_monitor;
+    std::ofstream high_order_candidate_monitor;
     std::ofstream final_dual_u_pairing_monitor;
     std::ofstream midpoint_iteration_residual_monitor;
+    std::ofstream trial_retry_monitor;
+    std::ofstream physical_interval_acceptance_monitor;
     std::ofstream beam_half_step_ledger;
     std::array<double, 6> beam_ledger_local_totals = {{0.0, 0.0, 0.0,
                                                         0.0, 0.0, 0.0}};
@@ -1234,8 +1315,25 @@ int main(int argc, char** argv)
         fct_macro_budget_monitor
             << "# step time_fs accepted state_advanced soft_unconverged "
             << "flux_direction x_region velocity_region face_count active_face_count min_alpha "
+            << "raw_abs_mass rejected_abs_mass rejected_mass_fraction "
+            << "raw_abs_current rejected_abs_current rejected_current_fraction "
+            << "raw_abs_energy rejected_abs_energy rejected_energy_fraction "
             << "delta_N_fct delta_J_fct delta_K_fct E_dot_J_fct R_fct_E\n";
         fct_macro_budget_monitor << std::scientific << std::setprecision(10);
+
+        high_order_candidate_monitor.open(
+            output_path(runtime, "high_order_candidate_negativity.dat").c_str());
+        high_order_candidate_monitor
+            << "# step time_fs accepted state_advanced soft_unconverged "
+            << "reconstructed_face_count negative_reconstructed_face_count "
+            << "negative_reconstructed_mass_weight "
+            << "negative_reconstructed_current_weight "
+            << "negative_reconstructed_energy_weight "
+            << "high_candidate_negative_cell_count high_candidate_negative_mass "
+            << "high_candidate_negative_current_weight "
+            << "high_candidate_negative_energy_weight "
+            << "low_order_negative_cell_count low_order_negative_mass\n";
+        high_order_candidate_monitor << std::scientific << std::setprecision(10);
 
         final_dual_u_pairing_monitor.open(
             output_path(runtime, "final_dual_u_pairing.dat").c_str());
@@ -1277,7 +1375,7 @@ int main(int argc, char** argv)
 
         if (runtime.diagnostic_level >= 2) {
             midpoint_iteration_residual_monitor.open(
-                output_path(runtime, "midpoint_iteration_residuals.dat").c_str());
+                output_path(runtime, "trial_midpoint_residuals.dat").c_str());
             midpoint_iteration_residual_monitor
                 << "# step time_fs iteration residual_E residual_J_bkg "
                 << "residual_E_contraction residual_J_bkg_contraction "
@@ -1294,7 +1392,8 @@ int main(int argc, char** argv)
             beam_half_step_ledger
                 << "# accepted_step time_fs dt_s N_in N_out injected_energy "
                 << "outflow_energy injected_current boundary_current_out "
-                << "injected_current_impulse outflow_current_impulse\n";
+                << "injected_current_impulse outflow_current_impulse "
+                << "physical_substep\n";
             beam_half_step_ledger << std::scientific << std::setprecision(17);
         }
 
@@ -1309,6 +1408,24 @@ int main(int argc, char** argv)
             << "x_worst  u_worst  mu_worst\n";
         f_neg_monitor << std::scientific << std::setprecision(8);
         f_neg_monitor.close();
+
+        trial_retry_monitor.open(
+            output_path(runtime, "trial_retry_diagnostics.dat").c_str());
+        trial_retry_monitor
+            << "# physical_step time_fs trial retry_index split_depth "
+            << "acceptance_kind residual_E residual_J_bkg residual_f "
+            << "beam_continuity_valid transport_safe energy_eta "
+            << "energy_residual energy_limit accepted reason\n";
+        trial_retry_monitor << std::scientific << std::setprecision(17);
+
+        physical_interval_acceptance_monitor.open(
+            output_path(runtime, "physical_interval_acceptance.dat").c_str());
+        physical_interval_acceptance_monitor
+            << "# physical_step time_begin_fs time_end_fs dt_s accepted_substeps "
+            << "strict soft retry_count split_count wall_time_retry_s "
+            << "operator_evaluations_retry residual_E residual_J_bkg residual_f\n";
+        physical_interval_acceptance_monitor << std::scientific
+                                             << std::setprecision(17);
 
     }
     long long accepted_after_restart = 0;
@@ -1328,6 +1445,11 @@ int main(int argc, char** argv)
     long long performance_face_pairing_attempted_steps = 0;
     long long performance_face_pairing_accepted_steps = 0;
     long long performance_face_pairing_fallback_steps = 0;
+    int soft_core_macro_debt_consecutive_steps = 0;
+    long long performance_retry_count = 0;
+    long long performance_split_count = 0;
+    long long performance_operator_evaluations_retry = 0;
+    double performance_wall_time_retry = 0.0;
     double performance_final_residual_e = 0.0;
     double performance_final_residual_j_bkg = 0.0;
     double performance_final_residual_f = 0.0;
@@ -1545,10 +1667,309 @@ int main(int argc, char** argv)
             midpoint_iteration_residual_monitor.flush();
         }
 
-        const bool midpoint_soft_accepted =
-            midpoint_result.soft_unconverged &&
-            midpoint_result.state_advanced != 0 &&
-            !midpoint_result.failed;
+        // A max-iteration result is a transaction candidate, not an accepted
+        // state.  The compact energy account below is intentionally evaluated
+        // only for that final candidate, never inside the Picard loop.
+        double soft_energy_eta = std::numeric_limits<double>::infinity();
+        double soft_energy_residual = std::numeric_limits<double>::quiet_NaN();
+        const double soft_energy_limit = std::min(
+            5.0 * runtime.soft_candidate_energy_p99_reference,
+            runtime.soft_candidate_energy_absolute_limit);
+        const auto residual_history_is_contracting =
+            [](const std::vector<double>& history) {
+                if (history.size() < 4) return false;
+                const size_t begin = history.size() - 4;
+                bool continuously_growing = true;
+                double log_sum = 0.0;
+                int ratio_count = 0;
+                for (size_t i = begin + 1; i < history.size(); ++i) {
+                    if (!std::isfinite(history[i]) ||
+                        !std::isfinite(history[i - 1])) return false;
+                    continuously_growing = continuously_growing &&
+                        history[i] > history[i - 1];
+                    if (history[i - 1] > 0.0 && history[i] >= 0.0) {
+                        const double ratio = history[i] / history[i - 1];
+                        if (!std::isfinite(ratio)) return false;
+                        log_sum += std::log(std::max(ratio,
+                            std::numeric_limits<double>::min()));
+                        ++ratio_count;
+                    }
+                }
+                if (continuously_growing || ratio_count == 0) return false;
+                const double last_ratio = history.back() /
+                    std::max(history[history.size() - 2],
+                             std::numeric_limits<double>::min());
+                return std::isfinite(last_ratio) && last_ratio <= 1.0 &&
+                    std::exp(log_sum / static_cast<double>(ratio_count)) < 1.0;
+            };
+        const auto evaluate_soft_candidate =
+            [&](VlasovAmpereMidpointSolver::Result& candidate,
+                const Species& candidate_start_bkg,
+                const BeamPIC& candidate_start_beam,
+                const EMFields& candidate_start_fields,
+                double candidate_time, double candidate_dt,
+                int retry_index, int split_depth, const char* trial_name) {
+                bool accepted = false;
+                soft_energy_eta = std::numeric_limits<double>::infinity();
+                soft_energy_residual = std::numeric_limits<double>::quiet_NaN();
+                const bool residuals_ok =
+                    std::isfinite(candidate.residual_E) &&
+                    std::isfinite(candidate.residual_J_bkg) &&
+                    std::isfinite(candidate.residual_f) &&
+                    candidate.residual_E <= runtime.soft_candidate_field_tolerance &&
+                    candidate.residual_J_bkg <= runtime.soft_candidate_current_tolerance;
+                const bool histories_ok =
+                    residual_history_is_contracting(
+                        candidate.midpoint_residual_e_history) &&
+                    residual_history_is_contracting(
+                        candidate.midpoint_residual_j_bkg_history) &&
+                    !candidate.midpoint_residual_f_history.empty() &&
+                    std::isfinite(candidate.midpoint_residual_f_history.back()) &&
+                    !((candidate.midpoint_residual_f_history.size() >= 4) &&
+                      candidate.midpoint_residual_f_history.back() >
+                          candidate.midpoint_residual_f_history[
+                              candidate.midpoint_residual_f_history.size() - 2] &&
+                      candidate.midpoint_residual_f_history[
+                              candidate.midpoint_residual_f_history.size() - 2] >
+                          candidate.midpoint_residual_f_history[
+                              candidate.midpoint_residual_f_history.size() - 3] &&
+                      candidate.midpoint_residual_f_history[
+                              candidate.midpoint_residual_f_history.size() - 3] >
+                          candidate.midpoint_residual_f_history[
+                              candidate.midpoint_residual_f_history.size() - 4]);
+                const bool basic_ok = !candidate.failed &&
+                    candidate.acceptance_kind ==
+                        VlasovAmpereMidpointSolver::SOFT_CANDIDATE &&
+                    candidate.transport_safe != 0 &&
+                    candidate.beam_continuity_valid != 0 &&
+                    residuals_ok && histories_ok;
+                if (basic_ok) {
+                    double start_number = 0.0;
+                    double start_bkg_ke = 0.0;
+                    double end_number = 0.0;
+                    double end_bkg_ke = 0.0;
+                    candidate_start_bkg.total_particle_number_and_energy(
+                        start_number, start_bkg_ke);
+                    Species energy_candidate = candidate.species_np1;
+                    double candidate_collision_energy = 0.0;
+                    if (energy_candidate.collisions_enabled) {
+                        candidate_collision_energy += collision.apply(
+                            energy_candidate, candidate_dt, Param::dens,
+                            Param::temperature_e, Const::me, 1.0, 1.0);
+                        candidate_collision_energy += collision.apply(
+                            energy_candidate, candidate_dt,
+                            Param::dens / Param::Z_ion, Param::temperature_i,
+                            Param::mass_ion, static_cast<double>(Param::Z_ion),
+                            1.0);
+                    }
+                    energy_candidate.total_particle_number_and_energy(
+                        end_number, end_bkg_ke);
+                    double packed[9] = {
+                        start_bkg_ke, end_bkg_ke,
+                        candidate_start_beam.total_kinetic_energy(),
+                        candidate.beam_np1.total_kinetic_energy(),
+                        candidate_start_fields.total_energy(),
+                        candidate.fields_np1.total_energy(),
+                        candidate.beam_np1.last_injected_energy(),
+                        candidate.beam_np1.last_outflow_energy(),
+                        candidate_collision_energy
+                    };
+                    MPI_Allreduce(MPI_IN_PLACE, packed, 9, MPI_DOUBLE, MPI_SUM,
+                                  MPI_COMM_WORLD);
+                    const double delta_bkg = packed[1] - packed[0];
+                    const double delta_beam = packed[3] - packed[2];
+                    const double delta_field = packed[5] - packed[4];
+                    soft_energy_residual = delta_bkg + delta_beam + delta_field -
+                        packed[6] + packed[7] - packed[8];
+                    const double energy_scale = std::fabs(delta_bkg) +
+                        std::fabs(delta_beam) + std::fabs(delta_field) +
+                        std::fabs(packed[6]) + std::fabs(packed[7]) +
+                        std::fabs(packed[8]) + 1.0;
+                    soft_energy_eta = std::fabs(soft_energy_residual) / energy_scale;
+                    accepted = std::isfinite(soft_energy_eta) &&
+                        soft_energy_eta <= soft_energy_limit;
+                }
+                if (mpi_rank == 0 && trial_retry_monitor.is_open()) {
+                    trial_retry_monitor << physical_step << " "
+                        << candidate_time / Const::femto << " " << trial_name << " "
+                        << retry_index << " " << split_depth << " "
+                        << static_cast<int>(candidate.acceptance_kind) << " "
+                        << candidate.residual_E << " "
+                        << candidate.residual_J_bkg << " "
+                        << candidate.residual_f << " "
+                        << candidate.beam_continuity_valid << " "
+                        << candidate.transport_safe << " " << soft_energy_eta
+                        << " " << soft_energy_residual << " "
+                        << soft_energy_limit << " " << (accepted ? 1 : 0)
+                        << " " << (basic_ok ? "energy_gate" : "candidate_gate")
+                        << "\n";
+                    trial_retry_monitor.flush();
+                }
+                if (accepted) {
+                    candidate.state_advanced = 1;
+                    candidate.soft_accepted = true;
+                } else if (!candidate.failed) {
+                    candidate.acceptance_kind =
+                        VlasovAmpereMidpointSolver::RETRY_REQUIRED;
+                }
+                return accepted;
+            };
+
+        bool midpoint_soft_accepted = false;
+        int retry_count_step = 0;
+        int split_count_step = 0;
+        int operator_evaluations_retry_step = 0;
+        double wall_time_retry_step = 0.0;
+        bool split_collisions_applied = false;
+        double split_beam_injected_number = 0.0;
+        double split_beam_outflow_number = 0.0;
+        double split_beam_injected_energy = 0.0;
+        double split_beam_outflow_energy = 0.0;
+        double split_beam_injected_impulse = 0.0;
+        double split_beam_outflow_impulse = 0.0;
+        std::array<double, 12> split_beam_ledger_rows = {{0.0}};
+        if (midpoint_result.acceptance_kind ==
+            VlasovAmpereMidpointSolver::SOFT_CANDIDATE) {
+            midpoint_soft_accepted = evaluate_soft_candidate(
+                midpoint_result, bkg_step_start, beam_step_start,
+                fields_step_start, time, dt, retry_count_step, 0, "initial");
+            if (!midpoint_soft_accepted &&
+                midpoint_result.midpoint_predictor_used != 0) {
+                const double retry_wall_start = MPI_Wtime();
+                const VlasovAmpereMidpointSolver::MidpointInitialGuessMode saved_mode =
+                    midpoint_solver.midpoint_initial_guess_mode();
+                midpoint_solver.set_midpoint_initial_guess_mode(
+                    VlasovAmpereMidpointSolver::MIDPOINT_INITIAL_GUESS_NONE);
+                ++retry_count_step;
+                midpoint_result = midpoint_solver.advance_background_and_fields(
+                    bkg_step_start, beam_step_start, fields_step_start, sgrid,
+                    dt, time, mpi_rank, mpi_size);
+                midpoint_solver.set_midpoint_initial_guess_mode(saved_mode);
+                operator_evaluations_retry_step +=
+                    midpoint_result.operator_evaluations;
+                wall_time_retry_step += MPI_Wtime() - retry_wall_start;
+                if (midpoint_result.acceptance_kind ==
+                    VlasovAmpereMidpointSolver::SOFT_CANDIDATE) {
+                    midpoint_soft_accepted = evaluate_soft_candidate(
+                        midpoint_result, bkg_step_start, beam_step_start,
+                        fields_step_start, time, dt, retry_count_step, 0,
+                        "predictor_none");
+                }
+            }
+        }
+        if (!midpoint_soft_accepted && !midpoint_result.failed &&
+            midpoint_result.acceptance_kind ==
+                VlasovAmpereMidpointSolver::RETRY_REQUIRED) {
+            // A split is two complete physical intervals.  Nothing below
+            // touches bkg_e/beam/fields until both local candidates pass.
+            const double split_wall_start = MPI_Wtime();
+            const double half_dt = 0.5 * dt;
+            const VlasovAmpereMidpointSolver::MidpointInitialGuessMode saved_mode =
+                midpoint_solver.midpoint_initial_guess_mode();
+            midpoint_solver.set_midpoint_initial_guess_mode(
+                VlasovAmpereMidpointSolver::MIDPOINT_INITIAL_GUESS_NONE);
+            VlasovAmpereMidpointSolver::Result first_half =
+                midpoint_solver.advance_background_and_fields(
+                    bkg_step_start, beam_step_start, fields_step_start, sgrid,
+                    half_dt, current_time + half_dt, mpi_rank, mpi_size);
+            bool first_ok = first_half.converged && !first_half.failed &&
+                first_half.state_advanced != 0;
+            if (!first_ok && first_half.acceptance_kind ==
+                VlasovAmpereMidpointSolver::SOFT_CANDIDATE) {
+                first_ok = evaluate_soft_candidate(
+                    first_half, bkg_step_start, beam_step_start,
+                    fields_step_start, current_time + half_dt, half_dt, retry_count_step,
+                    1, "split_half_1");
+            }
+            double split_collision_energy = 0.0;
+            VlasovAmpereMidpointSolver::Result second_half;
+            bool second_ok = false;
+            if (first_ok) {
+                Species split_bkg_mid = first_half.species_np1;
+                if (split_bkg_mid.collisions_enabled) {
+                    split_collision_energy += collision.apply(
+                        split_bkg_mid, half_dt, Param::dens,
+                        Param::temperature_e, Const::me, 1.0, 1.0);
+                    split_collision_energy += collision.apply(
+                        split_bkg_mid, half_dt, Param::dens / Param::Z_ion,
+                        Param::temperature_i, Param::mass_ion,
+                        static_cast<double>(Param::Z_ion), 1.0);
+                }
+                second_half = midpoint_solver.advance_background_and_fields(
+                    split_bkg_mid, first_half.beam_np1, first_half.fields_np1,
+                    sgrid, half_dt, time, mpi_rank, mpi_size);
+                second_ok = second_half.converged && !second_half.failed &&
+                    second_half.state_advanced != 0;
+                if (!second_ok && second_half.acceptance_kind ==
+                    VlasovAmpereMidpointSolver::SOFT_CANDIDATE) {
+                    second_ok = evaluate_soft_candidate(
+                        second_half, split_bkg_mid, first_half.beam_np1,
+                        first_half.fields_np1, time, half_dt, retry_count_step, 1,
+                        "split_half_2");
+                }
+                if (second_ok && second_half.species_np1.collisions_enabled) {
+                    split_collision_energy += collision.apply(
+                        second_half.species_np1, half_dt, Param::dens,
+                        Param::temperature_e, Const::me, 1.0, 1.0);
+                    split_collision_energy += collision.apply(
+                        second_half.species_np1, half_dt, Param::dens / Param::Z_ion,
+                        Param::temperature_i, Param::mass_ion,
+                        static_cast<double>(Param::Z_ion), 1.0);
+                }
+            }
+            midpoint_solver.set_midpoint_initial_guess_mode(saved_mode);
+            operator_evaluations_retry_step += first_half.operator_evaluations +
+                (first_ok ? second_half.operator_evaluations : 0);
+            wall_time_retry_step += MPI_Wtime() - split_wall_start;
+            if (first_ok && second_ok) {
+                split_beam_injected_number =
+                    first_half.beam_np1.last_injected_number() +
+                    second_half.beam_np1.last_injected_number();
+                split_beam_outflow_number =
+                    first_half.beam_np1.last_outflow_number() +
+                    second_half.beam_np1.last_outflow_number();
+                split_beam_injected_energy =
+                    first_half.beam_np1.last_injected_energy() +
+                    second_half.beam_np1.last_injected_energy();
+                split_beam_outflow_energy =
+                    first_half.beam_np1.last_outflow_energy() +
+                    second_half.beam_np1.last_outflow_energy();
+                split_beam_injected_impulse = half_dt *
+                    (first_half.beam_np1.last_injected_current() +
+                     second_half.beam_np1.last_injected_current());
+                split_beam_outflow_impulse = half_dt *
+                    (first_half.beam_np1.last_outflow_current() +
+                     second_half.beam_np1.last_outflow_current());
+                const BeamPIC* split_beams[2] = {
+                    &first_half.beam_np1, &second_half.beam_np1};
+                for (int half = 0; half < 2; ++half) {
+                    const BeamPIC& split_beam = *split_beams[half];
+                    const size_t row = static_cast<size_t>(6 * half);
+                    split_beam_ledger_rows[row] =
+                        split_beam.last_injected_number();
+                    split_beam_ledger_rows[row + 1] =
+                        split_beam.last_outflow_number();
+                    split_beam_ledger_rows[row + 2] =
+                        split_beam.last_injected_energy();
+                    split_beam_ledger_rows[row + 3] =
+                        split_beam.last_outflow_energy();
+                    split_beam_ledger_rows[row + 4] = half_dt *
+                        split_beam.last_injected_current();
+                    split_beam_ledger_rows[row + 5] = half_dt *
+                        split_beam.last_outflow_current();
+                }
+                midpoint_result = second_half;
+                collision_energy_step = split_collision_energy;
+                split_collisions_applied = true;
+                split_count_step = 1;
+                midpoint_soft_accepted = midpoint_result.soft_unconverged &&
+                    midpoint_result.state_advanced != 0 && !midpoint_result.failed;
+            } else {
+                midpoint_result = first_ok ? second_half : first_half;
+                midpoint_result.acceptance_kind =
+                    VlasovAmpereMidpointSolver::RETRY_REQUIRED;
+            }
+        }
         if ((!midpoint_result.converged && !midpoint_soft_accepted) ||
             midpoint_result.failed) {
             const char* failure_reason = "NONE";
@@ -1783,15 +2204,63 @@ int main(int argc, char** argv)
             MPI_Abort(MPI_COMM_WORLD, 9);
             return 9;
         }
+        if (midpoint_result.soft_unconverged) {
+            const bool core_macro_debt =
+                midpoint_result.neg_mass_core_fraction > 1.0e-6 ||
+                midpoint_result.neg_energy_core_fraction > 1.0e-6 ||
+                midpoint_result.neg_current_core_fraction > 1.0e-6;
+            soft_core_macro_debt_consecutive_steps = core_macro_debt
+                ? soft_core_macro_debt_consecutive_steps + 1 : 0;
+            if (soft_core_macro_debt_consecutive_steps >= 3) {
+                if (mpi_rank == 0) {
+                    std::fprintf(stderr,
+                        "ERROR: soft-candidate core macro debt exceeded the "
+                        "three accepted-step limit at step %d.\n", step);
+                }
+                flush_full_beam_ledger();
+                MPI_Abort(MPI_COMM_WORLD, 18);
+                return 18;
+            }
+        } else {
+            soft_core_macro_debt_consecutive_steps = 0;
+        }
 
         bkg_e = midpoint_result.species_np1;
         beam = midpoint_result.beam_np1;
         fields = midpoint_result.fields_np1;
+        const double accepted_beam_injected_number = split_count_step != 0
+            ? split_beam_injected_number : beam.last_injected_number();
+        const double accepted_beam_outflow_number = split_count_step != 0
+            ? split_beam_outflow_number : beam.last_outflow_number();
+        const double accepted_beam_injected_energy = split_count_step != 0
+            ? split_beam_injected_energy : beam.last_injected_energy();
+        const double accepted_beam_outflow_energy = split_count_step != 0
+            ? split_beam_outflow_energy : beam.last_outflow_energy();
+        const double accepted_beam_injected_impulse = split_count_step != 0
+            ? split_beam_injected_impulse : beam.last_injected_current() * dt;
+        const double accepted_beam_outflow_impulse = split_count_step != 0
+            ? split_beam_outflow_impulse : beam.last_outflow_current() * dt;
+        if (mpi_rank == 0 && physical_interval_acceptance_monitor.is_open()) {
+            physical_interval_acceptance_monitor
+                << physical_step << " " << current_time / Const::femto << " "
+                << time / Const::femto << " " << dt << " "
+                << (split_count_step != 0 ? 2 : 1) << " "
+                << (midpoint_result.converged ? 1 : 0) << " "
+                << (midpoint_result.soft_unconverged ? 1 : 0) << " "
+                << retry_count_step << " " << split_count_step << " "
+                << wall_time_retry_step << " "
+                << operator_evaluations_retry_step << " "
+                << midpoint_result.residual_E << " "
+                << midpoint_result.residual_J_bkg << " "
+                << midpoint_result.residual_f << "\n";
+            physical_interval_acceptance_monitor.flush();
+        }
         // The midpoint kernel only evaluates moments on diagnostic trials.
         // Refresh once for the accepted production state below, rather than
         // once for every Picard iterate.
         moments_current = false;
-        if (runtime.diagnostic_level >= 2 && !midpoint_result.failed) {
+        if (runtime.diagnostic_level >= 2 && !midpoint_result.failed &&
+            split_count_step == 0) {
             write_fixed_midpoint_face_pairing(
                 output_path(runtime, "fixed_midpoint_face_pairing.dat"),
                 physical_step, time, dt, midpoint_result, fields_step_start,
@@ -1799,7 +2268,8 @@ int main(int argc, char** argv)
                 mpi_rank, mpi_size, fixed_midpoint_face_pairing_started);
             fixed_midpoint_face_pairing_started = true;
         }
-        if (runtime.diagnostic_level >= 2 && runtime.dump_final_midpoint) {
+        if (runtime.diagnostic_level >= 2 && runtime.dump_final_midpoint &&
+            split_count_step == 0) {
             VlasovAmpereMidpointSolver::MidpointAuditState audit_state;
             audit_state.step = physical_step;
             audit_state.time_s = time;
@@ -1908,18 +2378,19 @@ int main(int argc, char** argv)
             midpoint_result.fct_macro_budget_valid != 0) {
             static const char* const x_region_names[3] = {
                 "B_left", "core", "B_right"};
-            static const char* const velocity_region_names[2] = {
-                "velocity_core", "velocity_tail"};
-            const std::array<VlasovAmpereMidpointSolver::FctMacroBudget, 6>*
+            static const char* const velocity_region_names[3] = {
+                "velocity_core", "upar_8_to_10", "upar_tail_gt_10"};
+            const std::array<VlasovAmpereMidpointSolver::FctMacroBudget,
+                VlasovAmpereMidpointSolver::FCT_MACRO_REGION_COUNT>*
                 direction_budgets[2] = {
                     &midpoint_result.fct_macro_budget_x,
                     &midpoint_result.fct_macro_budget_u};
             static const char* const direction_names[2] = {"x", "u"};
             for (int direction = 0; direction < 2; ++direction) {
                 for (int x_region = 0; x_region < 3; ++x_region) {
-                    for (int velocity_region = 0; velocity_region < 2;
+                    for (int velocity_region = 0; velocity_region < 3;
                          ++velocity_region) {
-                        const size_t bin = static_cast<size_t>(2 * x_region +
+                        const size_t bin = static_cast<size_t>(3 * x_region +
                                                                velocity_region);
                         const VlasovAmpereMidpointSolver::FctMacroBudget& budget =
                             (*direction_budgets[direction])[bin];
@@ -1932,13 +2403,50 @@ int main(int argc, char** argv)
                             << velocity_region_names[velocity_region] << " "
                             << budget.face_count << " "
                             << budget.active_face_count << " "
-                            << budget.min_alpha << " " << budget.delta_n << " "
-                            << budget.delta_j << " " << budget.delta_k << " "
+                            << budget.min_alpha << " "
+                            << budget.raw_abs_mass << " "
+                            << budget.rejected_abs_mass << " "
+                            << (budget.raw_abs_mass > 0.0
+                                ? budget.rejected_abs_mass / budget.raw_abs_mass
+                                : 0.0) << " "
+                            << budget.raw_abs_current << " "
+                            << budget.rejected_abs_current << " "
+                            << (budget.raw_abs_current > 0.0
+                                ? budget.rejected_abs_current /
+                                    budget.raw_abs_current : 0.0) << " "
+                            << budget.raw_abs_energy << " "
+                            << budget.rejected_abs_energy << " "
+                            << (budget.raw_abs_energy > 0.0
+                                ? budget.rejected_abs_energy /
+                                    budget.raw_abs_energy : 0.0) << " "
+                            << budget.delta_n << " " << budget.delta_j << " "
+                            << budget.delta_k << " "
                             << budget.e_dot_j << " " << budget.r_fct_e << "\n";
                     }
                 }
             }
             fct_macro_budget_monitor.flush();
+        }
+        if (mpi_rank == 0 && collect_step_diagnostics &&
+            midpoint_result.state_advanced != 0 && !midpoint_result.failed) {
+            const VlasovAmpereMidpointSolver::HighOrderCandidateAudit& audit =
+                midpoint_result.high_order_candidate_audit;
+            high_order_candidate_monitor
+                << step << " " << time / Const::femto << " " << 1 << " "
+                << midpoint_result.state_advanced << " "
+                << midpoint_result.soft_unconverged << " "
+                << audit.reconstructed_face_count << " "
+                << audit.negative_reconstructed_face_count << " "
+                << audit.negative_reconstructed_mass_weight << " "
+                << audit.negative_reconstructed_current_weight << " "
+                << audit.negative_reconstructed_energy_weight << " "
+                << audit.high_candidate_negative_cell_count << " "
+                << audit.high_candidate_negative_mass << " "
+                << audit.high_candidate_negative_current_weight << " "
+                << audit.high_candidate_negative_energy_weight << " "
+                << audit.low_order_negative_cell_count << " "
+                << audit.low_order_negative_mass << "\n";
+            high_order_candidate_monitor.flush();
         }
         if (mpi_rank == 0 && collect_step_diagnostics &&
             midpoint_result.state_advanced != 0 && !midpoint_result.failed &&
@@ -2124,7 +2632,7 @@ int main(int argc, char** argv)
                 f_neg_monitor.close();
             }
         }
-        if (bkg_e.collisions_enabled) {
+        if (bkg_e.collisions_enabled && !split_collisions_applied) {
             trace_progress(config, mpi_rank, step, "before collisions");
             collision_energy_step +=
                 collision.apply(bkg_e, dt, Param::dens, Param::temperature_e,
@@ -2137,6 +2645,12 @@ int main(int argc, char** argv)
             trace_progress(config, mpi_rank, step, "after collisions");
             moments_current = false;
         }
+        if (split_collisions_applied) {
+            // Both physical half steps applied their own collision update to
+            // transaction-local states before the final commit above.
+            cumulative_collision_energy_delta += collision_energy_step;
+            moments_current = false;
+        }
 
         trace_progress(config, mpi_rank, step, "before end sync");
         if (!moments_current) {
@@ -2147,8 +2661,8 @@ int main(int argc, char** argv)
         fields.update_gauss_residual_diagnostics(mpi_rank, mpi_size);
         trace_progress(config, mpi_rank, step, "after end sync");
 
-        net_nb_change_step = beam.last_injected_number()
-                            - beam.last_outflow_number();
+        net_nb_change_step = accepted_beam_injected_number -
+            accepted_beam_outflow_number;
 
         if (beam_ledger_enabled) {
             // Beam counters are local because injection and outflow can be
@@ -2156,12 +2670,12 @@ int main(int argc, char** argv)
             // performs one final reduction; only the explicit full audit mode
             // pays for a collective at every accepted step.
             double beam_ledger_local[6] = {
-                beam.last_injected_number(),
-                beam.last_outflow_number(),
-                beam.last_injected_energy(),
-                beam.last_outflow_energy(),
-                beam.last_injected_current() * dt,
-                beam.last_outflow_current() * dt
+                accepted_beam_injected_number,
+                accepted_beam_outflow_number,
+                accepted_beam_injected_energy,
+                accepted_beam_outflow_energy,
+                accepted_beam_injected_impulse,
+                accepted_beam_outflow_impulse
             };
             if (runtime.beam_ledger_mode == BEAM_LEDGER_SUMMARY) {
                 for (int value = 0; value < 6; ++value) {
@@ -2170,30 +2684,58 @@ int main(int argc, char** argv)
                 }
             }
             if (write_beam_ledger) {
-                double beam_ledger_global[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-                MPI_Allreduce(beam_ledger_local, beam_ledger_global, 6, MPI_DOUBLE,
-                              MPI_SUM, MPI_COMM_WORLD);
+                double beam_ledger_global[12] = {0.0};
+                const int ledger_rows = split_count_step != 0 ? 2 : 1;
+                double beam_ledger_send[12] = {0.0};
+                if (split_count_step != 0) {
+                    for (int value = 0; value < 12; ++value)
+                        beam_ledger_send[value] =
+                            split_beam_ledger_rows[static_cast<size_t>(value)];
+                } else {
+                    for (int value = 0; value < 6; ++value)
+                        beam_ledger_send[value] = beam_ledger_local[value];
+                }
+                MPI_Allreduce(beam_ledger_send, beam_ledger_global, 6 * ledger_rows,
+                              MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
                 if (mpi_rank == 0) {
-                    for (int value = 0; value < 6; ++value) {
-                        beam_ledger_full_totals[static_cast<size_t>(value)] +=
-                            beam_ledger_global[value];
+                    for (int half = 0; half < ledger_rows; ++half) {
+                        const size_t row = static_cast<size_t>(6 * half);
+                        for (int value = 0; value < 6; ++value)
+                            beam_ledger_full_totals[static_cast<size_t>(value)] +=
+                                beam_ledger_global[row + static_cast<size_t>(value)];
                     }
-                    if (runtime.beam_ledger_reference_enabled &&
-                        beam_reference_row_count < 2) {
-                        const size_t row = static_cast<size_t>(6 * beam_reference_row_count);
-                        for (int value = 0; value < 6; ++value) {
-                            beam_reference_rows[row + static_cast<size_t>(value)] =
-                                beam_ledger_global[value];
+                    if (runtime.beam_ledger_reference_enabled) {
+                        for (int half = 0; half < ledger_rows &&
+                             beam_reference_row_count < 2; ++half) {
+                            const size_t destination = static_cast<size_t>(
+                                6 * beam_reference_row_count);
+                            const size_t source = static_cast<size_t>(6 * half);
+                            for (int value = 0; value < 6; ++value)
+                                beam_reference_rows[destination +
+                                    static_cast<size_t>(value)] =
+                                    beam_ledger_global[source +
+                                        static_cast<size_t>(value)];
+                            ++beam_reference_row_count;
                         }
-                        ++beam_reference_row_count;
                     }
-                    beam_half_step_ledger
-                        << physical_step << " " << time / Const::femto << " " << dt << " "
-                        << beam_ledger_global[0] << " " << beam_ledger_global[1] << " "
-                        << beam_ledger_global[2] << " " << beam_ledger_global[3] << " "
-                        << beam_ledger_global[4] / dt << " "
-                        << beam_ledger_global[5] / dt << " "
-                        << beam_ledger_global[4] << " " << beam_ledger_global[5] << "\n";
+                    for (int half = 0; half < ledger_rows; ++half) {
+                        const size_t row = static_cast<size_t>(6 * half);
+                        const double ledger_dt = split_count_step != 0 ?
+                            0.5 * dt : dt;
+                        const double ledger_time = split_count_step != 0 ?
+                            current_time + (half + 1) * ledger_dt : time;
+                        beam_half_step_ledger
+                            << physical_step << " " << ledger_time / Const::femto
+                            << " " << ledger_dt << " "
+                            << beam_ledger_global[row] << " "
+                            << beam_ledger_global[row + 1] << " "
+                            << beam_ledger_global[row + 2] << " "
+                            << beam_ledger_global[row + 3] << " "
+                            << beam_ledger_global[row + 4] / ledger_dt << " "
+                            << beam_ledger_global[row + 5] / ledger_dt << " "
+                            << beam_ledger_global[row + 4] << " "
+                            << beam_ledger_global[row + 5] << " " << half << "\n";
+                    }
                     const bool checkpoint_due = runtime.checkpoint_enabled &&
                         next_checkpoint < runtime.checkpoint_times_fs.size() &&
                         time / Const::femto >= runtime.checkpoint_times_fs[next_checkpoint];
@@ -2210,14 +2752,43 @@ int main(int argc, char** argv)
             const double field_energy_step_end = fields.total_energy();
             dke_bkg_step = bkg_ke_step_end - bkg_ke_step_start;
             dE_field_step = field_energy_step_end - field_energy_step_start;
-            E_src_in_step = beam.last_injected_energy();
-            E_src_out_step = beam.last_outflow_energy();
+            E_src_in_step = accepted_beam_injected_energy;
+            E_src_out_step = accepted_beam_outflow_energy;
             const double total_energy_delta =
                 (bkg_ke_step_end + beam_ke_step_end + field_energy_step_end) -
                 (bkg_ke_step_start + beam_ke_step_start + field_energy_step_start);
             E_balance_step =
                 total_energy_delta - E_src_in_step + E_src_out_step
                 - collision_energy_step;
+
+            // The quantities above are rank-local.  write_step_diagnostics()
+            // performs its own packed reduction, but the accepted-energy
+            // ledger is written directly by rank zero.  Reduce a separate
+            // packed copy here so that its total-system account is global
+            // without changing the established step-diagnostics protocol.
+            double accepted_total_energy_terms[7] = {
+                dke_bkg_step,
+                beam_ke_step_end - beam_ke_step_start,
+                dE_field_step,
+                E_src_in_step,
+                E_src_out_step,
+                collision_energy_step,
+                E_balance_step
+            };
+            if (collect_accepted_energy_audit) {
+                MPI_Allreduce(MPI_IN_PLACE, accepted_total_energy_terms, 7,
+                              MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+            }
+            const double accepted_total_energy_residual =
+                accepted_total_energy_terms[0] +
+                accepted_total_energy_terms[1] +
+                accepted_total_energy_terms[2] -
+                accepted_total_energy_terms[3] +
+                accepted_total_energy_terms[4] -
+                accepted_total_energy_terms[5];
+            const double accepted_total_energy_reconstruction_error =
+                accepted_total_energy_residual -
+                accepted_total_energy_terms[6];
 
             if (collect_step_diagnostics) {
             diag.write_step_diagnostics(step, time,
@@ -2289,11 +2860,21 @@ int main(int argc, char** argv)
                                         midpoint_result.background_coupling_mode);
             }
             if (collect_accepted_energy_audit &&
-                midpoint_result.state_advanced != 0 && !midpoint_result.failed) {
-                cumulative_total_energy_residual_for_audit += E_balance_step;
+                midpoint_result.state_advanced != 0 && !midpoint_result.failed &&
+                split_count_step == 0) {
+                cumulative_total_energy_residual_for_audit +=
+                    accepted_total_energy_residual;
                 diag.write_accepted_energy_ledger(
                     physical_step, time, dt, midpoint_result,
-                    E_balance_step, cumulative_total_energy_residual_for_audit,
+                    accepted_total_energy_terms[0],
+                    accepted_total_energy_terms[1],
+                    accepted_total_energy_terms[2],
+                    accepted_total_energy_terms[3],
+                    accepted_total_energy_terms[4],
+                    accepted_total_energy_terms[5],
+                    accepted_total_energy_residual,
+                    accepted_total_energy_reconstruction_error,
+                    cumulative_total_energy_residual_for_audit,
                     mpi_rank);
             }
         }
@@ -2312,6 +2893,11 @@ int main(int argc, char** argv)
             midpoint_result.face_pairing_accepted;
         performance_face_pairing_fallback_steps +=
             midpoint_result.face_pairing_fallback_to_cell_baseline;
+        performance_retry_count += retry_count_step;
+        performance_split_count += split_count_step;
+        performance_operator_evaluations_retry +=
+            operator_evaluations_retry_step;
+        performance_wall_time_retry += wall_time_retry_step;
         performance_acceleration_attempts += midpoint_result.acceleration_attempts;
         performance_acceleration_accepted += midpoint_result.acceleration_accepted;
         performance_acceleration_fallback_evaluations +=
@@ -2484,6 +3070,21 @@ int main(int argc, char** argv)
             << performance_total_nonlinear_iterations / accepted_scale << "\n"
             << "mean_operator_evaluations_per_step "
             << performance_total_operator_evaluations / accepted_scale << "\n"
+            << "retry_count " << performance_retry_count << "\n"
+            << "split_count " << performance_split_count << "\n"
+            << "wall_time_retry_s " << performance_wall_time_retry << "\n"
+            << "operator_evaluations_retry "
+            << performance_operator_evaluations_retry << "\n"
+            << "wall_time_per_physical_fs_s "
+            << performance_wall_max / physical_time_fs << "\n"
+            << "soft_candidate_field_tolerance "
+            << runtime.soft_candidate_field_tolerance << "\n"
+            << "soft_candidate_current_tolerance "
+            << runtime.soft_candidate_current_tolerance << "\n"
+            << "soft_candidate_energy_p99_reference "
+            << runtime.soft_candidate_energy_p99_reference << "\n"
+            << "soft_candidate_energy_absolute_limit "
+            << runtime.soft_candidate_energy_absolute_limit << "\n"
             << "midpoint_initial_guess_mode "
             << (runtime.midpoint_initial_guess_mode ==
                     RUNTIME_MIDPOINT_INITIAL_GUESS_FIELD_LINEAR

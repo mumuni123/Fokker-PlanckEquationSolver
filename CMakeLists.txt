@@ -25,6 +25,10 @@ set(FP_VELOCITY_GRID_UPAR_STRETCH "6.2" CACHE STRING
     "Smooth cylindrical u_parallel sinh mapping parameter")
 set(FP_VELOCITY_GRID_UPERP_STRETCH "5.9" CACHE STRING
     "Smooth cylindrical u_perp sinh mapping parameter")
+set(FP_UPAR_TAIL_CELLS_PER_SIDE 0 CACHE STRING
+    "Number of appended cylindrical u_parallel cells on each side")
+set(FP_UPAR_EXTENDED_MAX 10.0 CACHE STRING
+    "Outer cylindrical u_parallel bound; must equal 10 when tail count is zero")
 set(FP_AMPERE_TEST_SUITE_FINEST_NV "192" CACHE STRING
     "Finest Nv used to select the common physical 7.2 test timestep")
 # Reconfiguration defines one immutable result namespace for the complete
@@ -60,6 +64,36 @@ if(FP_BUILD_CHECKPOINT_TESTS)
         src/maxwell.cpp src/periodic_staggered_operators.cpp src/beam_pic.cpp)
     target_include_directories(checkpoint_roundtrip_test PRIVATE src)
     target_link_libraries(checkpoint_roundtrip_test ${MPI_CXX_LIBRARIES})
+
+    # Section 6: construction-only nested u_parallel grid checks.  These do
+    # not execute a solver or alter any production transport path.
+    add_executable(nested_upar_grid_baseline_test
+        tests/nested_upar_grid_test.cpp)
+    target_include_directories(nested_upar_grid_baseline_test PRIVATE src)
+    add_executable(nested_upar_grid_tail12_test
+        tests/nested_upar_grid_test.cpp)
+    target_include_directories(nested_upar_grid_tail12_test PRIVATE src)
+    target_compile_definitions(nested_upar_grid_tail12_test PRIVATE
+        FP_VELOCITY_GRID_UPAR_TAIL_CELLS_PER_SIDE=2
+        FP_VELOCITY_GRID_UPAR_EXTENDED_MAX=12.0)
+    add_executable(nested_upar_grid_tail14_test
+        tests/nested_upar_grid_test.cpp)
+    target_include_directories(nested_upar_grid_tail14_test PRIVATE src)
+    target_compile_definitions(nested_upar_grid_tail14_test PRIVATE
+        FP_VELOCITY_GRID_UPAR_TAIL_CELLS_PER_SIDE=4
+        FP_VELOCITY_GRID_UPAR_EXTENDED_MAX=14.0)
+    add_executable(nested_upar_grid_tail16_test
+        tests/nested_upar_grid_test.cpp)
+    target_include_directories(nested_upar_grid_tail16_test PRIVATE src)
+    target_compile_definitions(nested_upar_grid_tail16_test PRIVATE
+        FP_VELOCITY_GRID_UPAR_TAIL_CELLS_PER_SIDE=6
+        FP_VELOCITY_GRID_UPAR_EXTENDED_MAX=16.0)
+    add_executable(nested_upar_grid_tail18_test
+        tests/nested_upar_grid_test.cpp)
+    target_include_directories(nested_upar_grid_tail18_test PRIVATE src)
+    target_compile_definitions(nested_upar_grid_tail18_test PRIVATE
+        FP_VELOCITY_GRID_UPAR_TAIL_CELLS_PER_SIDE=8
+        FP_VELOCITY_GRID_UPAR_EXTENDED_MAX=18.0)
 
     add_executable(restart_one_step_equivalence_test
         tests/restart_one_step_equivalence_test.cpp
@@ -537,6 +571,9 @@ set(SOURCES
 
 add_executable(fp_solver ${SOURCES})
 target_include_directories(fp_solver PRIVATE src)
+target_compile_definitions(fp_solver PRIVATE
+    FP_VELOCITY_GRID_UPAR_TAIL_CELLS_PER_SIDE=${FP_UPAR_TAIL_CELLS_PER_SIDE}
+    FP_VELOCITY_GRID_UPAR_EXTENDED_MAX=${FP_UPAR_EXTENDED_MAX})
 if(FP_ENABLE_DEBUG_DIAGNOSTICS)
     target_compile_definitions(fp_solver PRIVATE FP_ENABLE_DEBUG_DIAGNOSTICS=1)
 else()

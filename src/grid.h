@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <sstream>
+#include <stdexcept>
 #include <vector>
 
 struct VelocityGrid {
@@ -188,6 +190,16 @@ struct VelocityGrid {
 // extents, but represent (u_parallel, u_perp), not the legacy (u, mu) grid.
 // Values in Species::f are cell-integrated masses M on this grid.
 struct CylindricalVelocityGrid {
+    struct NestedGridAudit {
+        double core_face_identity_linf;
+        double core_cell_identity_linf;
+        double core_vx_identity_linf;
+        double core_kinetic_energy_identity_linf;
+        double symmetry_linf;
+        double max_adjacent_width_ratio;
+        double phase_volume_relative_error;
+    } nested_audit;
+
     std::vector<double> upar_faces;
     std::vector<double> upar_cells;
     std::vector<double> upar_widths;
@@ -212,17 +224,64 @@ struct CylindricalVelocityGrid {
         kinetic_energy.resize(Param::Nvmu);
         vx.resize(Param::Nvmu);
 
-        assert(Param::Nv > 0 && Param::Nmu > 0 && Param::Nv % 2 == 0);
-        const double sinh_upar = std::sinh(Param::momentum_upar_stretch);
+        if (Param::Nv_core <= 0 || Param::Nv_tail < 0 ||
+            Param::Nv_core % 2 != 0 || Param::Nmu <= 0 ||
+            Param::momentum_upar_core_max <= 0.0 ||
+            Param::momentum_upar_extended_max < Param::momentum_upar_core_max ||
+            (Param::Nv_tail == 0 &&
+             Param::momentum_upar_extended_max != Param::momentum_upar_core_max) ||
+            (Param::Nv_tail > 0 &&
+             Param::momentum_upar_extended_max <= Param::momentum_upar_core_max)) {
+            throw std::runtime_error("invalid nested u_parallel grid configuration");
+        }
+        assert(Param::Nv > 0 && Param::Nmu > 0);
+
+        build_upar_core_faces();
+        append_symmetric_upar_tail_faces();
+
         const double sinh_uperp = std::sinh(Param::momentum_uperp_stretch);
-        for (int j = 0; j <= Param::Nv; ++j) {
-            const double xi = -1.0 + 2.0 * static_cast<double>(j) / Param::Nv;
-            upar_faces[j] = umax *
+        build_uperp_faces(umax, sinh_uperp);
+        build_cell_geometry_and_moments();
+        validate_nested_grid(umax);
+    }
+
+    void build_upar_core_faces()
+    {
+        const int offset = Param::Nv_tail;
+        const double core_max = Param::momentum_upar_core_max;
+        const double sinh_upar = std::sinh(Param::momentum_upar_stretch);
+        for (int j = 0; j <= Param::Nv_core; ++j) {
+            // Keep this expression structurally identical to the pre-tail
+            // grid so tail=0 preserves the established core bit pattern.
+            const double xi = -1.0 + 2.0 * static_cast<double>(j) /
+                                        Param::Nv_core;
+            upar_faces[offset + j] = core_max *
                 std::sinh(Param::momentum_upar_stretch * xi) / sinh_upar;
         }
-        upar_faces.front() = -umax;
-        upar_faces[Param::Nv / 2] = 0.0;
-        upar_faces.back() = umax;
+        upar_faces[offset] = -core_max;
+        upar_faces[offset + Param::Nv_core / 2] = 0.0;
+        upar_faces[offset + Param::Nv_core] = core_max;
+    }
+
+    void append_symmetric_upar_tail_faces()
+    {
+        const int tail = Param::Nv_tail;
+        if (tail == 0) return;
+        const double core_max = Param::momentum_upar_core_max;
+        const double extended_max = Param::momentum_upar_extended_max;
+        const double width = (extended_max - core_max) /
+                             static_cast<double>(tail);
+        for (int t = 0; t <= tail; ++t) {
+            upar_faces[t] = -extended_max + width * static_cast<double>(t);
+            upar_faces[tail + Param::Nv_core + t] =
+                core_max + width * static_cast<double>(t);
+        }
+        upar_faces.front() = -extended_max;
+        upar_faces.back() = extended_max;
+    }
+
+    void build_uperp_faces(double umax, double sinh_uperp)
+    {
         for (int k = 0; k <= Param::Nmu; ++k) {
             const double eta = static_cast<double>(k) / Param::Nmu;
             uperp_faces[k] = umax *
@@ -230,6 +289,10 @@ struct CylindricalVelocityGrid {
         }
         uperp_faces.front() = 0.0;
         uperp_faces.back() = umax;
+    }
+
+    void build_cell_geometry_and_moments()
+    {
         for (int j = 0; j < Param::Nv; ++j) {
             upar_cells[j] = 0.5 * (upar_faces[j] + upar_faces[j + 1]);
             upar_widths[j] = upar_faces[j + 1] - upar_faces[j];
@@ -254,6 +317,106 @@ struct CylindricalVelocityGrid {
                 vx[slot] = Const::c * upar_cells[j] / gamma;
             }
         }
+    }
+
+    void validate_nested_grid(double uperp_max)
+    {
+        const int offset = Param::Nv_tail;
+        const double core_max = Param::momentum_upar_core_max;
+        const double extended_max = Param::momentum_upar_extended_max;
+        const double sinh_upar = std::sinh(Param::momentum_upar_stretch);
+        nested_audit.core_face_identity_linf = 0.0;
+        nested_audit.core_cell_identity_linf = 0.0;
+        nested_audit.core_vx_identity_linf = 0.0;
+        nested_audit.core_kinetic_energy_identity_linf = 0.0;
+        nested_audit.symmetry_linf = 0.0;
+        nested_audit.max_adjacent_width_ratio = 1.0;
+        for (int j = 0; j <= Param::Nv_core; ++j) {
+            const double xi = -1.0 + 2.0 * static_cast<double>(j) /
+                                        Param::Nv_core;
+            const double expected = core_max *
+                std::sinh(Param::momentum_upar_stretch * xi) / sinh_upar;
+            nested_audit.core_face_identity_linf = std::max(
+                nested_audit.core_face_identity_linf,
+                std::fabs(upar_faces[offset + j] - expected));
+        }
+        for (int j = 0; j < Param::Nv_core; ++j) {
+            const double xi_left = -1.0 + 2.0 * static_cast<double>(j) /
+                                               Param::Nv_core;
+            const double xi_right = -1.0 + 2.0 * static_cast<double>(j + 1) /
+                                                Param::Nv_core;
+            const double face_left = core_max *
+                std::sinh(Param::momentum_upar_stretch * xi_left) / sinh_upar;
+            const double face_right = core_max *
+                std::sinh(Param::momentum_upar_stretch * xi_right) / sinh_upar;
+            const double expected = 0.5 * (face_left + face_right);
+            nested_audit.core_cell_identity_linf = std::max(
+                nested_audit.core_cell_identity_linf,
+                std::fabs(upar_cells[offset + j] - expected));
+            for (int k = 0; k < Param::Nmu; ++k) {
+                const double uperp = uperp_cells[k];
+                const double gamma = std::sqrt(1.0 + expected * expected +
+                                               uperp * uperp);
+                const size_t slot = static_cast<size_t>(offset + j) * Param::Nmu + k;
+                nested_audit.core_vx_identity_linf = std::max(
+                    nested_audit.core_vx_identity_linf,
+                    std::fabs(vx[slot] - Const::c * expected / gamma));
+                nested_audit.core_kinetic_energy_identity_linf = std::max(
+                    nested_audit.core_kinetic_energy_identity_linf,
+                    std::fabs(kinetic_energy[slot] - Const::me * Const::c * Const::c *
+                              (gamma - 1.0)));
+            }
+        }
+        for (int j = 0; j <= Param::Nv; ++j) {
+            nested_audit.symmetry_linf = std::max(
+                nested_audit.symmetry_linf,
+                std::fabs(upar_faces[j] + upar_faces[Param::Nv - j]));
+        }
+        for (int j = 1; j < Param::Nv; ++j) {
+            const double left = upar_widths[j - 1];
+            const double right = upar_widths[j];
+            nested_audit.max_adjacent_width_ratio = std::max(
+                nested_audit.max_adjacent_width_ratio,
+                std::max(left / right, right / left));
+        }
+        double ring_sum = 0.0;
+        for (int k = 0; k < Param::Nmu; ++k) ring_sum += uperp_ring_areas[k];
+        double upar_sum = 0.0;
+        for (int j = 0; j < Param::Nv; ++j) upar_sum += upar_widths[j];
+        const double expected_phase_volume =
+            2.0 * extended_max * Const::pi * uperp_max * uperp_max;
+        nested_audit.phase_volume_relative_error = std::fabs(
+            upar_sum * ring_sum - expected_phase_volume) /
+            std::max(expected_phase_volume, 1.0);
+
+        const double tolerance = 64.0 * std::numeric_limits<double>::epsilon() *
+                                 std::max(1.0, extended_max);
+        if (nested_audit.core_face_identity_linf > tolerance ||
+            nested_audit.core_cell_identity_linf > tolerance ||
+            nested_audit.core_vx_identity_linf > tolerance * Const::c ||
+            nested_audit.core_kinetic_energy_identity_linf >
+                tolerance * Const::me * Const::c * Const::c ||
+            nested_audit.symmetry_linf > tolerance ||
+            nested_audit.max_adjacent_width_ratio > 1.25 + tolerance ||
+            nested_audit.phase_volume_relative_error > 1.0e-13 ||
+            upar_faces.front() != -extended_max ||
+            upar_faces.back() != extended_max) {
+            std::ostringstream message;
+            message << "nested u_parallel grid validation failed: "
+                    << "Nv_core=" << Param::Nv_core
+                    << " Nv_tail_per_side=" << Param::Nv_tail
+                    << " core_max=" << core_max
+                    << " extended_max=" << extended_max
+                    << " core_face_linf=" << nested_audit.core_face_identity_linf
+                    << " core_cell_linf=" << nested_audit.core_cell_identity_linf
+                    << " symmetry_linf=" << nested_audit.symmetry_linf
+                    << " max_adjacent_width_ratio="
+                    << nested_audit.max_adjacent_width_ratio
+                    << " phase_volume_relative_error="
+                    << nested_audit.phase_volume_relative_error
+                    << " (required max_adjacent_width_ratio<=1.25)";
+            throw std::runtime_error(message.str());
+        }
 
 #if FP_ENABLE_DEBUG_DIAGNOSTICS
         for (int j = 0; j < Param::Nv; ++j) {
@@ -266,19 +429,20 @@ struct CylindricalVelocityGrid {
             assert(uperp_faces[k + 1] > uperp_faces[k]);
             assert(std::isfinite(uperp_widths[k]) && uperp_widths[k] > 0.0);
         }
-        assert(upar_faces.front() == -umax && upar_faces.back() == umax);
-        assert(uperp_faces.front() == 0.0 && uperp_faces.back() == umax);
+        assert(upar_faces.front() == -extended_max &&
+               upar_faces.back() == extended_max);
+        assert(uperp_faces.front() == 0.0 && uperp_faces.back() == uperp_max);
 #ifndef NDEBUG
         const double symmetry_tolerance = 64.0 *
-            std::numeric_limits<double>::epsilon() * umax;
+            std::numeric_limits<double>::epsilon() * extended_max;
         for (int j = 0; j <= Param::Nv; ++j)
             assert(std::fabs(upar_faces[j] + upar_faces[Param::Nv - j]) <=
                    symmetry_tolerance);
 #endif
-        double ring_sum = 0.0;
-        for (int k = 0; k < Param::Nmu; ++k) ring_sum += uperp_ring_areas[k];
-        assert(std::fabs(ring_sum - Const::pi * umax * umax) /
-               (Const::pi * umax * umax) <= 1.0e-13);
+        double debug_ring_sum = 0.0;
+        for (int k = 0; k < Param::Nmu; ++k) debug_ring_sum += uperp_ring_areas[k];
+        assert(std::fabs(debug_ring_sum - Const::pi * uperp_max * uperp_max) /
+               (Const::pi * uperp_max * uperp_max) <= 1.0e-13);
         if (Param::Nv == 96)
             assert(*std::min_element(upar_widths.begin(), upar_widths.end()) >= 0.0035 &&
                    *std::min_element(upar_widths.begin(), upar_widths.end()) <= 0.0070);

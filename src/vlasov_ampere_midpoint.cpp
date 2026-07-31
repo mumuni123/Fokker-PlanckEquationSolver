@@ -65,6 +65,10 @@ void VlasovAmpereMidpointSolver::reset_current_diag(CurrentDiagnostics& diag) co
 void VlasovAmpereMidpointSolver::reset_result(Result& result) const
 {
     result = Result();
+    result.acceptance_kind = HARD_FAILURE;
+    result.transport_safe = 0;
+    result.last_4_contraction_E.fill(std::numeric_limits<double>::quiet_NaN());
+    result.last_4_contraction_J_bkg.fill(std::numeric_limits<double>::quiet_NaN());
     result.operator_evaluations = 0;
     result.midpoint_initial_guess_mode =
         static_cast<int>(midpoint_initial_guess_mode_);
@@ -169,6 +173,12 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
             budgets[direction]->face_count = 0;
             budgets[direction]->active_face_count = 0;
             budgets[direction]->min_alpha = 1.0;
+            budgets[direction]->raw_abs_mass = 0.0;
+            budgets[direction]->rejected_abs_mass = 0.0;
+            budgets[direction]->raw_abs_current = 0.0;
+            budgets[direction]->rejected_abs_current = 0.0;
+            budgets[direction]->raw_abs_energy = 0.0;
+            budgets[direction]->rejected_abs_energy = 0.0;
             budgets[direction]->delta_n = 0.0;
             budgets[direction]->delta_j = 0.0;
             budgets[direction]->delta_k = 0.0;
@@ -205,6 +215,7 @@ void VlasovAmpereMidpointSolver::reset_result(Result& result) const
     result.low_order_roundoff_zeroed_mass = 0.0;
     result.fct_roundoff_zeroed_count = 0;
     result.fct_roundoff_zeroed_mass = 0.0;
+    result.high_order_candidate_audit = HighOrderCandidateAudit();
     result.accepted_energy_ledger = AcceptedEnergyLedger();
     result.accepted_energy_ledger.valid = 0;
     result.accepted_energy_ledger.strict_accepted = 0;

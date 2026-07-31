@@ -49,6 +49,76 @@ bool finite_persistent_state(const BeamPersistentState& s)
     return true;
 }
 bool rename_atomic(const std::string& from, const std::string& to) { return std::rename(from.c_str(), to.c_str()) == 0; }
+
+unsigned long long configuration_hash_for_velocity_layout(
+    int nv, int nmu, double upar_core_max,
+    bool low_order_only, bool high_order_enabled, bool fct_enabled)
+{
+    unsigned long long h = 1469598103934665603ULL;
+    const double values[] = {
+        Const::qe, Const::me, Const::c, Const::eps0,
+        Param::dens, Param::temperature_e, Param::temperature_i,
+        Param::densb, Param::jb, Param::gambetab, Param::beam_macro_weight,
+        Param::Lx, Param::dx, Param::t_inject_start, Param::t_inject_end,
+        Param::dt_multiplier, Param::dt_snapshot, Param::velocity_space_cfl,
+        Param::semi_lagrangian_cfl, upar_core_max,
+        Param::momentum_upar_stretch, Param::momentum_uperp_stretch,
+        Param::v_floor, Param::u_floor
+    };
+    h = checkpoint_hash64(values, sizeof(values), h);
+    const char topology[] = "background_periodic_x;field_periodic_face;beam_open_x";
+    h = checkpoint_hash64(topology, sizeof(topology) - 1, h);
+    const int dims[] = {Param::nx, Param::Nghost, nv, nmu,
+                        Param::Z_ion, Param::beam_macro_particles_per_cell,
+                        Param::enable_beam_boundary_injection ? 1 : 0,
+                        Param::abort_on_vmax_loss ? 1 : 0,
+                        low_order_only ? 1 : 0, high_order_enabled ? 1 : 0,
+                        fct_enabled ? 1 : 0};
+    return checkpoint_hash64(dims, sizeof(dims), h);
+}
+
+unsigned long long combine_rank_hash(unsigned long long local_hash,
+                                     int rank, int size)
+{
+    std::vector<unsigned long long> all(rank == 0 ? static_cast<size_t>(size) : 0);
+    MPI_Gather(&local_hash, 1, MPI_UNSIGNED_LONG_LONG,
+               rank == 0 ? all.data() : 0, 1, MPI_UNSIGNED_LONG_LONG,
+               0, MPI_COMM_WORLD);
+    unsigned long long combined = 1469598103934665603ULL;
+    if (rank == 0) {
+        for (int r = 0; r < size; ++r)
+            combined = checkpoint_hash64(&all[static_cast<size_t>(r)],
+                                         sizeof(unsigned long long), combined);
+    }
+    MPI_Bcast(&combined, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+    return combined;
+}
+
+void remap_moments_from_core_payload(const std::vector<double>& f_owned,
+                                     const Species& bkg, const SpatialGrid& sg,
+                                     double& mass, double& parallel_momentum,
+                                     double& kinetic_energy)
+{
+    mass = 0.0;
+    parallel_momentum = 0.0;
+    kinetic_energy = 0.0;
+    const int offset = Param::Nv_tail;
+    for (int ix = 0; ix < sg.nx_local; ++ix) {
+        const size_t xbase = static_cast<size_t>(ix) *
+                             static_cast<size_t>(Param::Nv_core) * Param::Nmu;
+        for (int iv = 0; iv < Param::Nv_core; ++iv) {
+            const double upar = bkg.cgrid.upar_cells[offset + iv];
+            for (int imu = 0; imu < Param::Nmu; ++imu) {
+                const double value = f_owned[xbase +
+                    static_cast<size_t>(iv) * Param::Nmu + imu];
+                const size_t slot = static_cast<size_t>(offset + iv) * Param::Nmu + imu;
+                mass += value;
+                parallel_momentum += value * Const::me * Const::c * upar;
+                kinetic_energy += value * bkg.cgrid.kinetic_energy[slot];
+            }
+        }
+    }
+}
 }
 
 unsigned long long checkpoint_hash64(const void* data, size_t bytes, unsigned long long hash)
@@ -67,30 +137,9 @@ unsigned long long checkpoint_configuration_hash(bool low_order_only,
                                                  bool high_order_enabled,
                                                  bool fct_enabled)
 {
-    unsigned long long h = 1469598103934665603ULL;
-    // This is deliberately a physics/grid identity, not a build identity.
-    // A restart must never silently mix a different plasma, beam, time, or
-    // cylindrical velocity-grid definition with persisted state.
-    const double values[] = {
-        Const::qe, Const::me, Const::c, Const::eps0,
-        Param::dens, Param::temperature_e, Param::temperature_i,
-        Param::densb, Param::jb, Param::gambetab, Param::beam_macro_weight,
-        Param::Lx, Param::dx, Param::t_inject_start, Param::t_inject_end,
-        Param::dt_multiplier, Param::dt_snapshot, Param::velocity_space_cfl,
-        Param::semi_lagrangian_cfl, Param::momentum_umax,
-        Param::momentum_upar_stretch, Param::momentum_uperp_stretch,
-        Param::v_floor, Param::u_floor
-    };
-    h = checkpoint_hash64(values, sizeof(values), h);
-    const char topology[] = "background_periodic_x;field_periodic_face;beam_open_x";
-    h = checkpoint_hash64(topology, sizeof(topology) - 1, h);
-    const int dims[] = {Param::nx, Param::Nghost, Param::Nv, Param::Nmu,
-                        Param::Z_ion, Param::beam_macro_particles_per_cell,
-                        Param::enable_beam_boundary_injection ? 1 : 0,
-                        Param::abort_on_vmax_loss ? 1 : 0,
-                        low_order_only ? 1 : 0, high_order_enabled ? 1 : 0,
-                        fct_enabled ? 1 : 0};
-    return checkpoint_hash64(dims, sizeof(dims), h);
+    return configuration_hash_for_velocity_layout(
+        Param::Nv, Param::Nmu, Param::momentum_upar_core_max,
+        low_order_only, high_order_enabled, fct_enabled);
 }
 
 unsigned long long checkpoint_velocity_grid_hash(const Species& bkg)
@@ -188,7 +237,8 @@ bool read_checkpoint_reference_hashes(const std::string& directory,
 bool write_checkpoint(const std::string& directory, const CheckpointControlState& c,
                       const Species& bkg, const BeamPIC& beam, const EMFields& fields,
                       const SpatialGrid& sg, int rank, int size, std::string& error,
-                      bool low_order_only, bool high_order_enabled, bool fct_enabled)
+                      bool low_order_only, bool high_order_enabled, bool fct_enabled,
+                      const CheckpointVelocityRemapAudit* remap_audit)
 {
     const std::string::size_type slash = directory.find_last_of('/');
     const std::string parent = slash == std::string::npos ? std::string() : directory.substr(0, slash);
@@ -248,6 +298,10 @@ bool write_checkpoint(const std::string& directory, const CheckpointControlState
     if (rank==0 && global_ok) {
         const std::string manifest=directory+"/manifest.dat", tmp_manifest=manifest+".tmp"; std::ofstream out(tmp_manifest.c_str());
         out<<"magic FPCHKPT1\nversion 1\nendianness "<<kEndian<<"\nsizeof_double "<<sizeof(double)<<"\nsizeof_uint64 "<<sizeof(unsigned long long)<<"\nmpi_size "<<size<<"\nnx "<<Param::nx<<"\nnghost "<<Param::Nghost<<"\nnv "<<Param::Nv<<"\nnmu "<<Param::Nmu
+           <<"\nupar_core_nv "<<Param::Nv_core
+           <<"\nupar_tail_cells_per_side "<<Param::Nv_tail
+           <<"\nupar_core_max "<<std::setprecision(17)<<Param::momentum_upar_core_max
+           <<"\nupar_extended_max "<<Param::momentum_upar_extended_max
            <<"\nLx "<<std::setprecision(17)<<Param::Lx<<"\ndx "<<Param::dx<<"\nconfig_hash "<<checkpoint_configuration_hash(low_order_only, high_order_enabled, fct_enabled)
            <<"\nvelocity_grid_hash "<<checkpoint_velocity_grid_hash(bkg)
            <<"\nphysics_parameter_hash "<<checkpoint_physics_parameter_hash()
@@ -255,6 +309,20 @@ bool write_checkpoint(const std::string& directory, const CheckpointControlState
            <<"\nstate_hash_field_faces "<<state_hashes.field_faces
            <<"\nstate_hash_beam "<<state_hashes.beam
            <<"\nstep "<<c.step<<"\ntime_s "<<c.time_s<<"\ndt_s "<<c.dt_s<<"\nrank_files "<<size<<"\n";
+        if (remap_audit && remap_audit->applied) {
+            out << "velocity_grid_remapped 1\n"
+                << "tail_initialization zero_diagnostic\n"
+                << "remap_mass_before " << remap_audit->mass_before << "\n"
+                << "remap_mass_after " << remap_audit->mass_after << "\n"
+                << "remap_parallel_momentum_before " << remap_audit->parallel_momentum_before << "\n"
+                << "remap_parallel_momentum_after " << remap_audit->parallel_momentum_after << "\n"
+                << "remap_kinetic_energy_before " << remap_audit->kinetic_energy_before << "\n"
+                << "remap_kinetic_energy_after " << remap_audit->kinetic_energy_after << "\n"
+                << "remap_core_hash_before " << remap_audit->core_hash_before << "\n"
+                << "remap_core_hash_after " << remap_audit->core_hash_after << "\n";
+        } else {
+            out << "velocity_grid_remapped 0\n";
+        }
         for (int r = 0; r < size; ++r) {
             out << "rank " << r << " " << all_bytes[r] << " "
                 << all_hash[r] << "\n";
@@ -270,8 +338,11 @@ bool write_checkpoint(const std::string& directory, const CheckpointControlState
 bool read_checkpoint(const std::string& directory, CheckpointControlState& c,
                      Species& bkg, BeamPIC& beam, EMFields& fields,
                      const SpatialGrid& sg, int rank, int size, std::string& error,
-                     bool low_order_only, bool high_order_enabled, bool fct_enabled)
+                     bool low_order_only, bool high_order_enabled, bool fct_enabled,
+                     bool allow_velocity_grid_remap,
+                     CheckpointVelocityRemapAudit* remap_audit)
 {
+    if (remap_audit) *remap_audit = CheckpointVelocityRemapAudit{};
     enum CheckpointReadFailure {
         kManifestOpenOrMagic = 1 << 0,
         kMpiSizeMismatch = 1 << 1,
@@ -290,6 +361,9 @@ bool read_checkpoint(const std::string& directory, CheckpointControlState& c,
     };
     int manifest_failure_mask = 0;
     unsigned long long expected_bytes = 0, expected_hash = 0;
+    int saved_nv = -1;
+    int saved_nmu = -1;
+    int velocity_remap = 0;
     if (rank == 0) {
         std::ifstream manifest((directory + "/manifest.dat").c_str());
         std::string key, magic;
@@ -318,15 +392,33 @@ bool read_checkpoint(const std::string& directory, CheckpointControlState& c,
             checkpoint_velocity_grid_hash(bkg);
         const unsigned long long expected_physics_hash =
             checkpoint_physics_parameter_hash();
+        const bool remap_candidate = allow_velocity_grid_remap &&
+            Param::Nv_tail > 0 && nv == Param::Nv_core &&
+            nmu == Param::Nmu && nx == Param::nx;
+        const unsigned long long remap_source_config_hash =
+            configuration_hash_for_velocity_layout(
+                Param::Nv_core, Param::Nmu, Param::momentum_upar_core_max,
+                low_order_only, high_order_enabled, fct_enabled);
+        const bool remap_configuration_matches =
+            config_hash == remap_source_config_hash &&
+            physics_hash == remap_source_config_hash;
+        if (remap_candidate && remap_configuration_matches &&
+            bkg.cgrid.nested_audit.core_face_identity_linf == 0.0 &&
+            bkg.cgrid.nested_audit.core_cell_identity_linf == 0.0) {
+            velocity_remap = 1;
+        }
         if (manifest_size != size) manifest_failure_mask |= kMpiSizeMismatch;
-        if (nx != Param::nx || nv != Param::Nv || nmu != Param::Nmu)
+        if (nx != Param::nx || nmu != Param::Nmu ||
+            (nv != Param::Nv && velocity_remap == 0))
             manifest_failure_mask |= kGridMismatch;
-        if (config_hash != expected_config_hash)
+        if (config_hash != expected_config_hash && velocity_remap == 0)
             manifest_failure_mask |= kConfigurationHashMismatch;
-        if (velocity_hash != expected_velocity_hash)
+        if (velocity_hash != expected_velocity_hash && velocity_remap == 0)
             manifest_failure_mask |= kVelocityGridHashMismatch;
-        if (physics_hash != expected_physics_hash)
+        if (physics_hash != expected_physics_hash && velocity_remap == 0)
             manifest_failure_mask |= kPhysicsHashMismatch;
+        saved_nv = nv;
+        saved_nmu = nmu;
         if (manifest_failure_mask != 0) {
             std::fprintf(stderr,
                 "Checkpoint manifest mismatch: path=%s mask=0x%x "
@@ -341,6 +433,9 @@ bool read_checkpoint(const std::string& directory, CheckpointControlState& c,
         }
     }
     MPI_Bcast(&manifest_failure_mask, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&saved_nv, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&saved_nmu, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&velocity_remap, 1, MPI_INT, 0, MPI_COMM_WORLD);
     // The manifest lists every rank. Broadcast the complete compact table so
     // each rank can verify its own file before entering the solver.
     std::vector<unsigned long long> expected_table;
@@ -370,7 +465,8 @@ bool read_checkpoint(const std::string& directory, CheckpointControlState& c,
         std::memcmp(h.magic,kMagic,sizeof(kMagic)) || h.version!=kVersion ||
         h.endian_tag!=kEndian || h.mpi_rank!=rank || h.mpi_size!=size ||
         h.ix_start!=sg.ix_start || h.nx_local!=sg.nx_local ||
-        h.nghost!=sg.nghost || h.nv!=Param::Nv || h.nmu!=Param::Nmu)
+        h.nghost!=sg.nghost || h.nv!=saved_nv || h.nmu!=saved_nmu ||
+        (velocity_remap == 0 && h.nv != Param::Nv))
         local_failure_mask |= kRankHeaderMismatch;
     if (local_failure_mask == 0 &&
         !in.read(reinterpret_cast<char*>(&c),sizeof(c)))
@@ -379,7 +475,11 @@ bool read_checkpoint(const std::string& directory, CheckpointControlState& c,
     std::vector<double> ex_owned;
     BeamPersistentState state;
     if (local_failure_mask == 0) {
-        if (h.f_count!=static_cast<unsigned long long>(sg.nx_local*Param::Nvmu) ||
+        const unsigned long long expected_f_count =
+            static_cast<unsigned long long>(sg.nx_local) *
+            static_cast<unsigned long long>(saved_nv) *
+            static_cast<unsigned long long>(saved_nmu);
+        if (h.f_count != expected_f_count ||
             h.ex_face_count!=static_cast<unsigned long long>(sg.nx_local)) {
             local_failure_mask |= kPayloadCountMismatch;
         } else {
@@ -440,9 +540,117 @@ bool read_checkpoint(const std::string& directory, CheckpointControlState& c,
         error="checkpoint validation failed; see rank-0 diagnostics";
         return false;
     }
-    for(int ix=0;ix<sg.nx_local;++ix) std::copy(f_owned.begin()+static_cast<size_t>(ix)*Param::Nvmu,f_owned.begin()+static_cast<size_t>(ix+1)*Param::Nvmu,bkg.f.begin()+static_cast<size_t>(sg.nghost+ix)*Param::Nvmu);
+    if (velocity_remap != 0) {
+        CheckpointVelocityRemapAudit local_audit = {};
+        local_audit.applied = true;
+        remap_moments_from_core_payload(f_owned, bkg, sg,
+                                        local_audit.mass_before,
+                                        local_audit.parallel_momentum_before,
+                                        local_audit.kinetic_energy_before);
+        const unsigned long long local_before = checkpoint_hash64(
+            f_owned.data(), f_owned.size() * sizeof(double));
+        std::fill(bkg.f.begin(), bkg.f.end(), 0.0);
+        std::fill(bkg.f_tmp.begin(), bkg.f_tmp.end(), 0.0);
+        std::vector<double> core_after(f_owned.size(), 0.0);
+        for (int ix = 0; ix < sg.nx_local; ++ix) {
+            const size_t old_base = static_cast<size_t>(ix) *
+                static_cast<size_t>(Param::Nv_core) * Param::Nmu;
+            const size_t new_base = static_cast<size_t>(sg.nghost + ix) * Param::Nvmu;
+            for (int iv = 0; iv < Param::Nv_core; ++iv) {
+                const size_t old_row = old_base + static_cast<size_t>(iv) * Param::Nmu;
+                const size_t new_row = new_base +
+                    static_cast<size_t>(Param::Nv_tail + iv) * Param::Nmu;
+                std::copy(f_owned.begin() + old_row,
+                          f_owned.begin() + old_row + Param::Nmu,
+                          bkg.f.begin() + new_row);
+                std::copy(f_owned.begin() + old_row,
+                          f_owned.begin() + old_row + Param::Nmu,
+                          core_after.begin() + old_row);
+            }
+        }
+        bkg.f_tmp = bkg.f;
+        remap_moments_from_core_payload(core_after, bkg, sg,
+                                        local_audit.mass_after,
+                                        local_audit.parallel_momentum_after,
+                                        local_audit.kinetic_energy_after);
+        local_audit.core_hash_before = combine_rank_hash(local_before, rank, size);
+        local_audit.core_hash_after = combine_rank_hash(checkpoint_hash64(
+            core_after.data(), core_after.size() * sizeof(double)), rank, size);
+        double values[6] = {local_audit.mass_before, local_audit.mass_after,
+                            local_audit.parallel_momentum_before,
+                            local_audit.parallel_momentum_after,
+                            local_audit.kinetic_energy_before,
+                            local_audit.kinetic_energy_after};
+        MPI_Allreduce(MPI_IN_PLACE, values, 6, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        local_audit.mass_before = values[0];
+        local_audit.mass_after = values[1];
+        local_audit.parallel_momentum_before = values[2];
+        local_audit.parallel_momentum_after = values[3];
+        local_audit.kinetic_energy_before = values[4];
+        local_audit.kinetic_energy_after = values[5];
+        const double tolerance = 4096.0 * std::numeric_limits<double>::epsilon();
+        const bool remap_conserved =
+            local_audit.core_hash_before == local_audit.core_hash_after &&
+            std::fabs(local_audit.mass_after - local_audit.mass_before) <=
+                tolerance * std::max(1.0, std::fabs(local_audit.mass_before)) &&
+            std::fabs(local_audit.parallel_momentum_after -
+                      local_audit.parallel_momentum_before) <=
+                tolerance * std::max(1.0, std::fabs(local_audit.parallel_momentum_before)) &&
+            std::fabs(local_audit.kinetic_energy_after -
+                      local_audit.kinetic_energy_before) <=
+                tolerance * std::max(1.0, std::fabs(local_audit.kinetic_energy_before));
+        int remap_ok = remap_conserved ? 1 : 0;
+        MPI_Allreduce(MPI_IN_PLACE, &remap_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        if (remap_ok == 0) {
+            error = "checkpoint velocity-grid remap failed conservation/hash audit";
+            return false;
+        }
+        if (remap_audit) *remap_audit = local_audit;
+    } else {
+        for(int ix=0;ix<sg.nx_local;++ix) std::copy(
+            f_owned.begin()+static_cast<size_t>(ix)*Param::Nvmu,
+            f_owned.begin()+static_cast<size_t>(ix+1)*Param::Nvmu,
+            bkg.f.begin()+static_cast<size_t>(sg.nghost+ix)*Param::Nvmu);
+    }
     std::copy(ex_owned.begin(),ex_owned.end(),fields.Ex_face.begin()); beam.import_persistent_state(state,sg); fields.sync_cell_ex_from_faces(rank,size);
     return true;
+}
+
+bool write_checkpoint_velocity_remap_audit(
+    const std::string& directory, const CheckpointVelocityRemapAudit& audit,
+    int rank, int size, std::string& error)
+{
+    int ok = audit.applied ? 1 : 0;
+    if (rank == 0 && ok) {
+        std::ofstream out((directory + "/velocity_grid_remap_audit.result").c_str(),
+                          std::ios::out | std::ios::trunc);
+        const double mass_difference = audit.mass_after - audit.mass_before;
+        const double momentum_difference =
+            audit.parallel_momentum_after - audit.parallel_momentum_before;
+        const double energy_difference =
+            audit.kinetic_energy_after - audit.kinetic_energy_before;
+        out << std::scientific << std::setprecision(17)
+            << "velocity_grid_remapped 1\n"
+            << "tail_initialization zero_diagnostic\n"
+            << "mass_before " << audit.mass_before << "\n"
+            << "mass_after " << audit.mass_after << "\n"
+            << "mass_difference " << mass_difference << "\n"
+            << "parallel_momentum_before " << audit.parallel_momentum_before << "\n"
+            << "parallel_momentum_after " << audit.parallel_momentum_after << "\n"
+            << "parallel_momentum_difference " << momentum_difference << "\n"
+            << "kinetic_energy_before " << audit.kinetic_energy_before << "\n"
+            << "kinetic_energy_after " << audit.kinetic_energy_after << "\n"
+            << "kinetic_energy_difference " << energy_difference << "\n"
+            << "core_hash_before " << audit.core_hash_before << "\n"
+            << "core_hash_after " << audit.core_hash_after << "\n"
+            << "core_hash_match " <<
+                (audit.core_hash_before == audit.core_hash_after ? 1 : 0) << "\n";
+        if (!out) ok = 0;
+    }
+    MPI_Bcast(&ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (!ok) error = "checkpoint velocity-grid remap audit write failed";
+    (void)size;
+    return ok != 0;
 }
 
 bool write_midpoint_audit_state(

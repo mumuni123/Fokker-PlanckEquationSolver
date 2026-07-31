@@ -30,6 +30,10 @@ RuntimeOptions defaults()
     o.accepted_energy_audit_cadence = 500;
     o.accepted_energy_audit_start_fs = -1.0;
     o.accepted_energy_audit_end_fs = -1.0;
+    o.soft_candidate_field_tolerance = 3.0e-6;
+    o.soft_candidate_current_tolerance = 3.0e-5;
+    o.soft_candidate_energy_p99_reference = 1.0e-3;
+    o.soft_candidate_energy_absolute_limit = 5.0e-3;
     o.midpoint_initial_guess_mode = RUNTIME_MIDPOINT_INITIAL_GUESS_NONE;
     o.midpoint_acceleration_mode = RUNTIME_MIDPOINT_ACCELERATION_NONE;
     o.anderson_depth = 3;
@@ -54,6 +58,7 @@ RuntimeOptions defaults()
     o.restart_enabled = false;
     o.operator_audit_mode = false;
     o.beam_ledger_reference_enabled = false;
+    o.velocity_grid_remap_enabled = false;
     return o;
 }
 
@@ -111,6 +116,12 @@ RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,
             else if (arg == "--overwrite-output") options.overwrite_output = true;
             else if (arg == "--restart" && has_value) {
                 options.restart_dir = value; options.restart_enabled = true; ++i;
+            } else if (arg == "--remap-checkpoint-velocity-grid" && i + 2 < argc) {
+                options.remap_checkpoint_source = argv[++i];
+                options.remap_checkpoint_destination = argv[++i];
+                options.velocity_grid_remap_enabled = true;
+            } else if (arg == "--remap-checkpoint-velocity-grid") {
+                error = "--remap-checkpoint-velocity-grid requires <old_dir> <new_dir>";
             } else if (arg == "--operator-audit" && has_value) {
                 options.operator_audit_dir = value; options.operator_audit_mode = true; ++i;
             } else if (arg == "--beam-ledger-reference" && has_value) {
@@ -191,6 +202,14 @@ RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,
                     options.accepted_energy_audit_end_fs = window[1];
                 }
                 ++i;
+            } else if (arg == "--soft-candidate-field-tol" && has_value) {
+                options.soft_candidate_field_tolerance = std::strtod(value, 0); ++i;
+            } else if (arg == "--soft-candidate-current-tol" && has_value) {
+                options.soft_candidate_current_tolerance = std::strtod(value, 0); ++i;
+            } else if (arg == "--soft-candidate-energy-p99" && has_value) {
+                options.soft_candidate_energy_p99_reference = std::strtod(value, 0); ++i;
+            } else if (arg == "--soft-candidate-energy-absolute-limit" && has_value) {
+                options.soft_candidate_energy_absolute_limit = std::strtod(value, 0); ++i;
             } else if (arg == "--background-coupling-mode" && has_value) {
                 const std::string mode(value);
                 if (mode == "legacy") options.background_coupling_mode = 0;
@@ -252,6 +271,10 @@ RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,
         if (options.dt_scale <= 0.0 || options.midpoint_max_iters < 1 ||
             options.diagnostic_level < 0 || options.diagnostic_level > 2 ||
             options.accepted_energy_audit_cadence < 1 ||
+            !(options.soft_candidate_field_tolerance > 0.0) ||
+            !(options.soft_candidate_current_tolerance > 0.0) ||
+            !(options.soft_candidate_energy_p99_reference > 0.0) ||
+            !(options.soft_candidate_energy_absolute_limit > 0.0) ||
             ((options.accepted_energy_audit_start_fs >= 0.0 ||
               options.accepted_energy_audit_end_fs >= 0.0) &&
              (!(options.accepted_energy_audit_start_fs >= 0.0) ||
@@ -308,6 +331,11 @@ RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,
                  (options.restart_enabled || options.checkpoint_enabled ||
                   options.stop_after_accepted_steps >= 0))
             error = "--operator-audit is exclusive with time advancement options";
+        else if (options.velocity_grid_remap_enabled &&
+                 (options.restart_enabled || options.checkpoint_enabled ||
+                  options.operator_audit_mode ||
+                  options.stop_after_accepted_steps >= 0))
+            error = "--remap-checkpoint-velocity-grid is exclusive with time advancement options";
     }
     broadcast_string(error, 0);
     if (!error.empty()) {
@@ -318,7 +346,9 @@ RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,
     broadcast_string(options.restart_dir, 0);
     broadcast_string(options.operator_audit_dir, 0);
     broadcast_string(options.beam_ledger_reference, 0);
-    double numbers[17] = {
+    broadcast_string(options.remap_checkpoint_source, 0);
+    broadcast_string(options.remap_checkpoint_destination, 0);
+    double numbers[21] = {
         options.stop_time_fs,
         options.dt_scale,
         options.midpoint_trace_start_fs,
@@ -335,10 +365,14 @@ RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,
         options.face_pairing_energy_pair_tolerance,
         options.face_pairing_energy_residual_fraction,
         options.face_pairing_mass_relative_tolerance,
-        options.face_pairing_f_residual_growth_tolerance
+        options.face_pairing_f_residual_growth_tolerance,
+        options.soft_candidate_field_tolerance,
+        options.soft_candidate_current_tolerance,
+        options.soft_candidate_energy_p99_reference,
+        options.soft_candidate_energy_absolute_limit
     };
     long long accepted = options.stop_after_accepted_steps;
-    int ints[14] = {options.midpoint_max_iters, options.diagnostic_level,
+    int ints[15] = {options.midpoint_max_iters, options.diagnostic_level,
                    options.accepted_energy_audit_cadence,
                    options.dump_final_midpoint ? 1 : 0, options.overwrite_output ? 1 : 0,
                    options.checkpoint_enabled ? 1 : 0, options.restart_enabled ? 1 : 0,
@@ -346,10 +380,11 @@ RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,
                    static_cast<int>(options.midpoint_acceleration_mode),
                    options.anderson_depth, options.acceleration_start_iter,
                    options.face_pairing_mode,
-                   static_cast<int>(options.midpoint_initial_guess_mode)};
-    MPI_Bcast(numbers, 17, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+                   static_cast<int>(options.midpoint_initial_guess_mode),
+                   options.velocity_grid_remap_enabled ? 1 : 0};
+    MPI_Bcast(numbers, 21, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(&accepted, 1, MPI_LONG_LONG_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(ints, 14, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(ints, 15, MPI_INT, 0, MPI_COMM_WORLD);
     int audit = options.operator_audit_mode ? 1 : 0;
     MPI_Bcast(&audit, 1, MPI_INT, 0, MPI_COMM_WORLD);
     int beam_ledger_reference = options.beam_ledger_reference_enabled ? 1 : 0;
@@ -374,6 +409,10 @@ RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,
     options.face_pairing_energy_residual_fraction = numbers[14];
     options.face_pairing_mass_relative_tolerance = numbers[15];
     options.face_pairing_f_residual_growth_tolerance = numbers[16];
+    options.soft_candidate_field_tolerance = numbers[17];
+    options.soft_candidate_current_tolerance = numbers[18];
+    options.soft_candidate_energy_p99_reference = numbers[19];
+    options.soft_candidate_energy_absolute_limit = numbers[20];
     options.stop_after_accepted_steps = accepted; options.midpoint_max_iters = ints[0];
     options.diagnostic_level = ints[1];
     options.accepted_energy_audit_cadence = ints[2];
@@ -389,6 +428,7 @@ RuntimeOptions parse_runtime_options(int argc, char** argv, int mpi_rank,
     options.face_pairing_mode = ints[12];
     options.midpoint_initial_guess_mode =
         static_cast<RuntimeMidpointInitialGuessMode>(ints[13]);
+    options.velocity_grid_remap_enabled = ints[14] != 0;
     options.beam_ledger_reference_enabled = beam_ledger_reference != 0;
     (void)mpi_size;
     return options;

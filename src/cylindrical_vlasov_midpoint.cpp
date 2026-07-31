@@ -864,13 +864,31 @@ midpoint_iteration_retry:
         const double h = dt / nsub;
         const bool fct_macro_budget_enabled = step_diagnostics_enabled_ &&
             fct_enabled_ && !low_order_only_;
-        std::array<FctMacroBudget, 6> fct_macro_budget_x_local;
-        std::array<FctMacroBudget, 6> fct_macro_budget_u_local;
-        const auto reset_fct_macro_budget = [](std::array<FctMacroBudget, 6>& budget) {
+        const bool high_order_candidate_audit_enabled =
+            step_diagnostics_enabled_ && !low_order_only_;
+        long long reconstructed_face_count_local = 0;
+        long long negative_reconstructed_face_count_local = 0;
+        long double negative_reconstructed_mass_weight_local = 0.0L;
+        long double negative_reconstructed_current_weight_local = 0.0L;
+        long double negative_reconstructed_energy_weight_local = 0.0L;
+        long long high_candidate_negative_cell_count_local = 0;
+        long double high_candidate_negative_mass_local = 0.0L;
+        long double high_candidate_negative_current_weight_local = 0.0L;
+        long double high_candidate_negative_energy_weight_local = 0.0L;
+        std::array<FctMacroBudget, FCT_MACRO_REGION_COUNT> fct_macro_budget_x_local;
+        std::array<FctMacroBudget, FCT_MACRO_REGION_COUNT> fct_macro_budget_u_local;
+        const auto reset_fct_macro_budget = [](std::array<FctMacroBudget,
+            FCT_MACRO_REGION_COUNT>& budget) {
             for (size_t bin = 0; bin < budget.size(); ++bin) {
                 budget[bin].face_count = 0;
                 budget[bin].active_face_count = 0;
                 budget[bin].min_alpha = 1.0;
+                budget[bin].raw_abs_mass = 0.0;
+                budget[bin].rejected_abs_mass = 0.0;
+                budget[bin].raw_abs_current = 0.0;
+                budget[bin].rejected_abs_current = 0.0;
+                budget[bin].raw_abs_energy = 0.0;
+                budget[bin].rejected_abs_energy = 0.0;
                 budget[bin].delta_n = 0.0;
                 budget[bin].delta_j = 0.0;
                 budget[bin].delta_k = 0.0;
@@ -880,19 +898,8 @@ midpoint_iteration_retry:
         };
         reset_fct_macro_budget(fct_macro_budget_x_local);
         reset_fct_macro_budget(fct_macro_budget_u_local);
-        std::vector<double> fct_macro_fmax;
-        if (fct_macro_budget_enabled) {
-            fct_macro_fmax.assign(static_cast<size_t>(sg.nx_total), 0.0);
-            for (int cell = 0; cell < sg.nx_total; ++cell) {
-                double maximum = 0.0;
-                for (int j = 0; j < Param::Nv; ++j)
-                    for (int k = 0; k < Param::Nmu; ++k)
-                        maximum = std::max(maximum,
-                            midpoint_state.f[mass_index(cell, j, k)]);
-                fct_macro_fmax[static_cast<size_t>(cell)] = maximum;
-            }
-        }
         const auto fct_macro_bin = [&](int cell, int j, int k) {
+            (void)k;
             int global_ix = sg.ix_start + cell - ng;
             global_ix %= sg.nx_global;
             if (global_ix < 0) global_ix += sg.nx_global;
@@ -900,12 +907,13 @@ midpoint_iteration_retry:
             const double x_max = sg.x_min + sg.nx_global * sg.dx;
             const int x_region = x < sg.x_min + 0.2e-6 ? 0 :
                 (x > x_max - 0.2e-6 ? 2 : 1);
-            const double fmax = fct_macro_fmax[static_cast<size_t>(cell)];
-            const bool velocity_core = fmax > 0.0 &&
-                midpoint_state.f[mass_index(cell, j, k)] >= 1.0e-8 * fmax;
-            return 2 * x_region + (velocity_core ? 0 : 1);
+            const double abs_upar = std::fabs(bkg_n.cgrid.upar_cells[j]);
+            const int velocity_region = abs_upar > 10.0 ? 2 :
+                (abs_upar > 8.0 ? 1 : 0);
+            return 3 * x_region + velocity_region;
         };
-        const auto add_fct_macro_cell = [&](std::array<FctMacroBudget, 6>& budgets,
+        const auto add_fct_macro_cell = [&](std::array<FctMacroBudget,
+                                              FCT_MACRO_REGION_COUNT>& budgets,
                                             int cell, int j, int k,
                                             double delta_mass) {
             const int bin = fct_macro_bin(cell, j, k);
@@ -916,6 +924,27 @@ midpoint_iteration_retry:
                 delta_mass;
             budget.delta_k += bkg_n.cgrid.kinetic_energy[idx2(j, k)] *
                 delta_mass;
+        };
+        const auto add_fct_macro_antidiffusion = [](FctMacroBudget& budget,
+                                                     double alpha,
+                                                     double anti_transfer,
+                                                     double current_weight,
+                                                     double energy_weight) {
+            const long double raw = std::fabs(
+                static_cast<long double>(anti_transfer));
+            const long double rejected = std::fabs(
+                (1.0L - static_cast<long double>(alpha)) *
+                static_cast<long double>(anti_transfer));
+            budget.raw_abs_mass += raw;
+            budget.rejected_abs_mass += rejected;
+            budget.raw_abs_current +=
+                std::fabs(static_cast<long double>(current_weight)) * raw;
+            budget.rejected_abs_current +=
+                std::fabs(static_cast<long double>(current_weight)) * rejected;
+            budget.raw_abs_energy +=
+                std::fabs(static_cast<long double>(energy_weight)) * raw;
+            budget.rejected_abs_energy +=
+                std::fabs(static_cast<long double>(energy_weight)) * rejected;
         };
         const auto accumulate_final_fct_macro_budget = [&]() {
             if (!fct_macro_budget_enabled) return;
@@ -931,15 +960,22 @@ midpoint_iteration_retry:
                         const double anti = fx_high[id] - fx_low[id];
                         if (anti == 0.0) continue;
                         const double alpha = (fx_final[id] - fx_low[id]) / anti;
+                        const double anti_transfer = h * anti;
                         const double delta_flux = fx_final[id] - fx_high[id];
                         const bool active = alpha < 1.0 - 1.0e-14;
-                        const int face_bin = fct_macro_bin(right_cell, j, k);
+                        const int donor_cell = anti_transfer >= 0.0 ?
+                            left_cell : right_cell;
+                        const int face_bin = fct_macro_bin(donor_cell, j, k);
                         FctMacroBudget& face_budget = fct_macro_budget_x_local[
                             static_cast<size_t>(face_bin)];
                         ++face_budget.face_count;
                         if (active) ++face_budget.active_face_count;
                         face_budget.min_alpha = std::min(face_budget.min_alpha,
                                                          alpha);
+                        add_fct_macro_antidiffusion(face_budget, alpha,
+                            anti_transfer,
+                            bkg_n.charge * bkg_n.cgrid.vx[idx2(j, k)],
+                            bkg_n.cgrid.kinetic_energy[idx2(j, k)]);
                         add_fct_macro_cell(fct_macro_budget_x_local,
                                            left_cell, j, k, -h * delta_flux);
                         add_fct_macro_cell(fct_macro_budget_x_local,
@@ -963,14 +999,23 @@ midpoint_iteration_retry:
                         const double anti = fu_high[id] - fu_low[id];
                         if (anti == 0.0) continue;
                         const double alpha = (fu_final[id] - fu_low[id]) / anti;
+                        const double anti_transfer = h * anti;
                         const double delta_flux = fu_final[id] - fu_high[id];
+                        const int donor_j = anti_transfer >= 0.0 ? jf - 1 : jf;
                         FctMacroBudget& face_budget = fct_macro_budget_u_local[
-                            static_cast<size_t>(fct_macro_bin(cell, jf - 1, k))];
+                            static_cast<size_t>(fct_macro_bin(cell, donor_j, k))];
                         ++face_budget.face_count;
                         if (alpha < 1.0 - 1.0e-14)
                             ++face_budget.active_face_count;
                         face_budget.min_alpha = std::min(face_budget.min_alpha,
                                                          alpha);
+                        add_fct_macro_antidiffusion(face_budget, alpha,
+                            anti_transfer,
+                            0.5 * bkg_n.charge *
+                                (bkg_n.cgrid.vx[idx2(jf - 1, k)] +
+                                 bkg_n.cgrid.vx[idx2(jf, k)]),
+                            0.5 * (bkg_n.cgrid.kinetic_energy[idx2(jf - 1, k)] +
+                                   bkg_n.cgrid.kinetic_energy[idx2(jf, k)]));
                         add_fct_macro_cell(fct_macro_budget_u_local,
                                            cell, jf - 1, k, -h * delta_flux);
                         add_fct_macro_cell(fct_macro_budget_u_local,
@@ -991,49 +1036,102 @@ midpoint_iteration_retry:
         };
         const auto finalize_fct_macro_budget = [&]() {
             if (!fct_macro_budget_enabled) return;
-            long long counts[24] = {0};
-            double sums[48] = {0.0};
-            double minima[12] = {
-                1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-                1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
-            std::array<FctMacroBudget, 6>* local_budgets[2] = {
+            long long counts[4 * FCT_MACRO_REGION_COUNT] = {0};
+            double sums[20 * FCT_MACRO_REGION_COUNT] = {0.0};
+            double minima[2 * FCT_MACRO_REGION_COUNT];
+            std::fill(minima, minima + 2 * FCT_MACRO_REGION_COUNT, 1.0);
+            std::array<FctMacroBudget, FCT_MACRO_REGION_COUNT>* local_budgets[2] = {
                 &fct_macro_budget_x_local, &fct_macro_budget_u_local};
             for (int direction = 0; direction < 2; ++direction) {
-                for (int bin = 0; bin < 6; ++bin) {
-                    const int offset = 6 * direction + bin;
+                for (int bin = 0; bin < FCT_MACRO_REGION_COUNT; ++bin) {
+                    const int offset = FCT_MACRO_REGION_COUNT * direction + bin;
                     const FctMacroBudget& local = (*local_budgets[direction])[bin];
                     counts[2 * offset] = local.face_count;
                     counts[2 * offset + 1] = local.active_face_count;
-                    sums[4 * offset] = local.delta_n;
-                    sums[4 * offset + 1] = local.delta_j;
-                    sums[4 * offset + 2] = local.delta_k;
-                    sums[4 * offset + 3] = local.e_dot_j;
+                    sums[10 * offset] = local.raw_abs_mass;
+                    sums[10 * offset + 1] = local.rejected_abs_mass;
+                    sums[10 * offset + 2] = local.raw_abs_current;
+                    sums[10 * offset + 3] = local.rejected_abs_current;
+                    sums[10 * offset + 4] = local.raw_abs_energy;
+                    sums[10 * offset + 5] = local.rejected_abs_energy;
+                    sums[10 * offset + 6] = local.delta_n;
+                    sums[10 * offset + 7] = local.delta_j;
+                    sums[10 * offset + 8] = local.delta_k;
+                    sums[10 * offset + 9] = local.e_dot_j;
                     minima[offset] = local.min_alpha;
                 }
             }
-            MPI_Allreduce(MPI_IN_PLACE, counts, 24, MPI_LONG_LONG_INT,
+            MPI_Allreduce(MPI_IN_PLACE, counts, 4 * FCT_MACRO_REGION_COUNT,
+                          MPI_LONG_LONG_INT,
                           MPI_SUM, MPI_COMM_WORLD);
-            MPI_Allreduce(MPI_IN_PLACE, sums, 48, MPI_DOUBLE, MPI_SUM,
+            MPI_Allreduce(MPI_IN_PLACE, sums, 20 * FCT_MACRO_REGION_COUNT,
+                          MPI_DOUBLE, MPI_SUM,
                           MPI_COMM_WORLD);
-            MPI_Allreduce(MPI_IN_PLACE, minima, 12, MPI_DOUBLE, MPI_MIN,
+            MPI_Allreduce(MPI_IN_PLACE, minima, 2 * FCT_MACRO_REGION_COUNT,
+                          MPI_DOUBLE, MPI_MIN,
                           MPI_COMM_WORLD);
             result.fct_macro_budget_valid = 1;
-            std::array<FctMacroBudget, 6>* result_budgets[2] = {
+            std::array<FctMacroBudget, FCT_MACRO_REGION_COUNT>* result_budgets[2] = {
                 &result.fct_macro_budget_x, &result.fct_macro_budget_u};
             for (int direction = 0; direction < 2; ++direction) {
-                for (int bin = 0; bin < 6; ++bin) {
-                    const int offset = 6 * direction + bin;
+                for (int bin = 0; bin < FCT_MACRO_REGION_COUNT; ++bin) {
+                    const int offset = FCT_MACRO_REGION_COUNT * direction + bin;
                     FctMacroBudget& global = (*result_budgets[direction])[bin];
                     global.face_count = counts[2 * offset];
                     global.active_face_count = counts[2 * offset + 1];
                     global.min_alpha = minima[offset];
-                    global.delta_n = sums[4 * offset];
-                    global.delta_j = sums[4 * offset + 1];
-                    global.delta_k = sums[4 * offset + 2];
-                    global.e_dot_j = sums[4 * offset + 3];
+                    global.raw_abs_mass = sums[10 * offset];
+                    global.rejected_abs_mass = sums[10 * offset + 1];
+                    global.raw_abs_current = sums[10 * offset + 2];
+                    global.rejected_abs_current = sums[10 * offset + 3];
+                    global.raw_abs_energy = sums[10 * offset + 4];
+                    global.rejected_abs_energy = sums[10 * offset + 5];
+                    global.delta_n = sums[10 * offset + 6];
+                    global.delta_j = sums[10 * offset + 7];
+                    global.delta_k = sums[10 * offset + 8];
+                    global.e_dot_j = sums[10 * offset + 9];
                     global.r_fct_e = global.delta_k - global.e_dot_j;
                 }
             }
+        };
+        const auto finalize_high_order_candidate_audit = [&]() {
+            if (!high_order_candidate_audit_enabled) return;
+            long long counts[3] = {
+                reconstructed_face_count_local,
+                negative_reconstructed_face_count_local,
+                high_candidate_negative_cell_count_local};
+            double weights[6] = {
+                static_cast<double>(negative_reconstructed_mass_weight_local),
+                static_cast<double>(negative_reconstructed_current_weight_local),
+                static_cast<double>(negative_reconstructed_energy_weight_local),
+                static_cast<double>(high_candidate_negative_mass_local),
+                static_cast<double>(high_candidate_negative_current_weight_local),
+                static_cast<double>(high_candidate_negative_energy_weight_local)};
+            MPI_Allreduce(MPI_IN_PLACE, counts, 3, MPI_LONG_LONG_INT,
+                          MPI_SUM, MPI_COMM_WORLD);
+            MPI_Allreduce(MPI_IN_PLACE, weights, 6, MPI_DOUBLE, MPI_SUM,
+                          MPI_COMM_WORLD);
+            result.high_order_candidate_audit.reconstructed_face_count = counts[0];
+            result.high_order_candidate_audit.negative_reconstructed_face_count =
+                counts[1];
+            result.high_order_candidate_audit.negative_reconstructed_mass_weight =
+                weights[0];
+            result.high_order_candidate_audit.negative_reconstructed_current_weight =
+                weights[1];
+            result.high_order_candidate_audit.negative_reconstructed_energy_weight =
+                weights[2];
+            result.high_order_candidate_audit.high_candidate_negative_cell_count =
+                counts[2];
+            result.high_order_candidate_audit.high_candidate_negative_mass =
+                weights[3];
+            result.high_order_candidate_audit.high_candidate_negative_current_weight =
+                weights[4];
+            result.high_order_candidate_audit.high_candidate_negative_energy_weight =
+                weights[5];
+            result.high_order_candidate_audit.low_order_negative_cell_count =
+                result.low_order_negative_count;
+            result.high_order_candidate_audit.low_order_negative_mass =
+                result.low_order_negative_mass;
         };
         const auto finalize_directional_limiter_statistics = [&]() {
             if (low_order_only_) {
@@ -1452,7 +1550,7 @@ midpoint_iteration_retry:
                     inv_cell_volume[idx2(j, k)];
             };
 
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(static) reduction(+:reconstructed_face_count_local,negative_reconstructed_face_count_local,negative_reconstructed_mass_weight_local,negative_reconstructed_current_weight_local,negative_reconstructed_energy_weight_local)
             for (int iface = 0; iface <= nxl; ++iface) {
                 const int il = ng + iface - 1;
                 const int ir = ng + iface;
@@ -1465,6 +1563,30 @@ midpoint_iteration_retry:
                                 fbar(ir, j, k), fbar(ir + 1, j, k),
                                 x_center(il - 1), x_center(il),
                                 x_center(ir), x_center(ir + 1), s_face);
+                        if (high_order_candidate_audit_enabled) {
+                            const double volume = sg.dx *
+                                bkg_n.cgrid.upar_widths[j] *
+                                bkg_n.cgrid.uperp_ring_areas[k];
+                            const double current_weight = std::fabs(
+                                bkg_n.charge * bkg_n.cgrid.vx[idx2(j, k)]);
+                            const double energy_weight =
+                                bkg_n.cgrid.kinetic_energy[idx2(j, k)];
+                            const double reconstructed[2] = {
+                                states.left, states.right};
+                            reconstructed_face_count_local += 2;
+                            for (int side = 0; side < 2; ++side) {
+                                if (reconstructed[side] < 0.0) {
+                                    const long double debt = -static_cast<long double>(
+                                        reconstructed[side]) * volume;
+                                    ++negative_reconstructed_face_count_local;
+                                    negative_reconstructed_mass_weight_local += debt;
+                                    negative_reconstructed_current_weight_local +=
+                                        current_weight * debt;
+                                    negative_reconstructed_energy_weight_local +=
+                                        energy_weight * debt;
+                                }
+                            }
+                        }
                         const double analytic_speed =
                             bkg_n.cgrid.vx[idx2(j, k)];
                         const double transport_speed =
@@ -1488,7 +1610,7 @@ midpoint_iteration_retry:
             close_periodic_face_blocks(fx_high, nxl, Param::Nvmu,
                                        mpi_rank, mpi_size, 908);
 
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(static) reduction(+:reconstructed_face_count_local,negative_reconstructed_face_count_local,negative_reconstructed_mass_weight_local,negative_reconstructed_current_weight_local,negative_reconstructed_energy_weight_local)
             for (int ix = 0; ix < nxl; ++ix) {
                 const int storage_ix = ng + ix;
                 const double a = bkg_n.charge * fields_mid.Ex[storage_ix] /
@@ -1517,6 +1639,33 @@ midpoint_iteration_retry:
                                 bkg_n.cgrid.upar_cells[jr],
                                 s_jrr,
                                 bkg_n.cgrid.upar_faces[jf]);
+                        if (high_order_candidate_audit_enabled) {
+                            const double volume = sg.dx * area * 0.5 *
+                                (bkg_n.cgrid.upar_widths[jl] +
+                                 bkg_n.cgrid.upar_widths[jr]);
+                            const double current_weight = std::fabs(
+                                0.5 * bkg_n.charge *
+                                (bkg_n.cgrid.vx[idx2(jl, k)] +
+                                 bkg_n.cgrid.vx[idx2(jr, k)]));
+                            const double energy_weight = 0.5 *
+                                (bkg_n.cgrid.kinetic_energy[idx2(jl, k)] +
+                                 bkg_n.cgrid.kinetic_energy[idx2(jr, k)]);
+                            const double reconstructed[2] = {
+                                states.left, states.right};
+                            reconstructed_face_count_local += 2;
+                            for (int side = 0; side < 2; ++side) {
+                                if (reconstructed[side] < 0.0) {
+                                    const long double debt = -static_cast<long double>(
+                                        reconstructed[side]) * volume;
+                                    ++negative_reconstructed_face_count_local;
+                                    negative_reconstructed_mass_weight_local += debt;
+                                    negative_reconstructed_current_weight_local +=
+                                        current_weight * debt;
+                                    negative_reconstructed_energy_weight_local +=
+                                        energy_weight * debt;
+                                }
+                            }
+                        }
                         const size_t id = uface_index(ix, jf, k);
                         // Production high order is centered at every x.
                         // Donor-cell transport exists only in the separate
@@ -2365,7 +2514,7 @@ midpoint_iteration_retry:
                 double thread_donor_outflow = 0.0;
                 double thread_donor_scale = 1.0;
                 int thread_donor_global_linear = -1;
-            #pragma omp for schedule(static) reduction(min:candidate_min,high_candidate_min) reduction(max:high_candidate_donor_excess,high_low_identity_linf,high_low_identity_violation,final_tolerance_linf,final_positivity_violation,candidate_nonfinite,donor_roundoff_warning) reduction(+:donor_beta_count,roundoff_normalized_count,roundoff_normalized_mass) reduction(min:donor_beta_min)
+            #pragma omp for schedule(static) reduction(min:candidate_min,high_candidate_min) reduction(max:high_candidate_donor_excess,high_low_identity_linf,high_low_identity_violation,final_tolerance_linf,final_positivity_violation,candidate_nonfinite,donor_roundoff_warning) reduction(+:donor_beta_count,roundoff_normalized_count,roundoff_normalized_mass,high_candidate_negative_cell_count_local,high_candidate_negative_mass_local,high_candidate_negative_current_weight_local,high_candidate_negative_energy_weight_local) reduction(min:donor_beta_min)
             for (int ix = 0; ix < nxl; ++ix) {
                 for (int j = 0; j < Param::Nv; ++j) {
                 for (int k = 0; k < Param::Nmu; ++k) {
@@ -2399,6 +2548,20 @@ midpoint_iteration_retry:
                                                           high_candidate);
                         } else {
                             candidate_nonfinite = 1.0;
+                        }
+                    }
+                    if (high_order_candidate_audit_enabled) {
+                        const double high_candidate = m_low + high_minus_low;
+                        if (std::isfinite(high_candidate) && high_candidate < 0.0) {
+                            const long double debt = -static_cast<long double>(
+                                high_candidate);
+                            ++high_candidate_negative_cell_count_local;
+                            high_candidate_negative_mass_local += debt;
+                            high_candidate_negative_current_weight_local +=
+                                std::fabs(bkg_n.charge *
+                                    bkg_n.cgrid.vx[idx2(j, k)]) * debt;
+                            high_candidate_negative_energy_weight_local +=
+                                bkg_n.cgrid.kinetic_energy[idx2(j, k)] * debt;
                         }
                     }
                     const double transfer_divergence = ax_left_raw - ax_right_raw +
@@ -4490,6 +4653,7 @@ midpoint_iteration_retry:
             }
             finalize_directional_limiter_statistics();
             finalize_fct_macro_budget();
+            finalize_high_order_candidate_audit();
         }
         // Emit expensive closure data once, for the candidate that will be
         // committed.  Earlier Picard trials need only transport, Ampere and
@@ -5022,6 +5186,8 @@ midpoint_iteration_retry:
             result.fields_np1 = fields_new;
             result.converged = true;
             result.state_advanced = 1;
+            result.acceptance_kind = STRICT_ACCEPTED;
+            result.transport_safe = 1;
             // Preserve all production layers for the fixed-state operator
             // bundle.  Normal stepping does not retain these extra copies.
             result.low_x_flux = fx_low;
@@ -5077,6 +5243,8 @@ midpoint_iteration_retry:
             result.fields_np1 = fields_new;
             result.converged = true;
             result.state_advanced = 1;
+            result.acceptance_kind = STRICT_ACCEPTED;
+            result.transport_safe = 1;
             trace_live("strict_accept", iter + 1, -1);
             if (step_diagnostics_enabled_ || fixed_candidate)
                 finalize_coupling_regions();
@@ -5290,8 +5458,26 @@ midpoint_iteration_retry:
     result.beam_np1 = beam_predictor;
     result.fields_np1 = last_fields;
     result.soft_unconverged = true;
-    result.soft_accepted = true;
-    result.state_advanced = 1;
-    trace_live("soft_accept", max_iters, -1);
+    result.soft_accepted = false;
+    result.state_advanced = 0;
+    result.acceptance_kind = SOFT_CANDIDATE;
+    result.transport_safe = 1;
+    const size_t history_count = result.midpoint_residual_e_history.size();
+    for (size_t slot = 0; slot < result.last_4_contraction_E.size(); ++slot) {
+        const size_t offset = result.last_4_contraction_E.size() - 1 - slot;
+        if (history_count < offset + 2) continue;
+        const size_t current = history_count - 1 - offset;
+        const double e_previous = result.midpoint_residual_e_history[current - 1];
+        const double j_previous = result.midpoint_residual_j_bkg_history[current - 1];
+        const double e_current = result.midpoint_residual_e_history[current];
+        const double j_current = result.midpoint_residual_j_bkg_history[current];
+        result.last_4_contraction_E[slot] =
+            e_previous > 0.0 ? e_current / e_previous :
+            (e_current == 0.0 ? 1.0 : std::numeric_limits<double>::infinity());
+        result.last_4_contraction_J_bkg[slot] =
+            j_previous > 0.0 ? j_current / j_previous :
+            (j_current == 0.0 ? 1.0 : std::numeric_limits<double>::infinity());
+    }
+    trace_live("soft_candidate", max_iters, -1);
     return result;
 }
