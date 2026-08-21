@@ -3127,6 +3127,7 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
     result.joint_midpoint_residual_linf = 0.0;
     result.joint_midpoint_poisson_residual_linf = 0.0;
     result.joint_midpoint_energy_residual = 0.0;
+    result.joint_midpoint_pairing_field_built = false;
     result.accepted = false;
     result.finite = true;
     result.cfl_ok = dt > 0.0;
@@ -3271,6 +3272,27 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
                 field_solver_.solve(eval_fields, mpi_rank, mpi_size, options);
                 poisson_residual = field_solver_.diagnostics().residual_linf;
                 local_ok = std::isfinite(poisson_residual);
+                std::vector<double> pairing_face;
+                if (local_ok) {
+                    const bool pairing_ok =
+                        field_solver_.build_potential_pairing_field(
+                            fields, eval_fields, pairing_face,
+                            mpi_rank, mpi_size);
+                    result.joint_midpoint_pairing_field_built =
+                        result.joint_midpoint_pairing_field_built || pairing_ok;
+                    local_ok = pairing_ok;
+                }
+                std::vector<double> e_pair_cell(
+                    static_cast<size_t>(grid_.nx_local), 0.0);
+                if (local_ok && pairing_face.size() ==
+                        static_cast<size_t>(grid_.nx_local + 1)) {
+                    for (int ix = 0; ix < grid_.nx_local; ++ix)
+                        e_pair_cell[static_cast<size_t>(ix)] = 0.5 *
+                            (pairing_face[static_cast<size_t>(ix)] +
+                             pairing_face[static_cast<size_t>(ix + 1)]);
+                } else {
+                    local_ok = false;
+                }
                 std::vector<double> phi_local(static_cast<size_t>(grid_.nx_local), 0.0);
                 for (int ix = 0; ix < grid_.nx_local; ++ix) {
                     const size_t id = static_cast<size_t>(grid_.nghost + ix);
@@ -3282,18 +3304,14 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
                 phi_residual_out.swap(phi_local);
                 for (size_t i = 0; i < phi_residual_out.size(); ++i)
                     local_ok = local_ok && std::isfinite(phi_residual_out[i]);
-                std::vector<double> e_local(static_cast<size_t>(grid_.nx_local), 0.0);
-                for (int ix = 0; ix < grid_.nx_local; ++ix)
-                    e_local[static_cast<size_t>(ix)] =
-                        eval_fields.Ex[static_cast<size_t>(grid_.nghost + ix)];
                 double residual_linf = 0.0;
                 double residual_scale = 1.0;
                 local_ok = local_ok &&
                     JointPhaseSpaceMidpointOperator::evaluate_local_residual(
-                        grid_, electrons.cgrid, m_old, state, e_local, dt,
+                        grid_, electrons.cgrid, m_old, state, e_pair_cell, dt,
                         mpi_rank, mpi_size, bundle, residual, residual_linf,
                         residual_scale, allow_negative_probe);
-                e_local_out = e_local;
+                e_local_out = e_pair_cell;
                 normalized_norm = residual_linf /
                     std::max(1.0, residual_scale);
                 // The Gauss residual has units of rho/eps0.  Comparing its
@@ -3610,6 +3628,8 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
     const double negative_tolerance = 4096.0 *
         std::numeric_limits<double>::epsilon() *
         std::max(1.0, candidate_bounds[1]);
+    result.joint_midpoint_min_mass = candidate_bounds[0];
+    result.joint_midpoint_max_mass = candidate_bounds[1];
     if (candidate_bounds[0] < -negative_tolerance) {
         unsigned long long local_index =
             local_first_negative == candidate.size()
@@ -3641,23 +3661,171 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
     const OpenPoissonWorkIdentity poisson_work =
         field_solver_.evaluate_work_identity(fields, candidate_fields,
                                              rho_delta, mpi_rank, mpi_size);
+    std::vector<double> final_pairing_face;
+    const bool final_pairing_ok =
+        field_solver_.build_potential_pairing_field(
+            fields, candidate_fields, final_pairing_face,
+            mpi_rank, mpi_size);
+    if (!final_pairing_ok || final_pairing_face.size() !=
+            static_cast<size_t>(grid_.nx_local + 1)) {
+        result.failure_code = 71;
+        result.failure_stage = "joint_midpoint_final_pairing_field";
+        return result;
+    }
+    result.joint_midpoint_pairing_field_built = true;
     double local_delta_ke_u = 0.0;
+    double local_delta_ke_x = 0.0;
+    long double local_u_face_work = 0.0L;
+    long double local_force_current_work = 0.0L;
+    long double local_charge_current_work = 0.0L;
+    long double local_charge_current_work_interior = 0.0L;
+    long double local_charge_current_work_endpoint = 0.0L;
+    const int nmu = static_cast<int>(electrons.cgrid.uperp_cells.size());
+    const int nupar = static_cast<int>(electrons.cgrid.upar_cells.size());
+    const std::vector<double> hamiltonian_velocity =
+        JointPhaseSpaceMidpointOperator::build_hamiltonian_velocity(
+            electrons.cgrid);
+    std::vector<double> final_pairing_cell(
+        static_cast<size_t>(grid_.nx_local), 0.0);
+    for (int ix = 0; ix < grid_.nx_local; ++ix) {
+        final_pairing_cell[static_cast<size_t>(ix)] = 0.5 *
+            (final_pairing_face[static_cast<size_t>(ix)] +
+             final_pairing_face[static_cast<size_t>(ix + 1)]);
+    }
     for (int ix = 0; ix < grid_.nx_local; ++ix) {
         // accepted_bundle and candidate are rank-local slabs here too.
         const size_t base = static_cast<size_t>(ix) * nq;
-        for (int q = 0; q < nq; ++q)
+        for (int q = 0; q < nq; ++q) {
+            local_delta_ke_x +=
+                electrons.cgrid.kinetic_energy[static_cast<size_t>(q)] *
+                accepted_bundle.mass_delta_x[base + static_cast<size_t>(q)];
             local_delta_ke_u +=
                 electrons.cgrid.kinetic_energy[static_cast<size_t>(q)] *
                 accepted_bundle.mass_delta_u[base + static_cast<size_t>(q)];
+            const double midpoint_mass = 0.5 *
+                (m_old[base + static_cast<size_t>(q)] +
+                 candidate[base + static_cast<size_t>(q)]);
+            local_force_current_work += static_cast<long double>(dt) *
+                static_cast<long double>(final_pairing_cell[
+                    static_cast<size_t>(ix)]) *
+                static_cast<long double>(-Const::qe) *
+                static_cast<long double>(hamiltonian_velocity[
+                    static_cast<size_t>(q)]) *
+                static_cast<long double>(midpoint_mass);
+        }
+        for (int jf = 1; jf < nupar; ++jf) {
+            for (int k = 0; k < nmu; ++k) {
+                const size_t left = static_cast<size_t>((jf - 1) * nmu + k);
+                const size_t right = static_cast<size_t>(jf * nmu + k);
+                const double delta_k =
+                    electrons.cgrid.kinetic_energy[right] -
+                    electrons.cgrid.kinetic_energy[left];
+                const size_t face_id =
+                    (static_cast<size_t>(ix) *
+                     static_cast<size_t>(nupar + 1) +
+                     static_cast<size_t>(jf)) *
+                    static_cast<size_t>(nmu) +
+                    static_cast<size_t>(k);
+                local_u_face_work += static_cast<long double>(dt) *
+                    static_cast<long double>(delta_k) *
+                    static_cast<long double>(accepted_bundle.u_flux_rate[face_id]);
+            }
+        }
     }
+    for (int iface = 0; iface <= grid_.nx_local; ++iface) {
+        const int global_face = grid_.ix_start + iface;
+        // A shared MPI face is owned by the rank on its left.  Physical
+        // endpoints retain the half-cell quadrature weights.
+        if (iface == 0 && global_face != 0) continue;
+        const double weight =
+            (global_face == 0 || global_face == grid_.nx_global) ? 0.5 : 1.0;
+        local_charge_current_work += static_cast<long double>(dt) *
+            static_cast<long double>(weight * grid_.dx) *
+            static_cast<long double>(final_pairing_face[
+                static_cast<size_t>(iface)]) *
+            static_cast<long double>(accepted_bundle.charge_current_face[
+                static_cast<size_t>(iface)]);
+        if (global_face == 0 || global_face == grid_.nx_global) {
+            local_charge_current_work_endpoint += static_cast<long double>(dt) *
+                static_cast<long double>(weight * grid_.dx) *
+                static_cast<long double>(final_pairing_face[
+                    static_cast<size_t>(iface)]) *
+                static_cast<long double>(accepted_bundle.charge_current_face[
+                    static_cast<size_t>(iface)]);
+        } else {
+            local_charge_current_work_interior += static_cast<long double>(dt) *
+                static_cast<long double>(weight * grid_.dx) *
+                static_cast<long double>(final_pairing_face[
+                    static_cast<size_t>(iface)]) *
+                static_cast<long double>(accepted_bundle.charge_current_face[
+                    static_cast<size_t>(iface)]);
+        }
+    }
+    result.joint_midpoint_delta_k_x = global_sum(local_delta_ke_x);
     const double delta_ke_u = global_sum(local_delta_ke_u);
+    result.joint_midpoint_delta_k_u = delta_ke_u;
+    double global_u_face_work = 0.0;
+    double local_u_face_work_double = static_cast<double>(local_u_face_work);
+    MPI_Allreduce(&local_u_face_work_double, &global_u_face_work, 1,
+                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    result.joint_midpoint_u_face_work = global_u_face_work;
+    double global_force_current_work = 0.0;
+    const double local_force_current_work_double =
+        static_cast<double>(local_force_current_work);
+    MPI_Allreduce(&local_force_current_work_double,
+                  &global_force_current_work, 1, MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+    result.joint_midpoint_force_current_work = global_force_current_work;
+    double global_charge_current_work = 0.0;
+    double local_charge_current_work_double =
+        static_cast<double>(local_charge_current_work);
+    MPI_Allreduce(&local_charge_current_work_double,
+                  &global_charge_current_work, 1, MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+    result.joint_midpoint_charge_current_work = global_charge_current_work;
+    double global_charge_current_work_interior = 0.0;
+    const double local_charge_current_work_interior_double =
+        static_cast<double>(local_charge_current_work_interior);
+    MPI_Allreduce(&local_charge_current_work_interior_double,
+                  &global_charge_current_work_interior, 1, MPI_DOUBLE,
+                  MPI_SUM, MPI_COMM_WORLD);
+    result.joint_midpoint_charge_current_work_interior =
+        global_charge_current_work_interior;
+    double global_charge_current_work_endpoint = 0.0;
+    const double local_charge_current_work_endpoint_double =
+        static_cast<double>(local_charge_current_work_endpoint);
+    MPI_Allreduce(&local_charge_current_work_endpoint_double,
+                  &global_charge_current_work_endpoint, 1, MPI_DOUBLE,
+                  MPI_SUM, MPI_COMM_WORLD);
+    result.joint_midpoint_charge_current_work_endpoint =
+        global_charge_current_work_endpoint;
+    result.joint_midpoint_poisson_potential_charge_work =
+        poisson_work.potential_charge_work;
+    result.joint_midpoint_current_pair_residual =
+        result.joint_midpoint_u_face_work -
+        result.joint_midpoint_charge_current_work;
+    result.joint_midpoint_force_charge_residual =
+        result.joint_midpoint_force_current_work -
+        result.joint_midpoint_charge_current_work;
+    result.joint_midpoint_poisson_transport_residual =
+        poisson_work.field_energy_change - poisson_work.electrode_work +
+        result.joint_midpoint_charge_current_work;
+    result.joint_midpoint_field_energy_change =
+        poisson_work.field_energy_change;
+    result.joint_midpoint_electrode_work = poisson_work.electrode_work;
+    result.joint_midpoint_domain_energy_change =
+        result.joint_midpoint_delta_k_x +
+        result.joint_midpoint_delta_k_u +
+        poisson_work.field_energy_change;
+    result.joint_midpoint_energy_residual =
+        result.joint_midpoint_current_pair_residual +
+        result.joint_midpoint_poisson_transport_residual;
     const double combined_energy_residual = delta_ke_u +
         poisson_work.field_energy_change - poisson_work.electrode_work;
     const double candidate_energy_scale = std::max(
         1.0e-300, std::max(std::fabs(delta_ke_u),
                             std::max(std::fabs(poisson_work.field_energy_change),
                                      std::fabs(poisson_work.electrode_work))));
-    result.joint_midpoint_energy_residual = combined_energy_residual;
     if (!poisson_work.finite ||
         std::fabs(combined_energy_residual) / candidate_energy_scale > 1.0e-8) {
         result.failure_code = 75;
@@ -3684,8 +3852,6 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
     result.ledger.domain_energy_after = field_after + kinetic_after;
     result.ledger.domain_energy_change =
         result.ledger.domain_energy_after - result.ledger.domain_energy_before;
-    result.joint_midpoint_energy_residual =
-        result.ledger.domain_energy_change;
     result.ledger.gauss_charge_residual =
         field_solver_.diagnostics().boundary_charge_residual;
     ++step_count_;

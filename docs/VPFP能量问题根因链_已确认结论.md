@@ -7,7 +7,7 @@
 > `docs/archive/VPFP时间中心不一致_JC修复与验收实施方案.md`、
 > `docs/archive/VPFP_P3联合x_u_Poisson功通量重构实施方案.md`。
 >
-> 当前后续实现入口：`docs/VPFP_联合相空间时间中心能量闭合重构实施方案.md`。
+> 当前后续实现入口：`docs/VPFP_能量根因链最终核查与逐阶段修复实施方案.md`。
 
 ## 1. 最终结论
 
@@ -167,3 +167,42 @@ P3 路线曾尝试通过 $u$ 方向能量共轭离散速度表、局部 $x/u/Poi
 - 不继续修改归档的 JC/P3 局部修补路线；
 - 不使用能量投影、全局补偿或仅缩小 $dt$ 作为替代修复。
 
+## 9. 2026-08-22 F10 对 J1 根因链的最新约束
+
+最新 F10 单 rank 结果并未推翻本文件关于旧 Strang/PPM 结构性不闭合的结论，但将**当前 J1 center-trace 原型**的首个可测缺口显著收窄。
+
+平衡 `smooth-background` 已通过；只有非平凡 `smooth-perturbed-background` 触发 code 75。其能量分解为：
+
+$$
+W_u=28.891863089349869,
+\qquad
+W_F=28.891863089349886,
+$$
+
+$$
+W_J=22.224220061661196,
+\qquad
+R_{uJ}=6.6676430276886727\ \mathrm{J/m^2},
+$$
+
+$$
+R_{PJ}=-5.2950189122213942\times10^{-6}\ \mathrm{J/m^2}.
+$$
+
+其中 $W_F$ 使用同一 accepted midpoint mass、同一 pairing cell field 和生产 `vH` 构造。因此：
+
+$$
+W_u-W_F\simeq-1.7\times10^{-14}\ \mathrm{J/m^2},
+$$
+
+说明当前 J1 的 u-face 功、u trace、`vH` 和 midpoint mass 已通过其直接共轭检查。主缺口现在确定在：
+
+$$
+W_F-W_J,
+$$
+
+即 cell force current 到由 x flux 构造的 `charge_current_face` 的映射、face averaging/ownership 或其与 pairing face 的离散内积。
+
+这不是修改 Poisson 空间算子、放宽 Newton 或调节能量 gate 的依据。并且，已记录的 endpoint `W_J` 本身接近零并不能排除周期接缝影响首末 cell force work；在没有 boundary-cell force-work 分解前，不得将问题简单归为“纯内部面错误”。
+
+所以当前 J1 的下一步严格遵循主方案第 11 节情形 B：审计生产 `x_flux_rate`、`charge_current_face`、midpoint face trace、首末 cell/seam 映射和 MPI face ownership。不得进入 F11、J1 MPI、J2 或 J3。

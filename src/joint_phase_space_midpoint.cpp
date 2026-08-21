@@ -54,29 +54,39 @@ std::vector<double> JointPhaseSpaceMidpointOperator::build_hamiltonian_velocity(
         throw std::runtime_error("J0 Hamiltonian velocity grid dimensions invalid");
     }
 
+    // This velocity is not an analytic cell velocity.  It is the exact
+    // algebraic transpose of the J1 centered u_parallel face trace under the
+    // cell-integrated-mass representation.  Do not replace it with vg.vx,
+    // vg.vx_energy_conjugate_cell, or a centered derivative on the
+    // nonuniform grid.
+    if (vg.upar_widths.size() != static_cast<size_t>(nv))
+        throw std::runtime_error("J1 Hamiltonian velocity widths invalid");
     std::vector<double> result(static_cast<size_t>(nv * nmu), 0.0);
-    for (int j = 0; j < nv; ++j) {
-        int left = j == 0 ? 0 : j - 1;
-        int right = j + 1 == nv ? nv - 1 : j + 1;
-        if (left == right) {
-            throw std::runtime_error("J0 Hamiltonian velocity derivative is degenerate");
-        }
-        const double du = vg.upar_cells[right] - vg.upar_cells[left];
-        if (!(du > 0.0) || !std::isfinite(du)) {
-            throw std::runtime_error("J0 Hamiltonian velocity u spacing invalid");
+    for (int jf = 1; jf < nv; ++jf) {
+        const int jl = jf - 1;
+        const int jr = jf;
+        const double du_left = vg.upar_widths[static_cast<size_t>(jl)];
+        const double du_right = vg.upar_widths[static_cast<size_t>(jr)];
+        if (!(du_left > 0.0) || !(du_right > 0.0) ||
+            !std::isfinite(du_left) || !std::isfinite(du_right)) {
+            throw std::runtime_error("J1 Hamiltonian velocity width invalid");
         }
         for (int k = 0; k < nmu; ++k) {
-            const size_t left_id = static_cast<size_t>(left * nmu + k);
-            const size_t right_id = static_cast<size_t>(right * nmu + k);
-            const double value =
-                (vg.kinetic_energy[right_id] - vg.kinetic_energy[left_id]) /
-                (Const::me * Const::c * du);
-            if (!std::isfinite(value) ||
-                std::fabs(value) > Const::c *
-                    (1.0 + 4096.0 * std::numeric_limits<double>::epsilon())) {
-                throw std::runtime_error("J0 Hamiltonian velocity is invalid");
-            }
-            result[static_cast<size_t>(j * nmu + k)] = value;
+            const size_t left_id = static_cast<size_t>(jl * nmu + k);
+            const size_t right_id = static_cast<size_t>(jr * nmu + k);
+            const double delta_k = vg.kinetic_energy[right_id] -
+                vg.kinetic_energy[left_id];
+            result[left_id] += delta_k /
+                (2.0 * Const::me * Const::c * du_left);
+            result[right_id] += delta_k /
+                (2.0 * Const::me * Const::c * du_right);
+        }
+    }
+    for (size_t i = 0; i < result.size(); ++i) {
+        if (!std::isfinite(result[i]) ||
+            std::fabs(result[i]) > Const::c *
+                (1.0 + 4096.0 * std::numeric_limits<double>::epsilon())) {
+            throw std::runtime_error("J1 Hamiltonian velocity is invalid");
         }
     }
     return result;
@@ -154,7 +164,7 @@ JointPhaseSpaceMidpointOperator::build_periodic_center_flux(
                 // Integrating f over dx and the perpendicular ring gives the
                 // mass rate across a u face.  Endpoint faces stay exactly 0.
                 bundle.u_flux_rate[u_index(ix, jface, k, nv, nmu)] =
-                    a * f_trace * sg.dx * vg.uperp_ring_areas[k];
+                    a * f_trace;
 
                 const size_t q = static_cast<size_t>(jface * nmu + k);
                 const double delta_k = vg.kinetic_energy[q] -
@@ -314,6 +324,12 @@ bool JointPhaseSpaceMidpointOperator::evaluate_local_residual(
     for (size_t i = 0; i < m_old_local.size(); ++i)
         if (!std::isfinite(m_old_local[i]) || !std::isfinite(m_candidate_local[i]))
             return false;
+    std::vector<double> m_mid_local(count, 0.0);
+    for (size_t i = 0; i < count; ++i) {
+        m_mid_local[i] = 0.5 *
+            (m_old_local[i] + m_candidate_local[i]);
+        if (!std::isfinite(m_mid_local[i])) return false;
+    }
     for (size_t i = 0; i < e_cell_local.size(); ++i)
         if (!std::isfinite(e_cell_local[i])) return false;
 
@@ -322,18 +338,18 @@ bool JointPhaseSpaceMidpointOperator::evaluate_local_residual(
     std::vector<double> left_ghost(static_cast<size_t>(nq), 0.0);
     std::vector<double> right_ghost(static_cast<size_t>(nq), 0.0);
     if (mpi_size == 1) {
-        std::copy(m_candidate_local.end() - nq, m_candidate_local.end(),
+        std::copy(m_mid_local.end() - nq, m_mid_local.end(),
                   left_ghost.begin());
-        std::copy(m_candidate_local.begin(), m_candidate_local.begin() + nq,
+        std::copy(m_mid_local.begin(), m_mid_local.begin() + nq,
                   right_ghost.begin());
     } else {
         const int left = mpi_rank > 0 ? mpi_rank - 1 : mpi_size - 1;
         const int right = mpi_rank + 1 < mpi_size ? mpi_rank + 1 : 0;
-        MPI_Sendrecv(m_candidate_local.data() +
+        MPI_Sendrecv(m_mid_local.data() +
                          static_cast<size_t>(nx - 1) * nq, nq, MPI_DOUBLE,
                      right, 7311, left_ghost.data(), nq, MPI_DOUBLE,
                      left, 7311, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        MPI_Sendrecv(m_candidate_local.data(), nq, MPI_DOUBLE, left, 7312,
+        MPI_Sendrecv(m_mid_local.data(), nq, MPI_DOUBLE, left, 7312,
                      right_ghost.data(), nq, MPI_DOUBLE, right, 7312,
                      MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     }
@@ -358,10 +374,10 @@ bool JointPhaseSpaceMidpointOperator::evaluate_local_residual(
                 const int q = j * nmu + k;
                 const double left = iface == 0
                     ? left_ghost[static_cast<size_t>(q)]
-                    : m_candidate_local[static_cast<size_t>(iface - 1) * nq + q];
+                    : m_mid_local[static_cast<size_t>(iface - 1) * nq + q];
                 const double right = iface == nx
                     ? right_ghost[static_cast<size_t>(q)]
-                    : m_candidate_local[static_cast<size_t>(iface) * nq + q];
+                    : m_mid_local[static_cast<size_t>(iface) * nq + q];
                 bundle.x_flux_rate[x_index(iface, j, k, nv, nmu)] =
                     velocity[static_cast<size_t>(q)] * 0.5 * (left + right) /
                     sg.dx;
@@ -377,10 +393,10 @@ bool JointPhaseSpaceMidpointOperator::evaluate_local_residual(
                 const size_t left = cell_index(ix, jf - 1, k, nv, nmu);
                 const size_t right = cell_index(ix, jf, k, nv, nmu);
                 const double ftrace = 0.5 *
-                    (m_candidate_local[left] / vg.upar_widths[jf - 1] +
-                     m_candidate_local[right] / vg.upar_widths[jf]);
+                    (m_mid_local[left] / vg.upar_widths[jf - 1] +
+                     m_mid_local[right] / vg.upar_widths[jf]);
                 bundle.u_flux_rate[u_index(ix, jf, k, nv, nmu)] =
-                    a * ftrace * sg.dx * vg.uperp_ring_areas[k];
+                    a * ftrace;
                 // `left`/`right` above index the x-u distribution.  The
                 // kinetic-energy table has velocity-slot layout only and
                 // must never be indexed with the x-cell offset.

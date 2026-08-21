@@ -14,6 +14,13 @@
 
 namespace {
 
+size_t cell_index(int ix, int j, int k, int nv, int nmu)
+{
+    return (static_cast<size_t>(ix) * static_cast<size_t>(nv) +
+            static_cast<size_t>(j)) * static_cast<size_t>(nmu) +
+           static_cast<size_t>(k);
+}
+
 struct Scenario {
     const char* name;
     double field;
@@ -31,20 +38,119 @@ struct ScenarioResult {
     double kinetic_roundoff_tolerance;
     double poisson_roundoff_tolerance;
     double g_gstar_roundoff_tolerance;
+    double local_global_flux_relative_error;
+    bool local_global_flux_pass;
+    double u_energy_adjoint_relative_error;
+    double u_energy_velocity_symmetry_error;
+    double u_energy_velocity_max_abs;
+    bool u_energy_adjoint_pass;
+    double x_force_charge_adjoint_relative_error;
+    bool x_force_charge_adjoint_pass;
     bool passed;
     ScenarioResult()
         : mass_scale(1.0), kinetic_scale(1.0), poisson_scale(1.0),
           g_gstar_scale(1.0), potential_charge_abs_scale(0.0),
           kinetic_roundoff_tolerance(0.0),
           poisson_roundoff_tolerance(0.0),
-          g_gstar_roundoff_tolerance(0.0), passed(false) {}
+          g_gstar_roundoff_tolerance(0.0),
+          local_global_flux_relative_error(0.0),
+          local_global_flux_pass(false),
+          u_energy_adjoint_relative_error(0.0),
+          u_energy_velocity_symmetry_error(0.0),
+          u_energy_velocity_max_abs(0.0),
+          u_energy_adjoint_pass(false),
+          x_force_charge_adjoint_relative_error(0.0),
+          x_force_charge_adjoint_pass(false), passed(false) {}
 };
 
-size_t cell_index(int ix, int j, int k, int nv, int nmu)
+struct UFluxGeometryResult {
+    bool selected;
+    bool passed;
+    double relative_error_dx1;
+    double relative_error_dx2;
+    double dx1;
+    double dx2;
+    double ring_k1;
+    double ring_k2;
+    double cell_mass_relative_error;
+    UFluxGeometryResult()
+        : selected(false), passed(true), relative_error_dx1(0.0),
+          relative_error_dx2(0.0), dx1(0.0), dx2(0.0), ring_k1(0.0),
+          ring_k2(0.0), cell_mass_relative_error(0.0) {}
+};
+
+UFluxGeometryResult run_u_flux_geometry_test(int rank, int size)
 {
-    return (static_cast<size_t>(ix) * static_cast<size_t>(nv) +
-            static_cast<size_t>(j)) * static_cast<size_t>(nmu) +
-           static_cast<size_t>(k);
+    UFluxGeometryResult result;
+    result.selected = true;
+    if (size != 1) {
+        result.passed = false;
+        return result;
+    }
+
+    const double f0 = 3.0e20;
+    const double field = 2.0e8;
+    const int jface = 1;
+    const int k1 = 1;
+    const int k2 = 2;
+    for (int case_id = 0; case_id < 2; ++case_id) {
+        SpatialGrid sg;
+        sg.init_with_domain(rank, size, 4,
+                           case_id == 0 ? 4.0e-6 : 8.0e-6);
+        CylindricalVelocityGrid vg;
+        vg.init_grid(1.5, 32, 8, 32, 0, 1.5, 1.5, 2.0);
+        const int nv = static_cast<int>(vg.upar_cells.size());
+        const int nmu = static_cast<int>(vg.uperp_cells.size());
+        const size_t count = static_cast<size_t>(sg.nx_global * nv * nmu);
+        std::vector<double> mass(count, 0.0);
+        for (int ix = 0; ix < sg.nx_global; ++ix)
+            for (int j = 0; j < nv; ++j)
+                for (int k = 0; k < nmu; ++k)
+                    mass[cell_index(ix, j, k, nv, nmu)] =
+                        f0 * sg.dx * vg.cell_phase_volume(j, k);
+        for (int j = 0; j < nv; ++j)
+            for (int k = 0; k < nmu; ++k) {
+                const double expected_mass =
+                    f0 * sg.dx * vg.cell_phase_volume(j, k);
+                const double actual_mass = mass[cell_index(0, j, k, nv, nmu)];
+                result.cell_mass_relative_error = std::max(
+                    result.cell_mass_relative_error,
+                    std::fabs(actual_mass - expected_mass) /
+                        std::max(1.0, std::fabs(expected_mass)));
+            }
+        std::vector<double> e_cell(static_cast<size_t>(sg.nx_global), field);
+        const JointPhaseSpaceFluxBundle bundle =
+            JointPhaseSpaceMidpointOperator::build_periodic_center_flux(
+                sg, vg, mass, e_cell, 1.0e-18);
+        const int k = case_id == 0 ? k1 : k2;
+        const double area = vg.uperp_ring_areas[static_cast<size_t>(k)];
+        const double accel = field * (-Const::qe) /
+            (Const::me * Const::c);
+        const double expected = accel * f0 * sg.dx * area;
+        const size_t flux_index =
+            (static_cast<size_t>(jface) * static_cast<size_t>(nmu) +
+             static_cast<size_t>(k));
+        const double actual = bundle.u_flux_rate[flux_index];
+        const double error = std::fabs(actual - expected) /
+            std::max(1.0, std::fabs(expected));
+        if (case_id == 0) {
+            result.relative_error_dx1 = error;
+            result.dx1 = sg.dx;
+            result.ring_k1 = area;
+        } else {
+            result.relative_error_dx2 = error;
+            result.dx2 = sg.dx;
+            result.ring_k2 = area;
+        }
+    }
+    result.passed = result.relative_error_dx1 <=
+            4096.0 * std::numeric_limits<double>::epsilon() &&
+        result.relative_error_dx2 <=
+            4096.0 * std::numeric_limits<double>::epsilon() &&
+        result.cell_mass_relative_error <=
+            4096.0 * std::numeric_limits<double>::epsilon() &&
+        result.dx1 != result.dx2 && result.ring_k1 != result.ring_k2;
+    return result;
 }
 
 double face_inner_product(const std::vector<double>& e_face,
@@ -135,6 +241,8 @@ ScenarioResult run_scenario(const Scenario& scenario, int rank, int size)
     const int nv = static_cast<int>(vg.upar_cells.size());
     const int nmu = static_cast<int>(vg.uperp_cells.size());
     const size_t count = static_cast<size_t>(nx * nv * nmu);
+    const double u_extent = std::max(
+        std::fabs(vg.upar_cells.front()), std::fabs(vg.upar_cells.back()));
     std::vector<double> m_mid(count, 0.0);
     const int center_j = nv / 2;
     for (int ix = 0; ix < nx; ++ix) {
@@ -151,9 +259,19 @@ ScenarioResult run_scenario(const Scenario& scenario, int rank, int size)
                 const double u = vg.upar_cells[static_cast<size_t>(j)];
                 const double up = vg.uperp_cells[static_cast<size_t>(k)];
                 const double shape = std::exp(-(u * u + up * up) / 0.35);
+                // F5.3 requires a positive deterministic state without the
+                // u_parallel symmetry of a Maxwellian.  Otherwise the net
+                // electric work is near zero and roundoff in two summation
+                // orders is incorrectly reported as an O(1) relative error.
+                const double asymmetric_factor =
+                    scenario.active_velocity_count == 0
+                    ? 1.0 + 0.15 * u / u_extent + 0.03 * std::sin(
+                        2.0 * Const::pi * static_cast<double>((ix + 1) *
+                        (k + 1)) / static_cast<double>(nx * nmu))
+                    : 1.0;
                 m_mid[cell_index(ix, j, k, nv, nmu)] = active
-                    ? 1.0e20 * x_factor * shape *
-                      vg.cell_phase_volume(j, k)
+                    ? 1.0e20 * x_factor * asymmetric_factor * shape *
+                       vg.cell_phase_volume(j, k)
                     : 0.0;
             }
         }
@@ -169,6 +287,157 @@ ScenarioResult run_scenario(const Scenario& scenario, int rank, int size)
         m_old[i] = m_mid[i] - 0.5 * bundle.mass_delta_total[i];
         m_new[i] = m_mid[i] + 0.5 * bundle.mass_delta_total[i];
     }
+    JointPhaseSpaceFluxBundle global_bundle;
+    JointPhaseSpaceFluxBundle local_bundle;
+    std::vector<double> global_residual;
+    std::vector<double> local_residual;
+    double global_residual_linf = 0.0;
+    double global_residual_scale = 0.0;
+    double local_residual_linf = 0.0;
+    double local_residual_scale = 0.0;
+    const bool global_ok =
+        JointPhaseSpaceMidpointOperator::evaluate_residual(
+            sg, vg, m_old, m_new, e_cell, dt, global_bundle,
+            global_residual, global_residual_linf, global_residual_scale);
+    const std::vector<double> e_cell_local = e_cell;
+    const bool local_ok =
+        JointPhaseSpaceMidpointOperator::evaluate_local_residual(
+            sg, vg, m_old, m_new, e_cell_local, dt, rank, size,
+            local_bundle, local_residual, local_residual_linf,
+            local_residual_scale,
+            // F4 compares the algebraic midpoint operator with the global
+            // residual on the same signed manufactured Newton probe.  It is
+            // not an accepted physical state, so use the same signed domain
+            // as evaluate_residual().
+            true);
+    double local_global_error = 0.0;
+    if (global_ok && local_ok &&
+        global_bundle.x_flux_rate.size() == local_bundle.x_flux_rate.size() &&
+        global_bundle.u_flux_rate.size() == local_bundle.u_flux_rate.size() &&
+        global_bundle.mass_delta_x.size() == local_bundle.mass_delta_x.size() &&
+        global_bundle.mass_delta_u.size() == local_bundle.mass_delta_u.size() &&
+        global_bundle.mass_delta_total.size() == local_bundle.mass_delta_total.size() &&
+        global_residual.size() == local_residual.size()) {
+        for (size_t i = 0; i < global_bundle.x_flux_rate.size(); ++i)
+            local_global_error = std::max(local_global_error,
+                std::fabs(global_bundle.x_flux_rate[i] -
+                          local_bundle.x_flux_rate[i]));
+        for (size_t i = 0; i < global_bundle.u_flux_rate.size(); ++i)
+            local_global_error = std::max(local_global_error,
+                std::fabs(global_bundle.u_flux_rate[i] -
+                          local_bundle.u_flux_rate[i]));
+        for (size_t i = 0; i < global_bundle.mass_delta_x.size(); ++i) {
+            local_global_error = std::max(local_global_error,
+                std::fabs(global_bundle.mass_delta_x[i] -
+                          local_bundle.mass_delta_x[i]));
+            local_global_error = std::max(local_global_error,
+                std::fabs(global_bundle.mass_delta_u[i] -
+                          local_bundle.mass_delta_u[i]));
+            local_global_error = std::max(local_global_error,
+                std::fabs(global_bundle.mass_delta_total[i] -
+                          local_bundle.mass_delta_total[i]));
+            local_global_error = std::max(local_global_error,
+                std::fabs(global_residual[i] - local_residual[i]));
+        }
+    } else {
+        local_global_error = std::numeric_limits<double>::infinity();
+    }
+    result.local_global_flux_relative_error = local_global_error /
+        std::max(1.0, std::max(global_residual_scale,
+                               std::max(std::fabs(global_residual_linf),
+                                        std::fabs(local_residual_linf))));
+    result.local_global_flux_pass = global_ok && local_ok &&
+        result.local_global_flux_relative_error <=
+            4096.0 * std::numeric_limits<double>::epsilon();
+    const std::vector<double> hamiltonian_velocity =
+        JointPhaseSpaceMidpointOperator::build_hamiltonian_velocity(vg);
+    long double u_work_from_flux = 0.0L;
+    long double u_work_from_velocity = 0.0L;
+    for (int ix = 0; ix < nx; ++ix) {
+        for (int jf = 1; jf < nv; ++jf) {
+            for (int k = 0; k < nmu; ++k) {
+                const size_t left = static_cast<size_t>((jf - 1) * nmu + k);
+                const size_t right = static_cast<size_t>(jf * nmu + k);
+                const double delta_k = vg.kinetic_energy[right] -
+                    vg.kinetic_energy[left];
+                const size_t flux_id =
+                    (static_cast<size_t>(ix) * static_cast<size_t>(nv + 1) +
+                     static_cast<size_t>(jf)) * static_cast<size_t>(nmu) +
+                    static_cast<size_t>(k);
+                u_work_from_flux += static_cast<long double>(dt) *
+                    static_cast<long double>(delta_k) *
+                    static_cast<long double>(bundle.u_flux_rate[flux_id]);
+            }
+        }
+        // build_hamiltonian_velocity() is the face-to-cell transpose already
+        // summed over all adjacent u faces.  Its work form is therefore a
+        // cell sum, not another u-face sum.
+        for (int j = 0; j < nv; ++j) {
+            for (int k = 0; k < nmu; ++k) {
+                const size_t velocity_id =
+                    static_cast<size_t>(j * nmu + k);
+                const size_t mass_id = cell_index(ix, j, k, nv, nmu);
+                u_work_from_velocity += static_cast<long double>(dt) *
+                    static_cast<long double>(e_cell[static_cast<size_t>(ix)]) *
+                    static_cast<long double>(-Const::qe) *
+                    static_cast<long double>(hamiltonian_velocity[velocity_id]) *
+                    static_cast<long double>(m_mid[mass_id]);
+            }
+        }
+    }
+    const long double u_work_scale = std::max(
+        1.0e-300L, std::max(std::fabs(u_work_from_flux),
+                            std::fabs(u_work_from_velocity)));
+    result.u_energy_adjoint_relative_error = static_cast<double>(
+        std::fabs(u_work_from_flux - u_work_from_velocity) / u_work_scale);
+    for (int j = 0; j < nv; ++j) {
+        const int mirror = nv - 1 - j;
+        for (int k = 0; k < nmu; ++k) {
+            const size_t id = static_cast<size_t>(j * nmu + k);
+            const size_t mirror_id = static_cast<size_t>(mirror * nmu + k);
+            result.u_energy_velocity_max_abs = std::max(
+                result.u_energy_velocity_max_abs,
+                std::fabs(hamiltonian_velocity[id]));
+            result.u_energy_velocity_symmetry_error = std::max(
+                result.u_energy_velocity_symmetry_error,
+                std::fabs(hamiltonian_velocity[id] +
+                          hamiltonian_velocity[mirror_id]));
+        }
+    }
+    result.u_energy_adjoint_pass =
+        result.u_energy_adjoint_relative_error <=
+            4096.0 * std::numeric_limits<double>::epsilon() &&
+        result.u_energy_velocity_symmetry_error <=
+            4096.0 * std::numeric_limits<double>::epsilon() * Const::c &&
+        result.u_energy_velocity_max_abs <= Const::c *
+            (1.0 + 4096.0 * std::numeric_limits<double>::epsilon());
+    std::vector<double> force_current(static_cast<size_t>(nx), 0.0);
+    for (int ix = 0; ix < nx; ++ix) {
+        long double sum = 0.0L;
+        for (int j = 0; j < nv; ++j)
+            for (int k = 0; k < nmu; ++k) {
+                const size_t q = static_cast<size_t>(j * nmu + k);
+                sum += static_cast<long double>(hamiltonian_velocity[q]) *
+                    static_cast<long double>(m_mid[cell_index(ix, j, k, nv, nmu)]);
+            }
+        force_current[static_cast<size_t>(ix)] = static_cast<double>(
+            static_cast<long double>(-Const::qe) * sum /
+            static_cast<long double>(sg.dx));
+    }
+    double x_force_charge_error = 0.0;
+    for (int iface = 1; iface < nx; ++iface) {
+        const double expected = 0.5 *
+            (force_current[static_cast<size_t>(iface - 1)] +
+             force_current[static_cast<size_t>(iface)]);
+        x_force_charge_error = std::max(
+            x_force_charge_error,
+            std::fabs(bundle.charge_current_face[static_cast<size_t>(iface)] -
+                      expected) /
+                std::max(1.0, std::fabs(expected)));
+    }
+    result.x_force_charge_adjoint_relative_error = x_force_charge_error;
+    result.x_force_charge_adjoint_pass = x_force_charge_error <=
+        4096.0 * std::numeric_limits<double>::epsilon();
 
     ElectrostaticBoundary boundary;
     boundary.type = ElectrostaticBoundaryType::DIRICHLET_PHI;
@@ -295,7 +564,10 @@ ScenarioResult run_scenario(const Scenario& scenario, int rank, int size)
     const double combined_roundoff_tolerance =
         result.kinetic_roundoff_tolerance +
         result.poisson_roundoff_tolerance;
-    result.passed = result.audit.finite && pairing_ok &&
+    result.passed = result.local_global_flux_pass &&
+        result.u_energy_adjoint_pass &&
+        result.x_force_charge_adjoint_pass &&
+        result.audit.finite && pairing_ok &&
         result.audit.mass_residual <=
             std::max(result.audit.mass_roundoff_bound, 1.0e-300) &&
         std::fabs(result.audit.kinetic_work_residual) <=
@@ -313,17 +585,35 @@ ScenarioResult run_scenario(const Scenario& scenario, int rank, int size)
     return result;
 }
 
-void write_result(std::ostream& out, const std::vector<ScenarioResult>& results)
+void write_result(std::ostream& out, const std::vector<ScenarioResult>& results,
+                  const UFluxGeometryResult& geometry)
 {
     double max_mass = 0.0;
     double max_kinetic = 0.0;
     double max_poisson = 0.0;
     double max_combined = 0.0;
     double max_pairing = 0.0;
-    bool pass = !results.empty();
+    bool pass = !results.empty() && geometry.passed;
+    bool j0_c = !results.empty();
+    bool j0_d = !results.empty();
+    bool j0_e = !results.empty();
+    bool j0_f = !results.empty();
     for (size_t i = 0; i < results.size(); ++i) {
         const ScenarioResult& r = results[i];
         pass = pass && r.passed;
+        j0_c = j0_c && r.local_global_flux_pass;
+        j0_d = j0_d && r.u_energy_adjoint_pass;
+        j0_e = j0_e && r.x_force_charge_adjoint_pass;
+        j0_f = j0_f && r.audit.finite &&
+            std::fabs(r.audit.poisson_work_residual) <=
+                r.poisson_roundoff_tolerance &&
+            std::fabs(r.audit.g_gstar_residual) <=
+                r.g_gstar_roundoff_tolerance &&
+            std::fabs(r.audit.combined_energy_residual) <=
+                r.kinetic_roundoff_tolerance +
+                r.poisson_roundoff_tolerance &&
+            r.audit.cell_volume_residual <= 1.0e-14 &&
+            r.audit.u_boundary_flux == 0.0;
         max_mass = std::max(max_mass, r.audit.mass_residual);
         max_kinetic = std::max(max_kinetic,
                                std::fabs(r.audit.kinetic_work_residual));
@@ -360,10 +650,49 @@ void write_result(std::ostream& out, const std::vector<ScenarioResult>& results)
             << r.poisson_roundoff_tolerance << "\n"
             << "case_" << r.name << "_g_gstar_roundoff_tolerance="
             << r.g_gstar_roundoff_tolerance << "\n"
+            << "case_" << r.name << "_local_global_flux_pass="
+            << (r.local_global_flux_pass ? 1 : 0) << "\n"
+            << "case_" << r.name << "_local_global_flux_relative_error="
+            << r.local_global_flux_relative_error << "\n"
+            << "case_" << r.name << "_u_energy_adjoint_pass="
+            << (r.u_energy_adjoint_pass ? 1 : 0) << "\n"
+            << "case_" << r.name << "_u_energy_adjoint_relative_error="
+            << r.u_energy_adjoint_relative_error << "\n"
+            << "case_" << r.name << "_u_energy_velocity_symmetry_error="
+            << r.u_energy_velocity_symmetry_error << "\n"
+            << "case_" << r.name << "_u_energy_velocity_max_abs="
+            << r.u_energy_velocity_max_abs << "\n"
+            << "case_" << r.name << "_x_force_charge_adjoint_pass="
+            << (r.x_force_charge_adjoint_pass ? 1 : 0) << "\n"
+            << "case_" << r.name << "_x_force_charge_adjoint_relative_error="
+            << r.x_force_charge_adjoint_relative_error << "\n"
             << "case_" << r.name << "_potential_charge_abs_scale="
             << r.potential_charge_abs_scale << "\n";
     }
     out << "status=" << (pass ? "PASS" : "FAIL") << "\n"
+        << "j0_a_cell_mass_pass="
+        << ((geometry.cell_mass_relative_error <=
+             4096.0 * std::numeric_limits<double>::epsilon()) ? 1 : 0)
+        << "\n"
+        << "j0_b_u_flux_geometry_pass=" << (geometry.passed ? 1 : 0) << "\n"
+        << "j0_c_midpoint_consistency_pass=" << (j0_c ? 1 : 0) << "\n"
+        << "j0_d_u_work_force_adjoint_pass=" << (j0_d ? 1 : 0) << "\n"
+        << "j0_e_x_current_force_adjoint_pass=" << (j0_e ? 1 : 0) << "\n"
+        << "j0_f_poisson_pairing_pass=" << (j0_f ? 1 : 0) << "\n"
+        << "j0_all_six_pass=" << (pass && j0_c && j0_d && j0_e && j0_f ? 1 : 0)
+        << "\n"
+        << "u_flux_geometry_selected=" << (geometry.selected ? 1 : 0) << "\n"
+        << "u_flux_geometry_pass=" << (geometry.passed ? 1 : 0) << "\n"
+        << "u_flux_geometry_dx1=" << geometry.dx1 << "\n"
+        << "u_flux_geometry_dx2=" << geometry.dx2 << "\n"
+        << "u_flux_geometry_ring_k1=" << geometry.ring_k1 << "\n"
+        << "u_flux_geometry_ring_k2=" << geometry.ring_k2 << "\n"
+        << "u_flux_geometry_relative_error_dx1="
+        << geometry.relative_error_dx1 << "\n"
+        << "u_flux_geometry_relative_error_dx2="
+        << geometry.relative_error_dx2 << "\n"
+        << "u_flux_geometry_cell_mass_relative_error="
+        << geometry.cell_mass_relative_error << "\n"
         << "mass_residual=" << max_mass << "\n"
         << "kinetic_work_residual=" << max_kinetic << "\n"
         << "poisson_work_residual=" << max_poisson << "\n"
@@ -432,17 +761,20 @@ int main(int argc, char** argv)
     for (size_t i = 0; i < scenarios.size(); ++i)
         results.push_back(run_scenario(scenarios[i], rank, size));
 
+    UFluxGeometryResult geometry;
+    if (test_case == "all") geometry = run_u_flux_geometry_test(rank, size);
+
     bool pass = true;
     for (size_t i = 0; i < results.size(); ++i) pass = pass && results[i].passed;
     if (rank == 0) {
         std::cout << std::setprecision(17);
-        write_result(std::cout, results);
+        write_result(std::cout, results, geometry);
         if (!result_path.empty()) {
             std::ofstream out(result_path.c_str(), std::ios::trunc);
             if (!out) pass = false;
             else {
                 out << std::setprecision(17);
-                write_result(out, results);
+                write_result(out, results, geometry);
             }
         }
     }

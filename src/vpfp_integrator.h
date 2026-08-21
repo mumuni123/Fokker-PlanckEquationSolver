@@ -461,6 +461,23 @@ struct VpfpStepResult {
     double joint_midpoint_residual_linf;
     double joint_midpoint_poisson_residual_linf;
     double joint_midpoint_energy_residual;
+    bool joint_midpoint_pairing_field_built;
+    double joint_midpoint_delta_k_x;
+    double joint_midpoint_delta_k_u;
+    double joint_midpoint_u_face_work;
+    double joint_midpoint_force_current_work;
+    double joint_midpoint_charge_current_work;
+    double joint_midpoint_charge_current_work_interior;
+    double joint_midpoint_charge_current_work_endpoint;
+    double joint_midpoint_poisson_potential_charge_work;
+    double joint_midpoint_poisson_transport_residual;
+    double joint_midpoint_current_pair_residual;
+    double joint_midpoint_force_charge_residual;
+    double joint_midpoint_domain_energy_change;
+    double joint_midpoint_field_energy_change;
+    double joint_midpoint_electrode_work;
+    double joint_midpoint_min_mass;
+    double joint_midpoint_max_mass;
     std::vector<JointPhaseSpaceIterationRecord> joint_midpoint_iterations_log;
 };
 
