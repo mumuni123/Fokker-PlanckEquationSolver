@@ -31,8 +31,7 @@ BeamPIC::BeamPIC()
       last_boundary_source_error_(0.0),
       last_open_face_error_(0.0),
       last_trajectory_reconstruction_error_(0.0),
-      rng_state_(0x9e3779b97f4a7c15ULL),
-      injected_begin_(0)
+      rng_state_(0x9e3779b97f4a7c15ULL)
 {}
 
 BeamPersistentState BeamPIC::export_persistent_state() const
@@ -96,8 +95,8 @@ void BeamPIC::import_persistent_state(const BeamPersistentState& s,
     last_open_face_error_ = 0.0;
     last_trajectory_reconstruction_error_ = s.last_trajectory_reconstruction_error;
     rng_state_ = s.rng_state;
-    injected_begin_ = particles.size();
-    injected_push_dt_.clear(); send_left_.clear(); send_right_.clear(); keep_.clear();
+    midpoint_state_ = BeamMidpointState();
+    send_left_.clear(); send_right_.clear(); keep_.clear();
     recv_left_.clear(); recv_right_.clear(); thread_keep_.clear();
     thread_send_left_.clear(); thread_send_right_.clear();
     trajectory_density_delta_.assign(static_cast<size_t>(sg.nx_local), 0.0);
@@ -109,7 +108,7 @@ size_t initial_particle_capacity(const SpatialGrid& sg)
 {
     const double active_time = std::max(
         0.0, std::min(Param::t_end, Param::t_inject_end) - Param::t_inject_start);
-    const double downstream_length = Param::Lx;
+    const double downstream_length = sg.dx * static_cast<double>(sg.nx_global);
     const double active_length = std::min(downstream_length, Param::beam_v0 * active_time);
     const int active_cells = std::max(1, static_cast<int>(std::ceil(active_length / sg.dx)) + 4);
     const int local_capacity_cells = std::max(1, std::min(sg.nx_local + 2 * sg.nghost,
@@ -127,7 +126,8 @@ inline double gather_staggered_ex(double x,
                                   const SpatialGrid& sg,
                                   const EMFields& fields)
 {
-    if (x < 0.0 || x >= Param::Lx) return 0.0;
+    const double length = sg.dx * static_cast<double>(sg.nx_global);
+    if (x < 0.0 || x >= length) return 0.0;
 
     // Ex is x-face centered. Relative to the nearest face, the shifted CIC
     // weights are h_x(-1), h_x(0), h_x(1); only two are nonzero.
@@ -171,69 +171,29 @@ inline double beam_kinetic_energy(const BeamParticle& p)
     return p.weight * beam_kinetic_energy_per_particle(p.px);
 }
 
-inline double push_particle(BeamParticle& p,
-                            const SpatialGrid& sg,
-                            const EMFields& fields,
-                            double dt,
-                            int& boundary_crossing)
+inline double beam_vx(double px)
 {
-    const double ex = gather_staggered_ex(p.x, sg, fields);
-    const double inv_mec = 1.0 / (Const::me * Const::c);
-    const double px_before = p.px;
-    const double x_before = p.x;
-    const double pnorm_before = p.px * inv_mec;
-    const double gamma_before = std::sqrt(1.0 + pnorm_before * pnorm_before);
+    const double u = px / (Const::me * Const::c);
+    return Const::c * u / std::sqrt(1.0 + u * u);
+}
 
-    const double force_x = (-Const::qe) * ex;
-    const double px_trial = px_before + force_x * dt;
-    const double pnorm_trial = px_trial * inv_mec;
-    const double gamma_trial = std::sqrt(1.0 + pnorm_trial * pnorm_trial);
-    const double vx_trial = Const::c * pnorm_trial / gamma_trial;
-    const double x_trial = x_before + vx_trial * dt;
-
-    boundary_crossing = 0;
-    double pushed_dt = dt;
-    double x_after = x_trial;
-    if (x_trial < 0.0 || x_trial >= Param::Lx) {
-        boundary_crossing = (x_trial < 0.0) ? -1 : 1;
-        const double boundary = (boundary_crossing < 0) ? 0.0 : Param::Lx;
-
-        if (force_x == 0.0) {
-            pushed_dt = std::max(
-                0.0, std::min(dt, (boundary - x_before) / vx_trial));
-        } else {
-            // Solve x(t) = x_boundary for the same kick-drift substep map used
-            // by the ordinary pusher. This work is restricted to outflow.
-            double t_inside = 0.0;
-            double t_outside = dt;
-            for (int iter = 0; iter < 48; ++iter) {
-                const double t_mid = 0.5 * (t_inside + t_outside);
-                const double px_mid = px_before + force_x * t_mid;
-                const double pnorm_mid = px_mid * inv_mec;
-                const double gamma_mid =
-                    std::sqrt(1.0 + pnorm_mid * pnorm_mid);
-                const double x_mid =
-                    x_before + Const::c * pnorm_mid / gamma_mid * t_mid;
-                const bool is_outside = (boundary_crossing < 0)
-                    ? (x_mid <= boundary) : (x_mid >= boundary);
-                if (is_outside) {
-                    t_outside = t_mid;
-                } else {
-                    t_inside = t_mid;
-                }
-            }
-            pushed_dt = t_outside;
-        }
-        x_after = boundary;
+// Pure drift at constant vx with an exact boundary-crossing time.  Returns
+// true if the particle stays inside; on a crossing sets side (-1 left,
+// +1 right) and pushed_dt (time to the boundary, within [0, dt]).
+inline bool drift_step(double x0, double vx, double dt, double length,
+                       int& side, double& pushed_dt)
+{
+    const double x1 = x0 + vx * dt;
+    side = 0;
+    pushed_dt = dt;
+    if (x1 < 0.0 || x1 >= length) {
+        side = (x1 < 0.0) ? -1 : 1;
+        const double boundary = (side < 0) ? 0.0 : length;
+        pushed_dt = (vx != 0.0)
+            ? std::max(0.0, std::min(dt, (boundary - x0) / vx)) : 0.0;
+        return false;
     }
-
-    p.px = px_before + force_x * pushed_dt;
-    p.x = x_after;
-    const double pnorm_after = p.px * inv_mec;
-    const double gamma_after = std::sqrt(1.0 + pnorm_after * pnorm_after);
-
-    return p.weight * (gamma_after - gamma_before)
-         * Const::me * Const::c * Const::c;
+    return true;
 }
 
 inline double random_unit(unsigned long long& state)
@@ -261,7 +221,7 @@ void resize_or_zero(std::vector<size_t>& values, size_t n)
     }
 }
 
-}
+} // namespace
 
 void BeamPIC::init(const SpatialGrid& sg)
 {
@@ -297,8 +257,7 @@ void BeamPIC::init(const SpatialGrid& sg)
     last_open_face_error_ = 0.0;
     last_trajectory_reconstruction_error_ = 0.0;
     rng_state_ = 0x9e3779b97f4a7c15ULL;
-    injected_begin_ = 0;
-    injected_push_dt_.clear();
+    midpoint_state_ = BeamMidpointState();
 
     const size_t capacity = initial_particle_capacity(sg);
     const size_t boundary_capacity = std::max(
@@ -336,8 +295,7 @@ void BeamPIC::begin_step(const SpatialGrid& sg, double dt)
     last_boundary_source_error_ = 0.0;
     last_open_face_error_ = 0.0;
     last_trajectory_reconstruction_error_ = 0.0;
-    injected_begin_ = 0;
-    injected_push_dt_.clear();
+    midpoint_state_ = BeamMidpointState();
     begin_current_interval(sg);
 }
 
@@ -362,89 +320,238 @@ void BeamPIC::begin_current_interval(const SpatialGrid& sg)
     interval_right_outflow_number_ = 0.0;
     interval_left_guard_path_number_ = 0.0;
     interval_right_guard_path_number_ = 0.0;
-    injected_begin_ = particles.size();
-    injected_push_dt_.clear();
 }
 
-void BeamPIC::inject(const SpatialGrid& sg, const EMFields& fields,
-                     double dt, double time, int mpi_rank, int mpi_size)
+BeamInjectionSchedule BeamPIC::generate_injection_schedule(
+    const SpatialGrid& sg, double step_start, double dt, int mpi_rank) const
 {
-    (void)fields;
-    (void)mpi_size;
-    injected_begin_ = particles.size();
-    injected_push_dt_.clear();
+    BeamInjectionSchedule schedule;
+    schedule.rng_state_after_generation = rng_state_;
+    schedule.remainder_after_generation = injection_remainder_;
+    if (mpi_rank != 0 || dt <= 0.0) return schedule;
 
-    const double step_start = time - dt;
     const double active_start = std::max(step_start, Param::t_inject_start);
-    const double active_end = std::min(time, Param::t_inject_end);
+    const double active_end = std::min(step_start + dt, Param::t_inject_end);
     const double active_dt = active_end - active_start;
-    if (active_dt <= 0.0) return;
+    if (!(active_dt > 0.0)) return schedule;
 
-    int n_new = 0;
-    if (mpi_rank == 0) {
-        const double depth_cells =
-            injection_remainder_ + Param::beam_v0 * active_dt / sg.dx;
-        const double macro_depth =
-            depth_cells * Param::beam_macro_particles_per_cell;
-        n_new = static_cast<int>(macro_depth);
-        injection_remainder_ =
-            depth_cells
-            - static_cast<double>(n_new) /
-              static_cast<double>(Param::beam_macro_particles_per_cell);
+    const double depth_cells = schedule.remainder_after_generation +
+        Param::beam_v0 * active_dt / sg.dx;
+    const double macro_depth = depth_cells * Param::beam_macro_particles_per_cell;
+    const int count = static_cast<int>(macro_depth);
+    schedule.remainder_after_generation = depth_cells -
+        static_cast<double>(count) / Param::beam_macro_particles_per_cell;
+    unsigned long long rng = schedule.rng_state_after_generation;
+    schedule.events.reserve(static_cast<size_t>(std::max(0, count)));
+    for (int i = 0; i < count; ++i) {
+        BeamInjectionEvent event;
+        event.crossing_time = active_start + random_unit(rng) * active_dt;
+        event.px = Param::beam_p0;
+        event.weight = beam_macro_weight(sg);
+        schedule.events.push_back(event);
+    }
+    schedule.rng_state_after_generation = rng;
+    return schedule;
+}
+
+void BeamPIC::commit_injection_schedule(const BeamInjectionSchedule& schedule,
+                                        int mpi_rank)
+{
+    if (mpi_rank != 0) return;
+    rng_state_ = schedule.rng_state_after_generation;
+    injection_remainder_ = schedule.remainder_after_generation;
+}
+
+void BeamPIC::predict_to_midpoint(const BeamInjectionSchedule& schedule,
+                                  const SpatialGrid& sg, const EMFields& field_n,
+                                  double time, double dt, int mpi_rank,
+                                  int mpi_size, BeamPIC& midpoint) const
+{
+    (void)field_n;  // The first half is a pure drift; no kick before E^{n+1/2}.
+    (void)mpi_size;
+    BeamMidpointState& ms = midpoint.midpoint_state_;
+    ms.particles.clear();
+    ms.active_remaining_dt.clear();
+    ms.kick_dt.clear();
+    ms.left_outflow_number = 0.0;
+    ms.right_outflow_number = 0.0;
+    ms.left_outflow_energy = 0.0;
+    ms.right_outflow_energy = 0.0;
+    ms.injected_number = 0.0;
+    ms.injected_energy = 0.0;
+    ms.trajectory_send_left = 0.0;
+    ms.trajectory_send_right = 0.0;
+    resize_or_zero(ms.trajectory_delta,
+                   static_cast<size_t>(sg.nx_local));
+    resize_or_zero(ms.boundary_source_delta,
+                   static_cast<size_t>(sg.nx_local));
+
+    const double half = 0.5 * dt;
+    const double t_mid = time + half;
+    const double length = sg.dx * static_cast<double>(sg.nx_global);
+
+    // Existing particles: pure drift x^{n+1/2} = x^n + (dt/2) v(p^n), with
+    // exact boundary-crossing removal and trajectory shape-change accounting.
+    for (size_t i = 0; i < particles.size(); ++i) {
+        const BeamParticle& p = particles[i];
+        const double vx = beam_vx(p.px);
+        const double x_mid = p.x + vx * half;
+        int side = 0;
+        double pushed_dt = half;
+            if (x_mid < 0.0 || x_mid >= length) {
+                drift_step(p.x, vx, half, length, side, pushed_dt);
+                const double x_cross = p.x + vx * pushed_dt;
+                add_shape_density(sg, ms.trajectory_delta,
+                              ms.trajectory_send_left,
+                              ms.trajectory_send_right,
+                              p.x, -p.weight);
+            add_shape_density(sg, ms.trajectory_delta,
+                              ms.trajectory_send_left,
+                              ms.trajectory_send_right,
+                              x_cross, p.weight);
+            const double ke = beam_kinetic_energy(p);
+            if (side < 0) {
+                ms.left_outflow_number += p.weight;
+                ms.left_outflow_energy += ke;
+            } else {
+                ms.right_outflow_number += p.weight;
+                ms.right_outflow_energy += ke;
+            }
+            continue;
+        }
+        BeamParticle mid = p;
+        mid.x = x_mid;
+        ms.particles.push_back(mid);
+        ms.active_remaining_dt.push_back(half);
+        ms.kick_dt.push_back(dt);
+        add_shape_density(sg, ms.trajectory_delta,
+                          ms.trajectory_send_left,
+                          ms.trajectory_send_right,
+                          p.x, -p.weight);
+        add_shape_density(sg, ms.trajectory_delta,
+                          ms.trajectory_send_left,
+                          ms.trajectory_send_right,
+                          x_mid, p.weight);
     }
 
-    particles.reserve(particles.size() + static_cast<size_t>(std::max(0, n_new)));
-    injected_push_dt_.reserve(static_cast<size_t>(std::max(0, n_new)));
-    const double source_ke_per_particle =
-        beam_kinetic_energy_per_particle(Param::beam_p0);
-    double injected_energy_call = 0.0;
-    double injected_number_call = 0.0;
-    for (int i = 0; i < n_new; ++i) {
-        // The particle does not exist before this sampled boundary crossing.
-        const double t_cross = active_start + random_unit(rng_state_) * active_dt;
-        const double remaining_dt = std::max(0.0, time - t_cross);
-
-        BeamParticle p;
-        p.x = 0.0;
-        p.px = Param::beam_p0;
-        p.weight = Param::beam_macro_weight;
-
-        last_injected_number_ += p.weight;
-        interval_injected_number_ += p.weight;
-        injected_number_call += p.weight;
-        injected_energy_call += p.weight * source_ke_per_particle;
-
-        if (p.weight > 0.0) {
-            particles.push_back(p);
-            injected_push_dt_.push_back(remaining_dt);
+    // Particles injected at t_cross <= t_mid: the midpoint deposit position
+    // is the real drift from x = 0 to t_mid (section 13.9).
+    if (mpi_rank == 0) {
+        for (size_t i = 0; i < schedule.events.size(); ++i) {
+            const BeamInjectionEvent& event = schedule.events[i];
+            if (event.crossing_time > t_mid || !(event.weight > 0.0)) continue;
+            const double v0 = beam_vx(event.px);
+            const double x_mid = v0 * (t_mid - event.crossing_time);
+            int side = 0;
+            double pushed_dt = t_mid - event.crossing_time;
+            if (x_mid < 0.0 || x_mid >= length) {
+                drift_step(0.0, v0, t_mid - event.crossing_time, length,
+                           side, pushed_dt);
+                const double x_cross = v0 * pushed_dt;
+                add_shape_density(sg, ms.trajectory_delta,
+                                  ms.trajectory_send_left,
+                                  ms.trajectory_send_right,
+                                  0.0, -event.weight);
+                add_shape_density(sg, ms.trajectory_delta,
+                                  ms.trajectory_send_left,
+                                  ms.trajectory_send_right,
+                                  x_cross, event.weight);
+                const double ke = event.weight *
+                    beam_kinetic_energy_per_particle(event.px);
+                if (side < 0) {
+                    ms.left_outflow_number += event.weight;
+                    ms.left_outflow_energy += ke;
+                } else {
+                    ms.right_outflow_number += event.weight;
+                    ms.right_outflow_energy += ke;
+                }
+            } else {
+                BeamParticle mid;
+                mid.x = x_mid;
+                mid.px = event.px;
+                mid.weight = event.weight;
+                ms.particles.push_back(mid);
+                ms.active_remaining_dt.push_back(half);
+                ms.kick_dt.push_back((time + dt) - event.crossing_time);
+                add_shape_density(sg, ms.trajectory_delta,
+                                  ms.trajectory_send_left,
+                                  ms.trajectory_send_right,
+                                  0.0, -event.weight);
+                add_shape_density(sg, ms.trajectory_delta,
+                                  ms.trajectory_send_left,
+                                  ms.trajectory_send_right,
+                                  x_mid, event.weight);
+            }
+            ms.injected_number += event.weight;
+            ms.injected_energy += event.weight *
+                beam_kinetic_energy_per_particle(event.px);
+            add_shape_density(sg, ms.boundary_source_delta,
+                              ms.trajectory_send_left,
+                              ms.trajectory_send_right,
+                              0.0, event.weight);
         }
     }
-    if (mpi_rank == 0 && !boundary_source_density_delta_.empty()) {
-        double source_guard_left = 0.0;
-        double source_guard_right = 0.0;
-        add_shape_density(sg, boundary_source_density_delta_,
-                          source_guard_left, source_guard_right,
-                          0.0, injected_number_call);
-    }
-    last_injected_current_ = (step_dt_ > 0.0)
-        ? -Const::qe * last_injected_number_ / step_dt_
-        : 0.0;
-    last_injected_energy_ += injected_energy_call;
-    cumulative_injected_energy_ += injected_energy_call;
+    // Move the midpoint particle list into the working beam (zero copy) so
+    // the midpoint density deposit sees it; the per-particle metadata stays
+    // in the midpoint state for the final pass.
+    midpoint.particles.swap(ms.particles);
 }
 
-void BeamPIC::push(const SpatialGrid& sg, const EMFields& fields, double dt,
-                   int mpi_rank, int mpi_size)
+void BeamPIC::finish_from_midpoint(const BeamInjectionSchedule& schedule,
+                                   const SpatialGrid& sg,
+                                   const EMFields& field_mid, double time,
+                                   double dt, int mpi_rank, int mpi_size,
+                                   std::vector<double>* local_delta_ke_by_x,
+                                   double* local_delta_ke_boundary)
 {
+    if (local_delta_ke_by_x != NULL) {
+        local_delta_ke_by_x->assign(static_cast<size_t>(sg.nx_local), 0.0);
+    }
+    BeamMidpointState& ms = midpoint_state_;
+    const size_t nxl = static_cast<size_t>(sg.nx_local);
+    // Self-contained sizing: the production flow calls begin_step first, but
+    // the direct predict/finish unit tests do not.
+    resize_or_zero(trajectory_density_delta_, nxl);
+    resize_or_zero(boundary_source_density_delta_, nxl);
+    // Fold the first-half (pure-drift) accumulations into the step ledgers.
+    if (trajectory_density_delta_.size() == nxl &&
+        ms.trajectory_delta.size() == nxl) {
+        for (size_t ix = 0; ix < nxl; ++ix) {
+            trajectory_density_delta_[ix] += ms.trajectory_delta[ix];
+        }
+    }
+    if (boundary_source_density_delta_.size() == nxl &&
+        ms.boundary_source_delta.size() == nxl) {
+        for (size_t ix = 0; ix < nxl; ++ix) {
+            boundary_source_density_delta_[ix] += ms.boundary_source_delta[ix];
+        }
+    }
+    interval_injected_number_ += ms.injected_number;
+    last_injected_number_ += ms.injected_number;
+    last_injected_energy_ += ms.injected_energy;
+    cumulative_injected_energy_ += ms.injected_energy;
+    interval_left_outflow_signed_number_ -= ms.left_outflow_number;
+    interval_right_outflow_number_ += ms.right_outflow_number;
+    last_outflow_number_ += ms.left_outflow_number + ms.right_outflow_number;
+    step_signed_outflow_number_ +=
+        ms.right_outflow_number - ms.left_outflow_number;
+    last_outflow_energy_ += ms.left_outflow_energy + ms.right_outflow_energy;
+    cumulative_outflow_energy_ +=
+        ms.left_outflow_energy + ms.right_outflow_energy;
+    if (mpi_rank == 0) {
+        interval_left_guard_path_number_ += ms.trajectory_send_left * sg.dx;
+    }
+    if (mpi_rank == mpi_size - 1) {
+        interval_right_guard_path_number_ += ms.trajectory_send_right * sg.dx;
+    }
+    double trajectory_send_left = ms.trajectory_send_left;
+    double trajectory_send_right = ms.trajectory_send_right;
+
+    const double length = sg.dx * static_cast<double>(sg.nx_global);
+    const double t_mid = time + 0.5 * dt;
     const double x_left = sg.ix_start * sg.dx;
     const double x_right = (sg.ix_start + sg.nx_local) * sg.dx;
     const long long np = static_cast<long long>(particles.size());
-    if (np == 0 && mpi_size == 1) {
-        send_left_.clear();
-        send_right_.clear();
-        keep_.clear();
-        return;
-    }
     const int nthreads = std::max(1, omp_get_max_threads());
 
     if (thread_keep_.size() != static_cast<size_t>(nthreads)) {
@@ -463,18 +570,23 @@ void BeamPIC::push(const SpatialGrid& sg, const EMFields& fields, double dt,
         thread_keep_[t].reserve(reserve_each);
         thread_send_left_[t].reserve(std::max<size_t>(1, reserve_each / 16));
         thread_send_right_[t].reserve(std::max<size_t>(1, reserve_each / 16));
-        resize_or_zero(thread_trajectory_density_delta_[t],
-                       static_cast<size_t>(sg.nx_local));
+        resize_or_zero(thread_trajectory_density_delta_[t], nxl);
         thread_send_left_trajectory_[t] = 0.0;
         thread_send_right_trajectory_[t] = 0.0;
     }
 
     double field_work = 0.0;
+    double boundary_work = 0.0;
     double outflow_energy = 0.0;
     double left_outflow_number = 0.0;
     double right_outflow_number = 0.0;
+    double second_half_injected_number = 0.0;
+    double second_half_injected_energy = 0.0;
 
-    #pragma omp parallel reduction(+:field_work,outflow_energy,left_outflow_number,right_outflow_number)
+    #pragma omp parallel reduction(+:field_work,boundary_work,outflow_energy, \
+                                   left_outflow_number,right_outflow_number, \
+                                   second_half_injected_number, \
+                                   second_half_injected_energy)
     {
         const int tid = omp_get_thread_num();
         std::vector<BeamParticle>& local_keep = thread_keep_[tid];
@@ -484,54 +596,174 @@ void BeamPIC::push(const SpatialGrid& sg, const EMFields& fields, double dt,
             thread_trajectory_density_delta_[tid];
         double local_trajectory_send_left = 0.0;
         double local_trajectory_send_right = 0.0;
+
+        // Kick with E^{n+1/2} at x^{n+1/2}, then the second half-drift.
         #pragma omp for schedule(static)
         for (long long i = 0; i < np; ++i) {
             BeamParticle p = particles[static_cast<size_t>(i)];
-            const double x_old = p.x;
-            double particle_dt = dt;
-            if (static_cast<size_t>(i) >= injected_begin_) {
-                const size_t injected_slot =
-                    static_cast<size_t>(i) - injected_begin_;
-                if (injected_slot < injected_push_dt_.size()) {
-                    particle_dt = injected_push_dt_[injected_slot];
+            const double x_mid = p.x;
+            const double kick_dt =
+                (static_cast<size_t>(i) < ms.kick_dt.size())
+                    ? ms.kick_dt[static_cast<size_t>(i)] : dt;
+            const double rem_dt =
+                (static_cast<size_t>(i) < ms.active_remaining_dt.size())
+                    ? ms.active_remaining_dt[static_cast<size_t>(i)] : 0.5 * dt;
+            const double ex = gather_staggered_ex(x_mid, sg, field_mid);
+            const double p_before = p.px;
+            p.px += (-Const::qe) * ex * kick_dt;
+            const double delta_ke =
+                (beam_kinetic_energy_per_particle(p.px) -
+                 beam_kinetic_energy_per_particle(p_before)) * p.weight;
+            field_work += delta_ke;
+            if (local_delta_ke_by_x != NULL) {
+                // Gate I (section 4.4): CIC cell attribution at x^{n+1/2}.
+                // Out-of-domain shares go to the boundary work audit (section
+                // I3), never renormalized into the domain.
+                const double s = x_mid * (1.0 / sg.dx) - 0.5;
+                const int i0 = static_cast<int>(std::floor(s));
+                const double frac = s - static_cast<double>(i0);
+                const int c0 = i0 - sg.ix_start;
+                const int c1 = i0 + 1 - sg.ix_start;
+                if (c0 >= 0 && c0 < sg.nx_local) {
+                    #pragma omp atomic
+                    (*local_delta_ke_by_x)[static_cast<size_t>(c0)] +=
+                        delta_ke * (1.0 - frac);
+                } else {
+                    boundary_work += delta_ke * (1.0 - frac);
+                }
+                if (c1 >= 0 && c1 < sg.nx_local) {
+                    #pragma omp atomic
+                    (*local_delta_ke_by_x)[static_cast<size_t>(c1)] +=
+                        delta_ke * frac;
+                } else {
+                    boundary_work += delta_ke * frac;
                 }
             }
-            int boundary_crossing = 0;
-            field_work += push_particle(p, sg, fields, particle_dt,
-                                        boundary_crossing);
-            const bool leaves_domain = boundary_crossing != 0;
-            const double x_path_end = p.x;
-
-            // This pair is the discrete shape change h_x - g_x. The face
-            // current is reconstructed from continuity below; no q*v moment
-            // is deposited or substituted for the trajectory current.
-            add_shape_density(sg, local_trajectory,
-                              local_trajectory_send_left,
-                              local_trajectory_send_right,
-                              x_old, -p.weight);
-            add_shape_density(sg, local_trajectory,
-                              local_trajectory_send_left,
-                              local_trajectory_send_right,
-                              x_path_end, p.weight);
-
-            if (leaves_domain) {
+            const double vx = beam_vx(p.px);
+            const double x_new = x_mid + vx * rem_dt;
+            int side = 0;
+            double pushed_dt = rem_dt;
+            if (x_new < 0.0 || x_new >= length) {
+                drift_step(x_mid, vx, rem_dt, length, side, pushed_dt);
+                const double x_cross = x_mid + vx * pushed_dt;
+                add_shape_density(sg, local_trajectory,
+                                  local_trajectory_send_left,
+                                  local_trajectory_send_right,
+                                  x_mid, -p.weight);
+                add_shape_density(sg, local_trajectory,
+                                  local_trajectory_send_left,
+                                  local_trajectory_send_right,
+                                  x_cross, p.weight);
                 outflow_energy += beam_kinetic_energy(p);
-                if (boundary_crossing < 0) {
-                    left_outflow_number += p.weight;
-                } else {
-                    right_outflow_number += p.weight;
-                }
+                if (side < 0) left_outflow_number += p.weight;
+                else right_outflow_number += p.weight;
                 continue;
             }
+            p.x = x_new;
+            add_shape_density(sg, local_trajectory,
+                              local_trajectory_send_left,
+                              local_trajectory_send_right,
+                              x_mid, -p.weight);
+            add_shape_density(sg, local_trajectory,
+                              local_trajectory_send_left,
+                              local_trajectory_send_right,
+                              x_new, p.weight);
 
             if (p.weight <= 0.0) continue;
-
             if (p.x < x_left && mpi_rank > 0) {
                 local_left.push_back(p);
             } else if (p.x >= x_right && mpi_rank + 1 < mpi_size) {
                 local_right.push_back(p);
             } else if (p.x >= x_left && p.x < x_right) {
                 local_keep.push_back(p);
+            }
+        }
+
+        // Particles injected after the midpoint: created in the second half
+        // and pushed for tau = t^{n+1} - t_cross (local first-order source
+        // discretization, documented in section 13.9).
+        #pragma omp single
+        if (mpi_rank == 0) {
+            for (size_t i = 0; i < schedule.events.size(); ++i) {
+                const BeamInjectionEvent& event = schedule.events[i];
+                if (event.crossing_time <= t_mid ||
+                    !(event.weight > 0.0)) continue;
+                const double tau = (time + dt) - event.crossing_time;
+                BeamParticle p;
+                p.x = 0.0;
+                p.px = event.px;
+                p.weight = event.weight;
+                const double ex = gather_staggered_ex(0.0, sg, field_mid);
+                const double p_before = p.px;
+                p.px += (-Const::qe) * ex * tau;
+                const double delta_ke =
+                    (beam_kinetic_energy_per_particle(p.px) -
+                     beam_kinetic_energy_per_particle(p_before)) * p.weight;
+                field_work += delta_ke;
+                if (local_delta_ke_by_x != NULL) {
+                    // Late-injection kick at the left boundary x=0.  The
+                    // out-of-domain CIC share goes to the boundary work audit.
+                    const double s = -0.5;
+                    const int i0 = static_cast<int>(std::floor(s));
+                    const double frac = s - static_cast<double>(i0);
+                    const int c0 = i0 - sg.ix_start;
+                    const int c1 = i0 + 1 - sg.ix_start;
+                    if (c0 >= 0 && c0 < sg.nx_local) {
+                        (*local_delta_ke_by_x)[static_cast<size_t>(c0)] +=
+                            delta_ke * (1.0 - frac);
+                    } else {
+                        boundary_work += delta_ke * (1.0 - frac);
+                    }
+                    if (c1 >= 0 && c1 < sg.nx_local) {
+                        (*local_delta_ke_by_x)[static_cast<size_t>(c1)] +=
+                            delta_ke * frac;
+                    } else {
+                        boundary_work += delta_ke * frac;
+                    }
+                }
+                const double vx = beam_vx(p.px);
+                const double x_new = vx * tau;
+                int side = 0;
+                double pushed_dt = tau;
+                if (x_new < 0.0 || x_new >= length) {
+                    drift_step(0.0, vx, tau, length, side, pushed_dt);
+                    const double x_cross = vx * pushed_dt;
+                    add_shape_density(sg, local_trajectory,
+                                      local_trajectory_send_left,
+                                      local_trajectory_send_right,
+                                      0.0, -p.weight);
+                    add_shape_density(sg, local_trajectory,
+                                      local_trajectory_send_left,
+                                      local_trajectory_send_right,
+                                      x_cross, p.weight);
+                    outflow_energy += beam_kinetic_energy(p);
+                    if (side < 0) left_outflow_number += p.weight;
+                    else right_outflow_number += p.weight;
+                } else {
+                    p.x = x_new;
+                    add_shape_density(sg, local_trajectory,
+                                      local_trajectory_send_left,
+                                      local_trajectory_send_right,
+                                      0.0, -p.weight);
+                    add_shape_density(sg, local_trajectory,
+                                      local_trajectory_send_left,
+                                      local_trajectory_send_right,
+                                      x_new, p.weight);
+                    if (p.x < x_left && mpi_rank > 0) {
+                        local_left.push_back(p);
+                    } else if (p.x >= x_right && mpi_rank + 1 < mpi_size) {
+                        local_right.push_back(p);
+                    } else if (p.x >= x_left && p.x < x_right) {
+                        local_keep.push_back(p);
+                    }
+                }
+                second_half_injected_number += event.weight;
+                second_half_injected_energy +=
+                    event.weight * beam_kinetic_energy_per_particle(event.px);
+                add_shape_density(sg, boundary_source_density_delta_,
+                                  local_trajectory_send_left,
+                                  local_trajectory_send_right,
+                                  0.0, event.weight);
             }
         }
         thread_send_left_trajectory_[tid] = local_trajectory_send_left;
@@ -548,8 +780,6 @@ void BeamPIC::push(const SpatialGrid& sg, const EMFields& fields, double dt,
         trajectory_density_delta_[static_cast<size_t>(ix)] += trajectory_sum;
     }
 
-    double trajectory_send_left = 0.0;
-    double trajectory_send_right = 0.0;
     for (int t = 0; t < nthreads; ++t) {
         trajectory_send_left += thread_send_left_trajectory_[t];
         trajectory_send_right += thread_send_right_trajectory_[t];
@@ -597,20 +827,29 @@ void BeamPIC::push(const SpatialGrid& sg, const EMFields& fields, double dt,
     }
 
     particles.swap(keep_);
-
     exchange_particles(sg, mpi_rank, mpi_size);
-    injected_begin_ = particles.size();
-    injected_push_dt_.clear();
-    last_outflow_energy_ += outflow_energy;
-    cumulative_outflow_energy_ += outflow_energy;
-    // The step scalar counts particles leaving either open boundary.
+
+    last_injected_number_ += second_half_injected_number;
+    last_injected_energy_ += second_half_injected_energy;
+    cumulative_injected_energy_ += second_half_injected_energy;
+    interval_injected_number_ += second_half_injected_number;
+    last_injected_current_ = (step_dt_ > 0.0)
+        ? -Const::qe * last_injected_number_ / step_dt_ : 0.0;
+
+    const double total_left_outflow =
+        ms.left_outflow_number + left_outflow_number;
+    const double total_right_outflow =
+        ms.right_outflow_number + right_outflow_number;
     last_outflow_number_ += left_outflow_number + right_outflow_number;
     step_signed_outflow_number_ += right_outflow_number - left_outflow_number;
+    last_outflow_energy_ += outflow_energy;
+    cumulative_outflow_energy_ += outflow_energy;
     last_outflow_current_ = (step_dt_ > 0.0)
-        ? -Const::qe * step_signed_outflow_number_ / step_dt_
-        : 0.0;
+        ? -Const::qe * step_signed_outflow_number_ / step_dt_ : 0.0;
     last_field_work_ += field_work;
-    // Left-going crossings carry negative x-directed number flux.
+    if (local_delta_ke_boundary != NULL) {
+        *local_delta_ke_boundary = boundary_work;
+    }
     interval_left_outflow_signed_number_ -= left_outflow_number;
     interval_right_outflow_number_ += right_outflow_number;
     if (!boundary_source_density_delta_.empty()) {
@@ -619,16 +858,63 @@ void BeamPIC::push(const SpatialGrid& sg, const EMFields& fields, double dt,
             double source_guard_right = 0.0;
             add_shape_density(sg, boundary_source_density_delta_,
                               source_guard_left, source_guard_right,
-                              0.0, -left_outflow_number);
+                              0.0, -total_left_outflow);
         }
         if (mpi_rank == mpi_size - 1) {
             double source_guard_left = 0.0;
             double source_guard_right = 0.0;
             add_shape_density(sg, boundary_source_density_delta_,
                               source_guard_left, source_guard_right,
-                              Param::Lx, -right_outflow_number);
+                              sg.dx * static_cast<double>(sg.nx_global),
+                              -total_right_outflow);
         }
     }
+    midpoint_state_ = BeamMidpointState();
+}
+
+void BeamPIC::swap_state(BeamPIC& other)
+{
+    particles.swap(other.particles);
+    density.swap(other.density);
+    current_x.swap(other.current_x);
+    current_face_x.swap(other.current_face_x);
+    density_step_start.swap(other.density_step_start);
+    std::swap(injection_remainder_, other.injection_remainder_);
+    std::swap(last_injected_energy_, other.last_injected_energy_);
+    std::swap(cumulative_injected_energy_, other.cumulative_injected_energy_);
+    std::swap(last_outflow_energy_, other.last_outflow_energy_);
+    std::swap(cumulative_outflow_energy_, other.cumulative_outflow_energy_);
+    std::swap(last_injected_number_, other.last_injected_number_);
+    std::swap(last_outflow_number_, other.last_outflow_number_);
+    std::swap(last_injected_current_, other.last_injected_current_);
+    std::swap(last_outflow_current_, other.last_outflow_current_);
+    std::swap(last_field_work_, other.last_field_work_);
+    std::swap(step_dt_, other.step_dt_);
+    std::swap(step_signed_outflow_number_, other.step_signed_outflow_number_);
+    std::swap(interval_injected_number_, other.interval_injected_number_);
+    std::swap(interval_left_outflow_signed_number_,
+              other.interval_left_outflow_signed_number_);
+    std::swap(interval_right_outflow_number_, other.interval_right_outflow_number_);
+    std::swap(interval_left_guard_path_number_,
+              other.interval_left_guard_path_number_);
+    std::swap(interval_right_guard_path_number_,
+              other.interval_right_guard_path_number_);
+    std::swap(last_continuity_abs_l1_residual_,
+              other.last_continuity_abs_l1_residual_);
+    std::swap(last_continuity_abs_linf_residual_,
+              other.last_continuity_abs_linf_residual_);
+    std::swap(last_continuity_l1_error_, other.last_continuity_l1_error_);
+    std::swap(last_continuity_linf_error_, other.last_continuity_linf_error_);
+    std::swap(last_boundary_flux_error_, other.last_boundary_flux_error_);
+    std::swap(last_boundary_source_error_, other.last_boundary_source_error_);
+    std::swap(last_open_face_error_, other.last_open_face_error_);
+    std::swap(last_trajectory_reconstruction_error_,
+              other.last_trajectory_reconstruction_error_);
+    std::swap(rng_state_, other.rng_state_);
+    std::swap(midpoint_state_, other.midpoint_state_);
+    trajectory_density_delta_.swap(other.trajectory_density_delta_);
+    boundary_source_density_delta_.swap(other.boundary_source_density_delta_);
+    reconstructed_current_face_x_.swap(other.reconstructed_current_face_x_);
 }
 
 void BeamPIC::exchange_particles(const SpatialGrid& sg, int mpi_rank, int mpi_size)
@@ -932,8 +1218,6 @@ void BeamPIC::finalize_charge_conserving_current(const SpatialGrid& sg,
     const double dx_over_dt = sg.dx * inv_dt;
     const double inv_dx = 1.0 / sg.dx;
 
-    // Guard shape changes determine the physical open-boundary face current.
-    // Guard current arrays themselves are discarded and never periodic-wrapped.
     double trajectory_flux =
         (-global_boundary_numbers[4] - preceding_changes[1]) * inv_dt;
     double trajectory_flux_correction = 0.0;
@@ -951,7 +1235,6 @@ void BeamPIC::finalize_charge_conserving_current(const SpatialGrid& sg,
         current_face_x[slot + 1] = -Const::qe * trajectory_flux;
     }
 
-    // Scheme 2: independently remove S_inj-S_out from the real density change.
     double reconstructed_flux =
         (-global_boundary_numbers[4] - preceding_changes[0]) * inv_dt;
     double reconstructed_flux_correction = 0.0;
@@ -971,8 +1254,6 @@ void BeamPIC::finalize_charge_conserving_current(const SpatialGrid& sg,
             -Const::qe * reconstructed_flux;
     }
 
-    // Internal MPI faces share one Beam current. The two global Beam faces
-    // remain independent open boundaries; there is deliberately no wrap.
     if (mpi_size > 1) {
         const double send_left_faces[2] = {
             current_face_x[0], reconstructed_current_face_x_[0]
@@ -1003,9 +1284,6 @@ void BeamPIC::finalize_charge_conserving_current(const SpatialGrid& sg,
 
     last_boundary_flux_error_ = 0.0;
     last_trajectory_reconstruction_error_ = 0.0;
-    // Keep diagnostics well scaled after injection switches off.  Using only
-    // the instantaneous injected flux makes any finite cancellation residue
-    // larger than one particle/s normalize to exactly one.
     const double reference_current_scale = std::max(1.0, std::fabs(Param::jb));
     const double reference_number_flux_scale =
         reference_current_scale / Const::qe;
@@ -1021,6 +1299,19 @@ void BeamPIC::finalize_charge_conserving_current(const SpatialGrid& sg,
             last_trajectory_reconstruction_error_,
             std::fabs(current_face_x[iface] -
                       reconstructed_current_face_x_[iface]) / scale);
+    }
+    // In 1D the endpoint-density continuity recurrence is the exact
+    // charge-conserving trajectory current (up to the independently supplied
+    // open-boundary face constant).  The direct shape-change accumulator can
+    // lose the destination-cell split when a particle endpoint crosses an MPI
+    // subdomain by more than one CIC share.  Keep its discrepancy above as a
+    // trajectory diagnostic, but make the conservative recurrence the
+    // authoritative current used by downstream production/audit consumers.
+    current_face_x = reconstructed_current_face_x_;
+    for (int ix = 0; ix < sg.nx_local; ++ix) {
+        current_x[static_cast<size_t>(ix)] =
+            0.5 * (current_face_x[static_cast<size_t>(ix)] +
+                   current_face_x[static_cast<size_t>(ix + 1)]);
     }
     const size_t n = std::min(density.size(), density_step_start.size());
     double interval_abs_l1 = 0.0;
@@ -1038,9 +1329,6 @@ void BeamPIC::finalize_charge_conserving_current(const SpatialGrid& sg,
         interval_abs_linf = std::max(interval_abs_linf, abs_err);
     }
 
-    // Normalize against a global injection-current scale, never against a
-    // nearly zero cell-local cancellation. Param::jb provides a stable scale
-    // outside the active injection window.
     const double interval_injection_current =
         Const::qe * global_boundary_numbers[0] * inv_dt;
     const double injection_current_scale =
@@ -1082,6 +1370,68 @@ void BeamPIC::finalize_charge_conserving_current(const SpatialGrid& sg,
             std::fabs(reconstructed_flux - expected_right_flux)) / flux_scale;
         last_boundary_flux_error_ =
             std::max(last_boundary_flux_error_, last_open_face_error_);
+    }
+}
+
+void BeamPIC::snapshot_midpoint_trajectory_current(
+    const SpatialGrid& sg, double elapsed_dt, int mpi_rank, int mpi_size,
+    std::vector<double>& current_face) const
+{
+    const size_t nxl = static_cast<size_t>(sg.nx_local);
+    current_face.assign(nxl + 1, 0.0);
+    if (!(elapsed_dt > 0.0) ||
+        midpoint_state_.trajectory_delta.size() != nxl) return;
+
+    double local_change = 0.0;
+    double correction = 0.0;
+    for (size_t i = 0; i < nxl; ++i) {
+        const double term = midpoint_state_.trajectory_delta[i] * sg.dx;
+        const double corrected = term - correction;
+        const double updated = local_change + corrected;
+        correction = (updated - local_change) - corrected;
+        local_change = updated;
+    }
+    double preceding_change = 0.0;
+    if (mpi_size > 1) {
+        MPI_Exscan(&local_change, &preceding_change, 1, MPI_DOUBLE, MPI_SUM,
+                   MPI_COMM_WORLD);
+        if (mpi_rank == 0) preceding_change = 0.0;
+    }
+    double local_left_guard = mpi_rank == 0
+        ? midpoint_state_.trajectory_send_left * sg.dx : 0.0;
+    double global_left_guard = 0.0;
+    MPI_Allreduce(&local_left_guard, &global_left_guard, 1, MPI_DOUBLE,
+                  MPI_SUM, MPI_COMM_WORLD);
+
+    const double inv_dt = 1.0 / elapsed_dt;
+    double number_flux = (-global_left_guard - preceding_change) * inv_dt;
+    current_face[0] = -Const::qe * number_flux;
+    double flux_correction = 0.0;
+    for (size_t i = 0; i < nxl; ++i) {
+        const double delta =
+            -midpoint_state_.trajectory_delta[i] * sg.dx * inv_dt;
+        const double corrected = delta - flux_correction;
+        const double updated = number_flux + corrected;
+        flux_correction = (updated - number_flux) - corrected;
+        number_flux = updated;
+        current_face[i + 1] = -Const::qe * number_flux;
+    }
+
+    if (mpi_size > 1) {
+        const double send_left = current_face[0];
+        double recv_right = 0.0;
+        MPI_Request reqs[2];
+        int nreq = 0;
+        if (mpi_rank > 0) {
+            MPI_Isend(&send_left, 1, MPI_DOUBLE, mpi_rank - 1, 682,
+                      MPI_COMM_WORLD, &reqs[nreq++]);
+        }
+        if (mpi_rank + 1 < mpi_size) {
+            MPI_Irecv(&recv_right, 1, MPI_DOUBLE, mpi_rank + 1, 682,
+                      MPI_COMM_WORLD, &reqs[nreq++]);
+        }
+        if (nreq > 0) MPI_Waitall(nreq, reqs, MPI_STATUSES_IGNORE);
+        if (mpi_rank + 1 < mpi_size) current_face[nxl] = recv_right;
     }
 }
 

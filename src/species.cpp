@@ -1,6 +1,8 @@
 #include "species.h"
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <map>
 #include <omp.h>
 
 namespace {
@@ -410,10 +412,161 @@ void Species::total_particle_number_and_energy(double& number,
     kinetic_energy = total_e;
 }
 
+void Species::fill_cylindrical_maxwellian_mass_slice(
+    std::vector<double>& values, double density, double temp,
+    double drift_vx) const
+{
+    values.assign(Param::Nvmu, 0.0);
+    if (!cylindrical_mass_representation || !sgrid || !(temp > 0.0)) return;
+
+    const double inv2uth2 = mass * Const::c * Const::c / (2.0 * temp);
+    const double drift_u = u_from_v(drift_vx);
+    double raw_number = 0.0;
+    for (int iv = 0; iv < Param::Nv; ++iv) {
+        for (int imu = 0; imu < Param::Nmu; ++imu) {
+            const double up = cgrid.upar_cells[iv];
+            const double ut = cgrid.uperp_cells[imu];
+            raw_number += std::exp(-((up - drift_u) * (up - drift_u) +
+                                     ut * ut) * inv2uth2) *
+                          cgrid.cell_phase_volume(iv, imu);
+        }
+    }
+    if (!(raw_number > 0.0)) return;
+
+    const double norm = std::max(0.0, density) / raw_number;
+    for (int iv = 0; iv < Param::Nv; ++iv) {
+        for (int imu = 0; imu < Param::Nmu; ++imu) {
+            const double up = cgrid.upar_cells[iv];
+            const double ut = cgrid.uperp_cells[imu];
+            const double f3 = norm * std::exp(-((up - drift_u) * (up - drift_u) +
+                                                ut * ut) * inv2uth2);
+            values[idx2(iv, imu)] = f3 * sgrid->dx *
+                                    cgrid.cell_phase_volume(iv, imu);
+        }
+    }
+}
+
 double Species::distribution_value(int ix_with_ghost, int iv, int imu) const
 {
     const double stored = f[idx3(ix_with_ghost, iv, imu)];
     if (!cylindrical_mass_representation) return stored;
     const double volume = sgrid->dx * cgrid.cell_phase_volume(iv, imu);
     return (volume > 0.0) ? stored / volume : 0.0;
+}
+
+void Species::swap_state(Species& other)
+{
+    f.swap(other.f);
+    f_tmp.swap(other.f_tmp);
+    number_density.swap(other.number_density);
+    charge_density.swap(other.charge_density);
+    current_x.swap(other.current_x);
+    current_face_x.swap(other.current_face_x);
+}
+
+SpeciesConversionResult Species::extract_conversion_masses(
+    const std::vector<ConversionMassRequest>& requests)
+{
+    SpeciesConversionResult r;
+    if (!cylindrical_mass_representation || !sgrid) return r;
+    const int ng = sgrid->nghost;
+    const int nxl = sgrid->nx_local;
+
+    // Validate every request before touching f (section 14.3).
+    for (size_t q = 0; q < requests.size(); ++q) {
+        const ConversionMassRequest& req = requests[q];
+        const int il = req.ix_global - sgrid->ix_start;
+        if (il < 0 || il >= nxl || req.iv < 0 || req.iv >= Param::Nv ||
+            req.imu < 0 || req.imu >= Param::Nmu ||
+            !std::isfinite(req.mass) || req.mass < 0.0) {
+            return r;
+        }
+        const double stored = f[idx3(ng + il, req.iv, req.imu)];
+        if (!std::isfinite(stored) || stored < 0.0) return r;
+        const double tolerance =
+            64.0 * std::numeric_limits<double>::epsilon() *
+            std::max(1.0, stored);
+        if (req.mass > stored + tolerance) return r;
+    }
+
+    // Apply: subtract exactly the requested masses and accumulate the
+    // removed moments with the shared production formula.
+    r.valid = true;
+    r.complete = true;
+    for (size_t q = 0; q < requests.size(); ++q) {
+        const ConversionMassRequest& req = requests[q];
+        const int il = req.ix_global - sgrid->ix_start;
+        const size_t slot = idx3(ng + il, req.iv, req.imu);
+        f[slot] -= req.mass;
+        double number, px, energy, jx_dx, pixx_dx, piperp_dx;
+        mass_cell_moments(req.mass, cgrid.upar_cells[req.iv],
+                          cgrid.uperp_cells[req.imu], number, px, energy,
+                          jx_dx, pixx_dx, piperp_dx);
+        r.number_removed += number;
+        r.px_removed += px;
+        r.energy_removed += energy;
+        r.jx_dx_removed += jx_dx;
+        r.pixx_dx_removed += pixx_dx;
+        r.piperp_dx_removed += piperp_dx;
+        r.number_scale += std::fabs(number);
+        r.px_scale += std::fabs(px);
+        r.energy_scale += std::fabs(energy);
+        r.jx_scale += std::fabs(jx_dx);
+        r.pixx_scale += std::fabs(pixx_dx);
+        r.piperp_scale += std::fabs(piperp_dx);
+    }
+    return r;
+}
+
+bool Species::validate_return_masses(
+    const std::vector<ReturnMassRequest>& requests) const
+{
+    if (!cylindrical_mass_representation || !sgrid) return false;
+    const int ng = sgrid->nghost;
+    const int nxl = sgrid->nx_local;
+    std::map<size_t, double> additions;
+    for (size_t q = 0; q < requests.size(); ++q) {
+        const ReturnMassRequest& req = requests[q];
+        const int il = req.ix_global - sgrid->ix_start;
+        if (il < 0 || il >= nxl || req.iv < 0 || req.iv >= Param::Nv ||
+            req.imu < 0 || req.imu >= Param::Nmu ||
+            !std::isfinite(req.mass) || req.mass < 0.0) return false;
+        const size_t id = idx3(ng + il, req.iv, req.imu);
+        const double next = additions[id] + req.mass;
+        if (!std::isfinite(next)) return false;
+        additions[id] = next;
+    }
+    for (std::map<size_t, double>::const_iterator it = additions.begin();
+         it != additions.end(); ++it) {
+        const double old = f[it->first];
+        if (!std::isfinite(old) || !std::isfinite(old + it->second) ||
+            old + it->second < 0.0) return false;
+    }
+    return true;
+}
+
+SpeciesReturnResult Species::add_return_masses(
+    const std::vector<ReturnMassRequest>& requests)
+{
+    SpeciesReturnResult r;
+    if (!validate_return_masses(requests)) return r;
+    const int ng = sgrid->nghost;
+    r.valid = true;
+    r.complete = true;
+    for (size_t q = 0; q < requests.size(); ++q) {
+        const ReturnMassRequest& req = requests[q];
+        const int il = req.ix_global - sgrid->ix_start;
+        f[idx3(ng + il, req.iv, req.imu)] += req.mass;
+        double n, px, e, jx, pixx, piperp;
+        mass_cell_moments(req.mass, cgrid.upar_cells[req.iv],
+                          cgrid.uperp_cells[req.imu], n, px, e, jx,
+                          pixx, piperp);
+        r.number_added += n; r.px_added += px; r.energy_added += e;
+        r.jx_dx_added += jx; r.pixx_dx_added += pixx;
+        r.piperp_dx_added += piperp;
+        r.number_scale += std::fabs(n); r.px_scale += std::fabs(px);
+        r.energy_scale += std::fabs(e); r.jx_scale += std::fabs(jx);
+        r.pixx_scale += std::fabs(pixx); r.piperp_scale += std::fabs(piperp);
+    }
+    return r;
 }

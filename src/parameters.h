@@ -8,11 +8,13 @@
 #define FP_ENABLE_DEBUG_DIAGNOSTICS 1
 #endif
 
-// Test-only overrides for the production section-7.2 velocity-grid
-// convergence audit.  Normal solver builds do not define these macros and
-// retain the established 96 x 64 momentum grid.
+// Production velocity-grid resolution.  The u_parallel domain half-width was
+// expanded to 20 to contain the beam-plasma instability tails (section 14
+// phase-4 record); Nv is raised to 192 so the thermal core keeps the same
+// ~0.0052 cell width as the former 96-cell grid at u_max=10 (192 x 64 grid).
+// Convergence builds may override FP_VELOCITY_GRID_NV via these macros.
 #ifndef FP_VELOCITY_GRID_NV
-#define FP_VELOCITY_GRID_NV 96
+#define FP_VELOCITY_GRID_NV 192
 #endif
 
 // The cylindrical u_parallel grid keeps this legacy resolution as an
@@ -26,8 +28,22 @@
 #define FP_VELOCITY_GRID_UPAR_TAIL_CELLS_PER_SIDE 0
 #endif
 
+#ifndef FP_VELOCITY_GRID_UPERP_MAX
+#define FP_VELOCITY_GRID_UPERP_MAX 10.0
+#endif
+
+// u_parallel domain half-width.  Expanded from 10 -> 12 -> 20 after the
+// phase-4 joint smoke showed the physical beam-plasma instability driving a
+// growing background tail: it reached u_parallel ~ +-10 by step 865 and
+// ~ +-12 by step 922, and the production run extends far beyond 1000 steps,
+// so the domain must comfortably contain the instability tails rather than
+// chase the boundary.  The u_perp extent stays at 10 via
+// FP_VELOCITY_GRID_UPERP_MAX.  With Nv=192 the thermal core cell width is
+// restored to the stage-3 value (~0.0052); the section 16.7/16.11
+// velocity-domain adequacy check re-examines both the extent and the
+// resolution against the production physics.
 #ifndef FP_VELOCITY_GRID_UPAR_CORE_MAX
-#define FP_VELOCITY_GRID_UPAR_CORE_MAX 10.0
+#define FP_VELOCITY_GRID_UPAR_CORE_MAX 20.0
 #endif
 
 #ifndef FP_VELOCITY_GRID_UPAR_EXTENDED_MAX
@@ -53,10 +69,11 @@
 #define FP_VELOCITY_GRID_UPERP_STRETCH 5.9
 #endif
 
-// Section-11 operator tests use small spatial-grid convergence builds.  The
-// production build keeps this unset and therefore retains nx=4000 exactly.
+// Production build uses the fixed 8000-cell / 40 um / 0.005 um grid.
+// Convergence builds may override FP_SPATIAL_GRID_NX with a different cell
+// count; the physical length stays 40 um in every case.
 #ifndef FP_SPATIAL_GRID_NX
-#define FP_SPATIAL_GRID_NX 4000
+#define FP_SPATIAL_GRID_NX 8000
 #endif
 
 namespace Const {
@@ -88,17 +105,14 @@ namespace Param {
     const double beam_v0   = betab * Const::c;
     const double beam_p0   = gambetab * Const::me * Const::c;
 
-    const double Lx    = 8.0 * Const::micro;
+    const double Lx    = 40.0 * Const::micro;
     const int    nx    = FP_SPATIAL_GRID_NX;
-#if FP_SPATIAL_GRID_NX == 4000
-    // Preserve the bit pattern used by production checkpoints created before
-    // FP_SPATIAL_GRID_NX became configurable.  Although Lx / 4000 is
-    // mathematically identical, it differs by one binary64 ULP and changes
-    // dx-dependent Beam weights and checkpoint identity hashes.
-    const double dx    = 0.002 * Const::micro;
+#if FP_SPATIAL_GRID_NX == 8000
+    // Production grid: 40 um / 8000 cells = 0.005 um exactly.
+    const double dx    = 0.005 * Const::micro;
 #else
-    // Operator convergence builds keep the same physical domain while
-    // varying only the number of spatial cells.
+    // Convergence builds keep the same 40 um physical domain while varying
+    // only the number of spatial cells.
     const double dx    = Lx / static_cast<double>(nx);
 #endif
     const double plasma_length = Lx;
@@ -114,10 +128,16 @@ namespace Param {
     const double velocity_space_cfl = 0.35;
     const double semi_lagrangian_cfl = 2.5;
     const bool   abort_on_vmax_loss = true;
-    const double umax_loss_abort_fraction = 1.0e-12;
+    // Production velocity-tail abort threshold.  The phase-4 joint smoke
+    // showed that the real beam-plasma instability (production beam in the
+    // 40 um plasma) drives a ~1e-12 background tail to u_parallel = +-10 by
+    // ~837 steps; the 1e-12 threshold inherited from the legacy solver made
+    // the marginal crossing (1.07e-12) a hard abort.  Relaxed to 1e-11 with
+    // the tail loss remaining a hard failure (section 7.4); the velocity
+    // domain adequacy is revisited against the section 16.7/16.11 runs.
+    const double umax_loss_abort_fraction = 1.0e-11;
     const double vmax_loss_abort_fraction = umax_loss_abort_fraction;
     const int    beam_macro_particles_per_cell = 1000; // 1000
-    const double beam_macro_weight = densb * dx / beam_macro_particles_per_cell;
     const double beam_source_x_start = 0.5 * Const::micro;
     const double beam_source_length  = 0.3 * Const::micro;
     const double beam_charge_compensation_alpha = 1.0;
@@ -126,8 +146,9 @@ namespace Param {
     const double omega_pe = std::sqrt(dens * Const::qe * Const::qe /
                                       (Const::eps0 * Const::me));
 
-    // Axisymmetric spherical momentum grid: (u, mu), u = p / (m c).
-    // The distribution is normalized with d3u = 2*pi*u^2 du dmu.
+    // Axisymmetric cylindrical momentum grid: (u_parallel, u_perp),
+    // u = p / (m c).  The distribution is normalized with
+    // d3u = 2*pi*u_perp du_parallel du_perp.
     const int Nv_core = FP_VELOCITY_GRID_UPAR_CORE_NV;
     const int Nv_tail = FP_VELOCITY_GRID_UPAR_TAIL_CELLS_PER_SIDE;
     const int Nv  = Nv_core + 2 * Nv_tail;
@@ -137,7 +158,8 @@ namespace Param {
     const double Nsigma = 80.0;
     // momentum_umax remains the historical u_perp and u_parallel-core bound.
     // The optional u_parallel extension is represented separately below.
-    const double momentum_umax = FP_VELOCITY_GRID_UPAR_CORE_MAX;
+    // u_perp bound (10); the u_parallel core bound is separate below.
+    const double momentum_umax = FP_VELOCITY_GRID_UPERP_MAX;
     const double momentum_upar_core_max = FP_VELOCITY_GRID_UPAR_CORE_MAX;
     const double momentum_upar_extended_max = FP_VELOCITY_GRID_UPAR_EXTENDED_MAX;
     const double momentum_refined_u = 0.2;

@@ -3,5 +3,6 @@ auto.sh
 results/
 output/
 build/
+.codex_tmp_mpi/
 docs/
 EPOCH-Compare/
