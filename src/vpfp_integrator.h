@@ -473,6 +473,16 @@ struct VpfpStepResult {
     double joint_midpoint_poisson_transport_residual;
     double joint_midpoint_current_pair_residual;
     double joint_midpoint_force_charge_residual;
+    // Stage-B1 seam diagnostics (docs/VPFP_F10情形B根因定位与严格修复实施方案.md
+    // sections 9-15).  Diagnostics only: they never participate in flux,
+    // residual, Newton, Poisson, energy gate or acceptance logic.
+    double joint_midpoint_pairing_face_left;
+    double joint_midpoint_pairing_face_right;
+    double joint_midpoint_force_current_first_cell;
+    double joint_midpoint_force_current_last_cell;
+    double joint_midpoint_naive_force_current_work;
+    double joint_midpoint_seam_predicted_residual;
+    double joint_midpoint_seam_prediction_error;
     double joint_midpoint_domain_energy_change;
     double joint_midpoint_field_energy_change;
     double joint_midpoint_electrode_work;

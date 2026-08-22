@@ -139,6 +139,29 @@ public:
         const JointPhaseSpaceFluxBundle& bundle,
         double poisson_work_residual, double g_gstar_residual);
 
+    // J1 TEST TOPOLOGY ONLY.
+    //
+    // The J1 x operator is periodic: global faces 0 and Nx represent
+    // the same seam current, while the OpenElectrostaticSolver pairing
+    // field retains two distinct non-periodic physical endpoint faces
+    // with half-cell quadrature weights.
+    //
+    // Therefore the u-force cell field must be the exact weighted
+    // transpose G* of the periodic centered x-current map G.
+    //
+    // Do not replace the first/last-cell formulas with
+    // 0.5*(E_left_face + E_right_face).
+    //
+    // This is NOT the production open-boundary rule.
+    // J2 must replace the periodic seam operator with the real
+    // OpenBackgroundBoundary operator and derive its corresponding G*.
+    static bool build_periodic_x_adjoint_cell_field(
+        const SpatialGrid& sg,
+        const std::vector<double>& pairing_face,
+        int mpi_rank,
+        int mpi_size,
+        std::vector<double>& pairing_cell);
+
 private:
     static std::size_t x_index(int iface, int j, int k,
                                int nv, int nmu);

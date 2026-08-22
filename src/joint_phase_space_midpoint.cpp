@@ -584,3 +584,74 @@ JointPhaseSpaceAuditResult JointPhaseSpaceMidpointOperator::audit(
     (void)sg;
     return result;
 }
+
+bool JointPhaseSpaceMidpointOperator::build_periodic_x_adjoint_cell_field(
+    const SpatialGrid& sg,
+    const std::vector<double>& pairing_face,
+    int mpi_rank,
+    int mpi_size,
+    std::vector<double>& pairing_cell)
+{
+    // J1 TEST TOPOLOGY ONLY.
+    //
+    // The J1 x operator is periodic: global faces 0 and Nx represent
+    // the same seam current, while the OpenElectrostaticSolver pairing
+    // field retains two distinct non-periodic physical endpoint faces
+    // with half-cell quadrature weights.
+    //
+    // Therefore the u-force cell field must be the exact weighted
+    // transpose G* of the periodic centered x-current map G.
+    //
+    // Do not replace the first/last-cell formulas with
+    // 0.5*(E_left_face + E_right_face).
+    //
+    // This is NOT the production open-boundary rule.
+    // J2 must replace the periodic seam operator with the real
+    // OpenBackgroundBoundary operator and derive its corresponding G*.
+    pairing_cell.clear();
+    if (!(sg.nx_local > 0) || !(sg.nx_global >= 2) ||
+        pairing_face.size() != static_cast<size_t>(sg.nx_local) + 1 ||
+        mpi_rank < 0 || mpi_rank >= mpi_size || mpi_size < 1) {
+        return false;
+    }
+    for (size_t i = 0; i < pairing_face.size(); ++i) {
+        if (!std::isfinite(pairing_face[i]))
+            return false;
+    }
+    double endpoint_local[2] = {0.0, 0.0};
+    if (mpi_rank == 0)
+        endpoint_local[0] = pairing_face.front();
+    if (mpi_rank == mpi_size - 1)
+        endpoint_local[1] = pairing_face.back();
+    double endpoint_global[2] = {0.0, 0.0};
+    MPI_Allreduce(endpoint_local, endpoint_global, 2, MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+    const double e_left = endpoint_global[0];
+    const double e_right = endpoint_global[1];
+    if (!std::isfinite(e_left) || !std::isfinite(e_right))
+        return false;
+    pairing_cell.assign(static_cast<size_t>(sg.nx_local), 0.0);
+    for (int ix = 0; ix < sg.nx_local; ++ix) {
+        const int ig = sg.ix_start + ix;
+        if (ig == 0) {
+            pairing_cell[static_cast<size_t>(ix)] =
+                0.5 * pairing_face[static_cast<size_t>(ix + 1)] +
+                0.25 * (e_left + e_right);
+        } else if (ig == sg.nx_global - 1) {
+            pairing_cell[static_cast<size_t>(ix)] =
+                0.5 * pairing_face[static_cast<size_t>(ix)] +
+                0.25 * (e_left + e_right);
+        } else {
+            pairing_cell[static_cast<size_t>(ix)] =
+                0.5 * (pairing_face[static_cast<size_t>(ix)] +
+                       pairing_face[static_cast<size_t>(ix + 1)]);
+        }
+    }
+    for (size_t i = 0; i < pairing_cell.size(); ++i) {
+        if (!std::isfinite(pairing_cell[i])) {
+            pairing_cell.clear();
+            return false;
+        }
+    }
+    return true;
+}

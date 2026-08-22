@@ -3128,6 +3128,13 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
     result.joint_midpoint_poisson_residual_linf = 0.0;
     result.joint_midpoint_energy_residual = 0.0;
     result.joint_midpoint_pairing_field_built = false;
+    result.joint_midpoint_pairing_face_left = 0.0;
+    result.joint_midpoint_pairing_face_right = 0.0;
+    result.joint_midpoint_force_current_first_cell = 0.0;
+    result.joint_midpoint_force_current_last_cell = 0.0;
+    result.joint_midpoint_naive_force_current_work = 0.0;
+    result.joint_midpoint_seam_predicted_residual = 0.0;
+    result.joint_midpoint_seam_prediction_error = 0.0;
     result.accepted = false;
     result.finite = true;
     result.cfl_ok = dt > 0.0;
@@ -3282,14 +3289,15 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
                         result.joint_midpoint_pairing_field_built || pairing_ok;
                     local_ok = pairing_ok;
                 }
-                std::vector<double> e_pair_cell(
-                    static_cast<size_t>(grid_.nx_local), 0.0);
+                std::vector<double> e_pair_cell;
                 if (local_ok && pairing_face.size() ==
                         static_cast<size_t>(grid_.nx_local + 1)) {
-                    for (int ix = 0; ix < grid_.nx_local; ++ix)
-                        e_pair_cell[static_cast<size_t>(ix)] = 0.5 *
-                            (pairing_face[static_cast<size_t>(ix)] +
-                             pairing_face[static_cast<size_t>(ix + 1)]);
+                    const bool adjoint_ok =
+                        JointPhaseSpaceMidpointOperator::
+                            build_periodic_x_adjoint_cell_field(
+                                grid_, pairing_face, mpi_rank, mpi_size,
+                                e_pair_cell);
+                    local_ok = local_ok && adjoint_ok;
                 } else {
                     local_ok = false;
                 }
@@ -3685,12 +3693,16 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
     const std::vector<double> hamiltonian_velocity =
         JointPhaseSpaceMidpointOperator::build_hamiltonian_velocity(
             electrons.cgrid);
-    std::vector<double> final_pairing_cell(
-        static_cast<size_t>(grid_.nx_local), 0.0);
-    for (int ix = 0; ix < grid_.nx_local; ++ix) {
-        final_pairing_cell[static_cast<size_t>(ix)] = 0.5 *
-            (final_pairing_face[static_cast<size_t>(ix)] +
-             final_pairing_face[static_cast<size_t>(ix + 1)]);
+    std::vector<double> final_pairing_cell;
+    const bool final_adjoint_ok =
+        JointPhaseSpaceMidpointOperator::
+            build_periodic_x_adjoint_cell_field(
+                grid_, final_pairing_face, mpi_rank, mpi_size,
+                final_pairing_cell);
+    if (!final_adjoint_ok) {
+        result.failure_code = 71;
+        result.failure_stage = "joint_midpoint_final_x_adjoint_field";
+        return result;
     }
     for (int ix = 0; ix < grid_.nx_local; ++ix) {
         // accepted_bundle and candidate are rank-local slabs here too.
@@ -3807,6 +3819,65 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
     result.joint_midpoint_force_charge_residual =
         result.joint_midpoint_force_current_work -
         result.joint_midpoint_charge_current_work;
+    std::vector<double> force_current_cell(
+        static_cast<size_t>(grid_.nx_local), 0.0);
+    for (int ix = 0; ix < grid_.nx_local; ++ix) {
+        long double sum = 0.0L;
+        const size_t base = static_cast<size_t>(ix) * nq;
+        for (int q = 0; q < nq; ++q) {
+            const double midpoint_mass = 0.5 *
+                (m_old[base + static_cast<size_t>(q)] +
+                 candidate[base + static_cast<size_t>(q)]);
+            sum += static_cast<long double>(
+                       hamiltonian_velocity[static_cast<size_t>(q)]) *
+                   static_cast<long double>(midpoint_mass);
+        }
+        force_current_cell[static_cast<size_t>(ix)] =
+            (-Const::qe) * static_cast<double>(sum) / grid_.dx;
+    }
+    long double local_naive_force_current_work = 0.0L;
+    for (int ix = 0; ix < grid_.nx_local; ++ix) {
+        const double naive_pairing_cell = 0.5 *
+            (final_pairing_face[static_cast<size_t>(ix)] +
+             final_pairing_face[static_cast<size_t>(ix + 1)]);
+        local_naive_force_current_work +=
+            static_cast<long double>(dt) *
+            static_cast<long double>(grid_.dx) *
+            static_cast<long double>(naive_pairing_cell) *
+            static_cast<long double>(
+                force_current_cell[static_cast<size_t>(ix)]);
+    }
+    double global_naive_force_current_work = 0.0;
+    const double local_naive_force_current_work_double =
+        static_cast<double>(local_naive_force_current_work);
+    MPI_Allreduce(&local_naive_force_current_work_double,
+                  &global_naive_force_current_work, 1, MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+    result.joint_midpoint_naive_force_current_work =
+        global_naive_force_current_work;
+    double endpoint_local[4] = {0.0, 0.0, 0.0, 0.0};
+    if (mpi_rank == 0) {
+        endpoint_local[0] = final_pairing_face.front();
+        endpoint_local[2] = force_current_cell.front();
+    }
+    if (mpi_rank == mpi_size - 1) {
+        endpoint_local[1] = final_pairing_face.back();
+        endpoint_local[3] = force_current_cell.back();
+    }
+    double endpoint_global[4] = {0.0, 0.0, 0.0, 0.0};
+    MPI_Allreduce(endpoint_local, endpoint_global, 4, MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+    result.joint_midpoint_pairing_face_left = endpoint_global[0];
+    result.joint_midpoint_pairing_face_right = endpoint_global[1];
+    result.joint_midpoint_force_current_first_cell = endpoint_global[2];
+    result.joint_midpoint_force_current_last_cell = endpoint_global[3];
+    const double seam_pred =
+        0.25 * dt * grid_.dx *
+        (endpoint_global[0] - endpoint_global[1]) *
+        (endpoint_global[2] - endpoint_global[3]);
+    result.joint_midpoint_seam_predicted_residual = seam_pred;
+    result.joint_midpoint_seam_prediction_error =
+        result.joint_midpoint_force_charge_residual - seam_pred;
     result.joint_midpoint_poisson_transport_residual =
         poisson_work.field_energy_change - poisson_work.electrode_work +
         result.joint_midpoint_charge_current_work;

@@ -224,6 +224,188 @@ long double production_potential_work_extended(
     return work;
 }
 
+struct PeriodicSeamAdjointResult {
+    bool selected;
+    bool helper_ok;
+    bool endpoint_asymmetry_pass;
+    bool weighted_adjoint_pass;
+    bool prediction_nonzero_pass;
+    bool prediction_identity_pass;
+    bool passed;
+    double weighted_adjoint_relative_error;
+    double w_f_adjoint;
+    double w_j;
+    double w_f_naive;
+    double old_naive_mismatch;
+    double seam_predicted_residual;
+    double prediction_error;
+    double pairing_face_left;
+    double pairing_face_right;
+    double force_current_first_cell;
+    double force_current_last_cell;
+    PeriodicSeamAdjointResult()
+        : selected(false), helper_ok(false), endpoint_asymmetry_pass(false),
+          weighted_adjoint_pass(false), prediction_nonzero_pass(false),
+          prediction_identity_pass(false), passed(false),
+          weighted_adjoint_relative_error(0.0), w_f_adjoint(0.0), w_j(0.0),
+          w_f_naive(0.0), old_naive_mismatch(0.0),
+          seam_predicted_residual(0.0), prediction_error(0.0),
+          pairing_face_left(0.0), pairing_face_right(0.0),
+          force_current_first_cell(0.0), force_current_last_cell(0.0) {}
+};
+
+// J0-E2 (stage B4): isolated verification that the production periodic-seam
+// weighted adjoint helper closes W_F == W_J globally, including the seam
+// faces 0 and Nx that the pre-existing J0-E interior-face loop never visits.
+PeriodicSeamAdjointResult run_periodic_seam_adjoint_test(int rank, int size)
+{
+    PeriodicSeamAdjointResult result;
+    result.selected = true;
+    const double eps_gate = 8192.0 * std::numeric_limits<double>::epsilon();
+
+    SpatialGrid sg;
+    sg.init_with_domain(rank, size, 4, 4.0e-6);
+    CylindricalVelocityGrid vg;
+    vg.init_grid(1.5, 32, 8, 32, 0, 1.5, 1.5, 2.0);
+    const int nx = sg.nx_global;
+    const int nv = static_cast<int>(vg.upar_cells.size());
+    const int nmu = static_cast<int>(vg.uperp_cells.size());
+    const size_t count = static_cast<size_t>(nx * nv * nmu);
+    const double u_extent = std::max(
+        std::fabs(vg.upar_cells.front()), std::fabs(vg.upar_cells.back()));
+
+    // B4.1: deterministic positive midpoint mass with no u_parallel symmetry
+    // and a monotone x tilt, so the first-cell and last-cell force currents
+    // cannot coincide.
+    std::vector<double> m_mid(count, 0.0);
+    for (int ix = 0; ix < nx; ++ix) {
+        const double x_tilt =
+            1.0 + 0.25 * ((static_cast<double>(ix) + 0.5) /
+                          static_cast<double>(nx) - 0.5);
+        for (int j = 0; j < nv; ++j) {
+            for (int k = 0; k < nmu; ++k) {
+                const double u = vg.upar_cells[static_cast<size_t>(j)];
+                const double up = vg.uperp_cells[static_cast<size_t>(k)];
+                const double shape = std::exp(-(u * u + up * up) / 0.35);
+                const double asymmetric_factor =
+                    1.0 + 0.15 * u / u_extent + 0.03 * std::sin(
+                        2.0 * Const::pi * static_cast<double>((ix + 1) *
+                        (k + 1)) / static_cast<double>(nx * nmu));
+                m_mid[cell_index(ix, j, k, nv, nmu)] =
+                    1.0e20 * x_tilt * asymmetric_factor * shape *
+                    vg.cell_phase_volume(j, k);
+            }
+        }
+    }
+    // Artificial non-periodic pairing face with distinct physical endpoints.
+    std::vector<double> pairing_face(static_cast<size_t>(nx) + 1, 0.0);
+    for (int f = 0; f <= nx; ++f) {
+        pairing_face[static_cast<size_t>(f)] =
+            2.0e8 * (1.0 + 0.5 * std::sin(
+                2.0 * Const::pi * static_cast<double>(f) /
+                static_cast<double>(nx))) +
+            5.0e7 * static_cast<double>(f) / static_cast<double>(nx);
+    }
+
+    std::vector<double> e_cell(static_cast<size_t>(nx), 2.0e8);
+    const double dt = 1.0e-18;
+    // B4.3: production x bundle only; charge_current_face is never rebuilt.
+    const JointPhaseSpaceFluxBundle bundle =
+        JointPhaseSpaceMidpointOperator::build_periodic_center_flux(
+            sg, vg, m_mid, e_cell, dt);
+    // B4.2: force current from the production Hamiltonian velocity.
+    const std::vector<double> hamiltonian_velocity =
+        JointPhaseSpaceMidpointOperator::build_hamiltonian_velocity(vg);
+    std::vector<double> force_current(static_cast<size_t>(nx), 0.0);
+    for (int ix = 0; ix < nx; ++ix) {
+        long double sum = 0.0L;
+        for (int j = 0; j < nv; ++j) {
+            for (int k = 0; k < nmu; ++k) {
+                const size_t q = static_cast<size_t>(j * nmu + k);
+                sum += static_cast<long double>(hamiltonian_velocity[q]) *
+                    static_cast<long double>(
+                        m_mid[cell_index(ix, j, k, nv, nmu)]);
+            }
+        }
+        force_current[static_cast<size_t>(ix)] = static_cast<double>(
+            static_cast<long double>(-Const::qe) * sum /
+            static_cast<long double>(sg.dx));
+    }
+
+    result.pairing_face_left = pairing_face.front();
+    result.pairing_face_right = pairing_face.back();
+    result.force_current_first_cell = force_current.front();
+    result.force_current_last_cell = force_current.back();
+    result.endpoint_asymmetry_pass =
+        result.pairing_face_left != result.pairing_face_right &&
+        result.force_current_first_cell != result.force_current_last_cell;
+
+    // B4.4: production weighted-adjoint helper.
+    std::vector<double> e_adjoint;
+    result.helper_ok =
+        JointPhaseSpaceMidpointOperator::build_periodic_x_adjoint_cell_field(
+            sg, pairing_face, rank, size, e_adjoint);
+
+    // B4.5: two independent work sums, no shared helper.
+    long double w_f_adjoint = 0.0L;
+    long double w_f_naive = 0.0L;
+    for (int ix = 0; ix < nx; ++ix) {
+        w_f_adjoint += static_cast<long double>(dt) *
+            static_cast<long double>(sg.dx) *
+            static_cast<long double>(e_adjoint[static_cast<size_t>(ix)]) *
+            static_cast<long double>(force_current[static_cast<size_t>(ix)]);
+        const double naive_field = 0.5 *
+            (pairing_face[static_cast<size_t>(ix)] +
+             pairing_face[static_cast<size_t>(ix + 1)]);
+        w_f_naive += static_cast<long double>(dt) *
+            static_cast<long double>(sg.dx) *
+            static_cast<long double>(naive_field) *
+            static_cast<long double>(force_current[static_cast<size_t>(ix)]);
+    }
+    long double w_j = 0.0L;
+    for (int iface = 0; iface <= nx; ++iface) {
+        const double weight =
+            (iface == 0 || iface == nx) ? 0.5 : 1.0;
+        w_j += static_cast<long double>(dt) *
+            static_cast<long double>(weight * sg.dx) *
+            static_cast<long double>(pairing_face[static_cast<size_t>(iface)]) *
+            static_cast<long double>(bundle.charge_current_face[
+                static_cast<size_t>(iface)]);
+    }
+    result.w_f_adjoint = static_cast<double>(w_f_adjoint);
+    result.w_f_naive = static_cast<double>(w_f_naive);
+    result.w_j = static_cast<double>(w_j);
+    result.old_naive_mismatch =
+        result.w_f_naive - result.w_j;
+    // B4.6: analytic seam prediction of the old naive-gather mismatch.
+    result.seam_predicted_residual = 0.25 * dt * sg.dx *
+        (result.pairing_face_left - result.pairing_face_right) *
+        (result.force_current_first_cell -
+         result.force_current_last_cell);
+    result.prediction_error = std::fabs(result.old_naive_mismatch -
+                                        result.seam_predicted_residual);
+
+    const double work_scale = std::max(
+        1.0, std::max(std::fabs(result.w_f_adjoint),
+                      std::fabs(result.w_j)));
+    result.weighted_adjoint_relative_error =
+        std::fabs(result.w_f_adjoint - result.w_j) / work_scale;
+    result.weighted_adjoint_pass = result.helper_ok &&
+        result.weighted_adjoint_relative_error <= eps_gate;
+    const double naive_scale = std::max(
+        1.0, std::max(std::fabs(result.w_f_naive),
+                      std::fabs(result.w_j)));
+    result.prediction_nonzero_pass =
+        std::fabs(result.old_naive_mismatch) >
+        eps_gate * naive_scale;
+    result.prediction_identity_pass = result.prediction_error <=
+        eps_gate * std::max(1.0, std::fabs(result.seam_predicted_residual));
+    result.passed = result.helper_ok && result.endpoint_asymmetry_pass &&
+        result.weighted_adjoint_pass && result.prediction_nonzero_pass &&
+        result.prediction_identity_pass;
+    return result;
+}
+
 ScenarioResult run_scenario(const Scenario& scenario, int rank, int size)
 {
     ScenarioResult result;
@@ -586,14 +768,16 @@ ScenarioResult run_scenario(const Scenario& scenario, int rank, int size)
 }
 
 void write_result(std::ostream& out, const std::vector<ScenarioResult>& results,
-                  const UFluxGeometryResult& geometry)
+                  const UFluxGeometryResult& geometry,
+                  const PeriodicSeamAdjointResult* seam)
 {
     double max_mass = 0.0;
     double max_kinetic = 0.0;
     double max_poisson = 0.0;
     double max_combined = 0.0;
     double max_pairing = 0.0;
-    bool pass = !results.empty() && geometry.passed;
+    bool pass = !results.empty() && geometry.passed &&
+        (!seam || !seam->selected || seam->passed);
     bool j0_c = !results.empty();
     bool j0_d = !results.empty();
     bool j0_e = !results.empty();
@@ -709,6 +893,34 @@ void write_result(std::ostream& out, const std::vector<ScenarioResult>& results,
         << "u_boundary_condition=zero_inflow_zero_outflow_ledger\n"
         << "x_trace=periodic_center_trace\n"
         << "combined_energy_definition=kinetic_plus_poisson_identity_residual\n";
+    if (seam && seam->selected) {
+        out << "j0_e2_periodic_seam_weighted_adjoint_pass="
+            << (seam->passed ? 1 : 0) << "\n"
+            << "j0_e2_helper_ok=" << (seam->helper_ok ? 1 : 0) << "\n"
+            << "j0_e2_endpoint_asymmetry_pass="
+            << (seam->endpoint_asymmetry_pass ? 1 : 0) << "\n"
+            << "j0_e2_weighted_adjoint_pass="
+            << (seam->weighted_adjoint_pass ? 1 : 0) << "\n"
+            << "j0_e2_prediction_nonzero_pass="
+            << (seam->prediction_nonzero_pass ? 1 : 0) << "\n"
+            << "j0_e2_prediction_identity_pass="
+            << (seam->prediction_identity_pass ? 1 : 0) << "\n"
+            << "j0_e2_weighted_adjoint_relative_error="
+            << seam->weighted_adjoint_relative_error << "\n"
+            << "j0_e2_w_f_adjoint=" << seam->w_f_adjoint << "\n"
+            << "j0_e2_w_j=" << seam->w_j << "\n"
+            << "j0_e2_w_f_naive=" << seam->w_f_naive << "\n"
+            << "j0_e2_old_naive_mismatch=" << seam->old_naive_mismatch << "\n"
+            << "j0_e2_seam_predicted_residual="
+            << seam->seam_predicted_residual << "\n"
+            << "j0_e2_prediction_error=" << seam->prediction_error << "\n"
+            << "j0_e2_pairing_face_left=" << seam->pairing_face_left << "\n"
+            << "j0_e2_pairing_face_right=" << seam->pairing_face_right << "\n"
+            << "j0_e2_force_current_first_cell="
+            << seam->force_current_first_cell << "\n"
+            << "j0_e2_force_current_last_cell="
+            << seam->force_current_last_cell << "\n";
+    }
 }
 
 } // namespace
@@ -764,17 +976,26 @@ int main(int argc, char** argv)
     UFluxGeometryResult geometry;
     if (test_case == "all") geometry = run_u_flux_geometry_test(rank, size);
 
+    PeriodicSeamAdjointResult seam_result;
+    const bool seam_selected = test_case == "all";
+    if (seam_selected)
+        seam_result = run_periodic_seam_adjoint_test(rank, size);
+
     bool pass = true;
     for (size_t i = 0; i < results.size(); ++i) pass = pass && results[i].passed;
+    if (!geometry.passed) pass = false;
+    if (seam_selected && !seam_result.passed) pass = false;
     if (rank == 0) {
         std::cout << std::setprecision(17);
-        write_result(std::cout, results, geometry);
+        write_result(std::cout, results, geometry,
+                     seam_selected ? &seam_result : 0);
         if (!result_path.empty()) {
             std::ofstream out(result_path.c_str(), std::ios::trunc);
             if (!out) pass = false;
             else {
                 out << std::setprecision(17);
-                write_result(out, results, geometry);
+                write_result(out, results, geometry,
+                             seam_selected ? &seam_result : 0);
             }
         }
     }
