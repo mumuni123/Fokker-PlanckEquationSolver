@@ -49,11 +49,27 @@ struct OpenPoissonWorkIdentity {
     double residual;
     double scale;
     bool finite;
+    // Stage A-FS (section 7C): stable-summation diagnostics.  These never
+    // enter Gate F or correct any field value.
+    double field_energy_change_direct;
+    double field_energy_change_from_totals;
+    double field_energy_change_reconstruction_error;
+    double term_abs_sum_energy_before;
+    double term_abs_sum_energy_after;
+    double term_abs_sum_potential_charge;
+    bool stable_accumulation_used;
     OpenPoissonWorkIdentity()
         : field_energy_before(0.0), field_energy_after(0.0),
           field_energy_change(0.0), electrode_work(0.0),
           potential_charge_work(0.0), residual(0.0), scale(1.0),
-          finite(false) {}
+          finite(false),
+          field_energy_change_direct(0.0),
+          field_energy_change_from_totals(0.0),
+          field_energy_change_reconstruction_error(0.0),
+          term_abs_sum_energy_before(0.0),
+          term_abs_sum_energy_after(0.0),
+          term_abs_sum_potential_charge(0.0),
+          stable_accumulation_used(false) {}
 };
 
 class OpenElectrostaticSolver {

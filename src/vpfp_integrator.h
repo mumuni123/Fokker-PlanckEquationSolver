@@ -15,8 +15,26 @@
 #include "vlasov_split_step.h"
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
+
+// A4 candidate/iteration diagnostics.  This extends the existing midpoint
+// audit without changing the legacy JointPhaseSpaceIterationRecord ABI.
+struct VpfpJointPhaseSpaceIterationRecord
+    : public JointPhaseSpaceIterationRecord {
+    double poisson_current_relative;
+    double poisson_current_residual;
+    double weighted_continuity_defect;
+    int phase_converged;
+    int poisson_converged;
+    int pairing_converged;
+    VpfpJointPhaseSpaceIterationRecord()
+        : JointPhaseSpaceIterationRecord(),
+          poisson_current_relative(std::numeric_limits<double>::infinity()),
+          poisson_current_residual(0.0), weighted_continuity_defect(0.0),
+          phase_converged(0), poisson_converged(0), pairing_converged(0) {}
+};
 
 struct VpfpStepLedger {
     double background_number_before;
@@ -483,12 +501,86 @@ struct VpfpStepResult {
     double joint_midpoint_naive_force_current_work;
     double joint_midpoint_seam_predicted_residual;
     double joint_midpoint_seam_prediction_error;
+    // Stage-A1 read-only Poisson-current pairing decomposition diagnostics
+    // (docs/VPFP_F10情形A_连续性Poisson功配对严格修复实施方案.md section 5).
+    // Diagnostics only: they never participate in flux, residual, Newton,
+    // Poisson, energy gate or acceptance logic.
+    double joint_midpoint_poisson_scalar_identity_residual;
+    double joint_midpoint_continuity_charge_linf;
+    double joint_midpoint_continuity_charge_l1;
+    double joint_midpoint_residual_charge_linf;
+    double joint_midpoint_charge_projection_mismatch_linf;
+    double joint_midpoint_u_boundary_charge_linf;
+    double joint_midpoint_potential_weighted_continuity_defect;
+    double joint_midpoint_poisson_current_predicted_residual;
+    double joint_midpoint_poisson_current_prediction_error;
+    double joint_midpoint_continuity_roundoff_bound;
+    double joint_midpoint_prediction_roundoff_bound;
+    int joint_midpoint_continuity_first_bad_global_ix;
+    // Stage-A-S0 read-only charge-assembly decomposition diagnostics
+    // (docs/VPFP_F10情形A_连续性Poisson功配对严格修复实施方案.md section 7A).
+    // Diagnostics only: they never modify rho assembly, Poisson, flux,
+    // Newton, energy gate or acceptance logic.
+    double joint_midpoint_density_assembly_mismatch_linf;
+    double joint_midpoint_density_assembly_mismatch_l1;
+    double joint_midpoint_density_assembly_roundoff_bound;
+    double joint_midpoint_mass_transport_charge_linf;
+    double joint_midpoint_mass_transport_roundoff_bound;
+    double joint_midpoint_transport_projection_mismatch_linf;
+    double joint_midpoint_parent_charge_scale_max;
+    double joint_midpoint_mass_delta_charge_linf;
+    int joint_midpoint_density_assembly_first_bad_global_ix;
+    int joint_midpoint_mass_transport_first_bad_global_ix;
+    double joint_midpoint_potential_weighted_assembly_defect;
+    double joint_midpoint_potential_weighted_transport_defect;
+    double joint_midpoint_weighted_defect_reconstruction_error;
+    // Stage-A-S1 (section 7B.4) read-only incremental-vs-absolute rho form
+    // comparison for the same final candidate.  Diagnostics only; the
+    // absolute form never overwrites the incremental result.
+    double joint_midpoint_candidate_rho_incremental;
+    double joint_midpoint_candidate_rho_absolute;
+    double joint_midpoint_candidate_rho_form_difference;
+    double joint_midpoint_candidate_rho_form_roundoff_bound;
+    // Minimal read-only Poisson identity acceptance fields: they expose the
+    // production OpenPoissonWorkIdentity scale/residual verbatim and apply
+    // the established 8192*eps gate without any relaxation.
+    double joint_midpoint_poisson_identity_scale;
+    double joint_midpoint_poisson_identity_roundoff_bound;
+    int joint_midpoint_poisson_scalar_identity_pass;
+    int joint_midpoint_poisson_identity_finite;
+    double joint_midpoint_poisson_identity_residual_to_bound_ratio;
+    // Stage A-FS-R1: dual Gate F sets (section 7C.10.6).  The legacy 8192
+    // gate stays visible; the production alias maps to 16384.
+    double joint_midpoint_poisson_identity_roundoff_bound_8192;
+    double joint_midpoint_poisson_identity_roundoff_bound_16384;
+    double joint_midpoint_poisson_identity_residual_to_bound_ratio_8192;
+    double joint_midpoint_poisson_identity_residual_to_bound_ratio_16384;
+    int joint_midpoint_poisson_scalar_identity_pass_8192;
+    int joint_midpoint_poisson_scalar_identity_pass_16384;
+    // Read-only absolute accumulation scales of the three local integrals
+    // inside evaluate_work_identity() (summation-error diagnosis only).
+    double joint_midpoint_poisson_term_abs_sum_energy_before;
+    double joint_midpoint_poisson_term_abs_sum_energy_after;
+    double joint_midpoint_poisson_term_abs_sum_potential_charge;
     double joint_midpoint_domain_energy_change;
+    // A4 candidate metric from the same state/eval_fields/flux bundle.
+    double joint_midpoint_candidate_poisson_current_residual;
+    double joint_midpoint_candidate_poisson_current_scale;
+    double joint_midpoint_candidate_poisson_current_relative;
+    double joint_midpoint_pairing_tolerance;
+    double joint_midpoint_candidate_poisson_scalar_residual;
+    double joint_midpoint_candidate_weighted_continuity_defect;
+    int joint_midpoint_phase_converged;
+    int joint_midpoint_poisson_converged;
+    int joint_midpoint_pairing_converged;
+    int joint_midpoint_recent_pairing_relative_count;
+    double joint_midpoint_recent_pairing_relative[3];
     double joint_midpoint_field_energy_change;
     double joint_midpoint_electrode_work;
     double joint_midpoint_min_mass;
     double joint_midpoint_max_mass;
-    std::vector<JointPhaseSpaceIterationRecord> joint_midpoint_iterations_log;
+    std::vector<VpfpJointPhaseSpaceIterationRecord>
+        joint_midpoint_iterations_log;
 };
 
 // Stage-H6 accepted-level cumulative tail ledgers (per-rank local) and

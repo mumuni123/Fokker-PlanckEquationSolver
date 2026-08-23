@@ -6,6 +6,30 @@
 #include <limits>
 #include <mpi.h>
 
+namespace {
+
+// Stage A-FS (section 7C.3): file-local Neumaier-compensated accumulator in
+// long double.  No global state; summation order is unchanged.
+struct LongDoubleNeumaierSum {
+    long double sum;
+    long double correction;
+
+    LongDoubleNeumaierSum() : sum(0.0L), correction(0.0L) {}
+
+    void add(long double value) {
+        const long double trial = sum + value;
+        if (std::fabs(sum) >= std::fabs(value))
+            correction += (sum - trial) + value;
+        else
+            correction += (value - trial) + sum;
+        sum = trial;
+    }
+
+    long double value() const { return sum + correction; }
+};
+
+} // namespace
+
 OpenElectrostaticSolver::OpenElectrostaticSolver()
 {
     boundary_.type = ElectrostaticBoundaryType::LEFT_E;
@@ -259,44 +283,114 @@ OpenPoissonWorkIdentity OpenElectrostaticSolver::evaluate_work_identity(
         before.phi.size() < static_cast<size_t>(ng + nxl) ||
         after.phi.size() < static_cast<size_t>(ng + nxl) ||
         rho_delta.size() < static_cast<size_t>(ng + nxl)) {
+        // stable_accumulation_used stays false on the early-return path.
         return result;
     }
 
-    double local[3] = { 0.0, 0.0, 0.0 };
+    // Stage A-FS (section 7C.4): every cell operation converts to long
+    // double first; field_energy_change is accumulated directly per cell
+    // with a factorized expression instead of subtracting two large global
+    // totals.
+    LongDoubleNeumaierSum energy_before_sum;
+    LongDoubleNeumaierSum energy_after_sum;
+    LongDoubleNeumaierSum field_delta_sum;
+    LongDoubleNeumaierSum potential_charge_sum;
+    LongDoubleNeumaierSum abs_before_sum;
+    LongDoubleNeumaierSum abs_after_sum;
+    LongDoubleNeumaierSum abs_potential_charge_sum;
+    const long double dx_ld = static_cast<long double>(grid_.dx);
+    const long double eps0_ld = static_cast<long double>(Const::eps0);
     for (int ix = 0; ix < nxl; ++ix) {
-        const double old_left = before.Ex_face[static_cast<size_t>(ix)];
-        const double old_right = before.Ex_face[static_cast<size_t>(ix + 1)];
-        const double new_left = after.Ex_face[static_cast<size_t>(ix)];
-        const double new_right = after.Ex_face[static_cast<size_t>(ix + 1)];
-        local[0] += Const::eps0 * grid_.dx *
-            (old_left * old_left + old_left * old_right +
-             old_right * old_right) / 6.0;
-        local[1] += Const::eps0 * grid_.dx *
-            (new_left * new_left + new_left * new_right +
-             new_right * new_right) / 6.0;
+        // Section 7C.4: convert all face values to long double first.
+        const long double old_l = static_cast<long double>(
+            before.Ex_face[static_cast<size_t>(ix)]);
+        const long double old_r = static_cast<long double>(
+            before.Ex_face[static_cast<size_t>(ix + 1)]);
+        const long double new_l = static_cast<long double>(
+            after.Ex_face[static_cast<size_t>(ix)]);
+        const long double new_r = static_cast<long double>(
+            after.Ex_face[static_cast<size_t>(ix + 1)]);
+        const long double cell_factor = eps0_ld * dx_ld / 6.0L;
+        // Field-energy cell term keeps the original discrete definition:
+        // U_E,i = eps0*dx/6 * (E_L^2 + E_L*E_R + E_R^2).
+        const long double term_before =
+            cell_factor *
+            (old_l * old_l + old_l * old_r + old_r * old_r);
+        const long double term_after =
+            cell_factor *
+            (new_l * new_l + new_l * new_r + new_r * new_r);
+        energy_before_sum.add(term_before);
+        energy_after_sum.add(term_after);
+        abs_before_sum.add(std::fabs(term_before));
+        abs_after_sum.add(std::fabs(term_after));
+        // Factorized per-cell direct difference (algebraically identical to
+        // term_after - term_before, but without local cancellation):
+        // dU_i = eps0*dx/6 * [ dL*(nL+oL) + dL*nR + oL*dR + dR*(nR+oR) ].
+        const long double d_left = new_l - old_l;
+        const long double d_right = new_r - old_r;
+        field_delta_sum.add(cell_factor *
+            (d_left * (new_l + old_l) +
+             d_left * new_r +
+             old_l * d_right +
+             d_right * (new_r + old_r)));
         // rho is a finite-volume cell average.  The production reconstruction
         // stores phi at the cell midpoint, while E is linear inside a cell and
         // the field energy above integrates E^2 exactly.  The matching dual
         // quantity is therefore the cell-average potential, not phi(x_i).
         // For linear E and quadratic phi,
         //   <phi>_i = phi(x_i) + dx * (E_R - E_L) / 12.
-        const double old_phi_average =
-            before.phi[static_cast<size_t>(ng + ix)] +
-            grid_.dx * (old_right - old_left) / 12.0;
-        const double new_phi_average =
-            after.phi[static_cast<size_t>(ng + ix)] +
-            grid_.dx * (new_right - new_left) / 12.0;
-        local[2] += 0.5 * (old_phi_average + new_phi_average) *
-            rho_delta[static_cast<size_t>(ng + ix)] * grid_.dx;
+        const long double old_phi_average =
+            static_cast<long double>(
+                before.phi[static_cast<size_t>(ng + ix)]) +
+            dx_ld * (old_r - old_l) / 12.0L;
+        const long double new_phi_average =
+            static_cast<long double>(
+                after.phi[static_cast<size_t>(ng + ix)]) +
+            dx_ld * (new_r - new_l) / 12.0L;
+        const long double potential_charge_term =
+            0.5L * (old_phi_average + new_phi_average) *
+            static_cast<long double>(
+                rho_delta[static_cast<size_t>(ng + ix)]) * dx_ld;
+        potential_charge_sum.add(potential_charge_term);
+        abs_potential_charge_sum.add(
+            std::fabs(potential_charge_term));
     }
-    double global[3] = { 0.0, 0.0, 0.0 };
-    MPI_Allreduce(local, global, 3, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-    result.field_energy_before = global[0];
-    result.field_energy_after = global[1];
-    result.field_energy_change = global[1] - global[0];
+    // Stage A-FS (section 7C.6): fixed-order MPI_LONG_DOUBLE reduction of all
+    // identity quantities and absolute-term-sum diagnostics; conversion to
+    // double happens only after the reduction.
+    const long double local_values[7] = {
+        energy_before_sum.value(),
+        energy_after_sum.value(),
+        field_delta_sum.value(),
+        potential_charge_sum.value(),
+        abs_before_sum.value(),
+        abs_after_sum.value(),
+        abs_potential_charge_sum.value()};
+    long double global_values[7] = {0.0L, 0.0L, 0.0L, 0.0L,
+                                    0.0L, 0.0L, 0.0L};
+    MPI_Allreduce(const_cast<long double*>(local_values), global_values, 7,
+                  MPI_LONG_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    result.stable_accumulation_used = true;
+    result.field_energy_change_direct =
+        static_cast<double>(global_values[2]);
+    result.field_energy_change_from_totals =
+        static_cast<double>(global_values[1] - global_values[0]);
+    result.field_energy_change_reconstruction_error =
+        static_cast<double>(global_values[2] -
+                            (global_values[1] - global_values[0]));
+    result.term_abs_sum_energy_before =
+        static_cast<double>(global_values[4]);
+    result.term_abs_sum_energy_after =
+        static_cast<double>(global_values[5]);
+    result.term_abs_sum_potential_charge =
+        static_cast<double>(global_values[6]);
+    result.field_energy_before = static_cast<double>(global_values[0]);
+    result.field_energy_after = static_cast<double>(global_values[1]);
+    result.field_energy_change = result.field_energy_change_direct;
     result.electrode_work = boundary_energy_work(before, after, mpi_rank,
                                                   mpi_size);
-    result.potential_charge_work = global[2];
+    result.potential_charge_work =
+        static_cast<double>(global_values[3]);
     result.residual = result.field_energy_change - result.electrode_work -
         result.potential_charge_work;
     result.scale = std::max(std::numeric_limits<double>::min(),
@@ -308,7 +402,13 @@ OpenPoissonWorkIdentity OpenElectrostaticSolver::evaluate_work_identity(
         std::isfinite(result.field_energy_change) &&
         std::isfinite(result.electrode_work) &&
         std::isfinite(result.potential_charge_work) &&
-        std::isfinite(result.residual);
+        std::isfinite(result.residual) &&
+        std::isfinite(result.field_energy_change_direct) &&
+        std::isfinite(result.field_energy_change_from_totals) &&
+        std::isfinite(result.field_energy_change_reconstruction_error) &&
+        std::isfinite(result.term_abs_sum_energy_before) &&
+        std::isfinite(result.term_abs_sum_energy_after) &&
+        std::isfinite(result.term_abs_sum_potential_charge);
     return result;
 }
 

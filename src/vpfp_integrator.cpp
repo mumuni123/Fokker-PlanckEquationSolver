@@ -1,4 +1,4 @@
-#include "vpfp_integrator.h"
+﻿#include "vpfp_integrator.h"
 
 #include <algorithm>
 #include <chrono>
@@ -3135,6 +3135,64 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
     result.joint_midpoint_naive_force_current_work = 0.0;
     result.joint_midpoint_seam_predicted_residual = 0.0;
     result.joint_midpoint_seam_prediction_error = 0.0;
+    result.joint_midpoint_poisson_scalar_identity_residual = 0.0;
+    result.joint_midpoint_continuity_charge_linf = 0.0;
+    result.joint_midpoint_continuity_charge_l1 = 0.0;
+    result.joint_midpoint_residual_charge_linf = 0.0;
+    result.joint_midpoint_charge_projection_mismatch_linf = 0.0;
+    result.joint_midpoint_u_boundary_charge_linf = 0.0;
+    result.joint_midpoint_potential_weighted_continuity_defect = 0.0;
+    result.joint_midpoint_poisson_current_predicted_residual = 0.0;
+    result.joint_midpoint_poisson_current_prediction_error = 0.0;
+    result.joint_midpoint_continuity_roundoff_bound = 0.0;
+    result.joint_midpoint_prediction_roundoff_bound = 0.0;
+    result.joint_midpoint_continuity_first_bad_global_ix = -1;
+    result.joint_midpoint_density_assembly_mismatch_linf = 0.0;
+    result.joint_midpoint_density_assembly_mismatch_l1 = 0.0;
+    result.joint_midpoint_density_assembly_roundoff_bound = 0.0;
+    result.joint_midpoint_mass_transport_charge_linf = 0.0;
+    result.joint_midpoint_mass_transport_roundoff_bound = 0.0;
+    result.joint_midpoint_transport_projection_mismatch_linf = 0.0;
+    result.joint_midpoint_parent_charge_scale_max = 0.0;
+    result.joint_midpoint_mass_delta_charge_linf = 0.0;
+    result.joint_midpoint_density_assembly_first_bad_global_ix = -1;
+    result.joint_midpoint_mass_transport_first_bad_global_ix = -1;
+    result.joint_midpoint_potential_weighted_assembly_defect = 0.0;
+    result.joint_midpoint_potential_weighted_transport_defect = 0.0;
+    result.joint_midpoint_weighted_defect_reconstruction_error = 0.0;
+    result.joint_midpoint_candidate_rho_incremental = 0.0;
+    result.joint_midpoint_candidate_rho_absolute = 0.0;
+    result.joint_midpoint_candidate_rho_form_difference = 0.0;
+    result.joint_midpoint_candidate_rho_form_roundoff_bound = 0.0;
+    result.joint_midpoint_poisson_identity_scale = 0.0;
+    result.joint_midpoint_poisson_identity_roundoff_bound = 0.0;
+    result.joint_midpoint_poisson_scalar_identity_pass = 0;
+    result.joint_midpoint_poisson_identity_finite = 0;
+    result.joint_midpoint_poisson_identity_residual_to_bound_ratio = 0.0;
+    result.joint_midpoint_poisson_identity_roundoff_bound_8192 = 0.0;
+    result.joint_midpoint_poisson_identity_roundoff_bound_16384 = 0.0;
+    result.joint_midpoint_poisson_identity_residual_to_bound_ratio_8192 =
+        0.0;
+    result.joint_midpoint_poisson_identity_residual_to_bound_ratio_16384 =
+        0.0;
+    result.joint_midpoint_poisson_scalar_identity_pass_8192 = 0;
+    result.joint_midpoint_poisson_scalar_identity_pass_16384 = 0;
+    result.joint_midpoint_poisson_term_abs_sum_energy_before = 0.0;
+    result.joint_midpoint_poisson_term_abs_sum_energy_after = 0.0;
+    result.joint_midpoint_poisson_term_abs_sum_potential_charge = 0.0;
+    result.joint_midpoint_candidate_poisson_current_residual = 0.0;
+    result.joint_midpoint_candidate_poisson_current_scale = 0.0;
+    result.joint_midpoint_candidate_poisson_current_relative =
+        std::numeric_limits<double>::infinity();
+    result.joint_midpoint_pairing_tolerance = 0.0;
+    result.joint_midpoint_candidate_poisson_scalar_residual = 0.0;
+    result.joint_midpoint_candidate_weighted_continuity_defect = 0.0;
+    result.joint_midpoint_phase_converged = 0;
+    result.joint_midpoint_poisson_converged = 0;
+    result.joint_midpoint_pairing_converged = 0;
+    result.joint_midpoint_recent_pairing_relative_count = 0;
+    for (double& value : result.joint_midpoint_recent_pairing_relative)
+        value = std::numeric_limits<double>::infinity();
     result.accepted = false;
     result.finite = true;
     result.cfl_ok = dt > 0.0;
@@ -3169,6 +3227,17 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
     std::vector<double> accepted_e_local;
     double accepted_norm = std::numeric_limits<double>::infinity();
     double accepted_poisson_residual = std::numeric_limits<double>::infinity();
+    const double pairing_tolerance = 1.0e-9;
+    result.joint_midpoint_pairing_tolerance = pairing_tolerance;
+    double accepted_pairing_residual = 0.0;
+    double accepted_pairing_scale = 0.0;
+    double accepted_pairing_relative =
+        std::numeric_limits<double>::infinity();
+    double accepted_scalar_residual = 0.0;
+    double accepted_weighted_defect = 0.0;
+    double log_pairing_residual = 0.0;
+    double log_pairing_relative = std::numeric_limits<double>::infinity();
+    double log_weighted_defect = 0.0;
     bool accepted_eval = false;
 
     const int max_iterations = 20;
@@ -3223,22 +3292,41 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
                                 double residual_linf, double phi_linf,
                                 double alpha, const std::vector<double>& state,
                                 int accepted, int failure_code) {
-        JointPhaseSpaceIterationRecord record;
-        record.iteration = iteration;
-        record.gmres_dimension = gmres_dimension;
-        record.residual_linf = residual_linf;
-        record.phi_residual_linf = phi_linf;
-        record.line_search_alpha = alpha;
         double local_min = std::numeric_limits<double>::infinity();
         for (size_t i = 0; i < state.size(); ++i)
             local_min = std::min(local_min, state[i]);
         double global_min = 0.0;
         MPI_Allreduce(&local_min, &global_min, 1, MPI_DOUBLE, MPI_MIN,
                       MPI_COMM_WORLD);
-        record.trial_min_mass = global_min;
-        record.accepted = accepted;
-        record.failure_code = failure_code;
-        result.joint_midpoint_iterations_log.push_back(record);
+        VpfpJointPhaseSpaceIterationRecord a4_record;
+        a4_record.iteration = iteration;
+        a4_record.gmres_dimension = gmres_dimension;
+        a4_record.residual_linf = residual_linf;
+        a4_record.phi_residual_linf = phi_linf;
+        a4_record.line_search_alpha = alpha;
+        a4_record.trial_min_mass = global_min;
+        a4_record.accepted = accepted;
+        a4_record.failure_code = failure_code;
+        a4_record.poisson_current_relative = log_pairing_relative;
+        a4_record.poisson_current_residual = log_pairing_residual;
+        a4_record.weighted_continuity_defect = log_weighted_defect;
+        a4_record.phase_converged = residual_linf <= residual_tolerance;
+        a4_record.poisson_converged = phi_linf <= poisson_tolerance;
+        a4_record.pairing_converged =
+            log_pairing_relative <= pairing_tolerance;
+        if (result.joint_midpoint_recent_pairing_relative_count < 3) {
+            result.joint_midpoint_recent_pairing_relative[
+                result.joint_midpoint_recent_pairing_relative_count++] =
+                log_pairing_relative;
+        } else {
+            result.joint_midpoint_recent_pairing_relative[0] =
+                result.joint_midpoint_recent_pairing_relative[1];
+            result.joint_midpoint_recent_pairing_relative[1] =
+                result.joint_midpoint_recent_pairing_relative[2];
+            result.joint_midpoint_recent_pairing_relative[2] =
+                log_pairing_relative;
+        }
+        result.joint_midpoint_iterations_log.push_back(a4_record);
     };
 
     auto evaluate = [&](const std::vector<double>& state,
@@ -3248,12 +3336,22 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
                         std::vector<double>& phi_residual_out,
                         double& normalized_norm,
                         double& poisson_residual,
+                        double& poisson_current_residual,
+                        double& poisson_current_scale,
+                        double& poisson_current_relative,
+                        double& poisson_scalar_residual,
+                        double& weighted_continuity_defect,
                         bool& finite,
                         bool allow_negative_probe,
                         std::vector<double>& e_local_out) -> bool {
         bool local_ok = true;
         normalized_norm = 0.0;
         poisson_residual = 0.0;
+        poisson_current_residual = 0.0;
+        poisson_current_scale = 0.0;
+        poisson_current_relative = std::numeric_limits<double>::infinity();
+        poisson_scalar_residual = 0.0;
+        weighted_continuity_defect = 0.0;
         try {
             if (state.size() != m_old.size()) local_ok = false;
             for (size_t i = 0; local_ok && i < state.size(); ++i)
@@ -3261,16 +3359,29 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
             if (local_ok) {
                 std::fill(eval_fields.rho.begin(), eval_fields.rho.end(), 0.0);
                 for (int ix = 0; ix < grid_.nx_local; ++ix) {
-                    double number = 0.0;
-                    // `state` is the rank-local joint Newton slab.  ix_start
-                    // is a global-grid coordinate and must never be used as
-                    // an offset into this local vector.
+                    // Stage A-S1 (section 7B.3): stable incremental charge
+                    // assembly.  In J1 the ion density is fixed and
+                    // Beam/Tail/source are off, so this is algebraically
+                    // identical to qe*(ni - n_e^{n+1}) but avoids subtracting
+                    // two large near-neutral totals.  Only this J1 candidate
+                    // evaluate path changes; EMFields::set_charge_density()
+                    // and every other caller keep the production form.
                     const size_t base = static_cast<size_t>(ix) * nq;
-                    for (int q = 0; q < nq; ++q) number += state[base + q];
-                    const double ni = ix < static_cast<int>(ion_density.size())
-                        ? ion_density[static_cast<size_t>(ix)] : 0.0;
-                    eval_fields.rho[static_cast<size_t>(grid_.nghost + ix)] =
-                        Const::qe * (ni - number / grid_.dx);
+                    long double delta_number = 0.0L;
+                    for (int q = 0; q < nq; ++q) {
+                        delta_number +=
+                            static_cast<long double>(state[base + q]) -
+                            static_cast<long double>(m_old[base + q]);
+                    }
+                    const long double delta_rho =
+                        -static_cast<long double>(Const::qe) *
+                        delta_number /
+                        static_cast<long double>(grid_.dx);
+                    eval_fields.rho[
+                        static_cast<size_t>(grid_.nghost + ix)] =
+                        fields.rho[
+                            static_cast<size_t>(grid_.nghost + ix)] +
+                        static_cast<double>(delta_rho);
                 }
                 OpenGaussSolveOptions options;
                 options.reconstruct_phi = true;
@@ -3344,6 +3455,100 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
                         std::max(std::fabs(d_ex_dx), std::fabs(rho_eps0)));
                 }
                 poisson_residual = phi_linf / phi_scale;
+
+                // A4 candidate metric: all quantities below are computed
+                // from this candidate state, its solved fields, and this
+                // candidate flux bundle.  No accepted/post-processed state
+                // is consulted.
+                int metric_ready = local_ok ? 1 : 0;
+                MPI_Allreduce(MPI_IN_PLACE, &metric_ready, 1, MPI_INT,
+                              MPI_MIN, MPI_COMM_WORLD);
+                if (metric_ready) {
+                    std::vector<double> rho_delta(eval_fields.rho.size(), 0.0);
+                    for (int ix = 0; ix < grid_.nx_local; ++ix) {
+                        rho_delta[static_cast<size_t>(grid_.nghost + ix)] =
+                            eval_fields.rho[static_cast<size_t>(grid_.nghost + ix)] -
+                            fields.rho[static_cast<size_t>(grid_.nghost + ix)];
+                    }
+                    const OpenPoissonWorkIdentity work =
+                        field_solver_.evaluate_work_identity(
+                            fields, eval_fields, rho_delta,
+                            mpi_rank, mpi_size);
+                    poisson_scalar_residual = work.residual;
+                    long double local_charge_work = 0.0L;
+                    long double local_weighted_defect = 0.0L;
+                    for (int iface = 0; iface <= grid_.nx_local; ++iface) {
+                        const int global_face = grid_.ix_start + iface;
+                        if (iface == 0 && global_face != 0) continue;
+                        const double weight =
+                            (global_face == 0 || global_face == grid_.nx_global)
+                            ? 0.5 : 1.0;
+                        local_charge_work +=
+                            static_cast<long double>(dt) *
+                            static_cast<long double>(weight * grid_.dx) *
+                            static_cast<long double>(pairing_face[
+                                static_cast<size_t>(iface)]) *
+                            static_cast<long double>(bundle.charge_current_face[
+                                static_cast<size_t>(iface)]);
+                    }
+                    for (int ix = 0; ix < grid_.nx_local; ++ix) {
+                        const size_t id = static_cast<size_t>(grid_.nghost + ix);
+                        const long double r_c =
+                            static_cast<long double>(rho_delta[id]) *
+                                static_cast<long double>(grid_.dx) +
+                            static_cast<long double>(dt) *
+                                static_cast<long double>(
+                                    bundle.charge_current_face[
+                                        static_cast<size_t>(ix) + 1] -
+                                    bundle.charge_current_face[
+                                        static_cast<size_t>(ix)]);
+                        const long double old_phi =
+                            static_cast<long double>(fields.phi[id]) +
+                            static_cast<long double>(grid_.dx) *
+                                (static_cast<long double>(fields.Ex_face[
+                                    static_cast<size_t>(ix) + 1]) -
+                                 static_cast<long double>(fields.Ex_face[
+                                    static_cast<size_t>(ix)])) / 12.0L;
+                        const long double new_phi =
+                            static_cast<long double>(eval_fields.phi[id]) +
+                            static_cast<long double>(grid_.dx) *
+                                (static_cast<long double>(eval_fields.Ex_face[
+                                    static_cast<size_t>(ix) + 1]) -
+                                 static_cast<long double>(eval_fields.Ex_face[
+                                    static_cast<size_t>(ix)])) / 12.0L;
+                        local_weighted_defect +=
+                            0.5L * (old_phi + new_phi) * r_c;
+                    }
+                    double global_charge_work = 0.0;
+                    const double local_charge_work_double =
+                        static_cast<double>(local_charge_work);
+                    MPI_Allreduce(&local_charge_work_double,
+                                  &global_charge_work, 1, MPI_DOUBLE,
+                                  MPI_SUM, MPI_COMM_WORLD);
+                    const double local_weighted_double =
+                        static_cast<double>(local_weighted_defect);
+                    double global_weighted_defect = 0.0;
+                    MPI_Allreduce(&local_weighted_double,
+                                  &global_weighted_defect, 1, MPI_DOUBLE,
+                                  MPI_SUM, MPI_COMM_WORLD);
+                    poisson_current_residual =
+                        work.field_energy_change - work.electrode_work +
+                        global_charge_work;
+                    poisson_current_scale = std::max(
+                        1.0, std::max(std::fabs(work.field_energy_change),
+                        std::max(std::fabs(work.electrode_work),
+                                 std::fabs(global_charge_work))));
+                    poisson_current_relative =
+                        std::fabs(poisson_current_residual) /
+                        poisson_current_scale;
+                    weighted_continuity_defect = global_weighted_defect;
+                    local_ok = work.finite &&
+                        std::isfinite(poisson_scalar_residual) &&
+                        std::isfinite(poisson_current_residual) &&
+                        std::isfinite(poisson_current_scale) &&
+                        std::isfinite(poisson_current_relative) &&
+                        std::isfinite(weighted_continuity_defect);
+                }
             }
         } catch (const std::exception&) {
             local_ok = false;
@@ -3361,20 +3566,51 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
         MPI_Allreduce(&poisson_residual, &global_poisson, 1, MPI_DOUBLE,
                       MPI_MAX, MPI_COMM_WORLD);
         poisson_residual = global_poisson;
+        MPI_Allreduce(MPI_IN_PLACE, &poisson_current_residual, 1,
+                      MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        MPI_Allreduce(MPI_IN_PLACE, &poisson_current_scale, 1,
+                      MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        MPI_Allreduce(MPI_IN_PLACE, &poisson_current_relative, 1,
+                      MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        MPI_Allreduce(MPI_IN_PLACE, &poisson_scalar_residual, 1,
+                      MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
         return true;
     };
 
     bool finite = false;
     if (!evaluate(candidate, candidate_fields, accepted_bundle, accepted_residual,
                   accepted_phi_residual,
-                  accepted_norm, accepted_poisson_residual, finite,
-                  false,
+                  accepted_norm, accepted_poisson_residual,
+                  accepted_pairing_residual, accepted_pairing_scale,
+                  accepted_pairing_relative, accepted_scalar_residual,
+                  accepted_weighted_defect, finite,
+                  // The initial candidate is the previously accepted state.
+                  // Accepted J1 states may contain signed roundoff-level mass
+                  // under the final code-76 tolerance, so the next step must
+                  // evaluate that same signed residual domain.  Positivity is
+                  // still enforced after convergence by the unchanged code-76
+                  // acceptance gate below; no clipping or tolerance change is
+                  // performed here.
+                  true,
                   accepted_e_local)) {
         result.finite = false;
         result.failure_code = 71;
         result.failure_stage = "joint_midpoint_initial_residual";
         return result;
     }
+    log_pairing_residual = accepted_pairing_residual;
+    log_pairing_relative = accepted_pairing_relative;
+    log_weighted_defect = accepted_weighted_defect;
+    result.joint_midpoint_candidate_poisson_current_residual =
+        accepted_pairing_residual;
+    result.joint_midpoint_candidate_poisson_current_scale =
+        accepted_pairing_scale;
+    result.joint_midpoint_candidate_poisson_current_relative =
+        accepted_pairing_relative;
+    result.joint_midpoint_candidate_poisson_scalar_residual =
+        accepted_scalar_residual;
+    result.joint_midpoint_candidate_weighted_continuity_defect =
+        accepted_weighted_defect;
     record_iteration(0, 0, accepted_norm, accepted_poisson_residual, 0.0,
                      candidate, 0, 0);
     // These values describe the last finite candidate even if Newton later
@@ -3386,10 +3622,25 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
 
     for (int iter = 0; iter < max_iterations; ++iter) {
         result.joint_midpoint_iterations = iter + 1;
-        if (accepted_norm <= residual_tolerance &&
-            accepted_poisson_residual <= poisson_tolerance) {
+        const bool accepted_phase_converged =
+            accepted_norm <= residual_tolerance;
+        const bool accepted_poisson_converged =
+            accepted_poisson_residual <= poisson_tolerance;
+        const bool accepted_pairing_converged =
+            accepted_pairing_relative <= pairing_tolerance;
+        result.joint_midpoint_phase_converged =
+            accepted_phase_converged ? 1 : 0;
+        result.joint_midpoint_poisson_converged =
+            accepted_poisson_converged ? 1 : 0;
+        result.joint_midpoint_pairing_converged =
+            accepted_pairing_converged ? 1 : 0;
+        if (accepted_phase_converged && accepted_poisson_converged &&
+            accepted_pairing_converged) {
             accepted_eval = true;
             result.joint_midpoint_converged = true;
+            log_pairing_residual = accepted_pairing_residual;
+            log_pairing_relative = accepted_pairing_relative;
+            log_weighted_defect = accepted_weighted_defect;
             record_iteration(iter + 1, 0, accepted_norm,
                              accepted_poisson_residual, 1.0, candidate, 1, 0);
             break;
@@ -3448,9 +3699,18 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
             std::vector<double> probe_e_local;
             double probe_norm = 0.0;
             double probe_poisson = 0.0;
+            double probe_pairing_residual = 0.0;
+            double probe_pairing_scale = 0.0;
+            double probe_pairing_relative =
+                std::numeric_limits<double>::infinity();
+            double probe_scalar_residual = 0.0;
+            double probe_weighted_defect = 0.0;
             bool probe_finite = false;
             if (!evaluate(probe, probe_fields, probe_bundle, probe_residual,
                           probe_phi_residual, probe_norm, probe_poisson,
+                          probe_pairing_residual, probe_pairing_scale,
+                          probe_pairing_relative, probe_scalar_residual,
+                          probe_weighted_defect,
                           probe_finite, true, probe_e_local)) {
                 result.failure_code = 72;
                 result.failure_stage = "joint_midpoint_jacobian_probe";
@@ -3498,6 +3758,8 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
                 step[i] += y[static_cast<size_t>(j)] * basis[static_cast<size_t>(j)][i];
 
         bool line_search_accepted = false;
+        const bool pairing_search = accepted_phase_converged &&
+            !accepted_pairing_converged;
         double lambda = 1.0;
         for (int ls = 0; ls < 12; ++ls) {
             std::vector<double> trial = candidate;
@@ -3511,10 +3773,19 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
             std::vector<double> trial_e_local;
             double trial_norm = 0.0;
             double trial_poisson = 0.0;
+            double trial_pairing_residual = 0.0;
+            double trial_pairing_scale = 0.0;
+            double trial_pairing_relative =
+                std::numeric_limits<double>::infinity();
+            double trial_scalar_residual = 0.0;
+            double trial_weighted_defect = 0.0;
             bool trial_finite = false;
             if (evaluate(trial, trial_fields, trial_bundle, trial_residual,
                          trial_phi_residual,
-                         trial_norm, trial_poisson, trial_finite,
+                         trial_norm, trial_poisson,
+                         trial_pairing_residual, trial_pairing_scale,
+                         trial_pairing_relative, trial_scalar_residual,
+                         trial_weighted_defect, trial_finite,
                          // A line-search candidate is an algebraic Newton
                          // trial.  It must use the same signed residual
                          // domain as the Jacobian probe; final positivity is
@@ -3522,9 +3793,15 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
                          // code-76 acceptance gate below.
                          true,
                          trial_e_local) &&
-                trial_finite && trial_norm < accepted_norm &&
-                trial_poisson <= std::max(poisson_tolerance,
-                                           accepted_poisson_residual * 2.0)) {
+                trial_finite &&
+                (pairing_search
+                    ? (trial_norm <= residual_tolerance &&
+                       trial_poisson <= poisson_tolerance &&
+                       trial_pairing_relative < accepted_pairing_relative)
+                    : (trial_norm < accepted_norm &&
+                       trial_poisson <= std::max(
+                           poisson_tolerance,
+                           accepted_poisson_residual * 2.0)))) {
                 candidate.swap(trial);
                 candidate_fields = trial_fields;
                 accepted_bundle = trial_bundle;
@@ -3533,6 +3810,24 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
                 accepted_e_local.swap(trial_e_local);
                 accepted_norm = trial_norm;
                 accepted_poisson_residual = trial_poisson;
+                accepted_pairing_residual = trial_pairing_residual;
+                accepted_pairing_scale = trial_pairing_scale;
+                accepted_pairing_relative = trial_pairing_relative;
+                accepted_scalar_residual = trial_scalar_residual;
+                accepted_weighted_defect = trial_weighted_defect;
+                result.joint_midpoint_candidate_poisson_current_residual =
+                    accepted_pairing_residual;
+                result.joint_midpoint_candidate_poisson_current_scale =
+                    accepted_pairing_scale;
+                result.joint_midpoint_candidate_poisson_current_relative =
+                    accepted_pairing_relative;
+                result.joint_midpoint_candidate_poisson_scalar_residual =
+                    accepted_scalar_residual;
+                result.joint_midpoint_candidate_weighted_continuity_defect =
+                    accepted_weighted_defect;
+                log_pairing_residual = accepted_pairing_residual;
+                log_pairing_relative = accepted_pairing_relative;
+                log_weighted_defect = accepted_weighted_defect;
                 result.joint_midpoint_residual_linf = accepted_norm;
                 result.joint_midpoint_poisson_residual_linf =
                     accepted_poisson_residual;
@@ -3565,14 +3860,28 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
                 std::vector<double> trial_e_local;
                 double trial_norm = 0.0;
                 double trial_poisson = 0.0;
+                double trial_pairing_residual = 0.0;
+                double trial_pairing_scale = 0.0;
+                double trial_pairing_relative =
+                    std::numeric_limits<double>::infinity();
+                double trial_scalar_residual = 0.0;
+                double trial_weighted_defect = 0.0;
                 bool trial_finite = false;
                 if (evaluate(trial, trial_fields, trial_bundle,
                              trial_residual, trial_phi_residual,
-                             trial_norm, trial_poisson, trial_finite,
+                             trial_norm, trial_poisson,
+                             trial_pairing_residual, trial_pairing_scale,
+                             trial_pairing_relative, trial_scalar_residual,
+                             trial_weighted_defect, trial_finite,
                              true, trial_e_local) && trial_finite &&
-                    trial_norm < accepted_norm &&
-                    trial_poisson <= std::max(
-                        poisson_tolerance, accepted_poisson_residual * 2.0)) {
+                    (pairing_search
+                        ? (trial_norm <= residual_tolerance &&
+                           trial_poisson <= poisson_tolerance &&
+                           trial_pairing_relative < accepted_pairing_relative)
+                        : (trial_norm < accepted_norm &&
+                           trial_poisson <= std::max(
+                               poisson_tolerance,
+                               accepted_poisson_residual * 2.0)))) {
                     candidate.swap(trial);
                     candidate_fields = trial_fields;
                     accepted_bundle = trial_bundle;
@@ -3581,6 +3890,24 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
                     accepted_e_local.swap(trial_e_local);
                     accepted_norm = trial_norm;
                     accepted_poisson_residual = trial_poisson;
+                    accepted_pairing_residual = trial_pairing_residual;
+                    accepted_pairing_scale = trial_pairing_scale;
+                    accepted_pairing_relative = trial_pairing_relative;
+                    accepted_scalar_residual = trial_scalar_residual;
+                    accepted_weighted_defect = trial_weighted_defect;
+                    result.joint_midpoint_candidate_poisson_current_residual =
+                        accepted_pairing_residual;
+                    result.joint_midpoint_candidate_poisson_current_scale =
+                        accepted_pairing_scale;
+                    result.joint_midpoint_candidate_poisson_current_relative =
+                        accepted_pairing_relative;
+                    result.joint_midpoint_candidate_poisson_scalar_residual =
+                        accepted_scalar_residual;
+                    result.joint_midpoint_candidate_weighted_continuity_defect =
+                        accepted_weighted_defect;
+                    log_pairing_residual = accepted_pairing_residual;
+                    log_pairing_relative = accepted_pairing_relative;
+                    log_weighted_defect = accepted_weighted_defect;
                     result.joint_midpoint_residual_linf = accepted_norm;
                     result.joint_midpoint_poisson_residual_linf =
                         accepted_poisson_residual;
@@ -3595,26 +3922,57 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
             }
         }
         if (!line_search_accepted) {
-            result.failure_code = 73;
-            result.failure_stage = "joint_midpoint_line_search";
+            result.failure_code = pairing_search ? 74 : 73;
+            result.failure_stage = pairing_search
+                ? "joint_midpoint_poisson_current_not_converged"
+                : "joint_midpoint_line_search";
             result.joint_midpoint_residual_linf = accepted_norm;
             result.joint_midpoint_poisson_residual_linf = accepted_poisson_residual;
+            log_pairing_residual = accepted_pairing_residual;
+            log_pairing_relative = accepted_pairing_relative;
+            log_weighted_defect = accepted_weighted_defect;
             record_iteration(iter + 1, gmres_dimension, accepted_norm,
-                             accepted_poisson_residual, 0.0, candidate, 0, 73);
+                             accepted_poisson_residual, 0.0, candidate, 0,
+                             result.failure_code);
             return result;
         }
     }
 
     if (!accepted_eval && accepted_norm <= residual_tolerance &&
-        accepted_poisson_residual <= poisson_tolerance) accepted_eval = true;
+        accepted_poisson_residual <= poisson_tolerance &&
+        accepted_pairing_relative <= pairing_tolerance) accepted_eval = true;
     result.joint_midpoint_residual_linf = accepted_norm;
     result.joint_midpoint_poisson_residual_linf = accepted_poisson_residual;
+    result.joint_midpoint_candidate_poisson_current_residual =
+        accepted_pairing_residual;
+    result.joint_midpoint_candidate_poisson_current_scale =
+        accepted_pairing_scale;
+    result.joint_midpoint_candidate_poisson_current_relative =
+        accepted_pairing_relative;
+    result.joint_midpoint_candidate_poisson_scalar_residual =
+        accepted_scalar_residual;
+    result.joint_midpoint_candidate_weighted_continuity_defect =
+        accepted_weighted_defect;
+    result.joint_midpoint_phase_converged =
+        accepted_norm <= residual_tolerance ? 1 : 0;
+    result.joint_midpoint_poisson_converged =
+        accepted_poisson_residual <= poisson_tolerance ? 1 : 0;
+    result.joint_midpoint_pairing_converged =
+        accepted_pairing_relative <= pairing_tolerance ? 1 : 0;
     if (!accepted_eval) {
         result.failure_code = 74;
-        result.failure_stage = "joint_midpoint_not_converged";
+        result.failure_stage =
+            result.joint_midpoint_phase_converged &&
+            result.joint_midpoint_poisson_converged &&
+            !result.joint_midpoint_pairing_converged
+            ? "joint_midpoint_poisson_current_not_converged"
+            : "joint_midpoint_not_converged";
+        log_pairing_residual = accepted_pairing_residual;
+        log_pairing_relative = accepted_pairing_relative;
+        log_weighted_defect = accepted_weighted_defect;
         record_iteration(result.joint_midpoint_iterations, 4,
                          accepted_norm, accepted_poisson_residual,
-                         0.0, candidate, 0, 74);
+                         0.0, candidate, 0, result.failure_code);
         return result;
     }
 
@@ -3891,6 +4249,544 @@ VpfpStepResult VpfpIntegrator::advance_joint_midpoint(
     result.joint_midpoint_energy_residual =
         result.joint_midpoint_current_pair_residual +
         result.joint_midpoint_poisson_transport_residual;
+    // Stage-A1 read-only residual decomposition (docs/VPFP_F10情形A_连续性
+    // Poisson功配对严格修复实施方案.md sections 2 and 5).  Diagnostics only:
+    // this block never modifies flux, residual, Newton, Poisson, the energy
+    // gate, acceptance logic or dt.  It uses only the final accepted
+    // candidate's accepted_residual, accepted_bundle, fields and
+    // candidate_fields; no current is rebuilt and no extra time advance.
+    result.joint_midpoint_poisson_scalar_identity_residual =
+        poisson_work.residual;
+    // Minimal read-only Poisson identity acceptance (production residual and
+    // scale verbatim, established 8192*eps gate; no relaxation).  Diagnostic
+    // only: it never alters the failure path.
+    result.joint_midpoint_poisson_identity_scale = poisson_work.scale;
+    // Stage A-FS-R1 (section 7C.10.6): dual Gate F sets; the legacy 8192
+    // gate stays visible, the production alias maps to 16384.
+    const double afsr1_eps = std::numeric_limits<double>::epsilon();
+    result.joint_midpoint_poisson_identity_roundoff_bound_8192 =
+        8192.0 * afsr1_eps * poisson_work.scale;
+    result.joint_midpoint_poisson_identity_roundoff_bound_16384 =
+        16384.0 * afsr1_eps * poisson_work.scale;
+    result.joint_midpoint_poisson_identity_roundoff_bound =
+        result.joint_midpoint_poisson_identity_roundoff_bound_8192;
+    result.joint_midpoint_poisson_identity_finite =
+        poisson_work.finite ? 1 : 0;
+    result.joint_midpoint_poisson_identity_residual_to_bound_ratio_8192 =
+        poisson_work.finite &&
+            result.joint_midpoint_poisson_identity_roundoff_bound_8192 > 0.0
+        ? std::fabs(poisson_work.residual) /
+              result.joint_midpoint_poisson_identity_roundoff_bound_8192
+        : std::numeric_limits<double>::infinity();
+    result.joint_midpoint_poisson_identity_residual_to_bound_ratio_16384 =
+        poisson_work.finite &&
+            result.joint_midpoint_poisson_identity_roundoff_bound_16384 >
+                0.0
+        ? std::fabs(poisson_work.residual) /
+              result.joint_midpoint_poisson_identity_roundoff_bound_16384
+        : std::numeric_limits<double>::infinity();
+    result.joint_midpoint_poisson_identity_residual_to_bound_ratio =
+        result.joint_midpoint_poisson_identity_residual_to_bound_ratio_8192;
+    result.joint_midpoint_poisson_scalar_identity_pass_8192 =
+        poisson_work.finite &&
+        result.joint_midpoint_poisson_identity_residual_to_bound_ratio_8192 <=
+            1.0
+        ? 1
+        : 0;
+    result.joint_midpoint_poisson_scalar_identity_pass_16384 =
+        poisson_work.finite &&
+        result.joint_midpoint_poisson_identity_residual_to_bound_ratio_16384 <=
+            1.0
+        ? 1
+        : 0;
+    // Compatibility alias maps to the production 16384 gate.
+    result.joint_midpoint_poisson_scalar_identity_pass =
+        result.joint_midpoint_poisson_scalar_identity_pass_16384;
+    // Summation-error diagnosis for the three local integrals inside
+    // evaluate_work_identity(): read-only absolute accumulation scales,
+    // computed with the same per-cell formulas but |.| inside the sum.
+    {
+        const int as1b_ng = grid_.nghost;
+        long double as1b_term0 = 0.0L;
+        long double as1b_term1 = 0.0L;
+        long double as1b_term2 = 0.0L;
+        const long double eps0_ld =
+            static_cast<long double>(Const::eps0);
+        for (int ix = 0; ix < grid_.nx_local; ++ix) {
+            const long double o_l = static_cast<long double>(
+                fields.Ex_face[static_cast<size_t>(ix)]);
+            const long double o_r = static_cast<long double>(
+                fields.Ex_face[static_cast<size_t>(ix) + 1]);
+            const long double n_l = static_cast<long double>(
+                candidate_fields.Ex_face[static_cast<size_t>(ix)]);
+            const long double n_r = static_cast<long double>(
+                candidate_fields.Ex_face[static_cast<size_t>(ix) + 1]);
+            as1b_term0 += std::fabs(eps0_ld *
+                static_cast<long double>(grid_.dx) *
+                (o_l * o_l + o_l * o_r + o_r * o_r) / 6.0L);
+            as1b_term1 += std::fabs(eps0_ld *
+                static_cast<long double>(grid_.dx) *
+                (n_l * n_l + n_l * n_r + n_r * n_r) / 6.0L);
+            const double old_phi_average =
+                fields.phi[static_cast<size_t>(as1b_ng + ix)] +
+                grid_.dx *
+                (fields.Ex_face[static_cast<size_t>(ix) + 1] -
+                 fields.Ex_face[static_cast<size_t>(ix)]) / 12.0;
+            const double new_phi_average =
+                candidate_fields.phi[
+                    static_cast<size_t>(as1b_ng + ix)] +
+                grid_.dx *
+                (candidate_fields.Ex_face[
+                     static_cast<size_t>(ix) + 1] -
+                 candidate_fields.Ex_face[
+                     static_cast<size_t>(ix)]) / 12.0;
+            const double rho_delta_cell =
+                candidate_fields.rho[
+                    static_cast<size_t>(as1b_ng + ix)] -
+                fields.rho[static_cast<size_t>(as1b_ng + ix)];
+            as1b_term2 += std::fabs(
+                0.5 * (old_phi_average + new_phi_average) *
+                rho_delta_cell * grid_.dx);
+        }
+        double as1b_local[3] = {
+            static_cast<double>(as1b_term0),
+            static_cast<double>(as1b_term1),
+            static_cast<double>(as1b_term2)};
+        double as1b_global[3] = {0.0, 0.0, 0.0};
+        MPI_Allreduce(as1b_local, as1b_global, 3, MPI_DOUBLE, MPI_SUM,
+                      MPI_COMM_WORLD);
+        result.joint_midpoint_poisson_term_abs_sum_energy_before =
+            as1b_global[0];
+        result.joint_midpoint_poisson_term_abs_sum_energy_after =
+            as1b_global[1];
+        result.joint_midpoint_poisson_term_abs_sum_potential_charge =
+            as1b_global[2];
+    }
+    const int a1_ng = grid_.nghost;
+    std::vector<long double> a1_mismatch(
+        static_cast<size_t>(grid_.nx_local), 0.0L);
+    // Stage-A-S0 per-cell storage (section 7A): assembly/transport values,
+    // per-cell assembly bound and transport scale.
+    std::vector<long double> as0_r_assembly(
+        static_cast<size_t>(grid_.nx_local), 0.0L);
+    std::vector<long double> as0_tau_assembly(
+        static_cast<size_t>(grid_.nx_local), 0.0L);
+    std::vector<long double> as0_r_transport(
+        static_cast<size_t>(grid_.nx_local), 0.0L);
+    // gamma_m per section 7A.4: m = N_u*N_perp + 8.  If the denominator is
+    // non-positive or non-finite the diagnostic bounds fail (infinite), so
+    // every downstream classification gate reports not-closed.
+    const long double as0_gamma_m_denom =
+        1.0L - static_cast<long double>(nq + 8) *
+        static_cast<long double>(std::numeric_limits<double>::epsilon());
+    const bool as0_gamma_ok = as0_gamma_m_denom > 0.0L &&
+        std::isfinite(static_cast<double>(as0_gamma_m_denom));
+    const long double as0_gamma_m = as0_gamma_ok
+        ? static_cast<long double>(nq + 8) *
+          static_cast<long double>(
+              std::numeric_limits<double>::epsilon()) /
+          as0_gamma_m_denom
+        : std::numeric_limits<long double>::infinity();
+    long double a1_local_cont_linf = 0.0L;
+    long double a1_local_cont_l1 = 0.0L;
+    long double a1_local_rq_linf = 0.0L;
+    long double a1_local_mismatch_linf = 0.0L;
+    long double a1_local_ubnd_linf = 0.0L;
+    long double a1_local_max_drho_dx = 0.0L;
+    long double a1_local_max_dt_dj = 0.0L;
+    long double a1_local_wc = 0.0L;
+    long double a1_local_abs_phi_rc = 0.0L;
+    // Stage-A-S0 local accumulators (section 7A.3/7A.4).
+    long double as0_local_asm_linf = 0.0L;
+    long double as0_local_asm_l1 = 0.0L;
+    long double as0_local_transp_linf = 0.0L;
+    long double as0_local_transp_proj_linf = 0.0L;
+    long double as0_local_mass_delta_linf = 0.0L;
+    long double as0_local_parent_max = 0.0L;
+    long double as0_local_max_s_transport = 0.0L;
+    long double as0_local_w_assembly = 0.0L;
+    long double as0_local_w_transport = 0.0L;
+    for (int ix = 0; ix < grid_.nx_local; ++ix) {
+        const size_t base = static_cast<size_t>(ix) * nq;
+        long double sum_residual = 0.0L;
+        // Section 7A.3: per-velocity-cell differencing first, then a single
+        // long double accumulation; never two large totals subtracted.
+        long double delta_number = 0.0L;
+        long double sum_abs_old = 0.0L;
+        long double sum_abs_new = 0.0L;
+        long double sum_abs_delta_mass = 0.0L;
+        for (int q = 0; q < nq; ++q) {
+            const long double old_m = static_cast<long double>(
+                m_old[base + static_cast<size_t>(q)]);
+            const long double new_m = static_cast<long double>(
+                candidate[base + static_cast<size_t>(q)]);
+            sum_residual += static_cast<long double>(
+                accepted_residual[base + static_cast<size_t>(q)]);
+            delta_number += new_m - old_m;
+            sum_abs_old += std::fabs(old_m);
+            sum_abs_new += std::fabs(new_m);
+            sum_abs_delta_mass += std::fabs(new_m - old_m);
+        }
+        const long double delta_q_mass =
+            -static_cast<long double>(Const::qe) * delta_number;
+        const long double rQ =
+            -static_cast<long double>(Const::qe) * sum_residual;
+        const size_t rho_id = static_cast<size_t>(a1_ng + ix);
+        const long double delta_rho_dx =
+            static_cast<long double>(
+                candidate_fields.rho[rho_id] - fields.rho[rho_id]) *
+            static_cast<long double>(grid_.dx);
+        const long double current_div_dt =
+            static_cast<long double>(dt) *
+            static_cast<long double>(
+                accepted_bundle.charge_current_face[
+                    static_cast<size_t>(ix) + 1] -
+                accepted_bundle.charge_current_face[
+                    static_cast<size_t>(ix)]);
+        const long double rC = delta_rho_dx + current_div_dt;
+        long double u_boundary_sum = 0.0L;
+        for (int k = 0; k < nmu; ++k) {
+            const size_t bottom =
+                static_cast<size_t>(ix) *
+                static_cast<size_t>(nupar + 1) *
+                static_cast<size_t>(nmu) +
+                static_cast<size_t>(k);
+            const size_t top = bottom +
+                static_cast<size_t>(nupar) *
+                static_cast<size_t>(nmu);
+            u_boundary_sum += static_cast<long double>(
+                accepted_bundle.u_flux_rate[top] -
+                accepted_bundle.u_flux_rate[bottom]);
+        }
+        const long double r_ub =
+            -static_cast<long double>(Const::qe) *
+            static_cast<long double>(dt) * u_boundary_sum;
+        // Same cell-average potential as evaluate_work_identity() and
+        // build_potential_pairing_field(): section 2.3 verbatim.
+        const double old_phi_average =
+            fields.phi[static_cast<size_t>(a1_ng + ix)] +
+            grid_.dx *
+            (fields.Ex_face[static_cast<size_t>(ix) + 1] -
+             fields.Ex_face[static_cast<size_t>(ix)]) / 12.0;
+        const double new_phi_average =
+            candidate_fields.phi[static_cast<size_t>(a1_ng + ix)] +
+            grid_.dx *
+            (candidate_fields.Ex_face[static_cast<size_t>(ix) + 1] -
+             candidate_fields.Ex_face[static_cast<size_t>(ix)]) / 12.0;
+        const long double phi_bar = static_cast<long double>(
+            0.5 * (old_phi_average + new_phi_average));
+        const long double mismatch = rC - rQ + r_ub;
+        a1_mismatch[static_cast<size_t>(ix)] = mismatch;
+        a1_local_cont_linf = std::max(a1_local_cont_linf,
+                                      std::fabs(rC));
+        a1_local_cont_l1 += std::fabs(rC);
+        a1_local_rq_linf = std::max(a1_local_rq_linf, std::fabs(rQ));
+        a1_local_mismatch_linf = std::max(a1_local_mismatch_linf,
+                                          std::fabs(mismatch));
+        a1_local_ubnd_linf = std::max(a1_local_ubnd_linf,
+                                      std::fabs(r_ub));
+        a1_local_max_drho_dx = std::max(a1_local_max_drho_dx,
+                                        std::fabs(delta_rho_dx));
+        a1_local_max_dt_dj = std::max(a1_local_max_dt_dj,
+                                      std::fabs(current_div_dt));
+        const long double phi_rc = phi_bar * rC;
+        a1_local_wc += phi_rc;
+        a1_local_abs_phi_rc += std::fabs(phi_rc);
+        // Stage-A-S0 section 7A.3/7A.4 per-cell quantities.
+        const long double r_assembly = delta_rho_dx - delta_q_mass;
+        const long double r_transport = delta_q_mass + current_div_dt;
+        const long double parent_charge =
+            std::fabs(static_cast<long double>(Const::qe)) *
+                (sum_abs_old + sum_abs_new) +
+            std::max(
+                std::fabs(static_cast<long double>(
+                    fields.rho[rho_id])),
+                std::fabs(static_cast<long double>(
+                    candidate_fields.rho[rho_id]))) *
+                static_cast<long double>(grid_.dx);
+        const long double tau_i_assembly =
+            32.0L * as0_gamma_m * std::max(1.0L, parent_charge);
+        const long double abs_qe =
+            std::fabs(static_cast<long double>(Const::qe));
+        const long double s_transport =
+            abs_qe * sum_abs_delta_mass +
+            std::fabs(static_cast<long double>(dt) *
+                      static_cast<long double>(
+                          accepted_bundle.charge_current_face[
+                              static_cast<size_t>(ix) + 1])) +
+            std::fabs(static_cast<long double>(dt) *
+                      static_cast<long double>(
+                          accepted_bundle.charge_current_face[
+                              static_cast<size_t>(ix)]));
+        const long double transport_projection =
+            r_transport - (rQ - r_ub);
+        as0_r_assembly[static_cast<size_t>(ix)] = r_assembly;
+        as0_tau_assembly[static_cast<size_t>(ix)] = tau_i_assembly;
+        as0_r_transport[static_cast<size_t>(ix)] = r_transport;
+        as0_local_asm_linf = std::max(as0_local_asm_linf,
+                                      std::fabs(r_assembly));
+        as0_local_asm_l1 += std::fabs(r_assembly);
+        as0_local_transp_linf = std::max(as0_local_transp_linf,
+                                         std::fabs(r_transport));
+        as0_local_transp_proj_linf =
+            std::max(as0_local_transp_proj_linf,
+                     std::fabs(transport_projection));
+        as0_local_mass_delta_linf = std::max(as0_local_mass_delta_linf,
+                                             std::fabs(delta_q_mass));
+        as0_local_parent_max = std::max(as0_local_parent_max,
+                                        parent_charge);
+        as0_local_max_s_transport = std::max(as0_local_max_s_transport,
+                                             s_transport);
+        const long double phi_asm = phi_bar * r_assembly;
+        const long double phi_transp = phi_bar * r_transport;
+        as0_local_w_assembly += phi_asm;
+        as0_local_w_transport += phi_transp;
+    }
+    double a1_max_local[6] = {
+        static_cast<double>(a1_local_cont_linf),
+        static_cast<double>(a1_local_rq_linf),
+        static_cast<double>(a1_local_mismatch_linf),
+        static_cast<double>(a1_local_ubnd_linf),
+        static_cast<double>(a1_local_max_drho_dx),
+        static_cast<double>(a1_local_max_dt_dj)};
+    double a1_max_global[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    MPI_Allreduce(a1_max_local, a1_max_global, 6, MPI_DOUBLE, MPI_MAX,
+                  MPI_COMM_WORLD);
+    double a1_sum_local[2] = {
+        static_cast<double>(a1_local_wc),
+        static_cast<double>(a1_local_abs_phi_rc)};
+    double a1_sum_global[2] = {0.0, 0.0};
+    MPI_Allreduce(a1_sum_local, a1_sum_global, 2, MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+    result.joint_midpoint_continuity_charge_linf = a1_max_global[0];
+    result.joint_midpoint_residual_charge_linf = a1_max_global[1];
+    result.joint_midpoint_charge_projection_mismatch_linf =
+        a1_max_global[2];
+    result.joint_midpoint_u_boundary_charge_linf = a1_max_global[3];
+    const double tau_c = 8192.0 *
+        std::numeric_limits<double>::epsilon() *
+        std::max(1.0, std::max(a1_max_global[4],
+                               std::max(a1_max_global[5],
+                                        a1_max_global[0])));
+    result.joint_midpoint_continuity_roundoff_bound = tau_c;
+    // l1 uses its own SUM reduction (it was not part of a1_sum).
+    {
+        const double a1_l1_local =
+            static_cast<double>(a1_local_cont_l1);
+        double a1_l1_global = 0.0;
+        MPI_Allreduce(&a1_l1_local, &a1_l1_global, 1, MPI_DOUBLE, MPI_SUM,
+                      MPI_COMM_WORLD);
+        result.joint_midpoint_continuity_charge_l1 = a1_l1_global;
+    }
+    result.joint_midpoint_potential_weighted_continuity_defect =
+        a1_sum_global[0];
+    const double r_pj_actual =
+        result.joint_midpoint_poisson_transport_residual;
+    const double predicted =
+        poisson_work.residual + a1_sum_global[0];
+    result.joint_midpoint_poisson_current_predicted_residual = predicted;
+    result.joint_midpoint_poisson_current_prediction_error =
+        r_pj_actual - predicted;
+    const double tau_a = 8192.0 *
+        std::numeric_limits<double>::epsilon() *
+        std::max(1.0, std::max(std::fabs(r_pj_actual),
+                               std::max(std::fabs(poisson_work.residual),
+                                        std::max(std::fabs(a1_sum_global[0]),
+                                                 a1_sum_global[1]))));
+    result.joint_midpoint_prediction_roundoff_bound = tau_a;
+    unsigned long long a1_local_first_bad =
+        std::numeric_limits<unsigned long long>::max();
+    for (int ix = 0; ix < grid_.nx_local; ++ix) {
+        if (std::fabs(static_cast<double>(
+                a1_mismatch[static_cast<size_t>(ix)])) > tau_c) {
+            a1_local_first_bad =
+                static_cast<unsigned long long>(grid_.ix_start + ix);
+            break;
+        }
+    }
+    unsigned long long a1_global_first_bad = 0;
+    MPI_Allreduce(&a1_local_first_bad, &a1_global_first_bad, 1,
+                  MPI_UNSIGNED_LONG_LONG, MPI_MIN, MPI_COMM_WORLD);
+    result.joint_midpoint_continuity_first_bad_global_ix =
+        a1_global_first_bad ==
+            std::numeric_limits<unsigned long long>::max()
+        ? -1
+        : static_cast<int>(a1_global_first_bad);
+    // Stage-A-S0 reductions and bounds (section 7A.4).  All ranks enter the
+    // same collectives in the same order.
+    double as0_max_local[5] = {
+        static_cast<double>(as0_local_asm_linf),
+        static_cast<double>(as0_local_transp_linf),
+        static_cast<double>(as0_local_transp_proj_linf),
+        static_cast<double>(as0_local_mass_delta_linf),
+        static_cast<double>(as0_local_parent_max)};
+    double as0_max_global[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    MPI_Allreduce(as0_max_local, as0_max_global, 5, MPI_DOUBLE, MPI_MAX,
+                  MPI_COMM_WORLD);
+    double as0_sum_local[2] = {
+        static_cast<double>(as0_local_asm_l1),
+        static_cast<double>(as0_local_w_assembly)};
+    double as0_sum_global[2] = {0.0, 0.0};
+    MPI_Allreduce(as0_sum_local, as0_sum_global, 2, MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+    const double as0_w_transport_local =
+        static_cast<double>(as0_local_w_transport);
+    double as0_w_transport_global = 0.0;
+    MPI_Allreduce(&as0_w_transport_local, &as0_w_transport_global, 1,
+                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    result.joint_midpoint_density_assembly_mismatch_linf =
+        as0_max_global[0];
+    {
+        const double as0_l1_local = as0_sum_global[0];
+        double as0_l1_global = 0.0;
+        MPI_Allreduce(&as0_l1_local, &as0_l1_global, 1, MPI_DOUBLE,
+                      MPI_SUM, MPI_COMM_WORLD);
+        result.joint_midpoint_density_assembly_mismatch_l1 =
+            as0_l1_global;
+    }
+    result.joint_midpoint_mass_transport_charge_linf =
+        as0_max_global[1];
+    result.joint_midpoint_transport_projection_mismatch_linf =
+        as0_max_global[2];
+    result.joint_midpoint_mass_delta_charge_linf = as0_max_global[3];
+    result.joint_midpoint_parent_charge_scale_max = as0_max_global[4];
+    const double as0_tau_assembly_global = as0_gamma_ok
+        ? 32.0 * static_cast<double>(as0_gamma_m) *
+              std::max(1.0, as0_max_global[4])
+        : std::numeric_limits<double>::infinity();
+    result.joint_midpoint_density_assembly_roundoff_bound =
+        as0_tau_assembly_global;
+    // max_i S_i^transport is a per-cell maximum: reduce it too.
+    {
+        const double as0_strans_local =
+            static_cast<double>(as0_local_max_s_transport);
+        double as0_strans_global = 0.0;
+        MPI_Allreduce(&as0_strans_local, &as0_strans_global, 1,
+                      MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        result.joint_midpoint_mass_transport_roundoff_bound =
+            8192.0 * std::numeric_limits<double>::epsilon() *
+            std::max(1.0, as0_strans_global);
+    }
+    result.joint_midpoint_potential_weighted_assembly_defect =
+        as0_sum_global[1];
+    result.joint_midpoint_potential_weighted_transport_defect =
+        as0_w_transport_global;
+    result.joint_midpoint_weighted_defect_reconstruction_error =
+        std::fabs(result.joint_midpoint_potential_weighted_continuity_defect -
+                  result.joint_midpoint_potential_weighted_assembly_defect -
+                  result.joint_midpoint_potential_weighted_transport_defect);
+    if (as0_tau_assembly_global <=
+            result.joint_midpoint_density_assembly_mismatch_linf) {
+        for (int ix = 0; ix < grid_.nx_local; ++ix) {
+            if (std::fabs(static_cast<double>(
+                    as0_r_assembly[static_cast<size_t>(ix)])) >
+                static_cast<double>(as0_tau_assembly[
+                    static_cast<size_t>(ix)])) {
+                result.joint_midpoint_density_assembly_first_bad_global_ix =
+                    grid_.ix_start + ix;
+                break;
+            }
+        }
+    }
+    {
+        unsigned long long as0_local_first_transp =
+            std::numeric_limits<unsigned long long>::max();
+        const double tau_t =
+            result.joint_midpoint_mass_transport_roundoff_bound;
+        for (int ix = 0; ix < grid_.nx_local; ++ix) {
+            if (std::fabs(static_cast<double>(
+                    as0_r_transport[static_cast<size_t>(ix)])) > tau_t) {
+                as0_local_first_transp =
+                    static_cast<unsigned long long>(grid_.ix_start + ix);
+                break;
+            }
+        }
+        unsigned long long as0_global_first_transp = 0;
+        MPI_Allreduce(&as0_local_first_transp, &as0_global_first_transp, 1,
+                      MPI_UNSIGNED_LONG_LONG, MPI_MIN, MPI_COMM_WORLD);
+        result.joint_midpoint_mass_transport_first_bad_global_ix =
+            as0_global_first_transp ==
+                std::numeric_limits<unsigned long long>::max()
+            ? -1
+            : static_cast<int>(as0_global_first_transp);
+    }
+    // Stage-A-S1 (section 7B.4): read-only comparison between the accepted
+    // incremental charge assembly and the legacy absolute form for the SAME
+    // final candidate.  The absolute form never overwrites the incremental
+    // result.
+    {
+        long double as1_local_incremental_linf = 0.0L;
+        long double as1_local_absolute_linf = 0.0L;
+        long double as1_local_diff_linf = 0.0L;
+        long double as1_local_bound_max = 0.0L;
+        const long double as1_gamma_m =
+            static_cast<long double>(nq + 8) *
+            static_cast<long double>(
+                std::numeric_limits<double>::epsilon()) /
+            as0_gamma_m_denom;
+        for (int ix = 0; ix < grid_.nx_local; ++ix) {
+            const size_t rho_id2 =
+                static_cast<size_t>(a1_ng + ix);
+            const size_t base2 = static_cast<size_t>(ix) * nq;
+            const double rho_incremental =
+                candidate_fields.rho[rho_id2];
+            double number = 0.0;
+            long double sum_abs_state = 0.0L;
+            long double sum_abs_old2 = 0.0L;
+            for (int q = 0; q < nq; ++q) {
+                number += candidate[base2 + static_cast<size_t>(q)];
+                sum_abs_state += std::fabs(static_cast<long double>(
+                    candidate[base2 + static_cast<size_t>(q)]));
+                sum_abs_old2 += std::fabs(static_cast<long double>(
+                    m_old[base2 + static_cast<size_t>(q)]));
+            }
+            const double ni = ix < static_cast<int>(ion_density.size())
+                ? ion_density[static_cast<size_t>(ix)]
+                : 0.0;
+            const double rho_absolute =
+                Const::qe * (ni - number / grid_.dx);
+            const double form_difference =
+                rho_incremental - rho_absolute;
+            const long double parent_scale =
+                std::max(std::fabs(static_cast<long double>(Const::qe) *
+                                   static_cast<long double>(ni)),
+                         static_cast<long double>(Const::qe) *
+                             (sum_abs_state + sum_abs_old2) /
+                             static_cast<long double>(grid_.dx)) +
+                std::fabs(static_cast<long double>(
+                    fields.rho[rho_id2]));
+            const long double bound_i =
+                as0_gamma_ok
+                ? 32.0L * as1_gamma_m * std::max(1.0L, parent_scale)
+                : std::numeric_limits<long double>::infinity();
+            as1_local_incremental_linf =
+                std::max(as1_local_incremental_linf,
+                         std::fabs(static_cast<long double>(
+                             rho_incremental)));
+            as1_local_absolute_linf =
+                std::max(as1_local_absolute_linf,
+                         std::fabs(static_cast<long double>(
+                             rho_absolute)));
+            as1_local_diff_linf = std::max(as1_local_diff_linf,
+                std::fabs(static_cast<long double>(form_difference)));
+            as1_local_bound_max = std::max(as1_local_bound_max,
+                                           std::fabs(bound_i));
+        }
+        double as1_local[4] = {
+            static_cast<double>(as1_local_incremental_linf),
+            static_cast<double>(as1_local_absolute_linf),
+            static_cast<double>(as1_local_diff_linf),
+            static_cast<double>(as1_local_bound_max)};
+        double as1_global[4] = {0.0, 0.0, 0.0, 0.0};
+        MPI_Allreduce(as1_local, as1_global, 4, MPI_DOUBLE, MPI_MAX,
+                      MPI_COMM_WORLD);
+        result.joint_midpoint_candidate_rho_incremental = as1_global[0];
+        result.joint_midpoint_candidate_rho_absolute = as1_global[1];
+        result.joint_midpoint_candidate_rho_form_difference =
+            as1_global[2];
+        result.joint_midpoint_candidate_rho_form_roundoff_bound =
+            as1_global[3];
+    }
     const double combined_energy_residual = delta_ke_u +
         poisson_work.field_energy_change - poisson_work.electrode_work;
     const double candidate_energy_scale = std::max(

@@ -7,7 +7,7 @@
 > `docs/archive/VPFP时间中心不一致_JC修复与验收实施方案.md`、
 > `docs/archive/VPFP_P3联合x_u_Poisson功通量重构实施方案.md`。
 >
-> 当前后续实现入口：`docs/VPFP_能量根因链最终核查与逐阶段修复实施方案.md`。
+> 当前后续实现入口：`docs/VPFP_J2开放背景联合中点离散与验收实施方案.md`。
 
 ## 1. 最终结论
 
@@ -206,3 +206,155 @@ $$
 这不是修改 Poisson 空间算子、放宽 Newton 或调节能量 gate 的依据。并且，已记录的 endpoint `W_J` 本身接近零并不能排除周期接缝影响首末 cell force work；在没有 boundary-cell force-work 分解前，不得将问题简单归为“纯内部面错误”。
 
 所以当前 J1 的下一步严格遵循主方案第 11 节情形 B：审计生产 `x_flux_rate`、`charge_current_face`、midpoint face trace、首末 cell/seam 映射和 MPI face ownership。不得进入 F11、J1 MPI、J2 或 J3。
+
+## 10. 2026-08-23 J1 最终闭合结论
+
+本节是当前状态的最终结论，覆盖第 8、9 节中“J1 尚未解决”的时效性描述；第 8、9 节继续保留为历史定位记录。
+
+### 10.1 情形 B：periodic seam 加权伴随缺口
+
+J1 manufactured 测试使用 periodic x current topology，但 Poisson pairing face 保留两个非周期端点和 endpoint half-weight。旧 cell gather：
+
+$$
+E_i^{\mathrm{cell}}=\frac{E_{i-1/2}+E_{i+1/2}}{2}
+$$
+
+不是 periodic current map 在该 face quadrature 下的加权转置，导致：
+
+$$
+W_F-W_J=6.6676430276886904\ \mathrm{J/m^2}.
+$$
+
+seam 解析预测在舍入误差内完全解释该缺口。修复为 J1 测试拓扑专用的：
+
+$$
+E_{\mathrm{cell}}=G^*E_{\mathrm{pair}}.
+$$
+
+修复后：
+
+$$
+W_u-W_F=O(\epsilon_{\mathrm{mach}}),
+\qquad
+W_F-W_J=O(\epsilon_{\mathrm{mach}}).
+$$
+
+该 helper 只能用于 J1 periodic manufactured topology，不能直接用于最终 open/reservoir background。
+
+### 10.2 情形 A：近中性电荷装配消减
+
+J1 原先分别构造：
+
+$$
+\rho^n=q_e(n_i-n_e^n),
+\qquad
+\rho^{n+1}=q_e(n_i-n_e^{n+1}),
+$$
+
+再计算两者之差。近中性大数相减使电荷连续性诊断出现约：
+
+$$
+3.26\times10^{-11}\ \mathrm{C/m^2}
+$$
+
+的装配舍入项。J1 固定离子、无 Beam/Tail/source 时，改用数学等价的稳定增量装配：
+
+$$
+\rho_i^{n+1}
+=\rho_i^n+
+\frac{q_e}{\Delta x}
+\sum_{j,k}\left(M_{i,j,k}^{n+1}-M_{i,j,k}^{n}\right).
+$$
+
+装配 mismatch 降至约：
+
+$$
+7.5\times10^{-17}\ \mathrm{C/m^2}.
+$$
+
+这不是能量补丁，也不是由 current divergence 覆盖电荷；candidate rho 仍由 candidate mass 决定。
+
+### 10.3 Poisson scalar identity 的稳定求和
+
+旧 `evaluate_work_identity()` 先分别求两个约为：
+
+$$
+1.39\times10^5\ \mathrm{J/m^2}
+$$
+
+的场能总量，再相减得到约：
+
+$$
+17.78\ \mathrm{J/m^2}.
+$$
+
+普通 double 顺序求和产生抵消放大。修复采用逐 cell 因式分解的场能差、`long double` Neumaier 累加和 `MPI_LONG_DOUBLE` 归约；未修改 Poisson solve、stencil、边界或场状态。
+
+零端点生产配置的 scalar identity 已通过。非零 Dirichlet endpoint 的完整离散边界功仍是独立已知限制，但不属于当前固定：
+
+```text
+phi_left=0
+phi_right=0
+```
+
+的生产模型。
+
+### 10.4 情形 A-N：非线性 residual 的功投影
+
+phase residual 与 Poisson residual 已经很小，但 potential-weighted continuity residual 仍可超出最终能量门。J1 收敛条件因此由两门扩展为：
+
+```text
+phase residual
+Poisson residual
+Poisson-current pairing residual
+```
+
+三者必须同时通过。pairing 门最终保持：
+
+$$
+10^{-9},
+$$
+
+总能量门保持：
+
+$$
+10^{-8}.
+$$
+
+没有通过缩放场、电流、分布或能量投影改变候选态。
+
+### 10.5 多步 signed-state 契约
+
+Newton trial 使用 signed residual domain，最终候选由 code-76 正性门验收。第一步接受态可能包含 code-76 容差内的 signed roundoff mass，因此下一步初始 candidate 也必须允许同一 signed residual domain；否则第二步会在初始 residual 阶段错误返回 code 71。
+
+修复只统一 residual 定义域，最终 code-76、`negative_tolerance` 和拒绝逻辑保持不变。
+
+### 10.6 最终验收结果
+
+以下均已通过：
+
+- J0 全部离散恒等式；
+- J1 periodic seam weighted-adjoint；
+- Poisson scalar identity；
+- charge continuity 与 potential-weighted prediction；
+- `smooth-background`；
+- `smooth-perturbed-background`；
+- `dt` 与 `dt/2`；
+- 10 步累计残差门；
+- 1/2/5 rank MPI ownership；
+- 情形 A 全量 A8 回归。
+
+MPI rank 比较必须区分两类尺度：结构恒等式按舍入误差验收；非线性停止量按 solver tolerance 验收。不同 rank 的迭代次数允许不同，只要都进入同一个收敛球且结构恒等式保持闭合。
+
+### 10.7 当前唯一下一步
+
+J1 只是 periodic manufactured 核心测试。最终生产模型必须回到：
+
+```text
+reservoir/open background
+nonperiodic DIRICHLET_PHI Poisson
+phi_left=0
+phi_right=0
+```
+
+因此下一步是 J2：为开放 x flux、reservoir source、边界 number/current/kinetic ledger 和非周期 Poisson pairing 重新建立同源离散。禁止把 J1 periodic `G^*` 直接接入生产开放边界。

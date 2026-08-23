@@ -10,6 +10,7 @@
 #include <limits>
 #include <mpi.h>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -406,6 +407,467 @@ PeriodicSeamAdjointResult run_periodic_seam_adjoint_test(int rank, int size)
     return result;
 }
 
+struct A2CaseResult {
+    bool ran;
+    bool finite;
+    bool poisson_scalar_identity_pass;
+    bool charge_residual_projection_pass;
+    bool poisson_current_prediction_pass;
+    bool nontrivial_wc_pass;
+    bool passed;
+    double w_c;
+    double r_p;
+    double r_pj;
+    double prediction_error;
+    double tau_c;
+    double tau_a;
+    double mismatch_linf;
+    double r_q_linf;
+    double r_c_linf;
+    double u_boundary_linf;
+    double total_charge_change;
+    A2CaseResult()
+        : ran(false), finite(false),
+          poisson_scalar_identity_pass(false),
+          charge_residual_projection_pass(false),
+          poisson_current_prediction_pass(false),
+          nontrivial_wc_pass(false), passed(false),
+          w_c(0.0), r_p(0.0), r_pj(0.0), prediction_error(0.0),
+          tau_c(0.0), tau_a(0.0), mismatch_linf(0.0), r_q_linf(0.0),
+          r_c_linf(0.0), u_boundary_linf(0.0),
+          total_charge_change(0.0) {}
+};
+
+struct A2PairResult {
+    bool selected;
+    A2CaseResult zero;
+    A2CaseResult injected;
+    bool passed;
+    A2PairResult() : selected(false), passed(false) {}
+};
+
+// Stage-A-S1 unit check (section 7B): the stable incremental charge
+// assembly is algebraically identical to qe*(ni - n_e) but numerically
+// superior for two near-neutral large totals.  This test verifies, with a
+// fixed ion background and near-neutral electron states under positive,
+// negative and tiny perturbations, that the production incremental form
+// (per-velocity-cell long double differencing, one final rounding) matches
+// an all-long-double high precision reference, while the legacy absolute
+// form does not.
+struct As1IncrementalRhoResult {
+    bool selected;
+    bool positive_pass;
+    bool negative_pass;
+    bool near_neutral_small_pass;
+    bool absolute_form_degrades;
+    bool passed;
+    double positive_incremental_error;
+    double positive_absolute_error;
+    double negative_incremental_error;
+    double near_neutral_incremental_error;
+    double near_neutral_absolute_error;
+    double roundoff_bound;
+    As1IncrementalRhoResult()
+        : selected(false), positive_pass(false), negative_pass(false),
+          near_neutral_small_pass(false),
+          absolute_form_degrades(false), passed(false),
+          positive_incremental_error(0.0),
+          positive_absolute_error(0.0),
+          negative_incremental_error(0.0),
+          near_neutral_incremental_error(0.0),
+          near_neutral_absolute_error(0.0), roundoff_bound(0.0) {}
+};
+
+As1IncrementalRhoResult run_as1_incremental_rho_test(int rank, int size)
+{
+    (void)rank;
+    (void)size;
+    As1IncrementalRhoResult result;
+    result.selected = true;
+    const double eps_gate = 8192.0 *
+        std::numeric_limits<double>::epsilon();
+
+    // Fixed ion background and a near-neutral electron state: n_e^0 differs
+    // from n_i by only 1e-13 relative, so rho^0 is a tiny difference of two
+    // large numbers - exactly the regime where the absolute form degrades.
+    const double ni = 3.0e20;
+    const double dx = 4.0e-6;
+    const int nq_local = 32 * 8;
+    const long double neutral_offset = 1.0e-13L;
+    const double m_cell =
+        static_cast<double>(static_cast<long double>(ni) *
+                            (1.0L + neutral_offset) *
+                            static_cast<long double>(dx) /
+                            static_cast<long double>(nq_local));
+    const long double rho_old_ld =
+        static_cast<long double>(Const::qe) *
+        (static_cast<long double>(ni) -
+         static_cast<long double>(m_cell) *
+             static_cast<long double>(nq_local) /
+             static_cast<long double>(dx));
+
+    auto run_subcase = [&](double relative_perturbation)
+        -> std::pair<double, double> {
+        // candidate = m_old + perturbation applied per velocity cell.
+        const double delta_m = m_cell * relative_perturbation;
+        long double delta_number_ref = 0.0L;
+        for (int q = 0; q < nq_local; ++q)
+            delta_number_ref += static_cast<long double>(delta_m);
+        const long double delta_rho_ref =
+            -static_cast<long double>(Const::qe) * delta_number_ref /
+            static_cast<long double>(dx);
+        // High precision reference.
+        const long double rho_reference = rho_old_ld + delta_rho_ref;
+        // Production incremental form semantics: per-velocity-cell
+        // long double differencing of double values, one final rounding,
+        // added to the stored old rho in double.
+        long double delta_number = 0.0L;
+        for (int q = 0; q < nq_local; ++q)
+            delta_number +=
+                static_cast<long double>(m_cell + delta_m) -
+                static_cast<long double>(m_cell);
+        const long double delta_rho =
+            -static_cast<long double>(Const::qe) * delta_number /
+            static_cast<long double>(dx);
+        const double rho_incremental = static_cast<double>(
+            rho_old_ld + delta_rho);
+        // Legacy absolute form semantics: plain double accumulation of the
+        // candidate total, then qe*(ni - number/dx).
+        double number = 0.0;
+        for (int q = 0; q < nq_local; ++q) number += m_cell + delta_m;
+        const double ni_double = static_cast<double>(
+            static_cast<long double>(ni));
+        const double rho_absolute =
+            Const::qe * (ni_double - number / dx);
+
+        const long double parent_scale =
+            std::max(std::fabs(static_cast<long double>(Const::qe) *
+                               static_cast<long double>(ni)),
+                     static_cast<long double>(Const::qe) *
+                         static_cast<long double>(m_cell + delta_m) *
+                         static_cast<long double>(nq_local) /
+                         static_cast<long double>(dx)) +
+            std::fabs(rho_old_ld);
+        result.roundoff_bound = std::max(result.roundoff_bound,
+            static_cast<double>(32.0L *
+                (static_cast<long double>(nq_local + 8) *
+                 static_cast<long double>(
+                     std::numeric_limits<double>::epsilon()) /
+                 (1.0L - static_cast<long double>(nq_local + 8) *
+                  static_cast<long double>(
+                      std::numeric_limits<double>::epsilon()))) *
+                std::max(1.0L, parent_scale)));
+        return {std::fabs(static_cast<double>(
+                    static_cast<long double>(rho_incremental) -
+                    rho_reference)),
+                std::fabs(static_cast<double>(
+                    static_cast<long double>(rho_absolute) -
+                    rho_reference))};
+    };
+
+    std::pair<double, double> pos = run_subcase(1.0e-6);
+    result.positive_incremental_error = pos.first;
+    result.positive_absolute_error = pos.second;
+    std::pair<double, double> neg = run_subcase(-1.0e-6);
+    result.negative_incremental_error = neg.first;
+    std::pair<double, double> small = run_subcase(1.0e-15);
+    result.near_neutral_incremental_error = small.first;
+    result.near_neutral_absolute_error = small.second;
+
+    const double scale = std::fabs(static_cast<double>(rho_old_ld));
+    const double tol = eps_gate * std::max(scale, 1.0);
+    result.positive_pass = pos.first <= tol;
+    result.negative_pass = neg.first <= tol;
+    result.near_neutral_small_pass = small.first <= tol;
+    result.absolute_form_degrades =
+        result.roundoff_bound > 0.0 &&
+        pos.second > pos.first && small.second > small.first;
+    result.passed = result.positive_pass && result.negative_pass &&
+        result.near_neutral_small_pass &&
+        result.absolute_form_degrades;
+    return result;
+}
+
+// Stage-A2 (docs/VPFP_F10情形A_连续性Poisson功配对严格修复实施方案.md
+// section 6): direct production-object identity test.  Both cases call
+// JointPhaseSpaceMidpointOperator::evaluate_local_residual(),
+// OpenElectrostaticSolver::solve(), evaluate_work_identity() and
+// build_potential_pairing_field(); no production formula is re-derived in
+// this test.
+A2CaseResult run_a2_case(bool inject_residual, int rank, int size)
+{
+    A2CaseResult result;
+    result.ran = true;
+    const double eps_gate = 8192.0 *
+        std::numeric_limits<double>::epsilon();
+
+    SpatialGrid sg;
+    sg.init_with_domain(rank, size, 4, 4.0e-6);
+    CylindricalVelocityGrid vg;
+    vg.init_grid(1.5, 32, 8, 32, 0, 1.5, 1.5, 2.0);
+    const int nx = sg.nx_global;
+    const int nv = static_cast<int>(vg.upar_cells.size());
+    const int nmu = static_cast<int>(vg.uperp_cells.size());
+    const size_t count = static_cast<size_t>(nx * nv * nmu);
+    const double u_extent = std::max(
+        std::fabs(vg.upar_cells.front()),
+        std::fabs(vg.upar_cells.back()));
+
+    // Deterministic positive midpoint mass with no u_parallel symmetry and a
+    // monotone x tilt (same construction as the J0-E2 seam test).
+    std::vector<double> m_mid(count, 0.0);
+    for (int ix = 0; ix < nx; ++ix) {
+        const double x_tilt =
+            1.0 + 0.25 * ((static_cast<double>(ix) + 0.5) /
+                          static_cast<double>(nx) - 0.5);
+        for (int j = 0; j < nv; ++j) {
+            for (int k = 0; k < nmu; ++k) {
+                const double u = vg.upar_cells[static_cast<size_t>(j)];
+                const double up = vg.uperp_cells[static_cast<size_t>(k)];
+                const double shape = std::exp(-(u * u + up * up) / 0.35);
+                const double asymmetric_factor =
+                    1.0 + 0.15 * u / u_extent + 0.03 * std::sin(
+                        2.0 * Const::pi * static_cast<double>((ix + 1) *
+                        (k + 1)) / static_cast<double>(nx * nmu));
+                m_mid[cell_index(ix, j, k, nv, nmu)] =
+                    1.0e20 * x_tilt * asymmetric_factor * shape *
+                    vg.cell_phase_volume(j, k);
+            }
+        }
+    }
+    std::vector<double> e_cell(static_cast<size_t>(nx), 2.0e8);
+    const double dt = 1.0e-18;
+    const JointPhaseSpaceFluxBundle bundle =
+        JointPhaseSpaceMidpointOperator::build_periodic_center_flux(
+            sg, vg, m_mid, e_cell, dt);
+    std::vector<double> m_old(count, 0.0);
+    std::vector<double> m_new(count, 0.0);
+    for (size_t i = 0; i < count; ++i) {
+        m_old[i] = m_mid[i] - 0.5 * bundle.mass_delta_total[i];
+        m_new[i] = m_mid[i] + 0.5 * bundle.mass_delta_total[i];
+    }
+
+    // Deterministic, x-asymmetric, strictly positive injection into the
+    // candidate only, so the phase-space residual becomes nonzero while the
+    // candidate stays positive and the total injected charge is controllable.
+    std::vector<double> injection(count, 0.0);
+    if (inject_residual) {
+        long double local_total = 0.0L;
+        for (int ix = 0; ix < nx; ++ix) {
+            const double x_bump =
+                1.0 + 0.5 * ((static_cast<double>(ix) + 0.5) /
+                             static_cast<double>(nx)) +
+                0.25 * std::sin(6.0 * Const::pi *
+                                (static_cast<double>(ix) + 0.5) /
+                                static_cast<double>(nx));
+            for (int j = 0; j < nv; ++j) {
+                for (int k = 0; k < nmu; ++k) {
+                    const double u =
+                        vg.upar_cells[static_cast<size_t>(j)];
+                    const double up =
+                        vg.uperp_cells[static_cast<size_t>(k)];
+                    const double shape =
+                        std::exp(-(u * u + up * up) / 0.35);
+                    const size_t id =
+                        cell_index(ix, j, k, nv, nmu);
+                    injection[id] =
+                        1.0e-4 * 1.0e20 * x_bump * shape *
+                        vg.cell_phase_volume(j, k);
+                    m_new[id] += injection[id];
+                    local_total += static_cast<long double>(
+                        injection[id]);
+                }
+            }
+        }
+        result.total_charge_change = static_cast<double>(local_total);
+    }
+
+    // Production residual evaluation on the final candidate.
+    JointPhaseSpaceFluxBundle a2_bundle;
+    std::vector<double> residual;
+    double residual_linf = 0.0;
+    double residual_scale = 0.0;
+    const bool eval_ok =
+        JointPhaseSpaceMidpointOperator::evaluate_local_residual(
+            sg, vg, m_old, m_new, e_cell, dt, rank, size,
+            a2_bundle, residual, residual_linf, residual_scale);
+
+    // Production Poisson states: the base charge change follows the same
+    // production face current used by the residual algebra (never rebuilt
+    // from M differences); the injection adds its own exact charge moment so
+    // that r^C matches r^Q by construction instead of by symmetry.
+    ElectrostaticBoundary boundary;
+    boundary.type = ElectrostaticBoundaryType::DIRICHLET_PHI;
+    boundary.e_left = 0.0;
+    boundary.phi_left = 0.0;
+    boundary.phi_right = 0.0;
+    OpenElectrostaticSolver poisson;
+    poisson.init(sg, boundary);
+    EMFields before;
+    EMFields after;
+    before.init(sg);
+    after.init(sg);
+    std::fill(before.rho.begin(), before.rho.end(), 0.0);
+    std::fill(after.rho.begin(), after.rho.end(), 0.0);
+    for (int ix = 0; ix < sg.nx_local; ++ix) {
+        double charge_delta = -dt *
+            (a2_bundle.charge_current_face[
+                static_cast<size_t>(ix) + 1] -
+             a2_bundle.charge_current_face[
+                 static_cast<size_t>(ix)]) / sg.dx;
+        if (inject_residual) {
+            long double s_sum = 0.0L;
+            for (int j = 0; j < nv; ++j)
+                for (int k = 0; k < nmu; ++k)
+                    s_sum += static_cast<long double>(
+                        injection[cell_index(ix, j, k, nv, nmu)]);
+            charge_delta += -Const::qe * static_cast<double>(s_sum) /
+                sg.dx;
+        }
+        after.rho[static_cast<size_t>(sg.nghost + ix)] = charge_delta;
+    }
+    OpenGaussSolveOptions solve_options;
+    solve_options.reconstruct_phi = true;
+    solve_options.compute_l1 = true;
+    solve_options.compute_boundary_audit = true;
+    poisson.solve(before, rank, size, solve_options);
+    poisson.solve(after, rank, size, solve_options);
+
+    std::vector<double> rho_delta(before.rho.size(), 0.0);
+    for (int ix = 0; ix < sg.nx_local; ++ix)
+        rho_delta[static_cast<size_t>(sg.nghost + ix)] =
+            after.rho[static_cast<size_t>(sg.nghost + ix)] -
+            before.rho[static_cast<size_t>(sg.nghost + ix)];
+    const OpenPoissonWorkIdentity work = poisson.evaluate_work_identity(
+        before, after, rho_delta, rank, size);
+    std::vector<double> pairing_face;
+    const bool pairing_ok = poisson.build_potential_pairing_field(
+        before, after, pairing_face, rank, size);
+
+    // Section 2/3 diagnostics built only from production outputs.
+    long double local_r_q_linf = 0.0L;
+    long double local_r_c_linf = 0.0L;
+    long double local_mismatch_linf = 0.0L;
+    long double local_ubnd_linf = 0.0L;
+    long double local_max_drho_dx = 0.0L;
+    long double local_max_dt_dj = 0.0L;
+    long double w_c = 0.0L;
+    long double abs_phi_rc_sum = 0.0L;
+    const int ng = sg.nghost;
+    for (int ix = 0; ix < sg.nx_local; ++ix) {
+        long double sum_residual = 0.0L;
+        for (int q = 0; q < nv * nmu; ++q)
+            sum_residual += static_cast<long double>(
+                residual[static_cast<size_t>(ix) *
+                         static_cast<size_t>(nv * nmu) +
+                         static_cast<size_t>(q)]);
+        const long double rQ =
+            -static_cast<long double>(Const::qe) * sum_residual;
+        const long double delta_rho_dx =
+            static_cast<long double>(rho_delta[
+                static_cast<size_t>(ng + ix)]) *
+            static_cast<long double>(sg.dx);
+        const long double current_div_dt =
+            static_cast<long double>(dt) *
+            static_cast<long double>(
+                a2_bundle.charge_current_face[
+                    static_cast<size_t>(ix) + 1] -
+                a2_bundle.charge_current_face[
+                    static_cast<size_t>(ix)]);
+        const long double rC = delta_rho_dx + current_div_dt;
+        long double u_boundary_sum = 0.0L;
+        for (int k = 0; k < nmu; ++k) {
+            const size_t bottom =
+                static_cast<size_t>(ix) *
+                static_cast<size_t>(nv + 1) *
+                static_cast<size_t>(nmu) +
+                static_cast<size_t>(k);
+            const size_t top = bottom +
+                static_cast<size_t>(nv) *
+                static_cast<size_t>(nmu);
+            u_boundary_sum += static_cast<long double>(
+                a2_bundle.u_flux_rate[top] -
+                a2_bundle.u_flux_rate[bottom]);
+        }
+        const long double r_ub =
+            -static_cast<long double>(Const::qe) *
+            static_cast<long double>(dt) * u_boundary_sum;
+        // Section 2.3 verbatim: the same cell-average potential used by
+        // evaluate_work_identity()/build_potential_pairing_field().
+        const double old_phi_average =
+            before.phi[static_cast<size_t>(ng + ix)] +
+            sg.dx *
+            (before.Ex_face[static_cast<size_t>(ix) + 1] -
+             before.Ex_face[static_cast<size_t>(ix)]) / 12.0;
+        const double new_phi_average =
+            after.phi[static_cast<size_t>(ng + ix)] +
+            sg.dx *
+            (after.Ex_face[static_cast<size_t>(ix) + 1] -
+             after.Ex_face[static_cast<size_t>(ix)]) / 12.0;
+        const long double phi_bar = static_cast<long double>(
+            0.5 * (old_phi_average + new_phi_average));
+        local_r_q_linf = std::max(local_r_q_linf, std::fabs(rQ));
+        local_r_c_linf = std::max(local_r_c_linf, std::fabs(rC));
+        local_mismatch_linf = std::max(local_mismatch_linf,
+            std::fabs(rC - rQ + r_ub));
+        local_ubnd_linf = std::max(local_ubnd_linf,
+                                   std::fabs(r_ub));
+        local_max_drho_dx = std::max(local_max_drho_dx,
+                                     std::fabs(delta_rho_dx));
+        local_max_dt_dj = std::max(local_max_dt_dj,
+                                   std::fabs(current_div_dt));
+        const long double phi_rc = phi_bar * rC;
+        w_c += phi_rc;
+        abs_phi_rc_sum += std::fabs(phi_rc);
+    }
+    const double w_j = dt * face_inner_product(
+        pairing_face, a2_bundle.charge_current_face, sg.dx);
+    result.w_c = static_cast<double>(w_c);
+    result.r_p = work.residual;
+    result.r_pj = work.field_energy_change - work.electrode_work + w_j;
+    const double predicted = result.r_p + result.w_c;
+    result.prediction_error = result.r_pj - predicted;
+    result.tau_c = eps_gate *
+        std::max(1.0, std::max(
+            static_cast<double>(local_max_drho_dx),
+            std::max(static_cast<double>(local_max_dt_dj),
+                     static_cast<double>(local_r_q_linf))));
+    result.tau_a = eps_gate *
+        std::max(1.0, std::max(std::fabs(result.r_pj),
+                               std::max(std::fabs(result.r_p),
+                                        std::max(std::fabs(result.w_c),
+                                         static_cast<double>(
+                                             abs_phi_rc_sum)))));
+    result.mismatch_linf = static_cast<double>(local_mismatch_linf);
+    result.r_q_linf = static_cast<double>(local_r_q_linf);
+    result.r_c_linf = static_cast<double>(local_r_c_linf);
+    result.u_boundary_linf = static_cast<double>(local_ubnd_linf);
+    const double poisson_scale = std::max(1.0e-300,
+        std::max(std::fabs(work.field_energy_before),
+        std::max(std::fabs(work.field_energy_after),
+        std::max(std::fabs(work.field_energy_change),
+                 std::fabs(work.potential_charge_work)))));
+    result.finite = eval_ok && pairing_ok && work.finite &&
+        std::isfinite(result.w_c) && std::isfinite(result.r_p) &&
+        std::isfinite(result.r_pj) &&
+        std::isfinite(result.prediction_error) &&
+        std::isfinite(result.tau_c) && std::isfinite(result.tau_a);
+    result.poisson_scalar_identity_pass = result.finite &&
+        std::fabs(work.residual) <= eps_gate * poisson_scale;
+    result.charge_residual_projection_pass = result.finite &&
+        result.mismatch_linf <= result.tau_c;
+    result.poisson_current_prediction_pass = result.finite &&
+        std::fabs(result.prediction_error) <= result.tau_a;
+    result.nontrivial_wc_pass = !inject_residual ||
+        std::fabs(result.w_c) > 100.0 * result.tau_a;
+    result.passed = result.finite &&
+        result.poisson_scalar_identity_pass &&
+        result.charge_residual_projection_pass &&
+        result.poisson_current_prediction_pass &&
+        result.nontrivial_wc_pass;
+    return result;
+}
+
 ScenarioResult run_scenario(const Scenario& scenario, int rank, int size)
 {
     ScenarioResult result;
@@ -767,9 +1229,42 @@ ScenarioResult run_scenario(const Scenario& scenario, int rank, int size)
     return result;
 }
 
-void write_result(std::ostream& out, const std::vector<ScenarioResult>& results,
+void write_a2_case(std::ostream& out, const char* tag,
+                   const A2CaseResult& r)
+{
+    out << "a2_" << tag << "_ran=" << (r.ran ? 1 : 0) << "\n"
+        << "a2_" << tag << "_finite=" << (r.finite ? 1 : 0) << "\n"
+        << "a2_" << tag << "_poisson_scalar_identity_pass="
+        << (r.poisson_scalar_identity_pass ? 1 : 0) << "\n"
+        << "a2_" << tag << "_charge_residual_projection_pass="
+        << (r.charge_residual_projection_pass ? 1 : 0) << "\n"
+        << "a2_" << tag << "_poisson_current_prediction_pass="
+        << (r.poisson_current_prediction_pass ? 1 : 0) << "\n"
+        << "a2_" << tag << "_nontrivial_wc_pass="
+        << (r.nontrivial_wc_pass ? 1 : 0) << "\n"
+        << "a2_" << tag << "_w_c=" << r.w_c << "\n"
+        << "a2_" << tag << "_r_p=" << r.r_p << "\n"
+        << "a2_" << tag << "_r_pj=" << r.r_pj << "\n"
+        << "a2_" << tag << "_prediction_error=" << r.prediction_error
+        << "\n"
+        << "a2_" << tag << "_tau_c=" << r.tau_c << "\n"
+        << "a2_" << tag << "_tau_a=" << r.tau_a << "\n"
+        << "a2_" << tag << "_mismatch_linf=" << r.mismatch_linf << "\n"
+        << "a2_" << tag << "_r_q_linf=" << r.r_q_linf << "\n"
+        << "a2_" << tag << "_r_c_linf=" << r.r_c_linf << "\n"
+        << "a2_" << tag << "_u_boundary_linf=" << r.u_boundary_linf
+        << "\n"
+        << "a2_" << tag << "_total_charge_change="
+        << r.total_charge_change << "\n"
+        << "a2_" << tag << "_pass=" << (r.passed ? 1 : 0) << "\n";
+}
+
+void write_result(std::ostream& out,
+                  const std::vector<ScenarioResult>& results,
                   const UFluxGeometryResult& geometry,
-                  const PeriodicSeamAdjointResult* seam)
+                  const PeriodicSeamAdjointResult* seam,
+                  const A2PairResult* a2,
+                  const As1IncrementalRhoResult* as1)
 {
     double max_mass = 0.0;
     double max_kinetic = 0.0;
@@ -777,7 +1272,9 @@ void write_result(std::ostream& out, const std::vector<ScenarioResult>& results,
     double max_combined = 0.0;
     double max_pairing = 0.0;
     bool pass = !results.empty() && geometry.passed &&
-        (!seam || !seam->selected || seam->passed);
+        (!seam || !seam->selected || seam->passed) &&
+        (!a2 || !a2->selected || a2->passed) &&
+        (!as1 || !as1->selected || as1->passed);
     bool j0_c = !results.empty();
     bool j0_d = !results.empty();
     bool j0_e = !results.empty();
@@ -918,8 +1415,38 @@ void write_result(std::ostream& out, const std::vector<ScenarioResult>& results,
             << "j0_e2_pairing_face_right=" << seam->pairing_face_right << "\n"
             << "j0_e2_force_current_first_cell="
             << seam->force_current_first_cell << "\n"
-            << "j0_e2_force_current_last_cell="
-            << seam->force_current_last_cell << "\n";
+             << "j0_e2_force_current_last_cell="
+             << seam->force_current_last_cell << "\n";
+    }
+    if (a2 && a2->selected) {
+        write_a2_case(out, "zero_residual", a2->zero);
+        write_a2_case(out, "injected_residual", a2->injected);
+        out << "a2_all_pass="
+            << ((a2->zero.passed && a2->injected.passed) ? 1 : 0)
+            << "\n";
+    }
+    if (as1 && as1->selected) {
+        out << "as1_incremental_positive_pass="
+            << (as1->positive_pass ? 1 : 0) << "\n"
+            << "as1_incremental_negative_pass="
+            << (as1->negative_pass ? 1 : 0) << "\n"
+            << "as1_incremental_near_neutral_small_pass="
+            << (as1->near_neutral_small_pass ? 1 : 0) << "\n"
+            << "as1_absolute_form_degrades="
+            << (as1->absolute_form_degrades ? 1 : 0) << "\n"
+            << "as1_incremental_positive_error="
+            << as1->positive_incremental_error << "\n"
+            << "as1_absolute_positive_error="
+            << as1->positive_absolute_error << "\n"
+            << "as1_incremental_negative_error="
+            << as1->negative_incremental_error << "\n"
+            << "as1_incremental_near_neutral_error="
+            << as1->near_neutral_incremental_error << "\n"
+            << "as1_absolute_near_neutral_error="
+            << as1->near_neutral_absolute_error << "\n"
+            << "as1_roundoff_bound=" << as1->roundoff_bound << "\n"
+            << "as1_incremental_rho_all_pass="
+            << (as1->passed ? 1 : 0) << "\n";
     }
 }
 
@@ -981,21 +1508,44 @@ int main(int argc, char** argv)
     if (seam_selected)
         seam_result = run_periodic_seam_adjoint_test(rank, size);
 
+    A2PairResult a2_result;
+    const bool a2_selected = test_case == "all";
+    if (a2_selected) {
+        a2_result.selected = true;
+        a2_result.zero =
+            run_a2_case(/*inject_residual=*/false, rank, size);
+        a2_result.injected =
+            run_a2_case(/*inject_residual=*/true, rank, size);
+        a2_result.passed =
+            a2_result.zero.passed && a2_result.injected.passed;
+    }
+
+    As1IncrementalRhoResult as1_result;
+    const bool as1_selected = test_case == "all";
+    if (as1_selected)
+        as1_result = run_as1_incremental_rho_test(rank, size);
+
     bool pass = true;
     for (size_t i = 0; i < results.size(); ++i) pass = pass && results[i].passed;
     if (!geometry.passed) pass = false;
     if (seam_selected && !seam_result.passed) pass = false;
+    if (a2_selected && !a2_result.passed) pass = false;
+    if (as1_selected && !as1_result.passed) pass = false;
     if (rank == 0) {
         std::cout << std::setprecision(17);
         write_result(std::cout, results, geometry,
-                     seam_selected ? &seam_result : 0);
+                     seam_selected ? &seam_result : 0,
+                     a2_selected ? &a2_result : 0,
+                     as1_selected ? &as1_result : 0);
         if (!result_path.empty()) {
             std::ofstream out(result_path.c_str(), std::ios::trunc);
             if (!out) pass = false;
             else {
                 out << std::setprecision(17);
                 write_result(out, results, geometry,
-                             seam_selected ? &seam_result : 0);
+                             seam_selected ? &seam_result : 0,
+                             a2_selected ? &a2_result : 0,
+                             as1_selected ? &as1_result : 0);
             }
         }
     }
